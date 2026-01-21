@@ -1,0 +1,211 @@
+"use strict";
+/**
+ * =============================================================================
+ * SECURITY MIDDLEWARE
+ * =============================================================================
+ *
+ * Comprehensive security middleware for production-ready API.
+ *
+ * SECURITY FEATURES:
+ * - Helmet security headers
+ * - Input sanitization (XSS, SQL injection prevention)
+ * - Request size limiting
+ * - CORS configuration
+ * - Request ID tracking
+ *
+ * SCALABILITY:
+ * - Stateless design
+ * - Low overhead
+ * - Works with load balancers
+ * =============================================================================
+ */
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.securityHeaders = void 0;
+exports.requestIdMiddleware = requestIdMiddleware;
+exports.sanitizeInput = sanitizeInput;
+exports.preventParamPollution = preventParamPollution;
+exports.blockSuspiciousRequests = blockSuspiciousRequests;
+exports.securityResponseHeaders = securityResponseHeaders;
+const helmet_1 = __importDefault(require("helmet"));
+const uuid_1 = require("uuid");
+const logger_service_1 = require("../services/logger.service");
+/**
+ * Generate and attach request ID for tracking
+ */
+function requestIdMiddleware(req, res, next) {
+    const requestId = req.headers['x-request-id'] || (0, uuid_1.v4)();
+    req.headers['x-request-id'] = requestId;
+    res.setHeader('X-Request-ID', requestId);
+    next();
+}
+/**
+ * Security headers using Helmet
+ * Configurable for different environments
+ */
+exports.securityHeaders = (0, helmet_1.default)({
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc: ["'self'"],
+            styleSrc: ["'self'", "'unsafe-inline'"],
+            scriptSrc: ["'self'"],
+            imgSrc: ["'self'", 'data:', 'https:'],
+            connectSrc: ["'self'"],
+            fontSrc: ["'self'"],
+            objectSrc: ["'none'"],
+            mediaSrc: ["'self'"],
+            frameSrc: ["'none'"],
+        },
+    },
+    crossOriginEmbedderPolicy: false, // Allow embedding for mobile apps
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+    dnsPrefetchControl: { allow: false },
+    frameguard: { action: 'deny' },
+    hidePoweredBy: true,
+    hsts: {
+        maxAge: 31536000, // 1 year
+        includeSubDomains: true,
+        preload: true,
+    },
+    ieNoOpen: true,
+    noSniff: true,
+    originAgentCluster: true,
+    permittedCrossDomainPolicies: { permittedPolicies: 'none' },
+    referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
+    xssFilter: true,
+});
+/**
+ * Input sanitization middleware
+ * Prevents XSS and injection attacks
+ */
+function sanitizeInput(req, _res, next) {
+    try {
+        // Sanitize body
+        if (req.body && typeof req.body === 'object') {
+            req.body = sanitizeObject(req.body);
+        }
+        // Sanitize query params
+        if (req.query && typeof req.query === 'object') {
+            req.query = sanitizeObject(req.query);
+        }
+        // Sanitize params
+        if (req.params && typeof req.params === 'object') {
+            req.params = sanitizeObject(req.params);
+        }
+        next();
+    }
+    catch (error) {
+        logger_service_1.logger.error('Input sanitization error', error);
+        next();
+    }
+}
+/**
+ * Recursively sanitize object values
+ */
+function sanitizeObject(obj) {
+    const sanitized = {};
+    for (const [key, value] of Object.entries(obj)) {
+        if (typeof value === 'string') {
+            sanitized[key] = sanitizeString(value);
+        }
+        else if (Array.isArray(value)) {
+            sanitized[key] = value.map(item => typeof item === 'string' ? sanitizeString(item) :
+                typeof item === 'object' ? sanitizeObject(item) : item);
+        }
+        else if (typeof value === 'object' && value !== null) {
+            sanitized[key] = sanitizeObject(value);
+        }
+        else {
+            sanitized[key] = value;
+        }
+    }
+    return sanitized;
+}
+/**
+ * Sanitize string to prevent XSS
+ */
+function sanitizeString(str) {
+    return str
+        // Remove script tags
+        .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+        // Remove on* attributes
+        .replace(/\s*on\w+\s*=\s*["'][^"']*["']/gi, '')
+        // Escape HTML entities
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#x27;')
+        // Remove potential SQL injection patterns
+        .replace(/['";\\]/g, '')
+        // Trim whitespace
+        .trim();
+}
+/**
+ * Prevent parameter pollution
+ */
+function preventParamPollution(req, _res, next) {
+    // Convert array params to single value (take first)
+    if (req.query) {
+        for (const [key, value] of Object.entries(req.query)) {
+            if (Array.isArray(value)) {
+                req.query[key] = value[0];
+            }
+        }
+    }
+    next();
+}
+/**
+ * Block suspicious requests
+ */
+function blockSuspiciousRequests(req, res, next) {
+    const suspiciousPatterns = [
+        /\.\.\//, // Path traversal
+        /<script/i, // XSS attempt
+        /union.*select/i, // SQL injection
+        /exec\s*\(/i, // Command injection
+        /\$\{.*\}/, // Template injection
+    ];
+    const requestString = JSON.stringify({
+        url: req.url,
+        body: req.body,
+        query: req.query,
+    });
+    for (const pattern of suspiciousPatterns) {
+        if (pattern.test(requestString)) {
+            logger_service_1.logger.warn('Blocked suspicious request', {
+                ip: req.ip,
+                url: req.url,
+                pattern: pattern.toString(),
+            });
+            res.status(400).json({
+                success: false,
+                error: {
+                    code: 'BAD_REQUEST',
+                    message: 'Invalid request',
+                },
+            });
+            return;
+        }
+    }
+    next();
+}
+/**
+ * Add security response headers
+ */
+function securityResponseHeaders(_req, res, next) {
+    // Prevent clickjacking
+    res.setHeader('X-Frame-Options', 'DENY');
+    // Prevent MIME type sniffing
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    // Enable XSS filter
+    res.setHeader('X-XSS-Protection', '1; mode=block');
+    // Referrer policy
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    // Permissions policy
+    res.setHeader('Permissions-Policy', 'geolocation=(self), microphone=(), camera=()');
+    next();
+}
+//# sourceMappingURL=security.middleware.js.map

@@ -1,0 +1,307 @@
+/**
+ * =============================================================================
+ * DRIVER MODULE - SERVICE
+ * =============================================================================
+ * 
+ * Business logic for driver operations.
+ * =============================================================================
+ */
+
+import { v4 as uuid } from 'uuid';
+import { db, BookingRecord, UserRecord } from '../../shared/database/db';
+import { AppError } from '../../shared/types/error.types';
+import { logger } from '../../shared/services/logger.service';
+import { CreateDriverInput } from './driver.schema';
+
+interface DashboardData {
+  stats: {
+    totalTrips: number;
+    completedToday: number;
+    totalEarnings: number;
+    todayEarnings: number;
+    rating: number;
+    acceptanceRate: number;
+  };
+  recentTrips: any[];
+  availability: {
+    isOnline: boolean;
+    lastOnline: string | null;
+  };
+}
+
+interface AvailabilityData {
+  isOnline: boolean;
+  currentLocation?: {
+    latitude: number;
+    longitude: number;
+  };
+  lastUpdated: string;
+}
+
+interface EarningsData {
+  period: string;
+  totalEarnings: number;
+  tripCount: number;
+  avgPerTrip: number;
+  breakdown: {
+    date: string;
+    amount: number;
+    trips: number;
+  }[];
+}
+
+class DriverService {
+  
+  // ==========================================================================
+  // TRANSPORTER - DRIVER MANAGEMENT
+  // ==========================================================================
+
+  /**
+   * Create a new driver under a transporter
+   */
+  async createDriver(transporterId: string, data: CreateDriverInput): Promise<UserRecord> {
+    // Check if driver with this phone already exists
+    const existing = db.getUserByPhone(data.phone, 'driver');
+    if (existing) {
+      throw new AppError(400, 'DRIVER_EXISTS', 'A driver with this phone number already exists');
+    }
+
+    const driver = db.createUser({
+      id: uuid(),
+      phone: data.phone,
+      role: 'driver',
+      name: data.name,
+      email: data.email || undefined,
+      transporterId: transporterId,
+      licenseNumber: data.licenseNumber,
+      isVerified: false,
+      isActive: true
+    });
+
+    logger.info(`Driver created: ${data.name} (${data.phone}) for transporter ${transporterId}`);
+    return driver;
+  }
+
+  /**
+   * Get all drivers for a transporter with stats
+   */
+  async getTransporterDrivers(transporterId: string): Promise<{
+    drivers: UserRecord[];
+    total: number;
+    available: number;
+    onTrip: number;
+  }> {
+    const drivers = db.getDriversByTransporter(transporterId);
+    
+    // Get all vehicles to check which drivers are assigned
+    const vehicles = db.getVehiclesByTransporter(transporterId);
+    const driversOnTrip = new Set(
+      vehicles
+        .filter(v => v.status === 'in_transit' && v.assignedDriverId)
+        .map(v => v.assignedDriverId)
+    );
+
+    const activeDrivers = drivers.filter(d => d.isActive);
+    const available = activeDrivers.filter(d => !driversOnTrip.has(d.id)).length;
+    const onTrip = activeDrivers.filter(d => driversOnTrip.has(d.id)).length;
+
+    return {
+      drivers: activeDrivers,
+      total: activeDrivers.length,
+      available,
+      onTrip
+    };
+  }
+
+  // ==========================================================================
+  // DRIVER DASHBOARD
+  // ==========================================================================
+
+  /**
+   * Get driver dashboard data
+   */
+  async getDashboard(userId: string): Promise<DashboardData> {
+    const bookings = db.getBookingsByDriver(userId);
+    
+    const today = new Date().toISOString().split('T')[0];
+    const completedBookings = bookings.filter((b: BookingRecord) => b.status === 'completed');
+    const todayBookings = completedBookings.filter((b: BookingRecord) => 
+      b.updatedAt?.startsWith(today)
+    );
+    
+    const totalEarnings = completedBookings.reduce((sum: number, b: BookingRecord) => sum + (b.totalAmount || 0), 0);
+    const todayEarnings = todayBookings.reduce((sum: number, b: BookingRecord) => sum + (b.totalAmount || 0), 0);
+    
+    return {
+      stats: {
+        totalTrips: completedBookings.length,
+        completedToday: todayBookings.length,
+        totalEarnings,
+        todayEarnings,
+        rating: 4.5, // Default rating
+        acceptanceRate: 85 // TODO: Calculate from actual data
+      },
+      recentTrips: completedBookings.slice(0, 5).map((b: BookingRecord) => ({
+        id: b.id,
+        pickup: b.pickup?.address || 'Unknown',
+        dropoff: b.drop?.address || 'Unknown',
+        price: b.totalAmount,
+        date: b.updatedAt,
+        status: b.status
+      })),
+      availability: {
+        isOnline: false,
+        lastOnline: null
+      }
+    };
+  }
+
+  /**
+   * Get driver availability status
+   */
+  async getAvailability(_userId: string): Promise<AvailabilityData> {
+    return {
+      isOnline: false,
+      currentLocation: undefined,
+      lastUpdated: new Date().toISOString()
+    };
+  }
+
+  /**
+   * Update driver availability
+   */
+  async updateAvailability(
+    _userId: string, 
+    data: { isOnline?: boolean; currentLocation?: { latitude: number; longitude: number } }
+  ): Promise<AvailabilityData> {
+    // For now, just return the status - would need to extend UserRecord for full support
+    return {
+      isOnline: data.isOnline || false,
+      currentLocation: data.currentLocation,
+      lastUpdated: new Date().toISOString()
+    };
+  }
+
+  /**
+   * Get driver earnings
+   */
+  async getEarnings(userId: string, period: string = 'week'): Promise<EarningsData> {
+    const bookings = db.getBookingsByDriver(userId);
+    const completedBookings = bookings.filter((b: BookingRecord) => b.status === 'completed');
+    
+    const now = new Date();
+    let startDate: Date;
+    
+    switch (period) {
+      case 'today':
+        startDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        break;
+      case 'week':
+        startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+        break;
+      case 'month':
+        startDate = new Date(now.getFullYear(), now.getMonth(), 1);
+        break;
+      default:
+        startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    }
+    
+    const periodBookings = completedBookings.filter((b: BookingRecord) => 
+      new Date(b.updatedAt || b.createdAt) >= startDate
+    );
+    
+    const totalEarnings = periodBookings.reduce((sum: number, b: BookingRecord) => sum + (b.totalAmount || 0), 0);
+    
+    // Group by date for breakdown
+    const byDate: { [key: string]: { amount: number; trips: number } } = {};
+    periodBookings.forEach((b: BookingRecord) => {
+      const date = (b.updatedAt || b.createdAt).split('T')[0];
+      if (!byDate[date]) {
+        byDate[date] = { amount: 0, trips: 0 };
+      }
+      byDate[date].amount += b.totalAmount || 0;
+      byDate[date].trips += 1;
+    });
+    
+    return {
+      period,
+      totalEarnings,
+      tripCount: periodBookings.length,
+      avgPerTrip: periodBookings.length > 0 ? totalEarnings / periodBookings.length : 0,
+      breakdown: Object.entries(byDate).map(([date, data]) => ({
+        date,
+        amount: data.amount,
+        trips: data.trips
+      }))
+    };
+  }
+
+  /**
+   * Get driver trips
+   */
+  async getTrips(
+    userId: string, 
+    options: { status?: string; limit: number; offset: number }
+  ) {
+    let bookings = db.getBookingsByDriver(userId);
+    
+    if (options.status) {
+      bookings = bookings.filter((b: BookingRecord) => b.status === options.status);
+    }
+    
+    const total = bookings.length;
+    const trips = bookings
+      .sort((a: BookingRecord, b: BookingRecord) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+      .slice(options.offset, options.offset + options.limit)
+      .map((b: BookingRecord) => ({
+        id: b.id,
+        pickup: b.pickup?.address || 'Unknown',
+        dropoff: b.drop?.address || 'Unknown',
+        price: b.totalAmount,
+        status: b.status,
+        date: b.createdAt,
+        customer: b.customerName || 'Customer'
+      }));
+    
+    return {
+      trips,
+      total,
+      hasMore: options.offset + options.limit < total
+    };
+  }
+
+  /**
+   * Get active trip for driver
+   */
+  async getActiveTrip(userId: string) {
+    const bookings = db.getBookingsByDriver(userId);
+    const activeStatuses = ['active', 'partially_filled', 'in_progress'];
+    
+    const activeTrip = bookings.find((b: BookingRecord) => activeStatuses.includes(b.status));
+    
+    if (!activeTrip) {
+      return null;
+    }
+    
+    return {
+      id: activeTrip.id,
+      status: activeTrip.status,
+      pickup: {
+        address: activeTrip.pickup?.address,
+        location: { lat: activeTrip.pickup?.latitude, lng: activeTrip.pickup?.longitude }
+      },
+      dropoff: {
+        address: activeTrip.drop?.address,
+        location: { lat: activeTrip.drop?.latitude, lng: activeTrip.drop?.longitude }
+      },
+      price: activeTrip.totalAmount,
+      customer: {
+        name: activeTrip.customerName,
+        phone: activeTrip.customerPhone
+      },
+      createdAt: activeTrip.createdAt
+    };
+  }
+}
+
+export const driverService = new DriverService();
