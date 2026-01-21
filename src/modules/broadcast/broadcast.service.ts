@@ -74,8 +74,13 @@ interface CreateBroadcastParams {
 class BroadcastService {
   
   /**
-   * Get active broadcasts for a driver
-   * Returns bookings that are still looking for trucks
+   * Get active broadcasts for a driver/transporter
+   * 
+   * Returns BOTH:
+   * 1. Legacy Bookings (single vehicle type)
+   * 2. New Orders with multiple vehicle types (requestedVehicles array)
+   * 
+   * Filters to only show vehicles matching the transporter's fleet
    */
   async getActiveBroadcasts(params: GetActiveBroadcastsParams) {
     const { driverId, vehicleType } = params;
@@ -84,31 +89,147 @@ class BroadcastService {
     const user = db.getUserById(driverId);
     const transporterId = user?.transporterId || driverId;
     
-    // Get active bookings for this transporter
+    // Get transporter's vehicle types for filtering
+    const transporterVehicles = db.getVehiclesByTransporter(transporterId);
+    const transporterVehicleTypes = new Set(
+      transporterVehicles.map(v => `${v.vehicleType.toLowerCase()}_${(v.vehicleSubtype || '').toLowerCase()}`)
+    );
+    const transporterTypesList = [...new Set(transporterVehicles.map(v => v.vehicleType.toLowerCase()))];
+    
+    logger.info(`Transporter ${transporterId} has vehicle types: ${transporterTypesList.join(', ')}`);
+    
+    const activeBroadcasts: any[] = [];
+    
+    // ============== 1. Get Legacy Bookings ==============
     const bookings = db.getActiveBookingsForTransporter(transporterId);
     
-    const activeBroadcasts = bookings
-      .filter((booking: BookingRecord) => {
-        // Filter by vehicle type if specified
-        if (vehicleType && booking.vehicleType.toLowerCase() !== vehicleType.toLowerCase()) {
-          return false;
-        }
-        
-        // Check if not expired
-        if (new Date(booking.expiresAt) < new Date()) {
-          return false;
-        }
-        
-        // Check if still needs trucks
-        if (booking.trucksFilled >= booking.trucksNeeded) {
-          return false;
-        }
-        
-        return true;
-      })
-      .map((booking: BookingRecord) => this.mapBookingToBroadcast(booking));
+    for (const booking of bookings) {
+      // Filter by vehicle type if specified
+      if (vehicleType && booking.vehicleType.toLowerCase() !== vehicleType.toLowerCase()) {
+        continue;
+      }
+      
+      // Check if not expired
+      if (new Date(booking.expiresAt) < new Date()) {
+        continue;
+      }
+      
+      // Check if still needs trucks
+      if (booking.trucksFilled >= booking.trucksNeeded) {
+        continue;
+      }
+      
+      // Check if transporter has matching vehicle type
+      if (!transporterTypesList.includes(booking.vehicleType.toLowerCase())) {
+        continue;
+      }
+      
+      activeBroadcasts.push(this.mapBookingToBroadcast(booking));
+    }
     
-    logger.info(`Found ${activeBroadcasts.length} active broadcasts for driver ${driverId}`);
+    // ============== 2. Get New Orders (Multi-Vehicle) ==============
+    const orders = db.getActiveOrders ? db.getActiveOrders() : [];
+    
+    for (const order of orders) {
+      // Check if not expired
+      if (new Date(order.expiresAt) < new Date()) {
+        continue;
+      }
+      
+      // Check if still needs trucks
+      if (order.trucksFilled >= order.totalTrucks) {
+        continue;
+      }
+      
+      // Get truck requests for this order
+      const truckRequests = db.getTruckRequestsByOrder ? db.getTruckRequestsByOrder(order.id) : [];
+      
+      // Filter to only vehicle types the transporter has
+      const relevantRequests = truckRequests.filter(tr => {
+        const typeKey = `${tr.vehicleType.toLowerCase()}_${(tr.vehicleSubtype || '').toLowerCase()}`;
+        return transporterVehicleTypes.has(typeKey) || transporterTypesList.includes(tr.vehicleType.toLowerCase());
+      });
+      
+      if (relevantRequests.length === 0) {
+        continue; // No matching vehicle types for this transporter
+      }
+      
+      // Group by vehicle type to create requestedVehicles array
+      const requestedVehiclesMap = new Map<string, any>();
+      
+      for (const tr of relevantRequests) {
+        const key = `${tr.vehicleType}_${tr.vehicleSubtype}`;
+        
+        if (!requestedVehiclesMap.has(key)) {
+          requestedVehiclesMap.set(key, {
+            vehicleType: tr.vehicleType,
+            vehicleSubtype: tr.vehicleSubtype || '',
+            count: 0,
+            filledCount: 0,
+            farePerTruck: tr.pricePerTruck,
+            capacityTons: 0 // Could be fetched from vehicle catalog
+          });
+        }
+        
+        const entry = requestedVehiclesMap.get(key)!;
+        entry.count += 1;
+        if (tr.status === 'assigned' || tr.status === 'completed') {
+          entry.filledCount += 1;
+        }
+      }
+      
+      const requestedVehicles = Array.from(requestedVehiclesMap.values());
+      
+      // Calculate totals from relevant requests only
+      const totalNeeded = requestedVehicles.reduce((sum, rv) => sum + rv.count, 0);
+      const totalFilled = requestedVehicles.reduce((sum, rv) => sum + rv.filledCount, 0);
+      const totalFare = requestedVehicles.reduce((sum, rv) => sum + (rv.count * rv.farePerTruck), 0);
+      const avgFarePerTruck = totalNeeded > 0 ? totalFare / totalNeeded : 0;
+      
+      // Build broadcast object with requestedVehicles
+      activeBroadcasts.push({
+        broadcastId: order.id,
+        customerId: order.customerId,
+        customerName: order.customerName || 'Customer',
+        customerMobile: order.customerPhone || '',
+        pickupLocation: {
+          latitude: order.pickup.latitude,
+          longitude: order.pickup.longitude,
+          address: order.pickup.address,
+          city: order.pickup.city,
+          state: order.pickup.state
+        },
+        dropLocation: {
+          latitude: order.drop.latitude,
+          longitude: order.drop.longitude,
+          address: order.drop.address,
+          city: order.drop.city,
+          state: order.drop.state
+        },
+        distance: order.distanceKm || 0,
+        estimatedDuration: Math.round((order.distanceKm || 100) * 1.5),
+        
+        // Multi-truck support
+        requestedVehicles: requestedVehicles,
+        totalTrucksNeeded: totalNeeded,
+        trucksFilledSoFar: totalFilled,
+        
+        // Legacy single type (first type for backward compat)
+        vehicleType: requestedVehicles[0]?.vehicleType || '',
+        vehicleSubtype: requestedVehicles[0]?.vehicleSubtype || '',
+        
+        goodsType: order.goodsType || 'General',
+        weight: order.cargoWeightKg ? `${order.cargoWeightKg} kg` : 'N/A',
+        farePerTruck: avgFarePerTruck,
+        totalFare: totalFare,
+        status: order.status,
+        isUrgent: false,
+        createdAt: order.createdAt,
+        expiresAt: order.expiresAt
+      });
+    }
+    
+    logger.info(`Found ${activeBroadcasts.length} active broadcasts for transporter ${transporterId}`);
     
     return activeBroadcasts;
   }
@@ -402,7 +523,7 @@ class BroadcastService {
   
   /**
    * Map internal booking to broadcast format for API response
-   * Enhanced with capacity/tonnage information
+   * Enhanced with capacity/tonnage information and requestedVehicles array
    */
   private mapBookingToBroadcast(booking: BookingRecord) {
     // Import vehicle catalog to get capacity info
@@ -410,6 +531,17 @@ class BroadcastService {
     
     // Get capacity information for the vehicle subtype
     const subtypeConfig = getSubtypeConfig(booking.vehicleType, booking.vehicleSubtype);
+    const capacityTons = subtypeConfig ? subtypeConfig.capacityKg / 1000 : 0;
+    
+    // Build requestedVehicles array for multi-truck UI compatibility
+    const requestedVehicles = [{
+      vehicleType: booking.vehicleType,
+      vehicleSubtype: booking.vehicleSubtype || '',
+      count: booking.trucksNeeded,
+      filledCount: booking.trucksFilled || 0,
+      farePerTruck: booking.pricePerTruck,
+      capacityTons: capacityTons
+    }];
     
     return {
       broadcastId: booking.id,
@@ -420,6 +552,10 @@ class BroadcastService {
       dropLocation: booking.drop,
       distance: booking.distanceKm || 0,
       estimatedDuration: Math.round((booking.distanceKm || 100) * 1.5), // Rough estimate: 1.5 min per km
+      
+      // Multi-truck support (NEW)
+      requestedVehicles: requestedVehicles,
+      
       totalTrucksNeeded: booking.trucksNeeded,
       trucksFilledSoFar: booking.trucksFilled || 0,
       vehicleType: booking.vehicleType,
@@ -436,7 +572,7 @@ class BroadcastService {
       // Enhanced: Capacity information for transporters
       capacityInfo: subtypeConfig ? {
         capacityKg: subtypeConfig.capacityKg,
-        capacityTons: subtypeConfig.capacityKg / 1000,
+        capacityTons: capacityTons,
         minTonnage: subtypeConfig.minTonnage,
         maxTonnage: subtypeConfig.maxTonnage
       } : null

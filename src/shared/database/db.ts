@@ -685,6 +685,30 @@ class DatabaseService {
     return this.data.orders[index];
   }
 
+  /**
+   * Get all active orders (not expired, not fully filled)
+   * Used by broadcast service to show multi-truck requests
+   */
+  getActiveOrders(): OrderRecord[] {
+    if (!this.data.orders) return [];
+    
+    const now = new Date();
+    return this.data.orders.filter(order => {
+      // Not expired
+      if (new Date(order.expiresAt) < now) return false;
+      
+      // Not fully filled or completed
+      if (order.status === 'fully_filled' || order.status === 'completed' || order.status === 'cancelled') {
+        return false;
+      }
+      
+      // Still needs trucks
+      if (order.trucksFilled >= order.totalTrucks) return false;
+      
+      return true;
+    });
+  }
+
   // ==========================================================================
   // TRUCK REQUEST OPERATIONS (NEW)
   // ==========================================================================
