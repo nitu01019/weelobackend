@@ -159,8 +159,8 @@ interface BroadcastData {
 
 class OrderService {
   
-  // Timeout for broadcasts (5 minutes default)
-  private readonly BROADCAST_TIMEOUT_MS = 5 * 60 * 1000;
+  // Timeout for broadcasts (1 minute - quick response needed)
+  private readonly BROADCAST_TIMEOUT_MS = 1 * 60 * 1000;  // 60 seconds
   
   // Active timers for order expiry
   private orderTimers: Map<string, NodeJS.Timeout> = new Map();

@@ -33,8 +33,8 @@ import { CreateOrderInput, TruckSelection } from './booking.schema';
 // =============================================================================
 
 const ORDER_CONFIG = {
-  // Timeout in milliseconds (5 minutes for testing, 30 minutes for production)
-  TIMEOUT_MS: 5 * 60 * 1000,  // 5 minutes
+  // Timeout in milliseconds (1 minute for quick response)
+  TIMEOUT_MS: 1 * 60 * 1000,  // 60 seconds
   
   // How often to check for expired orders
   EXPIRY_CHECK_INTERVAL_MS: 30 * 1000,  // Every 30 seconds
