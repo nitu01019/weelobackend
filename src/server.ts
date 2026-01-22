@@ -82,6 +82,7 @@ import { broadcastRouter } from './modules/broadcast/broadcast.routes';
 import { notificationRouter } from './modules/notification/notification.routes';
 import orderRouter from './modules/order/order.routes';
 import transporterRouter from './modules/transporter/transporter.routes';
+import { truckHoldRouter } from './modules/truck-hold';
 import { healthRoutes } from './shared/routes/health.routes';
 import { metricsMiddleware } from './shared/monitoring/metrics.service';
 import { fcmService } from './shared/services/fcm.service';
@@ -331,6 +332,9 @@ app.use(`${API_PREFIX}/transporter`, transporterRouter);
 
 // Notification routes (FCM token registration)
 app.use(`${API_PREFIX}/notifications`, notificationRouter);
+
+// Truck Hold System (BookMyShow-style holding)
+app.use(`${API_PREFIX}/truck-hold`, truckHoldRouter);
 
 // =============================================================================
 // DATABASE DEBUG ROUTES (Development only)
