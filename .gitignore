@@ -1,0 +1,50 @@
+# =============================================================================
+# WEELO BACKEND .gitignore - SECURITY CRITICAL
+# =============================================================================
+# NEVER commit secrets, credentials, or build artifacts to git
+# =============================================================================
+
+# Dependencies
+node_modules/
+
+# =============================================================================
+# SECURITY: Environment files contain API keys, secrets, database passwords
+# NEVER commit these - hackers scan GitHub for exposed .env files
+# =============================================================================
+.env
+.env.local
+.env.development
+.env.staging
+.env.production
+.env.test
+.env*.local
+
+# Build outputs
+dist/
+build/
+*.js.map
+
+# TypeScript cache
+*.tsbuildinfo
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Docker
+docker-compose.override.yml
+
+# Coverage
+coverage/
+.nyc_output/
