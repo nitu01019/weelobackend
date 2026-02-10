@@ -136,6 +136,8 @@ export const config = {
   },
 
   // SMS Provider
+  // Options: console (dev), twilio, msg91, aws-sns
+  // For AWS deployment: use 'aws-sns' - it uses IAM role automatically on ECS
   sms: {
     provider: getOptional('SMS_PROVIDER', 'console'),
     twilio: {
@@ -148,6 +150,20 @@ export const config = {
       senderId: getOptional('MSG91_SENDER_ID', 'WEELO'),
       templateId: getOptional('MSG91_TEMPLATE_ID', ''),
     },
+    awsSns: {
+      // Region must match AWS deployment region (ap-south-1 for India)
+      region: getOptional('AWS_SNS_REGION', 'ap-south-1'),
+      // On AWS ECS/EC2, leave empty - uses IAM Task Role automatically
+      // Only set for local development testing
+      accessKeyId: getOptional('AWS_ACCESS_KEY_ID', ''),
+      secretAccessKey: getOptional('AWS_SECRET_ACCESS_KEY', ''),
+    },
+  },
+
+  // Google Maps
+  googleMaps: {
+    apiKey: getOptional('GOOGLE_MAPS_API_KEY', ''),
+    enabled: getOptional('GOOGLE_MAPS_API_KEY', '').length > 0,
   },
 
   // Rate Limiting
@@ -194,6 +210,11 @@ function validateConfig(): void {
     // CORS must not be wildcard in production
     if (config.cors.origin === '*') {
       warnings.push('CORS_ORIGIN is set to "*" - this should be restricted in production');
+    }
+
+    // Google Maps should be configured for Places search
+    if (!config.googleMaps.enabled) {
+      errors.push('GOOGLE_MAPS_API_KEY is required in production for Places/Geocoding');
     }
     
     // Redis should be enabled for scalability

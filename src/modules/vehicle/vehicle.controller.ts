@@ -31,14 +31,37 @@ class VehicleController {
   calculatePricing = asyncHandler(async (req: Request, res: Response, _next: NextFunction) => {
     const query = validateSchema(pricingQuerySchema, req.query);
     const pricing = await vehicleService.calculatePricing({
-      ...query,
+      vehicleType: query.vehicleType,
+      distanceKm: query.distanceKm,
       trucksNeeded: query.trucksNeeded ?? 1
     });
     res.json(successResponse({ pricing }));
   });
 
   /**
+   * Check if vehicle number is available for registration
+   * GET /api/v1/vehicles/check/:vehicleNumber
+   * 
+   * Returns:
+   * - available: boolean - true if can be registered
+   * - exists: boolean - true if vehicle exists in system
+   * - ownedByYou: boolean - true if vehicle belongs to calling transporter
+   * - vehicleId: string - ID of existing vehicle (if exists and owned by you)
+   */
+  checkVehicleAvailability = asyncHandler(async (req: Request, res: Response, _next: NextFunction) => {
+    const { vehicleNumber } = req.params;
+    const transporterId = req.userId;
+    
+    const result = await vehicleService.checkVehicleAvailability(vehicleNumber, transporterId);
+    
+    res.json(successResponse(result));
+  });
+
+  /**
    * Register a new vehicle
+   * POST /api/v1/vehicles
+   * 
+   * Returns 409 if vehicle already exists (use upsert for update-or-create)
    */
   registerVehicle = asyncHandler(async (req: Request, res: Response, _next: NextFunction) => {
     const transporterId = req.userId!;
@@ -47,6 +70,31 @@ class VehicleController {
     const vehicle = await vehicleService.registerVehicle(transporterId, data);
     
     res.status(201).json(successResponse({ vehicle }));
+  });
+
+  /**
+   * Register or Update vehicle (Upsert)
+   * PUT /api/v1/vehicles/upsert
+   * 
+   * - If vehicle doesn't exist: creates new vehicle
+   * - If vehicle exists and belongs to you: updates it
+   * - If vehicle exists and belongs to someone else: returns 409 error
+   * 
+   * Response includes `isNew` flag to indicate if vehicle was created or updated
+   */
+  upsertVehicle = asyncHandler(async (req: Request, res: Response, _next: NextFunction) => {
+    const transporterId = req.userId!;
+    const data = validateSchema(registerVehicleSchema, req.body);
+    
+    const result = await vehicleService.registerOrUpdateVehicle(transporterId, data);
+    
+    res.status(result.isNew ? 201 : 200).json(successResponse({
+      vehicle: result.vehicle,
+      isNew: result.isNew,
+      message: result.isNew 
+        ? `Vehicle ${result.vehicle.vehicleNumber} registered successfully`
+        : `Vehicle ${result.vehicle.vehicleNumber} updated successfully`
+    }));
   });
 
   /**

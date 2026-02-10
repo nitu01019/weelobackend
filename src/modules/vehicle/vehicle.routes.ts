@@ -22,6 +22,7 @@ import {
   setMaintenanceSchema
 } from './vehicle.schema';
 import { logger } from '../../shared/services/logger.service';
+import { fleetCacheService, onVehicleChange } from '../../shared/services/fleet-cache.service';
 
 const router = Router();
 
@@ -69,6 +70,11 @@ router.get('/types', async (_req: Request, res: Response) => {
  * @route   GET /vehicles/list
  * @desc    Get transporter's vehicles with status counts
  * @access  Transporter only
+ * 
+ * REDIS CACHING:
+ * - Cache key: fleet:vehicles:{transporterId}
+ * - TTL: 5 minutes
+ * - Auto-invalidated on vehicle create/update/delete
  */
 router.get(
   '/list',
@@ -77,13 +83,15 @@ router.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const transporterId = req.user!.userId;
-      logger.info(`[Vehicles] Getting vehicles for transporter: ${transporterId}`);
+      const forceRefresh = req.query.refresh === 'true';
       
-      // Get all vehicles for this transporter
-      const allVehicles = db.getVehiclesByTransporter(transporterId);
+      logger.info(`[Vehicles] Getting vehicles for ${transporterId.substring(0, 8)}... (cache: ${forceRefresh ? 'bypass' : 'enabled'})`);
+      
+      // Get vehicles from Redis cache (falls back to DB on cache miss)
+      const cachedVehicles = await fleetCacheService.getTransporterVehicles(transporterId, forceRefresh);
       
       // Filter only active vehicles
-      const vehicles = allVehicles.filter(v => v.isActive !== false);
+      const vehicles = cachedVehicles.filter(v => v.isActive !== false);
       
       // Calculate status counts
       const available = vehicles.filter(v => v.status === 'available' || !v.status).length;
@@ -96,7 +104,7 @@ router.get(
         status: v.status || 'available'
       }));
       
-      logger.info(`[Vehicles] Returning ${normalizedVehicles.length} vehicles`);
+      logger.info(`[Vehicles] Returning ${normalizedVehicles.length} vehicles (${available} available)`);
       
       res.json({
         success: true,
@@ -105,7 +113,8 @@ router.get(
           total: normalizedVehicles.length,
           available,
           inTransit,
-          maintenance
+          maintenance,
+          cached: !forceRefresh  // Indicate if from cache
         }
       });
     } catch (error) {
@@ -119,6 +128,16 @@ router.get(
  * @route   GET /vehicles/available
  * @desc    Get available vehicles (for trip assignment)
  * @access  Transporter only
+ * 
+ * REDIS CACHING:
+ * - Uses fleet cache with available filter
+ * - TTL: 5 minutes
+ * - Auto-invalidated on vehicle status change
+ * 
+ * QUERY PARAMS:
+ * - vehicleType: Filter by type (e.g., "Open", "Container")
+ * - vehicleSubtype: Filter by subtype (e.g., "17ft")
+ * - refresh: Set to "true" to bypass cache
  */
 router.get(
   '/available',
@@ -128,14 +147,26 @@ router.get(
     try {
       const transporterId = req.user!.userId;
       const vehicleType = req.query.vehicleType as string | undefined;
+      const vehicleSubtype = req.query.vehicleSubtype as string | undefined;
+      const forceRefresh = req.query.refresh === 'true';
       
-      const vehicles = await vehicleService.getAvailableVehicles(transporterId, vehicleType);
+      logger.info(`[Vehicles] Getting available vehicles for ${transporterId.substring(0, 8)}... type: ${vehicleType || 'all'}`);
+      
+      // Use Redis cache for available vehicles
+      const cachedVehicles = await fleetCacheService.getAvailableVehicles(
+        transporterId,
+        vehicleType,
+        vehicleSubtype
+      );
+      
+      logger.info(`[Vehicles] Found ${cachedVehicles.length} available vehicles`);
       
       res.json({
         success: true,
         data: { 
-          vehicles,
-          total: vehicles.length
+          vehicles: cachedVehicles,
+          total: cachedVehicles.length,
+          cached: !forceRefresh
         }
       });
     } catch (error) {
@@ -197,9 +228,52 @@ router.get(
 );
 
 /**
+ * @route   GET /vehicles/check/:vehicleNumber
+ * @desc    Check if vehicle number is available for registration
+ * @access  Transporter only
+ * 
+ * RETURNS:
+ * - available: true if can be registered as new
+ * - exists: true if vehicle exists in system
+ * - ownedByYou: true if you already own this vehicle
+ * - vehicleId: ID of existing vehicle (if owned by you)
+ * 
+ * USE CASES:
+ * - Check before registering to avoid errors
+ * - Determine if should use upsert instead of register
+ */
+router.get(
+  '/check/:vehicleNumber',
+  authMiddleware,
+  roleGuard(['transporter']),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { vehicleNumber } = req.params;
+      const transporterId = req.user!.userId;
+      
+      const result = await vehicleService.checkVehicleAvailability(vehicleNumber, transporterId);
+      
+      res.json({
+        success: true,
+        data: result
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
  * @route   POST /vehicles
  * @desc    Register a new vehicle
  * @access  Transporter only
+ * 
+ * NOTE: Returns 409 if vehicle already exists.
+ * Use PUT /vehicles/upsert for create-or-update behavior.
+ * 
+ * AUTO-UPDATE CACHE:
+ * - Invalidates fleet:vehicles:{transporterId} on success
+ * - Ensures new vehicle appears immediately in truck selection
  */
 router.post(
   '/',
@@ -209,11 +283,15 @@ router.post(
     try {
       const transporterId = req.user!.userId;
       logger.info(`[Vehicles] Registering vehicle for transporter: ${transporterId}`);
-      logger.info(`[Vehicles] Request body: ${JSON.stringify(req.body)}`);
+      logger.debug(`[Vehicles] Request body: ${JSON.stringify(req.body)}`);
       
       const data = validateSchema(registerVehicleSchema, req.body);
       
       const vehicle = await vehicleService.registerVehicle(transporterId, data);
+      
+      // AUTO-UPDATE: Invalidate Redis cache so new vehicle appears immediately
+      await onVehicleChange(transporterId, vehicle.id);
+      logger.info(`[Vehicles] Cache invalidated for transporter ${transporterId.substring(0, 8)}`);
       
       logger.info(`[Vehicles] Vehicle registered: ${vehicle.vehicleNumber}`);
       
@@ -233,9 +311,91 @@ router.post(
         });
       }
       
-      // Handle duplicate vehicle
+      // Handle duplicate vehicle - same owner
+      if (error.code === 'VEHICLE_EXISTS_SAME_OWNER') {
+        return res.status(409).json({
+          success: false,
+          error: { 
+            code: 'VEHICLE_EXISTS_SAME_OWNER', 
+            message: error.message,
+            data: error.data  // Contains vehicleId for update
+          }
+        });
+      }
+      
+      // Handle duplicate vehicle - different owner
       if (error.code === 'VEHICLE_EXISTS') {
+        return res.status(409).json({
+          success: false,
+          error: { code: 'VEHICLE_EXISTS', message: error.message }
+        });
+      }
+      
+      next(error);
+    }
+  }
+);
+
+/**
+ * @route   PUT /vehicles/upsert
+ * @desc    Register or Update vehicle (Upsert)
+ * @access  Transporter only
+ * 
+ * BEHAVIOR:
+ * - If vehicle doesn't exist: creates new vehicle (201)
+ * - If vehicle exists and you own it: updates it (200)
+ * - If vehicle exists and owned by someone else: returns 409 error
+ * 
+ * RESPONSE:
+ * - vehicle: The created/updated vehicle
+ * - isNew: true if created, false if updated
+ * - message: Success message
+ * 
+ * USE THIS FOR:
+ * - "Save" buttons where user might be editing existing vehicle
+ * - Batch operations where you want to avoid checking first
+ */
+router.put(
+  '/upsert',
+  authMiddleware,
+  roleGuard(['transporter']),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const transporterId = req.user!.userId;
+      logger.info(`[Vehicles] Upsert vehicle for transporter: ${transporterId}`);
+      
+      const data = validateSchema(registerVehicleSchema, req.body);
+      
+      const result = await vehicleService.registerOrUpdateVehicle(transporterId, data);
+      
+      // AUTO-UPDATE: Invalidate Redis cache
+      await onVehicleChange(transporterId, result.vehicle.id);
+      
+      const action = result.isNew ? 'registered' : 'updated';
+      logger.info(`[Vehicles] Vehicle ${action}: ${result.vehicle.vehicleNumber}`);
+      
+      res.status(result.isNew ? 201 : 200).json({
+        success: true,
+        data: { 
+          vehicle: result.vehicle,
+          isNew: result.isNew
+        },
+        message: `Vehicle ${result.vehicle.vehicleNumber} ${action} successfully`
+      });
+    } catch (error: any) {
+      logger.error('[Vehicles] Error upserting vehicle', error);
+      
+      // Handle validation errors
+      if (error.code === 'VALIDATION_ERROR') {
         return res.status(400).json({
+          success: false,
+          error: { code: 'VALIDATION_ERROR', message: error.message }
+        });
+      }
+      
+      // Handle duplicate vehicle owned by someone else
+      if (error.code === 'VEHICLE_EXISTS') {
+        return res.status(409).json({
           success: false,
           error: { code: 'VEHICLE_EXISTS', message: error.message }
         });
@@ -303,6 +463,9 @@ router.put(
       
       const vehicle = await vehicleService.updateVehicle(vehicleId, transporterId, data);
       
+      // AUTO-UPDATE: Invalidate Redis cache
+      await onVehicleChange(transporterId, vehicleId);
+      
       res.json({
         success: true,
         data: { vehicle }
@@ -317,6 +480,8 @@ router.put(
  * @route   DELETE /vehicles/:vehicleId
  * @desc    Delete vehicle (soft delete)
  * @access  Transporter only (own vehicles)
+ * 
+ * AUTO-UPDATE CACHE: Invalidates on delete
  */
 router.delete(
   '/:vehicleId',
@@ -328,6 +493,9 @@ router.delete(
       const transporterId = req.user!.userId;
       
       await vehicleService.deleteVehicle(vehicleId, transporterId);
+      
+      // AUTO-UPDATE: Invalidate Redis cache
+      await onVehicleChange(transporterId, vehicleId);
       
       res.json({
         success: true,
@@ -347,6 +515,9 @@ router.delete(
  * @route   PUT /vehicles/:vehicleId/status
  * @desc    Update vehicle status
  * @access  Transporter only
+ * 
+ * AUTO-UPDATE CACHE: Invalidates on status change
+ * (critical for real-time availability in truck selection)
  */
 router.put(
   '/:vehicleId/status',
@@ -369,6 +540,9 @@ router.put(
         }
       );
       
+      // AUTO-UPDATE: Invalidate Redis cache (status affects availability)
+      await onVehicleChange(transporterId, vehicleId);
+      
       res.json({
         success: true,
         message: `Vehicle status updated to ${data.status}`,
@@ -384,6 +558,8 @@ router.put(
  * @route   PUT /vehicles/:vehicleId/maintenance
  * @desc    Put vehicle in maintenance mode
  * @access  Transporter only
+ * 
+ * AUTO-UPDATE CACHE: Invalidates when vehicle goes to maintenance
  */
 router.put(
   '/:vehicleId/maintenance',
@@ -401,6 +577,9 @@ router.put(
         data.reason,
         data.expectedEndDate
       );
+      
+      // AUTO-UPDATE: Invalidate Redis cache
+      await onVehicleChange(transporterId, vehicleId);
       
       res.json({
         success: true,

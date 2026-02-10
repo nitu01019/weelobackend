@@ -83,12 +83,12 @@ router.post(
 );
 
 // =============================================================================
-// CONFIRM HOLD
+// CONFIRM HOLD (Simple)
 // =============================================================================
 
 /**
  * @route   POST /truck-hold/confirm
- * @desc    Confirm held trucks (assign them permanently)
+ * @desc    Confirm held trucks (simple - without vehicle/driver assignment)
  * @access  Transporter only
  * 
  * @body    { holdId }
@@ -110,7 +110,7 @@ router.post(
         });
       }
       
-      logger.info(`[TruckHoldRoutes] Confirm request: ${holdId} by ${transporterId}`);
+      logger.info(`[TruckHoldRoutes] Simple confirm request: ${holdId} by ${transporterId}`);
       
       const result = await truckHoldService.confirmHold(holdId, transporterId);
       
@@ -124,6 +124,110 @@ router.post(
         res.status(400).json({
           success: false,
           error: { code: 'CONFIRM_FAILED', message: result.message }
+        });
+      }
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// =============================================================================
+// CONFIRM HOLD WITH ASSIGNMENTS (Full flow with vehicle + driver)
+// =============================================================================
+
+/**
+ * @route   POST /truck-hold/confirm-with-assignments
+ * @desc    Confirm held trucks with vehicle and driver assignments
+ * @access  Transporter only
+ * 
+ * This is the PRODUCTION endpoint that:
+ * 1. Validates vehicle availability (not in another trip)
+ * 2. Validates driver availability (not on another trip)
+ * 3. Creates assignment records
+ * 4. Updates vehicle status to 'in_transit'
+ * 5. Notifies drivers and customer
+ * 
+ * CORE INVARIANTS ENFORCED:
+ * - One truck can be assigned to only one active order
+ * - One driver can be on only one active trip
+ * - Atomic: all assignments succeed or none
+ * 
+ * @body    { 
+ *   holdId: string,
+ *   assignments: [{ vehicleId: string, driverId: string }, ...]
+ * }
+ * @returns { 
+ *   success: boolean,
+ *   data?: { assignmentIds: string[], tripIds: string[] },
+ *   message: string,
+ *   failedAssignments?: [{ vehicleId: string, reason: string }, ...]
+ * }
+ */
+router.post(
+  '/confirm-with-assignments',
+  authMiddleware,
+  roleGuard(['transporter']),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const transporterId = req.user!.userId;
+      const { holdId, assignments } = req.body;
+      
+      // Validate required fields
+      if (!holdId) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'VALIDATION_ERROR', message: 'holdId is required' }
+        });
+      }
+      
+      if (!assignments || !Array.isArray(assignments) || assignments.length === 0) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'VALIDATION_ERROR', message: 'assignments array is required' }
+        });
+      }
+      
+      // Validate each assignment has vehicleId and driverId
+      for (let i = 0; i < assignments.length; i++) {
+        const { vehicleId, driverId } = assignments[i];
+        if (!vehicleId || !driverId) {
+          return res.status(400).json({
+            success: false,
+            error: { 
+              code: 'VALIDATION_ERROR', 
+              message: `Assignment ${i + 1} is missing vehicleId or driverId` 
+            }
+          });
+        }
+      }
+      
+      logger.info(`[TruckHoldRoutes] Confirm with assignments: ${holdId} by ${transporterId} (${assignments.length} trucks)`);
+      
+      const result = await truckHoldService.confirmHoldWithAssignments(
+        holdId,
+        transporterId,
+        assignments
+      );
+      
+      if (result.success) {
+        res.json({
+          success: true,
+          data: {
+            assignmentIds: result.assignmentIds,
+            tripIds: result.tripIds
+          },
+          message: result.message
+        });
+      } else {
+        // Return 400 with detailed failure info
+        res.status(400).json({
+          success: false,
+          error: { 
+            code: 'CONFIRM_FAILED', 
+            message: result.message,
+            failedAssignments: result.failedAssignments
+          }
         });
       }
     } catch (error) {

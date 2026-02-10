@@ -98,7 +98,7 @@ class OrderService {
     const startTime = Date.now();
     
     // Get customer info
-    const customer = db.getUserById(customerId);
+    const customer = await db.getUserById(customerId);
     const customerName = customer?.name || 'Customer';
     
     // Calculate totals
@@ -122,7 +122,7 @@ class OrderService {
     // ==========================================================================
     // STEP 1: Create parent Order record
     // ==========================================================================
-    const order = db.createOrder({
+    const order = await db.createOrder({
       id: orderId,
       customerId,
       customerName,
@@ -159,7 +159,7 @@ class OrderService {
     const truckRequests = this.expandTruckSelections(orderId, data.trucks);
     
     // Batch create all truck requests
-    const createdRequests = db.createTruckRequestsBatch(truckRequests);
+    const createdRequests = await db.createTruckRequestsBatch(truckRequests);
     
     // ==========================================================================
     // STEP 3: Group requests by vehicle type for efficient broadcasting
@@ -182,10 +182,10 @@ class OrderService {
       logger.warn(`⚠️ NO TRANSPORTERS FOUND for any truck type in order ${orderId}`);
       
       // Update order status
-      db.updateOrder(orderId, { status: 'expired' });
+      await db.updateOrder(orderId, { status: 'expired' });
       
       // Update all requests to expired
-      db.updateTruckRequestsBatch(
+      await db.updateTruckRequestsBatch(
         createdRequests.map(r => r.id),
         { status: 'expired' }
       );
@@ -301,7 +301,7 @@ class OrderService {
     // Process each vehicle type group
     for (const group of groupedRequests) {
       // Find transporters with this vehicle type
-      const transporterIds = db.getTransportersWithVehicleType(
+      const transporterIds = await db.getTransportersWithVehicleType(
         group.vehicleType,
         group.vehicleSubtype
       );
@@ -310,7 +310,7 @@ class OrderService {
       
       // Update notifiedTransporters for each request in this group
       const requestIds = group.requests.map(r => r.id);
-      db.updateTruckRequestsBatch(requestIds, { notifiedTransporters: transporterIds });
+      await db.updateTruckRequestsBatch(requestIds, { notifiedTransporters: transporterIds });
       
       // Track unique transporters
       transporterIds.forEach(id => allTransporterIds.add(id));
@@ -362,7 +362,7 @@ class OrderService {
         
         // Emit to all transporters in this group
         for (const transporterId of transporterIds) {
-          const transporter = db.getUserById(transporterId);
+          const transporter = await db.getUserById(transporterId);
           emitToUser(transporterId, SocketEvent.NEW_BROADCAST, broadcastPayload);
           logger.info(`📢 Notified: ${transporter?.name || transporterId} for ${group.vehicleType} ${group.vehicleSubtype} (${group.requests.length} trucks)`);
         }
@@ -398,7 +398,7 @@ class OrderService {
    * Handle order timeout
    */
   private async handleOrderTimeout(orderId: string, customerId: string): Promise<void> {
-    const order = db.getOrderById(orderId);
+    const order = await db.getOrderById(orderId);
     
     if (!order) {
       logger.warn(`Order ${orderId} not found for timeout handling`);
@@ -415,19 +415,19 @@ class OrderService {
     logger.info(`⏰ TIMEOUT: Order ${orderId} expired`);
 
     // Get unfilled requests
-    const requests = db.getTruckRequestsByOrder(orderId);
+    const requests = await db.getTruckRequestsByOrder(orderId);
     const unfilledRequests = requests.filter(r => r.status === 'searching');
     const filledCount = requests.filter(r => ['assigned', 'accepted', 'in_progress', 'completed'].includes(r.status)).length;
 
     // Update unfilled requests to expired
-    db.updateTruckRequestsBatch(
+    await db.updateTruckRequestsBatch(
       unfilledRequests.map(r => r.id),
       { status: 'expired' }
     );
 
     if (filledCount > 0 && filledCount < order.totalTrucks) {
       // Partially filled
-      db.updateOrder(orderId, { status: 'expired' });
+      await db.updateOrder(orderId, { status: 'expired' });
       
       emitToUser(customerId, SocketEvent.BOOKING_EXPIRED, {
         orderId,
@@ -439,7 +439,7 @@ class OrderService {
       });
     } else if (filledCount === 0) {
       // No trucks filled
-      db.updateOrder(orderId, { status: 'expired' });
+      await db.updateOrder(orderId, { status: 'expired' });
       
       emitToUser(customerId, SocketEvent.NO_VEHICLES_AVAILABLE, {
         orderId,
@@ -469,7 +469,7 @@ class OrderService {
   private startCountdownNotifications(orderId: string, customerId: string): void {
     let remainingMs = ORDER_CONFIG.TIMEOUT_MS;
 
-    const countdownInterval = setInterval(() => {
+    const countdownInterval = setInterval(async () => {
       remainingMs -= ORDER_CONFIG.COUNTDOWN_INTERVAL_MS;
       
       if (remainingMs <= 0) {
@@ -477,7 +477,7 @@ class OrderService {
         return;
       }
 
-      const order = db.getOrderById(orderId);
+      const order = await db.getOrderById(orderId);
       if (!order || ['fully_filled', 'completed', 'cancelled', 'expired'].includes(order.status)) {
         clearInterval(countdownInterval);
         return;
@@ -544,7 +544,7 @@ class OrderService {
     const startTime = Date.now();
     
     // STEP 1: Validate request exists and is available
-    const request = db.getTruckRequestById(requestId);
+    const request = await db.getTruckRequestById(requestId);
     if (!request) {
       throw new AppError(404, 'REQUEST_NOT_FOUND', 'Truck request not found');
     }
@@ -556,7 +556,7 @@ class OrderService {
     }
 
     // Verify transporter has this vehicle type
-    const vehicle = db.getVehicleById(vehicleId);
+    const vehicle = await db.getVehicleById(vehicleId);
     if (!vehicle) {
       throw new AppError(404, 'VEHICLE_NOT_FOUND', 'Vehicle not found');
     }
@@ -569,12 +569,12 @@ class OrderService {
     }
 
     // Get transporter and driver info
-    const transporter = db.getUserById(transporterId);
-    const driver = driverId ? db.getUserById(driverId) : null;
+    const transporter = await db.getUserById(transporterId);
+    const driver = driverId ? await db.getUserById(driverId) : null;
     
     // STEP 2: Update the truck request IMMEDIATELY (atomic operation)
     const tripId = uuid();
-    const updatedRequest = db.updateTruckRequest(requestId, {
+    const updatedRequest = await db.updateTruckRequest(requestId, {
       status: 'assigned',
       assignedTransporterId: transporterId,
       assignedTransporterName: transporter?.businessName || transporter?.name || 'Unknown',
@@ -588,7 +588,7 @@ class OrderService {
     });
 
     // Get the parent order
-    const order = db.getOrderById(request.orderId);
+    const order = await db.getOrderById(request.orderId);
     if (!order) {
       logger.error(`Order ${request.orderId} not found for request ${requestId}`);
       return updatedRequest!;
@@ -599,13 +599,13 @@ class OrderService {
     const trucksRemaining = order.totalTrucks - newFilled;
     const newStatus = newFilled >= order.totalTrucks ? 'fully_filled' : 'partially_filled';
     
-    db.updateOrder(request.orderId, {
+    await db.updateOrder(request.orderId, {
       trucksFilled: newFilled,
       status: newStatus
     });
 
     // Get remaining searching requests for this vehicle type
-    const allRequests = db.getTruckRequestsByOrder(request.orderId);
+    const allRequests = await db.getTruckRequestsByOrder(request.orderId);
     const remainingRequests = allRequests.filter(r => 
       r.status === 'searching' && 
       r.vehicleType === request.vehicleType && 
@@ -747,7 +747,7 @@ class OrderService {
    * Get order by ID with all truck requests
    */
   async getOrderWithRequests(orderId: string, userId: string, userRole: string) {
-    const order = db.getOrderById(orderId);
+    const order = await db.getOrderById(orderId);
     if (!order) {
       throw new AppError(404, 'ORDER_NOT_FOUND', 'Order not found');
     }
@@ -757,7 +757,7 @@ class OrderService {
       throw new AppError(403, 'FORBIDDEN', 'Access denied');
     }
 
-    const requests = db.getTruckRequestsByOrder(orderId);
+    const requests = await db.getTruckRequestsByOrder(orderId);
 
     return {
       order,
@@ -775,7 +775,7 @@ class OrderService {
    * Get active truck requests for transporter (only matching their vehicle types)
    */
   async getActiveTruckRequestsForTransporter(transporterId: string) {
-    const requests = db.getActiveTruckRequestsForTransporter(transporterId);
+    const requests = await db.getActiveTruckRequestsForTransporter(transporterId);
     
     // Group by order for better UI
     const orderMap = new Map<string, { order: OrderRecord | undefined; requests: TruckRequestRecord[] }>();
@@ -783,7 +783,7 @@ class OrderService {
     for (const request of requests) {
       if (!orderMap.has(request.orderId)) {
         orderMap.set(request.orderId, {
-          order: db.getOrderById(request.orderId),
+          order: await db.getOrderById(request.orderId),
           requests: []
         });
       }
@@ -797,7 +797,7 @@ class OrderService {
    * Get customer's orders
    */
   async getCustomerOrders(customerId: string, page: number = 1, limit: number = 20) {
-    const orders = db.getOrdersByCustomer(customerId);
+    const orders = await db.getOrdersByCustomer(customerId);
     
     // Sort by newest first
     orders.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
@@ -807,8 +807,8 @@ class OrderService {
     const paginatedOrders = orders.slice(start, start + limit);
     
     // Include truck requests summary for each order
-    const ordersWithSummary = paginatedOrders.map(order => {
-      const requests = db.getTruckRequestsByOrder(order.id);
+    const ordersWithSummary = await Promise.all(paginatedOrders.map(async (order) => {
+      const requests = await db.getTruckRequestsByOrder(order.id);
       return {
         ...order,
         requestsSummary: {
@@ -819,7 +819,7 @@ class OrderService {
           expired: requests.filter(r => r.status === 'expired').length
         }
       };
-    });
+    }));
 
     return {
       orders: ordersWithSummary,

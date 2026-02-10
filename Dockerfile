@@ -20,34 +20,53 @@
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# Stage 1: Builder
+# Stage 1: Build TypeScript + Generate Prisma (self-contained)
 # -----------------------------------------------------------------------------
 FROM node:20-alpine AS builder
 
-# Install build dependencies
-RUN apk add --no-cache python3 make g++
+# Install OpenSSL for Prisma
+RUN apk add --no-cache openssl
 
 WORKDIR /app
 
-# Copy package files first (for better caching)
+# Copy package files and prisma schema first (layer cache)
 COPY package*.json ./
+COPY prisma ./prisma
 
-# Install all dependencies (including devDependencies for build)
+# Install ALL dependencies (devDeps needed for tsc + prisma)
 RUN npm ci --legacy-peer-deps
 
-# Copy source code
-COPY . .
+# Generate Prisma client for linux-musl (Alpine)
+RUN npx prisma generate
 
-# Build TypeScript
+# Copy source code and tsconfig
+COPY tsconfig.json ./
+COPY src ./src
+
+# Compile TypeScript → dist/
+# PRODUCTION: Build happens inside Docker — no local build needed
 RUN npm run build
 
-# Prune dev dependencies
-RUN npm prune --production
+# -----------------------------------------------------------------------------
+# Stage 2: Production Dependencies Only
+# -----------------------------------------------------------------------------
+FROM node:20-alpine AS deps
+
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install production dependencies only
+RUN npm ci --legacy-peer-deps --omit=dev
 
 # -----------------------------------------------------------------------------
-# Stage 2: Production
+# Stage 3: Production Runtime
 # -----------------------------------------------------------------------------
 FROM node:20-alpine AS production
+
+# Install OpenSSL for Prisma runtime + wget for healthcheck
+RUN apk add --no-cache openssl
 
 # Security: Run as non-root user
 RUN addgroup -g 1001 -S nodejs && \
@@ -55,10 +74,22 @@ RUN addgroup -g 1001 -S nodejs && \
 
 WORKDIR /app
 
-# Copy built application
+# Copy production dependencies
+COPY --from=deps --chown=weelo:nodejs /app/node_modules ./node_modules
+
+# Copy generated Prisma client from builder stage
+COPY --from=builder --chown=weelo:nodejs /app/node_modules/.prisma ./node_modules/.prisma
+COPY --from=builder --chown=weelo:nodejs /app/node_modules/@prisma ./node_modules/@prisma
+
+# Copy compiled dist from builder (NOT local — built inside Docker)
 COPY --from=builder --chown=weelo:nodejs /app/dist ./dist
-COPY --from=builder --chown=weelo:nodejs /app/node_modules ./node_modules
-COPY --from=builder --chown=weelo:nodejs /app/package*.json ./
+
+# Copy prisma schema and package files
+COPY --chown=weelo:nodejs prisma ./prisma
+COPY --chown=weelo:nodejs package*.json ./
+COPY --chown=weelo:nodejs scripts/docker-entrypoint.sh ./docker-entrypoint.sh
+
+RUN chmod +x ./docker-entrypoint.sh
 
 # Create logs directory
 RUN mkdir -p logs && chown weelo:nodejs logs
@@ -77,21 +108,28 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 # Switch to non-root user
 USER weelo
 
-# Start server (use cluster mode for production)
-CMD ["node", "dist/cluster.js"]
+# Start server via entrypoint (runs migration first, then starts server)
+CMD ["./docker-entrypoint.sh"]
 
 # -----------------------------------------------------------------------------
 # Stage 3: Development (optional)
 # -----------------------------------------------------------------------------
 FROM node:20-alpine AS development
 
+# Install OpenSSL for Prisma
+RUN apk add --no-cache openssl
+
 WORKDIR /app
 
-# Copy package files
+# Copy package files and prisma schema
 COPY package*.json ./
+COPY prisma ./prisma
 
 # Install all dependencies
 RUN npm ci --legacy-peer-deps
+
+# CRITICAL FIX: Generate Prisma client for development
+RUN npx prisma generate
 
 # Copy source code
 COPY . .

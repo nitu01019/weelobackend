@@ -318,14 +318,28 @@ export const HTTP_STATUS = {
 } as const;
 
 // =============================================================================
-// ERROR CODES
+// ERROR CODES - PRODUCTION GRADE (Hierarchical Structure)
 // =============================================================================
-
 /**
  * Application-specific error codes
+ * 
+ * SCALABILITY: Machine-readable codes for monitoring/alerting at scale
+ * EASY UNDERSTANDING: Categorized by domain (Auth, Validation, Business, System)
+ * MODULARITY: Easy to extend without breaking existing error handling
+ * CODING STANDARDS: Industry-standard taxonomy (inspired by Stripe/AWS)
+ * 
+ * PATTERN: Hierarchical error codes (Uber/Lyft production pattern)
+ * - 1xxx: Authentication & Authorization
+ * - 2xxx: Validation errors
+ * - 3xxx: Booking business logic
+ * - 4xxx: Resource errors (Vehicle, Driver, User)
+ * - 6xxx: Order business logic (multi-vehicle)
+ * - 9xxx: System/Infrastructure errors
  */
 export enum ErrorCode {
-  // Authentication (1xxx)
+  // =============================================================================
+  // AUTHENTICATION & AUTHORIZATION (1xxx)
+  // =============================================================================
   AUTH_INVALID_CREDENTIALS = 'AUTH_1001',
   AUTH_TOKEN_EXPIRED = 'AUTH_1002',
   AUTH_TOKEN_INVALID = 'AUTH_1003',
@@ -334,37 +348,126 @@ export enum ErrorCode {
   AUTH_OTP_MAX_ATTEMPTS = 'AUTH_1006',
   AUTH_USER_NOT_FOUND = 'AUTH_1007',
   AUTH_USER_INACTIVE = 'AUTH_1008',
+  AUTH_UNAUTHORIZED_ACCESS = 'AUTH_1009',
+  AUTH_TOKEN_REFRESH_FAILED = 'AUTH_1010',
   
-  // Validation (2xxx)
+  // =============================================================================
+  // VALIDATION ERRORS (2xxx)
+  // =============================================================================
   VALIDATION_ERROR = 'VAL_2001',
   VALIDATION_PHONE_INVALID = 'VAL_2002',
   VALIDATION_REQUIRED_FIELD = 'VAL_2003',
+  VALIDATION_LOCATION_INVALID = 'VAL_2004',
+  VALIDATION_DATE_RANGE_INVALID = 'VAL_2005',
+  VALIDATION_VEHICLE_TYPE_INVALID = 'VAL_2006',
+  VALIDATION_QUANTITY_INVALID = 'VAL_2007',
   
-  // Booking (3xxx)
+  // =============================================================================
+  // BOOKING BUSINESS LOGIC (3xxx)
+  // =============================================================================
   BOOKING_NOT_FOUND = 'BOOK_3001',
   BOOKING_INVALID_STATUS = 'BOOK_3002',
   BOOKING_ALREADY_ASSIGNED = 'BOOK_3003',
   BOOKING_CANNOT_CANCEL = 'BOOK_3004',
+  BOOKING_EXPIRED = 'BOOK_3005',
+  BOOKING_CANCELLED = 'BOOK_3006',
+  BOOKING_ALREADY_FILLED = 'BOOK_3007',
+  BROADCAST_EXPIRED = 'BOOK_3008',
   
+  // =============================================================================
+  // RESOURCE ERRORS - Vehicle, Driver, User (4xxx-5xxx)
+  // =============================================================================
   // Vehicle (4xxx)
   VEHICLE_NOT_FOUND = 'VEH_4001',
   VEHICLE_NOT_AVAILABLE = 'VEH_4002',
   VEHICLE_ALREADY_EXISTS = 'VEH_4003',
+  VEHICLE_INSUFFICIENT = 'VEH_4004',
   
   // Driver (5xxx)
   DRIVER_NOT_FOUND = 'DRV_5001',
   DRIVER_NOT_AVAILABLE = 'DRV_5002',
   DRIVER_ALREADY_ASSIGNED = 'DRV_5003',
   
-  // Order (6xxx)
+  // User (5xxx)
+  USER_NOT_FOUND = 'USER_5101',
+  TRANSPORTER_NOT_FOUND = 'USER_5102',
+  CUSTOMER_NOT_FOUND = 'USER_5103',
+  RESOURCE_CONFLICT = 'RES_5201',
+  DUPLICATE_RESOURCE = 'RES_5202',
+  
+  // =============================================================================
+  // ORDER BUSINESS LOGIC - Multi-vehicle orders (6xxx)
+  // =============================================================================
   ORDER_NOT_FOUND = 'ORD_6001',
   ORDER_INVALID_STATUS = 'ORD_6002',
+  ORDER_CANCELLED = 'ORD_6003',
+  ORDER_EXPIRED = 'ORD_6004',
+  ORDER_ACTIVE_EXISTS = 'ORD_6005',        // ⭐ NEW: Critical for cancel/resume flow
+  ORDER_ALREADY_FILLED = 'ORD_6006',
+  ORDER_CANNOT_CANCEL = 'ORD_6007',
+  ASSIGNMENT_CONFLICT = 'ORD_6008',
   
-  // System (9xxx)
+  // =============================================================================
+  // SYSTEM & INFRASTRUCTURE (9xxx)
+  // =============================================================================
   INTERNAL_ERROR = 'SYS_9001',
   SERVICE_UNAVAILABLE = 'SYS_9002',
   RATE_LIMIT_EXCEEDED = 'SYS_9003',
-  DATABASE_ERROR = 'SYS_9004'
+  DATABASE_ERROR = 'SYS_9004',
+  REDIS_ERROR = 'SYS_9005',
+  EXTERNAL_API_ERROR = 'SYS_9006',
+  SMS_SERVICE_ERROR = 'SYS_9007',
+  FCM_ERROR = 'SYS_9008',
+  S3_ERROR = 'SYS_9009',
+  CIRCUIT_BREAKER_OPEN = 'SYS_9010',
+  TIMEOUT_ERROR = 'SYS_9011',
+  IDEMPOTENCY_CONFLICT = 'SYS_9012'        // ⭐ NEW: For duplicate requests
+}
+
+/**
+ * Error category for grouping (used in monitoring dashboards)
+ * SCALABILITY: CloudWatch alarms can filter by category
+ */
+export enum ErrorCategory {
+  AUTH = 'authentication',
+  VALIDATION = 'validation',
+  BUSINESS = 'business_logic',
+  RESOURCE = 'resource',
+  SYSTEM = 'system'
+}
+
+/**
+ * Map error codes to categories (for automated alerting)
+ * MODULARITY: Centralized mapping makes it easy to add new errors
+ */
+export const ERROR_CATEGORY_MAP: Record<string, ErrorCategory> = {
+  // Auth errors (1xxx)
+  'AUTH_': ErrorCategory.AUTH,
+  
+  // Validation errors (2xxx)
+  'VAL_': ErrorCategory.VALIDATION,
+  
+  // Business logic (3xxx, 6xxx)
+  'BOOK_': ErrorCategory.BUSINESS,
+  'ORD_': ErrorCategory.BUSINESS,
+  
+  // Resource errors (4xxx, 5xxx)
+  'VEH_': ErrorCategory.RESOURCE,
+  'DRV_': ErrorCategory.RESOURCE,
+  'USER_': ErrorCategory.RESOURCE,
+  'RES_': ErrorCategory.RESOURCE,
+  
+  // System errors (9xxx)
+  'SYS_': ErrorCategory.SYSTEM
+};
+
+/**
+ * Get error category from error code
+ * EASY UNDERSTANDING: Simple prefix-based lookup
+ */
+export function getErrorCategory(errorCode: ErrorCode): ErrorCategory {
+  const prefix = errorCode.split('_')[0] + '_';
+  return ERROR_CATEGORY_MAP[prefix] || ErrorCategory.SYSTEM;
 }
 
 // =============================================================================

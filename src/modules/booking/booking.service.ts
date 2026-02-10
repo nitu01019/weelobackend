@@ -28,9 +28,14 @@ import { v4 as uuid } from 'uuid';
 import { db, BookingRecord } from '../../shared/database/db';
 import { AppError } from '../../shared/types/error.types';
 import { logger } from '../../shared/services/logger.service';
-import { emitToUser, emitToBooking, SocketEvent } from '../../shared/services/socket.service';
+import { emitToUser, emitToBooking, SocketEvent, isUserConnected } from '../../shared/services/socket.service';
 import { fcmService } from '../../shared/services/fcm.service';
 import { CreateBookingInput, GetBookingsQuery } from './booking.schema';
+import { availabilityService } from '../../shared/services/availability.service';
+import { generateVehicleKey } from '../../shared/services/vehicle-key.service';
+import { redisService } from '../../shared/services/redis.service';
+// 4 PRINCIPLES: Import production-grade error codes
+import { ErrorCode } from '../../core/constants';
 
 // =============================================================================
 // CONFIGURATION - Easy to adjust for testing vs production
@@ -40,16 +45,84 @@ const BOOKING_CONFIG = {
   // Timeout in milliseconds (1 minute for quick response)
   TIMEOUT_MS: 1 * 60 * 1000,  // 60 seconds
   
-  // How often to check for expired bookings
-  EXPIRY_CHECK_INTERVAL_MS: 30 * 1000,  // Every 30 seconds
+  // How often to check for expired bookings (Redis-based)
+  EXPIRY_CHECK_INTERVAL_MS: 5 * 1000,  // Every 5 seconds
   
   // Countdown notification interval (notify customer of remaining time)
   COUNTDOWN_INTERVAL_MS: 60 * 1000,  // Every 1 minute
 };
 
-// Store active timers for cleanup
-const bookingTimers = new Map<string, NodeJS.Timeout>();
-const countdownTimers = new Map<string, NodeJS.Timeout>();
+// =============================================================================
+// REDIS KEY PATTERNS (for distributed timers)
+// =============================================================================
+const TIMER_KEYS = {
+  BOOKING_EXPIRY: (bookingId: string) => `timer:booking:${bookingId}`,
+  COUNTDOWN: (bookingId: string) => `timer:countdown:${bookingId}`,
+};
+
+// Timer data interface
+interface BookingTimerData {
+  bookingId: string;
+  customerId: string;
+  createdAt: string;
+}
+
+// =============================================================================
+// EXPIRY CHECKER (Runs on every server instance - Redis ensures no duplicates)
+// =============================================================================
+let expiryCheckerInterval: NodeJS.Timeout | null = null;
+
+/**
+ * Start the booking expiry checker
+ * This runs on every server instance but uses Redis locks to prevent duplicate processing
+ */
+function startBookingExpiryChecker(): void {
+  if (expiryCheckerInterval) return;
+  
+  expiryCheckerInterval = setInterval(async () => {
+    try {
+      await processExpiredBookings();
+    } catch (error: any) {
+      logger.error('Booking expiry checker error', { error: error.message });
+    }
+  }, BOOKING_CONFIG.EXPIRY_CHECK_INTERVAL_MS);
+  
+  logger.info('📅 Booking expiry checker started (Redis-based, cluster-safe)');
+}
+
+/**
+ * Process all expired booking timers
+ * Uses Redis distributed lock to prevent multiple instances processing the same booking
+ */
+async function processExpiredBookings(): Promise<void> {
+  const expiredTimers = await redisService.getExpiredTimers<BookingTimerData>('timer:booking:');
+  
+  for (const timer of expiredTimers) {
+    // Try to acquire lock for this booking (prevents duplicate processing)
+    const lockKey = `lock:booking-expiry:${timer.data.bookingId}`;
+    const lock = await redisService.acquireLock(lockKey, 'expiry-checker', 30);
+    
+    if (!lock.acquired) {
+      // Another instance is processing this booking
+      continue;
+    }
+    
+    try {
+      await bookingService.handleBookingTimeout(timer.data.bookingId, timer.data.customerId);
+      await redisService.cancelTimer(timer.key);
+    } catch (error: any) {
+      logger.error('Failed to process expired booking', { 
+        bookingId: timer.data.bookingId, 
+        error: error.message 
+      });
+    } finally {
+      await redisService.releaseLock(lockKey, 'expiry-checker');
+    }
+  }
+}
+
+// Start expiry checker when module loads
+startBookingExpiryChecker();
 
 class BookingService {
   
@@ -67,27 +140,83 @@ class BookingService {
    * 4. Starts timeout countdown
    * 5. Multiple transporters can accept (partial fulfillment)
    * 6. Auto-expires if not filled within timeout
+   * 
+   * SCALABILITY:
+   * - Idempotency key prevents duplicate bookings
+   * - Redis stores key for 24 hours
+   * - Supports millions of concurrent users
+   * 
+   * EASY UNDERSTANDING:
+   * - If idempotency key exists, return cached booking
+   * - Otherwise create new booking and cache key
    */
   async createBooking(
     customerId: string,
     customerPhone: string,
-    data: CreateBookingInput
+    data: CreateBookingInput,
+    idempotencyKey?: string
   ): Promise<BookingRecord & { matchingTransportersCount: number; timeoutSeconds: number }> {
+    // SCALABILITY: Check idempotency key to prevent duplicate bookings
+    if (idempotencyKey) {
+      const cacheKey = `idempotency:booking:${customerId}:${idempotencyKey}`;
+      const cachedBooking = await redisService.get(cacheKey) as string | null;
+      
+      if (cachedBooking) {
+        // EASY UNDERSTANDING: Duplicate request detected, return existing booking
+        logger.info(`🔒 Idempotency: Duplicate booking request detected`, {
+          customerId,
+          idempotencyKey,
+          existingBookingId: cachedBooking
+        });
+        
+        const existingBooking = await db.getBookingById(cachedBooking);
+        if (existingBooking) {
+          const matchingTransporters = await db.getTransportersWithVehicleType(data.vehicleType);
+          return {
+            ...existingBooking,
+            matchingTransportersCount: matchingTransporters.length,
+            timeoutSeconds: Math.floor(BOOKING_CONFIG.TIMEOUT_MS / 1000)
+          };
+        }
+      }
+    }
+    
     // Get customer name
-    const customer = db.getUserById(customerId);
+    const customer = await db.getUserById(customerId);
     const customerName = customer?.name || 'Customer';
 
     // Calculate expiry based on config timeout
     const expiresAt = new Date(Date.now() + BOOKING_CONFIG.TIMEOUT_MS).toISOString();
 
     // ========================================
-    // SMART MATCHING: Find ALL transporters with matching vehicle TYPE
-    // Simplified: Match by type only (not subtype) for broader reach during testing
+    // SMART MATCHING: Find NEARBY transporters with matching vehicle TYPE
+    // Uses geohash-indexed availability service for O(1) proximity lookups
+    // Falls back to database query if no live transporters available
     // ========================================
-    const matchingTransporters = db.getTransportersWithVehicleType(
-      data.vehicleType
-      // Note: vehicleSubtype is optional - matches any subtype of that type
+    const vehicleKey = generateVehicleKey(data.vehicleType, data.vehicleSubtype);
+    
+    // First, try to find nearby ONLINE transporters (from heartbeat data)
+    // Uses Redis GEORADIUS for O(log N) proximity search
+    let nearbyTransporters = await availabilityService.getAvailableTransportersAsync(
+      vehicleKey,
+      data.pickup.coordinates.latitude,
+      data.pickup.coordinates.longitude,
+      20, // Get top 20 nearest transporters
+      50  // 50km radius
     );
+    
+    logger.info(`📍 Found ${nearbyTransporters.length} NEARBY online transporters for ${vehicleKey}`);
+    
+    // Fallback: If no nearby online transporters, get ALL transporters with matching vehicle type
+    // This ensures we still broadcast even if no one has sent heartbeats recently
+    let matchingTransporters: string[];
+    if (nearbyTransporters.length > 0) {
+      matchingTransporters = nearbyTransporters;
+      logger.info(`🎯 Using PROXIMITY-BASED matching (${nearbyTransporters.length} nearby)`);
+    } else {
+      matchingTransporters = await db.getTransportersWithVehicleType(data.vehicleType);
+      logger.info(`📋 Fallback to DATABASE matching (${matchingTransporters.length} total)`);
+    }
 
     logger.info(`╔══════════════════════════════════════════════════════════════╗`);
     logger.info(`║  🚛 NEW BOOKING REQUEST                                       ║`);
@@ -101,7 +230,7 @@ class BookingService {
     logger.info(`╚══════════════════════════════════════════════════════════════╝`);
 
     // Create booking
-    const booking = db.createBooking({
+    const booking = await db.createBooking({
       id: uuid(),
       customerId,
       customerName,
@@ -151,7 +280,7 @@ class BookingService {
       });
 
       // Mark as expired immediately
-      db.updateBooking(booking.id, { status: 'expired' });
+      await db.updateBooking(booking.id, { status: 'expired' });
       
       return {
         ...booking,
@@ -164,35 +293,78 @@ class BookingService {
     // ========================================
     // BROADCAST TO ALL MATCHING TRANSPORTERS
     // ========================================
+    // IMPORTANT: Include broadcastId AND orderId for Captain app compatibility
+    // Captain app's SocketIOService checks broadcastId first, then orderId
     const broadcastPayload = {
+      broadcastId: booking.id,  // CRITICAL: Captain app expects this!
+      orderId: booking.id,      // Alias for compatibility
       bookingId: booking.id,
+      customerId: booking.customerId,
       customerName: booking.customerName,
       vehicleType: booking.vehicleType,
       vehicleSubtype: booking.vehicleSubtype,
       trucksNeeded: booking.trucksNeeded,
+      totalTrucksNeeded: booking.trucksNeeded,  // Alias for Captain app
       trucksFilled: 0,
+      trucksFilledSoFar: 0,  // Alias for Captain app
       pricePerTruck: booking.pricePerTruck,
+      farePerTruck: booking.pricePerTruck,  // Alias for Captain app
       totalFare: booking.totalAmount,
+      // Nested location format (for Captain app)
+      pickupLocation: {
+        address: booking.pickup.address,
+        city: booking.pickup.city,
+        latitude: booking.pickup.latitude,
+        longitude: booking.pickup.longitude
+      },
+      dropLocation: {
+        address: booking.drop.address,
+        city: booking.drop.city,
+        latitude: booking.drop.latitude,
+        longitude: booking.drop.longitude
+      },
+      // Flat format (legacy)
       pickupAddress: booking.pickup.address,
       pickupCity: booking.pickup.city,
       dropAddress: booking.drop.address,
       dropCity: booking.drop.city,
       distanceKm: booking.distanceKm,
+      distance: booking.distanceKm,  // Alias for Captain app
       goodsType: booking.goodsType,
       weight: data.weight,
       createdAt: booking.createdAt,
       expiresAt: booking.expiresAt,
       timeoutSeconds: BOOKING_CONFIG.TIMEOUT_MS / 1000,
-      isUrgent: false
+      isUrgent: false,
+      // requestedVehicles array for multi-truck UI compatibility
+      requestedVehicles: [{
+        vehicleType: booking.vehicleType,
+        vehicleSubtype: booking.vehicleSubtype || '',
+        count: booking.trucksNeeded,
+        filledCount: 0,
+        farePerTruck: booking.pricePerTruck,
+        capacityTons: 0
+      }]
     };
 
+    logger.info(`╔══════════════════════════════════════════════════════════════╗`);
+    logger.info(`║  📢 BROADCASTING TO ${matchingTransporters.length} TRANSPORTERS                        ║`);
+    logger.info(`╚══════════════════════════════════════════════════════════════╝`);
+    logger.info(`Broadcast payload: ${JSON.stringify(broadcastPayload, null, 2).substring(0, 500)}...`);
+    
     for (const transporterId of matchingTransporters) {
-      const transporter = db.getUserById(transporterId);
+      const transporter = await db.getUserById(transporterId);
+      const isConnected = isUserConnected(transporterId);
+      
+      logger.info(`📢 Emitting to: ${transporter?.name || 'Unknown'} (ID: ${transporterId})`);
+      logger.info(`   - Business: ${transporter?.businessName || 'N/A'}`);
+      logger.info(`   - WebSocket connected: ${isConnected ? '✅ YES' : '❌ NO'}`);
+      logger.info(`   - isAvailable: ${transporter?.isAvailable !== false ? '✅ YES' : '❌ NO'}`);
       
       // Send via WebSocket (for app in foreground)
       emitToUser(transporterId, SocketEvent.NEW_BROADCAST, broadcastPayload);
 
-      logger.info(`📢 Notified: ${transporter?.name || transporterId} (${transporter?.businessName || 'N/A'})`);
+      logger.info(`   ✅ emitToUser() called for ${transporter?.name || transporterId}`);
     }
 
     // ========================================
@@ -224,6 +396,14 @@ class BookingService {
 
     logger.info(`✅ Booking ${booking.id} created, ${matchingTransporters.length} transporters notified`);
 
+    // SCALABILITY: Store idempotency key to prevent duplicate bookings
+    if (idempotencyKey) {
+      const cacheKey = `idempotency:booking:${customerId}:${idempotencyKey}`;
+      // Store for 24 hours (TTL in seconds)
+      await redisService.set(cacheKey, booking.id, 24 * 60 * 60);
+      logger.info(`🔒 Idempotency key stored for booking ${booking.id}`, { idempotencyKey });
+    }
+
     return {
       ...booking,
       matchingTransportersCount: matchingTransporters.length,
@@ -232,28 +412,37 @@ class BookingService {
   }
 
   /**
-   * Start timeout timer for booking
+   * Start timeout timer for booking (Redis-based for cluster support)
    * Auto-expires booking if not fully filled within timeout
+   * 
+   * SCALABILITY: Uses Redis timers instead of in-memory setTimeout
+   * - Works across multiple server instances
+   * - Survives server restarts
+   * - No duplicate processing (Redis locks)
    */
-  private startBookingTimeout(bookingId: string, customerId: string): void {
-    // Clear any existing timer
-    if (bookingTimers.has(bookingId)) {
-      clearTimeout(bookingTimers.get(bookingId)!);
-    }
-
-    const timer = setTimeout(async () => {
-      await this.handleBookingTimeout(bookingId, customerId);
-    }, BOOKING_CONFIG.TIMEOUT_MS);
-
-    bookingTimers.set(bookingId, timer);
-    logger.info(`⏱️ Timeout timer started for booking ${bookingId} (${BOOKING_CONFIG.TIMEOUT_MS / 1000}s)`);
+  private async startBookingTimeout(bookingId: string, customerId: string): Promise<void> {
+    // Cancel any existing timer for this booking
+    await redisService.cancelTimer(TIMER_KEYS.BOOKING_EXPIRY(bookingId));
+    
+    // Set new timer in Redis
+    const expiresAt = new Date(Date.now() + BOOKING_CONFIG.TIMEOUT_MS);
+    const timerData: BookingTimerData = {
+      bookingId,
+      customerId,
+      createdAt: new Date().toISOString()
+    };
+    
+    await redisService.setTimer(TIMER_KEYS.BOOKING_EXPIRY(bookingId), timerData, expiresAt);
+    
+    logger.info(`⏱️ Timeout timer started for booking ${bookingId} (${BOOKING_CONFIG.TIMEOUT_MS / 1000}s) [Redis-based]`);
   }
 
   /**
    * Handle booking timeout - called when timer expires
+   * Made public for the expiry checker to call
    */
-  private async handleBookingTimeout(bookingId: string, customerId: string): Promise<void> {
-    const booking = db.getBookingById(bookingId);
+  async handleBookingTimeout(bookingId: string, customerId: string): Promise<void> {
+    const booking = await db.getBookingById(bookingId);
     
     if (!booking) {
       logger.warn(`Booking ${bookingId} not found for timeout handling`);
@@ -272,7 +461,7 @@ class BookingService {
     // Check if partially filled
     if (booking.trucksFilled > 0 && booking.trucksFilled < booking.trucksNeeded) {
       // Partially filled - notify customer
-      db.updateBooking(bookingId, { status: 'expired' });
+      await db.updateBooking(bookingId, { status: 'expired' });
       
       emitToUser(customerId, SocketEvent.BOOKING_EXPIRED, {
         bookingId,
@@ -292,7 +481,7 @@ class BookingService {
 
     } else if (booking.trucksFilled === 0) {
       // No trucks filled - "No vehicle available"
-      db.updateBooking(bookingId, { status: 'expired' });
+      await db.updateBooking(bookingId, { status: 'expired' });
       
       emitToUser(customerId, SocketEvent.NO_VEHICLES_AVAILABLE, {
         bookingId,
@@ -324,11 +513,16 @@ class BookingService {
 
   /**
    * Start countdown notifications to customer
+   * 
+   * NOTE: Countdown is still local per-instance as it's just UI updates
+   * If user reconnects to different server, they get fresh countdown from booking state
    */
   private startCountdownNotifications(bookingId: string, customerId: string): void {
+    // For countdown, we can use local interval as it's just for UI updates
+    // The actual expiry is handled by Redis-based timer
     let remainingMs = BOOKING_CONFIG.TIMEOUT_MS;
 
-    const countdownInterval = setInterval(() => {
+    const countdownInterval = setInterval(async () => {
       remainingMs -= BOOKING_CONFIG.COUNTDOWN_INTERVAL_MS;
       
       if (remainingMs <= 0) {
@@ -336,7 +530,7 @@ class BookingService {
         return;
       }
 
-      const booking = db.getBookingById(bookingId);
+      const booking = await db.getBookingById(bookingId);
       if (!booking || ['fully_filled', 'completed', 'cancelled', 'expired'].includes(booking.status)) {
         clearInterval(countdownInterval);
         return;
@@ -352,29 +546,23 @@ class BookingService {
       });
 
     }, BOOKING_CONFIG.COUNTDOWN_INTERVAL_MS);
-
-    countdownTimers.set(bookingId, countdownInterval as unknown as NodeJS.Timeout);
+    
+    // Store reference locally (countdown is per-instance, not critical)
+    // The Redis timer handles the actual expiry
   }
 
   /**
-   * Clear all timers for a booking
+   * Clear all timers for a booking (Redis-based)
    */
-  private clearBookingTimers(bookingId: string): void {
-    if (bookingTimers.has(bookingId)) {
-      clearTimeout(bookingTimers.get(bookingId)!);
-      bookingTimers.delete(bookingId);
-    }
-    if (countdownTimers.has(bookingId)) {
-      clearInterval(countdownTimers.get(bookingId)!);
-      countdownTimers.delete(bookingId);
-    }
+  private async clearBookingTimers(bookingId: string): Promise<void> {
+    await redisService.cancelTimer(TIMER_KEYS.BOOKING_EXPIRY(bookingId));
   }
 
   /**
    * Cancel booking timeout (called when fully filled)
    */
-  cancelBookingTimeout(bookingId: string): void {
-    this.clearBookingTimers(bookingId);
+  async cancelBookingTimeout(bookingId: string): Promise<void> {
+    await this.clearBookingTimers(bookingId);
     logger.info(`⏱️ Timeout cancelled for booking ${bookingId}`);
   }
 
@@ -389,7 +577,7 @@ class BookingService {
     customerId: string,
     query: GetBookingsQuery
   ): Promise<{ bookings: BookingRecord[]; total: number; hasMore: boolean }> {
-    let bookings = db.getBookingsByCustomer(customerId);
+    let bookings = await db.getBookingsByCustomer(customerId);
 
     // Filter by status
     if (query.status) {
@@ -421,7 +609,7 @@ class BookingService {
     query: GetBookingsQuery
   ): Promise<{ bookings: BookingRecord[]; total: number; hasMore: boolean }> {
     // Get bookings that match this transporter's vehicle types
-    let bookings = db.getActiveBookingsForTransporter(transporterId);
+    let bookings = await db.getActiveBookingsForTransporter(transporterId);
 
     // Only show active/partially filled
     bookings = bookings.filter(b => 
@@ -454,7 +642,7 @@ class BookingService {
     userId: string,
     userRole: string
   ): Promise<BookingRecord> {
-    const booking = db.getBookingById(bookingId);
+    const booking = await db.getBookingById(bookingId);
 
     if (!booking) {
       throw new AppError(404, 'BOOKING_NOT_FOUND', 'Booking not found');
@@ -467,13 +655,14 @@ class BookingService {
 
     // Transporters can only see if they have matching vehicles
     if (userRole === 'transporter') {
-      const transporterVehicles = db.getVehiclesByTransporter(userId);
+      const transporterVehicles = await db.getVehiclesByTransporter(userId);
       const hasMatchingVehicle = transporterVehicles.some(
         v => v.vehicleType === booking.vehicleType && v.isActive
       );
       
       if (!hasMatchingVehicle) {
-        throw new AppError(403, 'FORBIDDEN', 'You do not have matching vehicles for this booking');
+        // 4 PRINCIPLES: Business logic error (insufficient vehicles)
+        throw new AppError(403, ErrorCode.VEHICLE_INSUFFICIENT, 'You do not have matching vehicles for this booking');
       }
     }
 
@@ -488,7 +677,7 @@ class BookingService {
     userId: string,
     userRole: string
   ): Promise<any[]> {
-    const booking = db.getBookingById(bookingId);
+    const booking = await db.getBookingById(bookingId);
 
     if (!booking) {
       throw new AppError(404, 'BOOKING_NOT_FOUND', 'Booking not found');
@@ -500,7 +689,7 @@ class BookingService {
     }
 
     // Get assignments for this booking
-    const assignments = db.getAssignmentsByBooking(bookingId);
+    const assignments = await db.getAssignmentsByBooking(bookingId);
 
     return assignments.map(a => ({
       assignmentId: a.id,
@@ -522,7 +711,7 @@ class BookingService {
    * Cancel booking
    */
   async cancelBooking(bookingId: string, customerId: string): Promise<BookingRecord> {
-    const booking = db.getBookingById(bookingId);
+    const booking = await db.getBookingById(bookingId);
 
     if (!booking) {
       throw new AppError(404, 'BOOKING_NOT_FOUND', 'Booking not found');
@@ -536,7 +725,7 @@ class BookingService {
       throw new AppError(400, 'INVALID_STATUS', 'Booking cannot be cancelled');
     }
 
-    const updated = db.updateBooking(bookingId, { status: 'cancelled' });
+    const updated = await db.updateBooking(bookingId, { status: 'cancelled' });
 
     // Notify via WebSocket
     emitToBooking(bookingId, SocketEvent.BOOKING_UPDATED, {
@@ -553,7 +742,7 @@ class BookingService {
    * ENHANCED: Cancels timeout when fully filled, notifies all parties
    */
   async incrementTrucksFilled(bookingId: string): Promise<BookingRecord> {
-    const booking = db.getBookingById(bookingId);
+    const booking = await db.getBookingById(bookingId);
 
     if (!booking) {
       throw new AppError(404, 'BOOKING_NOT_FOUND', 'Booking not found');
@@ -562,7 +751,7 @@ class BookingService {
     const newFilled = booking.trucksFilled + 1;
     const newStatus = newFilled >= booking.trucksNeeded ? 'fully_filled' : 'partially_filled';
 
-    const updated = db.updateBooking(bookingId, {
+    const updated = await db.updateBooking(bookingId, {
       trucksFilled: newFilled,
       status: newStatus
     });
@@ -628,7 +817,7 @@ class BookingService {
    * Decrement trucks filled (called when assignment is cancelled)
    */
   async decrementTrucksFilled(bookingId: string): Promise<BookingRecord> {
-    const booking = db.getBookingById(bookingId);
+    const booking = await db.getBookingById(bookingId);
 
     if (!booking) {
       throw new AppError(404, 'BOOKING_NOT_FOUND', 'Booking not found');
@@ -637,7 +826,7 @@ class BookingService {
     const newFilled = Math.max(0, booking.trucksFilled - 1);
     const newStatus = newFilled === 0 ? 'active' : 'partially_filled';
 
-    const updated = db.updateBooking(bookingId, {
+    const updated = await db.updateBooking(bookingId, {
       trucksFilled: newFilled,
       status: newStatus
     });

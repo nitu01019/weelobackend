@@ -1,0 +1,97 @@
+# =============================================================================
+# GITHUB ACTIONS WORKFLOW - Deploy Weelo Backend to ECS
+# =============================================================================
+# Place this file in: .github/workflows/deploy-production.yml
+# 
+# This solves the ARM64→AMD64 platform issue by building on native AMD64 runner
+# =============================================================================
+
+name: Deploy to Production ECS
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest  # Native AMD64 - solves platform issue!
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+      
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+      
+      - name: Build, tag, and push image to Amazon ECR
+        env:
+          ECR_REGISTRY: 318774499084.dkr.ecr.ap-south-1.amazonaws.com
+          ECR_REPOSITORY: weelo-backend
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          echo "Building Docker image..."
+          docker build -f Dockerfile.production \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            .
+          
+          echo "Pushing images to ECR..."
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+      
+      - name: Update ECS service
+        run: |
+          echo "Updating ECS service to use new image..."
+          aws ecs update-service \
+            --cluster weelocluster \
+            --service weelobackendtask-service-joxh3c0r \
+            --force-new-deployment \
+            --region ap-south-1
+          
+          echo "Waiting for service to stabilize..."
+          aws ecs wait services-stable \
+            --cluster weelocluster \
+            --services weelobackendtask-service-joxh3c0r \
+            --region ap-south-1
+          
+          echo "✅ Deployment successful!"
+      
+      - name: Verify deployment
+        run: |
+          echo "Checking service status..."
+          aws ecs describe-services \
+            --cluster weelocluster \
+            --services weelobackendtask-service-joxh3c0r \
+            --region ap-south-1 \
+            --query 'services[0].{status:status,runningCount:runningCount,taskDefinition:taskDefinition}' \
+            --output json
+
+# =============================================================================
+# SETUP INSTRUCTIONS
+# =============================================================================
+# 
+# 1. In GitHub repository, go to: Settings → Secrets and variables → Actions
+# 
+# 2. Add these secrets:
+#    • AWS_ACCESS_KEY_ID = <YOUR_AWS_ACCESS_KEY_ID>
+#    • AWS_SECRET_ACCESS_KEY = <YOUR_AWS_SECRET_ACCESS_KEY>
+# 
+# 3. Create this file: .github/workflows/deploy-production.yml
+# 
+# 4. Push to main branch:
+#    git add .github/workflows/deploy-production.yml
+#    git commit -m "Add GitHub Actions deployment workflow"
+#    git push origin main
+# 
+# 5. Deployment will trigger automatically!
+# 
+# =============================================================================

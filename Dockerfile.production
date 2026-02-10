@@ -1,0 +1,90 @@
+# =============================================================================
+# WEELO BACKEND - Simple Production Dockerfile
+# =============================================================================
+# PLATFORM: Explicitly build for linux/amd64 (ECS architecture)
+# =============================================================================
+
+FROM --platform=linux/amd64 node:20-alpine AS builder
+
+# Install build dependencies
+RUN apk add --no-cache openssl python3 make g++
+
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+COPY tsconfig.json ./
+
+# Install all dependencies
+RUN npm ci --legacy-peer-deps
+
+# Copy prisma schema first
+COPY prisma ./prisma
+
+# Generate Prisma client BEFORE building TypeScript
+RUN npx prisma generate
+
+# Copy source code
+COPY . .
+
+# Build TypeScript
+RUN npm run build
+
+# =============================================================================
+# Production stage
+# =============================================================================
+FROM --platform=linux/amd64 node:20-alpine
+
+# Accept build-time arguments for environment variables (SCALABILITY)
+ARG GOOGLE_MAPS_API_KEY
+ENV GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY}
+
+# Install runtime dependencies
+RUN apk add --no-cache openssl curl
+
+# Create non-root user
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S weelo -u 1001
+
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install production dependencies only
+RUN npm ci --legacy-peer-deps --omit=dev
+
+# Copy built code from builder
+COPY --from=builder --chown=weelo:nodejs /app/dist ./dist
+COPY --from=builder --chown=weelo:nodejs /app/node_modules/.prisma ./node_modules/.prisma
+COPY --from=builder --chown=weelo:nodejs /app/node_modules/@prisma ./node_modules/@prisma
+
+# Copy necessary files
+COPY --chown=weelo:nodejs prisma ./prisma
+COPY --chown=weelo:nodejs scripts ./scripts
+
+# Copy production environment file as fallback (Defense in Depth)
+# Runtime env vars from ECS Task Definition take precedence
+COPY --chown=weelo:nodejs .env.production .env
+
+# Create directories
+RUN mkdir -p logs uploads/driver-photos && \
+    chown -R weelo:nodejs logs uploads
+
+# Environment
+ENV NODE_ENV=production
+ENV PORT=3000
+# SCALABILITY: Optimize Node.js for production
+ENV NODE_OPTIONS="--max-old-space-size=2048 --enable-source-maps"
+
+EXPOSE 3000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:3000/health || exit 1
+
+# Switch to non-root user
+USER weelo
+
+# Start server via entrypoint (runs prisma db push first)
+CMD ["sh", "scripts/docker-entrypoint.sh"]

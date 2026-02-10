@@ -35,9 +35,7 @@ class AuthController {
    */
   verifyOtp = asyncHandler(async (req: Request, res: Response, _next: NextFunction) => {
     // Debug: Log incoming request body
-    console.log('=== VERIFY OTP REQUEST ===');
-    console.log('Request body:', JSON.stringify(req.body, null, 2));
-    console.log('==========================');
+    // OTP verification request received
     
     const data = validateSchema(verifyOtpSchema, req.body);
     

@@ -257,7 +257,5 @@ export function buildPaginationMeta(
 }
 
 // =============================================================================
-// TYPE EXPORTS
+// TYPE EXPORTS (types already exported above with their definitions)
 // =============================================================================
-
-export type { SuccessResponse, ResponseMeta, PaginationMeta };

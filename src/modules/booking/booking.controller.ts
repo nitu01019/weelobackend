@@ -14,13 +14,24 @@ import { asyncHandler } from '../../shared/middleware/error.middleware';
 class BookingController {
   /**
    * Create new booking broadcast
+   * 
+   * SCALABILITY:
+   * - Idempotency key prevents duplicate bookings
+   * - Supports millions of concurrent users
+   * 
+   * EASY UNDERSTANDING:
+   * - Extract X-Idempotency-Key from header
+   * - Pass to service for duplicate checking
    */
   createBooking = asyncHandler(async (req: Request, res: Response, _next: NextFunction) => {
     const userId = req.userId!;
     const userPhone = req.userPhone!;
     const data = validateSchema(createBookingSchema, req.body);
     
-    const booking = await bookingService.createBooking(userId, userPhone, data);
+    // SCALABILITY: Get idempotency key from header
+    const idempotencyKey = req.headers['x-idempotency-key'] as string | undefined;
+    
+    const booking = await bookingService.createBooking(userId, userPhone, data, idempotencyKey);
     
     res.status(201).json(successResponse({ booking }));
   });

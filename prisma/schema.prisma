@@ -1,0 +1,853 @@
+// =============================================================================
+// WEELO BACKEND - PRISMA SCHEMA (Production Ready)
+// =============================================================================
+// 
+// ARCHITECTURE:
+// - Customer App (Weelo): Customers create orders, track shipments
+// - Captain App (Weelo Captain): Transporters & Drivers manage fleet, accept trips
+// 
+// DATA SEPARATION:
+// - Users are separated by 'role' field (customer | transporter | driver)
+// - Customers can ONLY see their own orders
+// - Transporters can ONLY see their own vehicles, drivers, assignments
+// - Drivers can ONLY see their own trips
+// 
+// SCALABILITY:
+// - Indexes on all foreign keys and frequently queried fields
+// - Composite indexes for common query patterns
+// - Optimized for millions of users
+// 
+// =============================================================================
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl", "linux-musl-openssl-3.0.x", "linux-musl-arm64-openssl-3.0.x", "linux-arm64-openssl-3.0.x", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =============================================================================
+// ENUMS - Defined types for consistency
+// =============================================================================
+
+// User roles - determines which app they use
+enum UserRole {
+  customer    // Uses Customer App (Weelo) - creates orders
+  transporter // Uses Captain App - manages fleet, accepts orders
+  driver      // Uses Captain App - drives trucks, completes trips
+}
+
+// Vehicle operational status
+enum VehicleStatus {
+  available   // Ready for new trips
+  in_transit  // Currently on a trip
+  maintenance // Under maintenance
+  inactive    // Not operational
+}
+
+// Booking status (legacy single-truck bookings)
+enum BookingStatus {
+  active           // Looking for transporters
+  partially_filled // Some trucks assigned
+  fully_filled     // All trucks assigned
+  in_progress      // Trip started
+  completed        // Trip completed
+  cancelled        // Cancelled by customer
+  expired          // No transporter accepted in time
+}
+
+// Order status (new multi-truck system)
+enum OrderStatus {
+  active           // Looking for transporters
+  partially_filled // Some trucks assigned
+  fully_filled     // All trucks assigned
+  in_progress      // Trip started
+  completed        // Trip completed
+  cancelled        // Cancelled by customer
+  expired          // No transporter accepted in time
+}
+
+// Individual truck request status within an order
+enum TruckRequestStatus {
+  searching   // Looking for transporter
+  held        // Temporarily held by transporter (15 sec timer)
+  assigned    // Confirmed, waiting for driver
+  accepted    // Driver accepted
+  in_progress // Trip in progress
+  completed   // Trip completed
+  cancelled   // Cancelled
+  expired     // Hold/search expired
+}
+
+// Assignment/Trip status
+enum AssignmentStatus {
+  pending          // Waiting for driver to accept
+  driver_accepted  // Driver accepted the trip
+  driver_declined  // Driver declined
+  en_route_pickup  // Driver heading to pickup
+  at_pickup        // Driver arrived at pickup
+  in_transit       // Goods loaded, heading to drop
+  completed        // Trip completed
+  cancelled        // Trip cancelled
+}
+
+// Route point type for multi-stop orders
+enum RoutePointType {
+  PICKUP // Starting point
+  STOP   // Intermediate stop
+  DROP   // Final destination
+}
+
+// =============================================================================
+// USER MODEL
+// =============================================================================
+// 
+// SEPARATION BY ROLE:
+// - customer: Uses Customer App, creates orders
+// - transporter: Uses Captain App, manages fleet
+// - driver: Uses Captain App, assigned by transporter
+// 
+// UNIQUE CONSTRAINT: phone + role (same phone can be customer AND transporter)
+// =============================================================================
+
+model User {
+  id           String   @id @default(uuid())
+  phone        String   // Phone number (with country code)
+  role         UserRole // Determines which app they use
+  name         String
+  email        String?
+  profilePhoto String?
+
+  // =========================================
+  // CUSTOMER SPECIFIC FIELDS
+  // =========================================
+  company   String? // Company name
+  gstNumber String? // GST number for invoicing
+
+  // =========================================
+  // TRANSPORTER SPECIFIC FIELDS
+  // =========================================
+  businessName    String? // Fleet/Business name
+  businessAddress String?
+  panNumber       String?
+
+  // =========================================
+  // DRIVER SPECIFIC FIELDS
+  // =========================================
+  transporterId String? // Which transporter this driver works for
+  transporter   User?   @relation("TransporterDrivers", fields: [transporterId], references: [id])
+  drivers       User[]  @relation("TransporterDrivers")
+  licenseNumber String?
+  licenseExpiry String?
+  aadharNumber  String?
+
+  // Driver profile completion fields
+  address              String?
+  preferredVehicleType String?
+  preferredLanguage    String?  @default("en")
+  licenseFrontPhoto    String?  // S3 URL
+  licenseBackPhoto     String?  // S3 URL
+  isProfileCompleted   Boolean  @default(false)
+
+  // =========================================
+  // STATUS FLAGS
+  // =========================================
+  isVerified  Boolean  @default(false) // KYC verified
+  isActive    Boolean  @default(true)  // Account active
+  isAvailable Boolean? @default(true)  // Available for new orders (transporter/driver)
+
+  // =========================================
+  // TIMESTAMPS
+  // =========================================
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // =========================================
+  // RELATIONS
+  // =========================================
+  // Transporter relations
+  vehicles Vehicle[] @relation("TransporterVehicles")
+
+  // Driver relations  
+  assignedVehicles Vehicle[] @relation("DriverVehicles")
+
+  // Customer relations
+  bookings Booking[] @relation("CustomerBookings")
+  orders   Order[]   @relation("CustomerOrders")
+
+  // Assignment relations
+  transporterAssignments Assignment[] @relation("TransporterAssignments")
+  driverAssignments      Assignment[] @relation("DriverAssignments")
+
+  // Tracking relations
+  trackingRecords Tracking[] @relation("DriverTracking")
+
+  // TruckRequest relations
+  heldTruckRequests           TruckRequest[] @relation("HeldByTransporter")
+  assignedTruckRequests       TruckRequest[] @relation("AssignedTransporter")
+  driverAssignedTruckRequests TruckRequest[] @relation("AssignedDriver")
+
+  // Customer wallet and settings (for customer role only)
+  wallet   Wallet?           @relation("UserWallet")
+  settings CustomerSettings? @relation("UserSettings")
+
+  // =========================================
+  // INDEXES FOR SCALABILITY
+  // =========================================
+  @@unique([phone, role]) // Same phone can have different roles
+  @@index([role])         // Fast filtering by role
+  @@index([transporterId]) // Fast lookup of drivers by transporter
+  @@index([isActive, role]) // Active users by role
+  @@index([phone])        // Fast phone lookup
+  @@index([createdAt])    // For sorting/pagination
+}
+
+// =============================================================================
+// VEHICLE MODEL
+// =============================================================================
+// 
+// Owned by TRANSPORTER, optionally assigned to DRIVER
+// Used for matching customer orders to available trucks
+// =============================================================================
+
+model Vehicle {
+  id               String  @id @default(uuid())
+  transporterId    String  // Owner transporter
+  transporter      User    @relation("TransporterVehicles", fields: [transporterId], references: [id])
+  assignedDriverId String? // Currently assigned driver
+  assignedDriver   User?   @relation("DriverVehicles", fields: [assignedDriverId], references: [id])
+
+  // =========================================
+  // VEHICLE IDENTIFICATION
+  // =========================================
+  vehicleNumber  String  @unique // e.g., "MH12AB1234"
+  vehicleType    String  // e.g., "Open", "Container", "Tipper"
+  vehicleSubtype String  // e.g., "17ft", "20-24 Ton"
+  vehicleKey     String? // Normalized key for fast matching
+  capacity       String  // e.g., "24 Ton"
+  model          String? // e.g., "Tata Prima"
+  year           Int?    // Manufacturing year
+
+  // =========================================
+  // STATUS TRACKING
+  // =========================================
+  status             VehicleStatus @default(available)
+  currentTripId      String?       // If in_transit, which trip
+  maintenanceReason  String?
+  maintenanceEndDate String?
+  lastStatusChange   String?
+
+  // =========================================
+  // DOCUMENTS
+  // =========================================
+  rcNumber        String?
+  rcExpiry        String?
+  insuranceNumber String?
+  insuranceExpiry String?
+  permitNumber    String?
+  permitExpiry    String?
+  fitnessExpiry   String?
+
+  // =========================================
+  // PHOTOS
+  // =========================================
+  vehiclePhotos  String[] @default([])
+  rcPhoto        String?
+  insurancePhoto String?
+
+  // =========================================
+  // STATUS FLAGS
+  // =========================================
+  isVerified Boolean @default(false)
+  isActive   Boolean @default(true)
+
+  // =========================================
+  // TIMESTAMPS
+  // =========================================
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // =========================================
+  // RELATIONS
+  // =========================================
+  assignments   Assignment[]
+  truckRequests TruckRequest[]
+
+  // =========================================
+  // INDEXES FOR SCALABILITY
+  // =========================================
+  @@index([transporterId])                    // Transporter's vehicles
+  @@index([vehicleType, vehicleSubtype])      // Matching by type
+  @@index([vehicleKey])                       // Fast normalized matching
+  @@index([status])                           // Available vehicles
+  @@index([isActive])                         // Active vehicles only
+  @@index([status, isActive, vehicleType])    // Combined query optimization
+  @@index([transporterId, status, isActive])  // Transporter's available trucks
+}
+
+// =============================================================================
+// BOOKING MODEL (Legacy - Single Truck)
+// =============================================================================
+// 
+// Created by CUSTOMER from Customer App
+// For backward compatibility with single-truck bookings
+// =============================================================================
+
+model Booking {
+  id            String @id @default(uuid())
+  customerId    String
+  customer      User   @relation("CustomerBookings", fields: [customerId], references: [id])
+  customerName  String
+  customerPhone String
+
+  // =========================================
+  // LOCATIONS (JSON for flexibility)
+  // =========================================
+  pickup Json // { latitude, longitude, address, city?, state? }
+  drop   Json // { latitude, longitude, address, city?, state? }
+
+  // =========================================
+  // REQUIREMENTS
+  // =========================================
+  vehicleType    String
+  vehicleSubtype String
+  trucksNeeded   Int
+  trucksFilled   Int    @default(0)
+  distanceKm     Float
+  pricePerTruck  Float
+  totalAmount    Float
+
+  // =========================================
+  // GOODS INFO
+  // =========================================
+  goodsType String?
+  weight    String?
+
+  // =========================================
+  // STATUS
+  // =========================================
+  status BookingStatus @default(active)
+
+  // =========================================
+  // BROADCAST TRACKING
+  // =========================================
+  notifiedTransporters String[] @default([])
+
+  // =========================================
+  // TIMING
+  // =========================================
+  scheduledAt String?
+  expiresAt   String
+
+  // =========================================
+  // TIMESTAMPS
+  // =========================================
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // =========================================
+  // RELATIONS
+  // =========================================
+  assignments     Assignment[]
+  trackingRecords Tracking[]
+
+  // =========================================
+  // INDEXES FOR SCALABILITY
+  // =========================================
+  @@index([customerId])                  // Customer's bookings
+  @@index([status])                      // Active bookings
+  @@index([vehicleType, vehicleSubtype]) // Matching
+  @@index([createdAt])                   // Recent bookings
+  @@index([customerId, status])          // Customer's active bookings
+}
+
+// =============================================================================
+// ORDER MODEL (New - Multi Truck)
+// =============================================================================
+// 
+// Created by CUSTOMER from Customer App
+// Supports multiple trucks, intermediate stops
+// =============================================================================
+
+model Order {
+  id            String @id @default(uuid())
+  customerId    String
+  customer      User   @relation("CustomerOrders", fields: [customerId], references: [id])
+  customerName  String
+  customerPhone String
+
+  // =========================================
+  // ROUTE (Multi-stop support)
+  // =========================================
+  routePoints       Json @default("[]") // RoutePointRecord[]
+  currentRouteIndex Int  @default(0)    // Progress through route
+  stopWaitTimers    Json @default("[]") // Wait time at each stop
+
+  // =========================================
+  // LOCATIONS (Quick access)
+  // =========================================
+  pickup Json // First point
+  drop   Json // Last point
+
+  // =========================================
+  // ORDER SUMMARY
+  // =========================================
+  distanceKm   Float
+  totalTrucks  Int   // Total trucks requested
+  trucksFilled Int   @default(0)
+  totalAmount  Float
+
+  // =========================================
+  // GOODS INFO
+  // =========================================
+  goodsType     String?
+  weight        String?
+  cargoWeightKg Float?
+
+  // =========================================
+  // STATUS
+  // =========================================
+  status OrderStatus @default(active)
+
+  // =========================================
+  // CANCELLATION
+  // =========================================
+  cancelledAt        String?
+  cancellationReason String?
+
+  // =========================================
+  // TIMING
+  // =========================================
+  scheduledAt String?
+  expiresAt   String
+
+  // =========================================
+  // TIMESTAMPS
+  // =========================================
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // =========================================
+  // RELATIONS
+  // =========================================
+  truckRequests TruckRequest[]
+  assignments   Assignment[]
+
+  // =========================================
+  // INDEXES FOR SCALABILITY
+  // =========================================
+  @@index([customerId])         // Customer's orders
+  @@index([status])             // Active orders
+  @@index([createdAt])          // Recent orders
+  @@index([customerId, status]) // Customer's active orders
+  @@index([expiresAt])          // Expiring orders cleanup
+}
+
+// =============================================================================
+// TRUCK REQUEST MODEL
+// =============================================================================
+// 
+// Individual truck request within an Order
+// Each truck in a multi-truck order has its own request
+// =============================================================================
+
+model TruckRequest {
+  id            String @id @default(uuid())
+  orderId       String
+  order         Order  @relation(fields: [orderId], references: [id])
+  requestNumber Int    // 1, 2, 3... within order
+
+  // =========================================
+  // VEHICLE REQUIREMENTS
+  // =========================================
+  vehicleType    String
+  vehicleSubtype String
+  pricePerTruck  Float
+
+  // =========================================
+  // STATUS
+  // =========================================
+  status TruckRequestStatus @default(searching)
+
+  // =========================================
+  // HOLD INFO (15 sec timer)
+  // =========================================
+  heldById String?
+  heldBy   User?   @relation("HeldByTransporter", fields: [heldById], references: [id])
+  heldAt   String?
+
+  // =========================================
+  // ASSIGNMENT INFO
+  // =========================================
+  assignedTransporterId   String?
+  assignedTransporter     User?    @relation("AssignedTransporter", fields: [assignedTransporterId], references: [id])
+  assignedTransporterName String?
+  assignedVehicleId       String?
+  assignedVehicle         Vehicle? @relation(fields: [assignedVehicleId], references: [id])
+  assignedVehicleNumber   String?
+  assignedDriverId        String?
+  assignedDriver          User?    @relation("AssignedDriver", fields: [assignedDriverId], references: [id])
+  assignedDriverName      String?
+  assignedDriverPhone     String?
+
+  // =========================================
+  // TRACKING
+  // =========================================
+  tripId String?
+
+  // =========================================
+  // BROADCAST TRACKING
+  // =========================================
+  notifiedTransporters String[] @default([])
+
+  // =========================================
+  // TIMING
+  // =========================================
+  assignedAt String?
+
+  // =========================================
+  // TIMESTAMPS
+  // =========================================
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // =========================================
+  // RELATIONS
+  // =========================================
+  assignments Assignment[]
+
+  // =========================================
+  // INDEXES FOR SCALABILITY
+  // =========================================
+  @@index([orderId])                       // Requests for an order
+  @@index([status])                        // Searching requests
+  @@index([vehicleType, vehicleSubtype])   // Matching
+  @@index([heldById])                      // Held by transporter
+  @@index([assignedTransporterId])         // Assigned to transporter
+  @@index([status, vehicleType])           // Active requests by type
+}
+
+// =============================================================================
+// ASSIGNMENT MODEL
+// =============================================================================
+// 
+// Links: Customer Order -> Transporter -> Vehicle -> Driver
+// Created when transporter accepts a truck request
+// =============================================================================
+
+model Assignment {
+  id String @id @default(uuid())
+
+  // =========================================
+  // ORDER REFERENCE
+  // =========================================
+  bookingId      String?       // Legacy booking
+  booking        Booking?      @relation(fields: [bookingId], references: [id])
+  truckRequestId String?       // New truck request
+  truckRequest   TruckRequest? @relation(fields: [truckRequestId], references: [id])
+  orderId        String?       // Parent order
+  order          Order?        @relation(fields: [orderId], references: [id])
+
+  // =========================================
+  // TRANSPORTER INFO
+  // =========================================
+  transporterId   String
+  transporter     User   @relation("TransporterAssignments", fields: [transporterId], references: [id])
+  transporterName String
+
+  // =========================================
+  // VEHICLE INFO
+  // =========================================
+  vehicleId      String
+  vehicle        Vehicle @relation(fields: [vehicleId], references: [id])
+  vehicleNumber  String
+  vehicleType    String
+  vehicleSubtype String
+
+  // =========================================
+  // DRIVER INFO
+  // =========================================
+  driverId    String
+  driver      User   @relation("DriverAssignments", fields: [driverId], references: [id])
+  driverName  String
+  driverPhone String
+
+  // =========================================
+  // TRIP ID (Unique identifier for tracking)
+  // =========================================
+  tripId String @unique
+
+  // =========================================
+  // STATUS
+  // =========================================
+  status AssignmentStatus @default(pending)
+
+  // =========================================
+  // TIMESTAMPS
+  // =========================================
+  assignedAt       String
+  driverAcceptedAt String?
+  startedAt        String?
+  completedAt      String?
+
+  // =========================================
+  // INDEXES FOR SCALABILITY
+  // =========================================
+  @@index([bookingId])          // Assignments for booking
+  @@index([truckRequestId])     // Assignment for truck request
+  @@index([orderId])            // Assignments for order
+  @@index([transporterId])      // Transporter's assignments
+  @@index([driverId])           // Driver's assignments
+  @@index([status])             // Active assignments
+  @@index([driverId, status])   // Driver's active trips
+  @@index([transporterId, status]) // Transporter's active assignments
+}
+
+// =============================================================================
+// TRACKING MODEL
+// =============================================================================
+// 
+// Real-time driver location updates
+// Used by Customer App to track delivery
+// =============================================================================
+
+model Tracking {
+  id            String   @id @default(uuid())
+  tripId        String   @unique // One tracking per trip
+  driverId      String
+  driver        User     @relation("DriverTracking", fields: [driverId], references: [id])
+  vehicleNumber String
+  bookingId     String?
+  booking       Booking? @relation(fields: [bookingId], references: [id])
+
+  // =========================================
+  // LOCATION DATA
+  // =========================================
+  latitude  Float
+  longitude Float
+  speed     Float @default(0)
+  bearing   Float @default(0)
+  status    String
+
+  // =========================================
+  // TIMESTAMPS
+  // =========================================
+  lastUpdated DateTime @default(now())
+
+  // =========================================
+  // INDEXES FOR SCALABILITY
+  // =========================================
+  @@index([tripId])     // Lookup by trip
+  @@index([driverId])   // Driver's tracking
+  @@index([bookingId])  // Tracking for booking
+  @@index([lastUpdated]) // Recent updates
+}
+
+// =============================================================================
+// WALLET MODEL - Customer wallet balance and transactions
+// =============================================================================
+// 
+// SCALABILITY:
+// - One wallet per customer
+// - Indexed for fast balance lookups
+// - Handles millions of transactions
+// 
+// EASY UNDERSTANDING:
+// - Simple balance tracking
+// - Clear transaction history
+// 
+// MODULARITY:
+// - Separate from User model
+// - Can be extended for payment gateway integration
+// =============================================================================
+
+model Wallet {
+  id        String   @id @default(uuid())
+  userId    String   @unique // One wallet per customer
+  user      User     @relation("UserWallet", fields: [userId], references: [id], onDelete: Cascade)
+  balance   Float    @default(0) // Current wallet balance
+  currency  String   @default("INR")
+  
+  // =========================================
+  // TIMESTAMPS
+  // =========================================
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  // =========================================
+  // INDEXES FOR SCALABILITY
+  // =========================================
+  @@index([userId]) // Fast wallet lookup
+}
+
+// =============================================================================
+// CUSTOMER SETTINGS MODEL - App preferences and settings
+// =============================================================================
+// 
+// SCALABILITY:
+// - One settings record per customer
+// - Cached in Redis for fast access
+// 
+// EASY UNDERSTANDING:
+// - Clear boolean flags
+// - Simple key-value structure
+// 
+// MODULARITY:
+// - Separate from User model
+// - Easy to add new settings
+// 
+// CODING STANDARDS:
+// - Default values for all settings
+// - Clear naming conventions
+// =============================================================================
+
+model CustomerSettings {
+  id                    String   @id @default(uuid())
+  userId                String   @unique // One settings record per customer
+  user                  User     @relation("UserSettings", fields: [userId], references: [id], onDelete: Cascade)
+  
+  // =========================================
+  // NOTIFICATION PREFERENCES
+  // =========================================
+  pushNotifications     Boolean  @default(true)
+  smsNotifications      Boolean  @default(true)
+  emailNotifications    Boolean  @default(false)
+  
+  // =========================================
+  // APP PREFERENCES
+  // =========================================
+  language              String   @default("en") // en, hi, etc.
+  theme                 String   @default("light") // light, dark
+  
+  // =========================================
+  // VEHICLE TYPE FILTER (Rapido-style)
+  // =========================================
+  // Only: trucks, tractors, JCB, tempo (no bikes)
+  preferredVehicleTypes String[] @default(["truck", "tractor", "jcb", "tempo"])
+  
+  // =========================================
+  // TIMESTAMPS
+  // =========================================
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  // =========================================
+  // INDEXES FOR SCALABILITY
+  // =========================================
+  @@index([userId]) // Fast settings lookup
+}
+
+// =============================================================================
+// CUSTOM BOOKING STATUS ENUM
+// =============================================================================
+// 
+// Status flow: pending -> under_review -> approved/rejected -> completed
+// Separate from instant booking flow
+// =============================================================================
+
+enum CustomBookingStatus {
+  pending      // Awaiting review by team
+  under_review // Being reviewed
+  approved     // Approved, contacting customer
+  rejected     // Request rejected
+  completed    // Contract finalized
+  cancelled    // Cancelled by customer
+}
+
+// =============================================================================
+// CUSTOM BOOKING REQUEST MODEL
+// =============================================================================
+// 
+// PURPOSE:
+// - Long-term truck contracts (weeks/months)
+// - Form submission that goes to review queue
+// - Separate from instant Orders
+// 
+// SCALABILITY:
+// - Indexed on common query patterns
+// - Supports millions of concurrent requests
+// - Optimized for admin filtering and search
+// 
+// MODULARITY:
+// - Completely isolated from Order/Booking
+// - Will be managed by separate admin app later
+// 
+// EASY UNDERSTANDING:
+// - Clear field names
+// - Comprehensive comments
+// - Follows existing schema patterns
+// =============================================================================
+
+model CustomBookingRequest {
+  id            String   @id @default(uuid())
+  customerId    String   // Reference to User (customer role)
+  customerName  String
+  customerPhone String
+  customerEmail String?
+  companyName   String?  // Business name if applicable
+  
+  // =========================================
+  // ROUTE DETAILS
+  // =========================================
+  pickupCity     String   // Starting city
+  pickupState    String?  // Starting state
+  dropCity       String   // Destination city
+  dropState      String?  // Destination state
+  additionalInfo String?  // Route notes
+  
+  // =========================================
+  // VEHICLE REQUIREMENTS
+  // =========================================
+  // JSON array: [{ type: "Open", subtype: "17ft", quantity: 5 }, ...]
+  vehicleRequirements Json
+  totalTrucks         Int  // Sum of all quantities
+  
+  // =========================================
+  // DURATION
+  // =========================================
+  startDate      String   // YYYY-MM-DD
+  endDate        String   // YYYY-MM-DD
+  durationMonths Int?     // Calculated months
+  isFlexible     Boolean  @default(false) // Dates are flexible?
+  
+  // =========================================
+  // GOODS INFORMATION
+  // =========================================
+  goodsType        String?  // Type of goods
+  estimatedWeight  String?  // Weight per truck
+  specialRequests  String?  // Free text for special requirements
+  
+  // =========================================
+  // STATUS & REVIEW
+  // =========================================
+  status           CustomBookingStatus @default(pending)
+  reviewNotes      String?  // Internal notes from reviewer
+  reviewedBy       String?  // Admin/reviewer ID
+  reviewedAt       String?  // When reviewed
+  
+  // =========================================
+  // QUOTATION (After review)
+  // =========================================
+  quotedPrice      Float?   // Price quoted by team
+  quotedAt         String?
+  
+  // =========================================
+  // TIMESTAMPS
+  // =========================================
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  // =========================================
+  // INDEXES FOR SCALABILITY (Millions of requests)
+  // =========================================
+  @@index([customerId])           // Customer's requests
+  @@index([status])               // Filter by status
+  @@index([createdAt])            // Recent first
+  @@index([status, createdAt])    // Admin dashboard query
+  @@index([customerPhone])        // Search by phone
+  @@index([pickupCity, dropCity]) // Route search
+}
+

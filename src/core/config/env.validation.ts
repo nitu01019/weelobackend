@@ -139,8 +139,8 @@ const ENV_VARS: EnvVar[] = [
     name: 'SMS_PROVIDER',
     required: false,
     default: 'mock',
-    validator: (v) => ['mock', 'twilio', 'msg91', 'aws-sns'].includes(v),
-    description: 'SMS service provider'
+    validator: (v) => ['mock', 'console', 'twilio', 'msg91', 'aws-sns'].includes(v),
+    description: 'SMS service provider (mock, console, twilio, msg91, aws-sns)'
   },
   {
     name: 'TWILIO_ACCOUNT_SID',
@@ -200,6 +200,15 @@ const ENV_VARS: EnvVar[] = [
     name: 'S3_BUCKET',
     required: false,
     description: 'S3 bucket for file uploads'
+  },
+
+  // ==========================================================================
+  // GOOGLE MAPS (Places, Geocoding, Directions)
+  // ==========================================================================
+  {
+    name: 'GOOGLE_MAPS_API_KEY',
+    required: false,
+    description: 'Google Maps API key (Places, Geocoding, Directions)'
   },
 
   // ==========================================================================
@@ -282,6 +291,12 @@ export function validateEnvironment(): ValidationResult {
         result.valid = false;
         result.errors.push('DATABASE_URL is required in production');
       }
+
+      // Google Maps API key is required in production
+      if (envVar.name === 'GOOGLE_MAPS_API_KEY' && !value) {
+        result.valid = false;
+        result.errors.push('GOOGLE_MAPS_API_KEY is required in production for Places/Geocoding');
+      }
       
       // Redis should be enabled in production
       if (envVar.name === 'REDIS_ENABLED' && value !== 'true') {
@@ -327,6 +342,13 @@ export function validateEnvironment(): ValidationResult {
     if (!process.env.TWILIO_PHONE_NUMBER) {
       result.errors.push('TWILIO_PHONE_NUMBER is required when SMS_PROVIDER=twilio');
       result.valid = false;
+    }
+  }
+  
+  // AWS SNS validation - region is required, credentials are optional (IAM role on AWS)
+  if (process.env.SMS_PROVIDER === 'aws-sns') {
+    if (!process.env.AWS_SNS_REGION && !process.env.AWS_REGION) {
+      result.warnings.push('AWS_SNS_REGION not set, defaulting to ap-south-1');
     }
   }
 

@@ -445,3 +445,44 @@ export interface FCMNotification {
   priority?: 'high' | 'normal';
   data?: Record<string, any>;
 }
+
+// =============================================================================
+// CONVENIENCE EXPORTS - For backward compatibility and cleaner imports
+// =============================================================================
+
+/**
+ * Send push notification to a single user
+ * @param userId - The user ID to send notification to
+ * @param notification - Notification payload
+ */
+export async function sendPushNotification(
+  userId: string,
+  notification: { title: string; body: string; data?: Record<string, any> }
+): Promise<boolean> {
+  return fcmService.sendToUser(userId, {
+    type: notification.data?.type || NotificationType.GENERAL,
+    title: notification.title,
+    body: notification.body,
+    priority: 'high',
+    data: notification.data
+  });
+}
+
+/**
+ * Send push notifications to multiple users
+ * @param userIds - Array of user IDs to send notification to
+ * @param notification - Notification payload
+ * @returns Number of successful notifications sent
+ */
+export async function sendBatchPushNotifications(
+  userIds: string[],
+  notification: { title: string; body: string; data?: Record<string, any> }
+): Promise<number> {
+  return fcmService.sendToUsers(userIds, {
+    type: notification.data?.type || NotificationType.GENERAL,
+    title: notification.title,
+    body: notification.body,
+    priority: 'high',
+    data: notification.data
+  });
+}

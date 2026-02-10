@@ -13,6 +13,7 @@ import { db, VehicleRecord, VehicleStatus } from '../../shared/database/db';
 import { AppError } from '../../shared/types/error.types';
 import { logger } from '../../shared/services/logger.service';
 import { emitToUser } from '../../shared/services/socket.service';
+import { generateVehicleKey } from '../../shared/services/vehicle-key.service';
 import {
   RegisterVehicleInput,
   UpdateVehicleInput,
@@ -37,23 +38,61 @@ class VehicleService {
   /**
    * Register a new vehicle
    * Called by Transporter when adding a truck to their fleet
+   * 
+   * @param transporterId - ID of the transporter registering the vehicle
+   * @param data - Vehicle registration data
+   * @param options - Optional settings
+   * @param options.allowUpdate - If true, update existing vehicle instead of throwing error
    */
   async registerVehicle(
     transporterId: string,
-    data: RegisterVehicleInput
+    data: RegisterVehicleInput,
+    options?: { allowUpdate?: boolean }
   ): Promise<VehicleRecord> {
+    const vehicleNumber = data.vehicleNumber.toUpperCase().trim();
+    
     // Check if vehicle already registered
-    const existing = db.getVehicleByNumber(data.vehicleNumber);
+    // IMPORTANT: db.getVehicleByNumber returns a Promise (Prisma) - must await!
+    const existingResult = await db.getVehicleByNumber(vehicleNumber);
+    const existing = existingResult && typeof existingResult.then === 'function' 
+      ? await existingResult 
+      : existingResult;
+    
     if (existing) {
-      throw new AppError(400, 'VEHICLE_EXISTS', 'Vehicle with this number already registered');
+      // If allowUpdate is true, update the existing vehicle
+      if (options?.allowUpdate) {
+        return this.updateExistingVehicle(existing, transporterId, data);
+      }
+      
+      // If vehicle belongs to same transporter, provide helpful message
+      if (existing.transporterId === transporterId) {
+        throw new AppError(
+          409, 
+          'VEHICLE_EXISTS_SAME_OWNER', 
+          `Vehicle ${vehicleNumber} is already registered in your fleet. Use update instead.`,
+          { vehicleId: existing.id, vehicleNumber: existing.vehicleNumber }
+        );
+      }
+      
+      // Vehicle belongs to different transporter
+      throw new AppError(
+        409, 
+        'VEHICLE_EXISTS', 
+        `Vehicle ${vehicleNumber} is already registered by another transporter.`
+      );
     }
 
-    const vehicle = db.createVehicle({
+    // Generate normalized vehicle key at ONBOARDING time
+    // This is critical for fast matching at booking time
+    const vehicleKey = generateVehicleKey(data.vehicleType, data.vehicleSubtype);
+    
+    const vehicle = await db.createVehicle({
       id: uuid(),
       transporterId,
-      vehicleNumber: data.vehicleNumber.toUpperCase(),
+      vehicleNumber,
       vehicleType: data.vehicleType,
       vehicleSubtype: data.vehicleSubtype,
+      vehicleKey,  // NORMALIZED KEY - used for fast matching at booking time
       capacity: data.capacity,
       model: data.model,
       year: data.year,
@@ -73,37 +112,187 @@ class VehicleService {
       isActive: true
     });
 
-    logger.info(`Vehicle registered: ${data.vehicleNumber} (${data.vehicleType}) by ${transporterId}`);
+    logger.info(`[VEHICLE] Registered: ${vehicleNumber} (${data.vehicleType}/${data.vehicleSubtype}) -> Key: ${vehicleKey} by ${transporterId}`);
     
     // =========================================================================
     // REAL-TIME UPDATE: Emit socket event to transporter
     // This ensures the fleet list auto-refreshes when a vehicle is added
     // =========================================================================
-    try {
-      // Get updated fleet stats for the transporter
-      const fleetStats = this.calculateStatusCounts(db.getVehiclesByTransporter(transporterId));
+    this.emitFleetUpdate(transporterId, vehicle, 'added');
+    
+    return vehicle;
+  }
+
+  /**
+   * Register or Update vehicle (Upsert)
+   * If vehicle exists and belongs to same transporter, update it
+   * If vehicle doesn't exist, create it
+   * 
+   * Use this for "save" operations where user might be editing existing vehicle
+   */
+  async registerOrUpdateVehicle(
+    transporterId: string,
+    data: RegisterVehicleInput
+  ): Promise<{ vehicle: VehicleRecord; isNew: boolean }> {
+    const vehicleNumber = data.vehicleNumber.toUpperCase().trim();
+    
+    // IMPORTANT: db.getVehicleByNumber returns a Promise (Prisma) - must await!
+    const existingResult = await db.getVehicleByNumber(vehicleNumber);
+    const existing = existingResult && typeof existingResult.then === 'function' 
+      ? await existingResult 
+      : existingResult;
+    
+    if (existing) {
+      // Check ownership
+      if (existing.transporterId !== transporterId) {
+        throw new AppError(
+          409, 
+          'VEHICLE_EXISTS', 
+          `Vehicle ${vehicleNumber} is already registered by another transporter.`
+        );
+      }
       
-      // Emit vehicle registered event
-      emitToUser(transporterId, VehicleSocketEvents.VEHICLE_REGISTERED, {
+      // Update existing vehicle
+      const updated = await this.updateExistingVehicle(existing, transporterId, data);
+      return { vehicle: updated, isNew: false };
+    }
+    
+    // Create new vehicle
+    const vehicle = await this.registerVehicle(transporterId, data);
+    return { vehicle, isNew: true };
+  }
+
+  /**
+   * Check if a vehicle number is available for registration
+   * Returns info about existing vehicle if it exists
+   */
+  async checkVehicleAvailability(
+    vehicleNumber: string,
+    transporterId?: string
+  ): Promise<{
+    available: boolean;
+    exists: boolean;
+    ownedByYou: boolean;
+    vehicleId?: string;
+    message: string;
+  }> {
+    const normalized = vehicleNumber.toUpperCase().trim();
+    
+    // IMPORTANT: db.getVehicleByNumber returns a Promise (Prisma) - must await!
+    const existingResult = await db.getVehicleByNumber(normalized);
+    const existing = existingResult && typeof existingResult.then === 'function' 
+      ? await existingResult 
+      : existingResult;
+    
+    if (!existing) {
+      return {
+        available: true,
+        exists: false,
+        ownedByYou: false,
+        message: 'Vehicle number is available for registration'
+      };
+    }
+    
+    const ownedByYou = transporterId ? existing.transporterId === transporterId : false;
+    
+    return {
+      available: false,
+      exists: true,
+      ownedByYou,
+      vehicleId: existing.id,
+      message: ownedByYou 
+        ? 'This vehicle is already in your fleet. You can update it.'
+        : 'This vehicle is registered by another transporter.'
+    };
+  }
+
+  /**
+   * Update an existing vehicle with new registration data
+   * Internal method used by registerVehicle and registerOrUpdateVehicle
+   */
+  private async updateExistingVehicle(
+    existing: VehicleRecord,
+    transporterId: string,
+    data: RegisterVehicleInput
+  ): Promise<VehicleRecord> {
+    // Verify ownership
+    if (existing.transporterId !== transporterId) {
+      throw new AppError(403, 'FORBIDDEN', 'This vehicle does not belong to you');
+    }
+
+    // Generate new vehicle key if type/subtype changed
+    const vehicleKey = generateVehicleKey(data.vehicleType, data.vehicleSubtype);
+
+    const updated = await db.updateVehicle(existing.id, {
+      vehicleType: data.vehicleType,
+      vehicleSubtype: data.vehicleSubtype,
+      vehicleKey,
+      capacity: data.capacity,
+      model: data.model,
+      year: data.year,
+      rcNumber: data.rcNumber,
+      rcExpiry: data.rcExpiry,
+      insuranceNumber: data.insuranceNumber,
+      insuranceExpiry: data.insuranceExpiry,
+      permitNumber: data.permitNumber,
+      permitExpiry: data.permitExpiry,
+      fitnessExpiry: data.fitnessExpiry,
+      vehiclePhotos: data.vehiclePhotos,
+      rcPhoto: data.rcPhoto,
+      insurancePhoto: data.insurancePhoto,
+      isActive: true  // Reactivate if it was inactive
+    });
+
+    if (!updated) {
+      throw new AppError(500, 'UPDATE_FAILED', 'Failed to update vehicle');
+    }
+
+    logger.info(`[VEHICLE] Updated: ${existing.vehicleNumber} by ${transporterId}`);
+    
+    // Emit socket update
+    this.emitFleetUpdate(transporterId, updated, 'updated');
+    
+    return updated;
+  }
+
+  /**
+   * Emit fleet update socket events
+   * Centralized method for consistent real-time updates
+   */
+  private async emitFleetUpdate(
+    transporterId: string, 
+    vehicle: VehicleRecord, 
+    action: 'added' | 'updated' | 'deleted' | 'status_changed'
+  ): Promise<void> {
+    try {
+      const fleetVehicles = await db.getVehiclesByTransporter(transporterId);
+      const fleetStats = this.calculateStatusCounts(fleetVehicles);
+      
+      // Emit specific event
+      const eventName = action === 'added' 
+        ? VehicleSocketEvents.VEHICLE_REGISTERED 
+        : action === 'deleted'
+          ? VehicleSocketEvents.VEHICLE_DELETED
+          : VehicleSocketEvents.VEHICLE_UPDATED;
+      
+      emitToUser(transporterId, eventName, {
         vehicle,
         fleetStats,
-        message: `Vehicle ${vehicle.vehicleNumber} registered successfully`
+        message: `Vehicle ${vehicle.vehicleNumber} ${action} successfully`
       });
       
       // Also emit fleet updated for general refresh
       emitToUser(transporterId, VehicleSocketEvents.FLEET_UPDATED, {
-        action: 'added',
+        action,
         vehicleId: vehicle.id,
         fleetStats
       });
       
-      logger.debug(`Socket event emitted: ${VehicleSocketEvents.VEHICLE_REGISTERED} to ${transporterId}`);
+      logger.debug(`[SOCKET] ${eventName} emitted to ${transporterId}`);
     } catch (socketError) {
-      // Don't fail registration if socket emission fails
-      logger.warn(`Failed to emit socket event for vehicle registration: ${socketError}`);
+      // Don't fail operation if socket emission fails
+      logger.warn(`[SOCKET] Failed to emit fleet update: ${socketError}`);
     }
-    
-    return vehicle;
   }
 
   // ==========================================================================
@@ -114,7 +303,11 @@ class VehicleService {
    * Get vehicle by ID
    */
   async getVehicleById(vehicleId: string): Promise<VehicleRecord> {
-    const vehicle = db.getVehicleById(vehicleId);
+    // IMPORTANT: db methods return Promises (Prisma) - must await!
+    const vehicleResult = await db.getVehicleById(vehicleId);
+    const vehicle = vehicleResult && typeof vehicleResult.then === 'function' 
+      ? await vehicleResult 
+      : vehicleResult;
     if (!vehicle) {
       throw new AppError(404, 'VEHICLE_NOT_FOUND', 'Vehicle not found');
     }
@@ -125,7 +318,12 @@ class VehicleService {
    * Get vehicle by number
    */
   async getVehicleByNumber(vehicleNumber: string): Promise<VehicleRecord | null> {
-    return db.getVehicleByNumber(vehicleNumber.toUpperCase()) || null;
+    // IMPORTANT: db methods return Promises (Prisma) - must await!
+    const vehicleResult = await db.getVehicleByNumber(vehicleNumber.toUpperCase());
+    const vehicle = vehicleResult && typeof vehicleResult.then === 'function' 
+      ? await vehicleResult 
+      : vehicleResult;
+    return vehicle || null;
   }
 
   /**
@@ -135,7 +333,11 @@ class VehicleService {
     transporterId: string,
     query: GetVehiclesQuery
   ): Promise<{ vehicles: VehicleRecord[]; total: number; hasMore: boolean; statusCounts: Record<string, number> }> {
-    let vehicles = db.getVehiclesByTransporter(transporterId);
+    // IMPORTANT: db methods return Promises (Prisma) - must await!
+    const vehiclesResult = await db.getVehiclesByTransporter(transporterId);
+    let vehicles = vehiclesResult && typeof vehiclesResult.then === 'function' 
+      ? await vehiclesResult 
+      : vehiclesResult;
 
     // Calculate status counts BEFORE filtering (for dashboard stats)
     const statusCounts = this.calculateStatusCounts(vehicles);
@@ -228,7 +430,11 @@ class VehicleService {
       maintenanceEndDate?: string;
     }
   ): Promise<VehicleRecord> {
-    const vehicle = db.getVehicleById(vehicleId);
+    // IMPORTANT: db methods return Promises (Prisma) - must await!
+    const vehicleResult = await db.getVehicleById(vehicleId);
+    const vehicle = vehicleResult && typeof vehicleResult.then === 'function' 
+      ? await vehicleResult 
+      : vehicleResult;
     
     if (!vehicle) {
       throw new AppError(404, 'VEHICLE_NOT_FOUND', 'Vehicle not found');
@@ -259,7 +465,10 @@ class VehicleService {
       updates.currentTripId = undefined;
     }
 
-    const updated = db.updateVehicle(vehicleId, updates);
+    const updatedResult = await db.updateVehicle(vehicleId, updates);
+    const updated = updatedResult && typeof updatedResult.then === 'function' 
+      ? await updatedResult 
+      : updatedResult;
     
     if (!updated) {
       throw new AppError(500, 'UPDATE_FAILED', 'Failed to update vehicle status');
@@ -271,7 +480,11 @@ class VehicleService {
     // REAL-TIME UPDATE: Emit socket event for status change
     // =========================================================================
     try {
-      const fleetStats = this.calculateStatusCounts(db.getVehiclesByTransporter(transporterId));
+      const fleetVehiclesResult = await db.getVehiclesByTransporter(transporterId);
+      const fleetVehicles = fleetVehiclesResult && typeof fleetVehiclesResult.then === 'function' 
+        ? await fleetVehiclesResult 
+        : fleetVehiclesResult;
+      const fleetStats = this.calculateStatusCounts(fleetVehicles);
       
       emitToUser(transporterId, VehicleSocketEvents.VEHICLE_STATUS_CHANGED, {
         vehicle: updated,
@@ -349,8 +562,13 @@ class VehicleService {
    * Get available vehicles for a transporter (ready for new trips)
    */
   async getAvailableVehicles(transporterId: string, vehicleType?: string): Promise<VehicleRecord[]> {
-    let vehicles = db.getVehiclesByTransporter(transporterId)
-      .filter(v => v.isActive && (v.status === 'available' || !v.status));
+    // IMPORTANT: db methods return Promises (Prisma) - must await!
+    const vehiclesResult = await db.getVehiclesByTransporter(transporterId);
+    const allVehicles = vehiclesResult && typeof vehiclesResult.then === 'function' 
+      ? await vehiclesResult 
+      : vehiclesResult;
+    
+    let vehicles = (allVehicles || []).filter(v => v.isActive && (v.status === 'available' || !v.status));
     
     if (vehicleType) {
       vehicles = vehicles.filter(v => v.vehicleType === vehicleType);
@@ -418,7 +636,11 @@ class VehicleService {
     transporterId: string,
     data: UpdateVehicleInput
   ): Promise<VehicleRecord> {
-    const vehicle = db.getVehicleById(vehicleId);
+    // IMPORTANT: db methods return Promises (Prisma) - must await!
+    const vehicleResult = await db.getVehicleById(vehicleId);
+    const vehicle = vehicleResult && typeof vehicleResult.then === 'function' 
+      ? await vehicleResult 
+      : vehicleResult;
     
     if (!vehicle) {
       throw new AppError(404, 'VEHICLE_NOT_FOUND', 'Vehicle not found');
@@ -430,16 +652,22 @@ class VehicleService {
 
     // If changing vehicle number, check uniqueness
     if (data.vehicleNumber && data.vehicleNumber !== vehicle.vehicleNumber) {
-      const existing = db.getVehicleByNumber(data.vehicleNumber);
+      const existingResult = await db.getVehicleByNumber(data.vehicleNumber);
+      const existing = existingResult && typeof existingResult.then === 'function' 
+        ? await existingResult 
+        : existingResult;
       if (existing) {
         throw new AppError(400, 'VEHICLE_EXISTS', 'Vehicle with this number already exists');
       }
     }
 
-    const updated = db.updateVehicle(vehicleId, {
+    const updatedResult = await db.updateVehicle(vehicleId, {
       ...data,
       vehicleNumber: data.vehicleNumber?.toUpperCase()
     });
+    const updated = updatedResult && typeof updatedResult.then === 'function' 
+      ? await updatedResult 
+      : updatedResult;
 
     logger.info(`Vehicle updated: ${vehicleId}`);
     
@@ -447,7 +675,8 @@ class VehicleService {
     // REAL-TIME UPDATE: Emit socket event for vehicle update
     // =========================================================================
     try {
-      const fleetStats = this.calculateStatusCounts(db.getVehiclesByTransporter(transporterId));
+      const fleetVehicles2 = await db.getVehiclesByTransporter(transporterId);
+      const fleetStats = this.calculateStatusCounts(fleetVehicles2);
       
       emitToUser(transporterId, VehicleSocketEvents.VEHICLE_UPDATED, {
         vehicle: updated,
@@ -474,7 +703,11 @@ class VehicleService {
     transporterId: string,
     driverId: string
   ): Promise<VehicleRecord> {
-    const vehicle = db.getVehicleById(vehicleId);
+    // IMPORTANT: db methods return Promises (Prisma) - must await!
+    const vehicleResult = await db.getVehicleById(vehicleId);
+    const vehicle = vehicleResult && typeof vehicleResult.then === 'function' 
+      ? await vehicleResult 
+      : vehicleResult;
     
     if (!vehicle) {
       throw new AppError(404, 'VEHICLE_NOT_FOUND', 'Vehicle not found');
@@ -485,12 +718,18 @@ class VehicleService {
     }
 
     // Verify driver belongs to this transporter
-    const driver = db.getUserById(driverId);
+    const driverResult = await db.getUserById(driverId);
+    const driver = driverResult && typeof driverResult.then === 'function' 
+      ? await driverResult 
+      : driverResult;
     if (!driver || driver.transporterId !== transporterId) {
       throw new AppError(400, 'INVALID_DRIVER', 'Driver not found or does not belong to you');
     }
 
-    const updated = db.updateVehicle(vehicleId, { assignedDriverId: driverId });
+    const updatedResult = await db.updateVehicle(vehicleId, { assignedDriverId: driverId });
+    const updated = updatedResult && typeof updatedResult.then === 'function' 
+      ? await updatedResult 
+      : updatedResult;
     
     logger.info(`Driver ${driverId} assigned to vehicle ${vehicleId}`);
     return updated!;
@@ -503,7 +742,11 @@ class VehicleService {
     vehicleId: string,
     transporterId: string
   ): Promise<VehicleRecord> {
-    const vehicle = db.getVehicleById(vehicleId);
+    // IMPORTANT: db methods return Promises (Prisma) - must await!
+    const vehicleResult = await db.getVehicleById(vehicleId);
+    const vehicle = vehicleResult && typeof vehicleResult.then === 'function' 
+      ? await vehicleResult 
+      : vehicleResult;
     
     if (!vehicle) {
       throw new AppError(404, 'VEHICLE_NOT_FOUND', 'Vehicle not found');
@@ -513,7 +756,10 @@ class VehicleService {
       throw new AppError(403, 'FORBIDDEN', 'This vehicle does not belong to you');
     }
 
-    const updated = db.updateVehicle(vehicleId, { assignedDriverId: undefined });
+    const updatedResult = await db.updateVehicle(vehicleId, { assignedDriverId: undefined });
+    const updated = updatedResult && typeof updatedResult.then === 'function' 
+      ? await updatedResult 
+      : updatedResult;
     
     logger.info(`Driver unassigned from vehicle ${vehicleId}`);
     return updated!;
@@ -527,7 +773,11 @@ class VehicleService {
    * Delete vehicle (soft delete - marks inactive)
    */
   async deleteVehicle(vehicleId: string, transporterId: string): Promise<void> {
-    const vehicle = db.getVehicleById(vehicleId);
+    // IMPORTANT: db methods return Promises (Prisma) - must await!
+    const vehicleResult = await db.getVehicleById(vehicleId);
+    const vehicle = vehicleResult && typeof vehicleResult.then === 'function' 
+      ? await vehicleResult 
+      : vehicleResult;
     
     if (!vehicle) {
       throw new AppError(404, 'VEHICLE_NOT_FOUND', 'Vehicle not found');
@@ -538,7 +788,10 @@ class VehicleService {
     }
 
     // Soft delete - mark as inactive
-    db.updateVehicle(vehicleId, { isActive: false });
+    const updateResult = await db.updateVehicle(vehicleId, { isActive: false });
+    if (updateResult && typeof updateResult.then === 'function') {
+      await updateResult;
+    }
     
     logger.info(`Vehicle deleted: ${vehicleId}`);
     
@@ -546,7 +799,11 @@ class VehicleService {
     // REAL-TIME UPDATE: Emit socket event for vehicle deletion
     // =========================================================================
     try {
-      const fleetStats = this.calculateStatusCounts(db.getVehiclesByTransporter(transporterId));
+      const fleetVehiclesResult = await db.getVehiclesByTransporter(transporterId);
+      const fleetVehicles = fleetVehiclesResult && typeof fleetVehiclesResult.then === 'function' 
+        ? await fleetVehiclesResult 
+        : fleetVehiclesResult;
+      const fleetStats = this.calculateStatusCounts(fleetVehicles);
       
       emitToUser(transporterId, VehicleSocketEvents.VEHICLE_DELETED, {
         vehicleId,
@@ -576,15 +833,20 @@ class VehicleService {
     vehicleType: string,
     vehicleSubtype?: string
   ): Promise<string[]> {
-    return db.getTransportersWithVehicleType(vehicleType, vehicleSubtype);
+    return await db.getTransportersWithVehicleType(vehicleType, vehicleSubtype);
   }
 
   /**
    * Get vehicle types summary for a transporter
    */
   async getVehicleTypesSummary(transporterId: string): Promise<Record<string, number>> {
-    const vehicles = db.getVehiclesByTransporter(transporterId)
-      .filter(v => v.isActive);
+    // IMPORTANT: db methods return Promises (Prisma) - must await!
+    const vehiclesResult = await db.getVehiclesByTransporter(transporterId);
+    const allVehicles = vehiclesResult && typeof vehiclesResult.then === 'function' 
+      ? await vehiclesResult 
+      : vehiclesResult;
+    
+    const vehicles = (allVehicles || []).filter(v => v.isActive);
 
     const summary: Record<string, number> = {};
     for (const vehicle of vehicles) {

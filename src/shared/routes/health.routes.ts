@@ -26,6 +26,8 @@ import { circuitBreakerRegistry } from '../resilience/circuit-breaker';
 import { defaultQueue, bookingQueue, trackingQueue, authQueue } from '../resilience/request-queue';
 import { cacheService } from '../services/cache.service';
 import { logger } from '../services/logger.service';
+import { getConnectionStats, getIO } from '../services/socket.service';
+import { smsService } from '../../modules/auth/sms.service';
 
 const router = Router();
 
@@ -65,8 +67,10 @@ router.get('/health/ready', async (_req: Request, res: Response) => {
     
     // Check cache/Redis
     try {
-      const cacheHealthy = await cacheService.ping();
-      checks.cache = cacheHealthy;
+      // Test cache by setting and getting a test value
+      await cacheService.set('health_check', 'ok', 10);
+      const testValue = await cacheService.get('health_check');
+      checks.cache = testValue === 'ok';
     } catch {
       checks.cache = false;
     }
@@ -164,7 +168,10 @@ router.get('/health/detailed', async (_req: Request, res: Response) => {
       return acc;
     }, {} as Record<string, unknown>),
     
-    metrics: metrics.getMetricsJSON()
+    metrics: metrics.getMetricsJSON(),
+    
+    // SCALABILITY: SMS delivery metrics for production monitoring
+    sms: smsService.getMetrics()
   };
   
   res.json(healthStatus);
@@ -186,6 +193,40 @@ router.get('/version', (_req: Request, res: Response) => {
     nodeVersion: process.version,
     buildTime: process.env.BUILD_TIME || 'unknown',
     commitHash: process.env.COMMIT_HASH || 'unknown'
+  });
+});
+
+/**
+ * WebSocket debug endpoint - shows connected users
+ * CRITICAL for debugging broadcast issues!
+ */
+router.get('/health/websocket', (_req: Request, res: Response) => {
+  const io = getIO();
+  const stats = getConnectionStats();
+  
+  // Get detailed socket info
+  const connectedSockets: any[] = [];
+  if (io) {
+    io.sockets.sockets.forEach((socket) => {
+      connectedSockets.push({
+        socketId: socket.id,
+        userId: socket.data.userId || 'unknown',
+        role: socket.data.role || 'unknown',
+        phone: socket.data.phone || 'unknown',
+        rooms: [...socket.rooms],
+        connected: socket.connected
+      });
+    });
+  }
+  
+  res.json({
+    status: io ? 'initialized' : 'NOT INITIALIZED',
+    stats,
+    connectedSockets,
+    socketCount: connectedSockets.length,
+    message: connectedSockets.length === 0 
+      ? '⚠️ NO SOCKETS CONNECTED! Broadcasts will not be received in real-time.' 
+      : `✅ ${connectedSockets.length} socket(s) connected`
   });
 });
 

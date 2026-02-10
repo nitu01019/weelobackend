@@ -132,21 +132,21 @@ function sanitizeObject(obj: Record<string, any>): Record<string, any> {
 
 /**
  * Sanitize string to prevent XSS
+ * 
+ * IMPORTANT: This sanitization is for preventing XSS attacks.
+ * We should NOT escape HTML entities or remove quotes here because:
+ * 1. This corrupts legitimate data (addresses, names with apostrophes)
+ * 2. The data is already parsed JSON, not raw HTML
+ * 3. Output encoding should happen at render time, not input time
  */
 function sanitizeString(str: string): string {
   return str
-    // Remove script tags
+    // Remove script tags (XSS prevention)
     .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
-    // Remove on* attributes
+    // Remove on* event handlers (XSS prevention)
     .replace(/\s*on\w+\s*=\s*["'][^"']*["']/gi, '')
-    // Escape HTML entities
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#x27;')
-    // Remove potential SQL injection patterns
-    .replace(/['";\\]/g, '')
+    // Remove javascript: URLs
+    .replace(/javascript:/gi, '')
     // Trim whitespace
     .trim();
 }

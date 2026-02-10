@@ -27,7 +27,7 @@ class AssignmentService {
     data: CreateAssignmentInput
   ): Promise<AssignmentRecord> {
     // Verify booking exists and is active
-    const booking = db.getBookingById(data.bookingId);
+    const booking = await db.getBookingById(data.bookingId);
     if (!booking) {
       throw new AppError(404, 'BOOKING_NOT_FOUND', 'Booking not found');
     }
@@ -37,7 +37,7 @@ class AssignmentService {
     }
 
     // Verify vehicle belongs to this transporter
-    const vehicle = db.getVehicleById(data.vehicleId);
+    const vehicle = await db.getVehicleById(data.vehicleId);
     if (!vehicle) {
       throw new AppError(404, 'VEHICLE_NOT_FOUND', 'Vehicle not found');
     }
@@ -52,7 +52,7 @@ class AssignmentService {
     }
 
     // Verify driver belongs to this transporter
-    const driver = db.getUserById(data.driverId);
+    const driver = await db.getUserById(data.driverId);
     if (!driver) {
       throw new AppError(404, 'DRIVER_NOT_FOUND', 'Driver not found');
     }
@@ -60,8 +60,20 @@ class AssignmentService {
       throw new AppError(403, 'FORBIDDEN', 'This driver does not belong to you');
     }
 
+    // =================================================================
+    // RULE: ONE ACTIVE TRIP PER DRIVER
+    // Driver can only have one active assignment at a time
+    // This prevents double-booking of drivers
+    // =================================================================
+    const activeAssignment = await db.getActiveAssignmentByDriver(data.driverId);
+    if (activeAssignment) {
+      logger.warn(`⚠️ Driver ${driver.name} already has active trip: ${activeAssignment.tripId}`);
+      throw new AppError(400, 'DRIVER_BUSY', 
+        `Driver ${driver.name} already has an active trip. Please assign a different driver.`);
+    }
+
     // Get transporter info
-    const transporter = db.getUserById(transporterId);
+    const transporter = await db.getUserById(transporterId);
 
     // Create assignment
     const tripId = uuid();
@@ -82,7 +94,7 @@ class AssignmentService {
       assignedAt: new Date().toISOString()
     };
 
-    db.createAssignment(assignment);
+    await db.createAssignment(assignment);
 
     // Update booking trucks filled
     await bookingService.incrementTrucksFilled(data.bookingId);
@@ -123,14 +135,15 @@ class AssignmentService {
     let assignments: AssignmentRecord[];
 
     if (userRole === 'transporter') {
-      assignments = db.getAssignmentsByTransporter(userId);
+      assignments = await db.getAssignmentsByTransporter(userId);
     } else if (userRole === 'customer') {
       // Get customer's bookings, then get assignments for those
-      const bookings = db.getBookingsByCustomer(userId);
+      const bookings = await db.getBookingsByCustomer(userId);
       const bookingIds = bookings.map(b => b.id);
       assignments = [];
       for (const bookingId of bookingIds) {
-        assignments.push(...db.getAssignmentsByBooking(bookingId));
+        const bookingAssignments = await db.getAssignmentsByBooking(bookingId);
+        assignments.push(...bookingAssignments);
       }
     } else {
       assignments = [];
@@ -160,7 +173,7 @@ class AssignmentService {
     driverId: string,
     query: GetAssignmentsQuery
   ): Promise<{ assignments: AssignmentRecord[]; total: number; hasMore: boolean }> {
-    let assignments = db.getAssignmentsByDriver(driverId);
+    let assignments = await db.getAssignmentsByDriver(driverId);
 
     // Filter by status
     if (query.status) {
@@ -182,7 +195,7 @@ class AssignmentService {
     userId: string,
     userRole: string
   ): Promise<AssignmentRecord> {
-    const assignment = db.getAssignmentById(assignmentId);
+    const assignment = await db.getAssignmentById(assignmentId);
 
     if (!assignment) {
       throw new AppError(404, 'ASSIGNMENT_NOT_FOUND', 'Assignment not found');
@@ -207,7 +220,7 @@ class AssignmentService {
     assignmentId: string,
     driverId: string
   ): Promise<AssignmentRecord> {
-    const assignment = db.getAssignmentById(assignmentId);
+    const assignment = await db.getAssignmentById(assignmentId);
 
     if (!assignment) {
       throw new AppError(404, 'ASSIGNMENT_NOT_FOUND', 'Assignment not found');
@@ -221,7 +234,19 @@ class AssignmentService {
       throw new AppError(400, 'INVALID_STATUS', 'Assignment cannot be accepted');
     }
 
-    const updated = db.updateAssignment(assignmentId, {
+    // =================================================================
+    // RULE: ONE ACTIVE TRIP PER DRIVER (Double-check at accept time)
+    // Even if assignment was created, driver might have accepted another
+    // trip in the meantime. This is the final safety check.
+    // =================================================================
+    const activeAssignment = await db.getActiveAssignmentByDriver(driverId);
+    if (activeAssignment && activeAssignment.id !== assignmentId) {
+      logger.warn(`⚠️ Driver ${driverId} tried to accept ${assignmentId} but already has active trip: ${activeAssignment.tripId}`);
+      throw new AppError(400, 'DRIVER_BUSY', 
+        'You already have an active trip. Complete or cancel it before accepting a new one.');
+    }
+
+    const updated = await db.updateAssignment(assignmentId, {
       status: 'driver_accepted',
       driverAcceptedAt: new Date().toISOString()
     });
@@ -243,7 +268,7 @@ class AssignmentService {
     driverId: string,
     data: UpdateStatusInput
   ): Promise<AssignmentRecord> {
-    const assignment = db.getAssignmentById(assignmentId);
+    const assignment = await db.getAssignmentById(assignmentId);
 
     if (!assignment) {
       throw new AppError(404, 'ASSIGNMENT_NOT_FOUND', 'Assignment not found');
@@ -265,7 +290,7 @@ class AssignmentService {
       updates.completedAt = new Date().toISOString();
     }
 
-    const updated = db.updateAssignment(assignmentId, updates);
+    const updated = await db.updateAssignment(assignmentId, updates);
 
     // Notify booking room
     emitToBooking(assignment.bookingId, SocketEvent.ASSIGNMENT_STATUS_CHANGED, {
@@ -283,7 +308,7 @@ class AssignmentService {
     assignmentId: string,
     userId: string
   ): Promise<void> {
-    const assignment = db.getAssignmentById(assignmentId);
+    const assignment = await db.getAssignmentById(assignmentId);
 
     if (!assignment) {
       throw new AppError(404, 'ASSIGNMENT_NOT_FOUND', 'Assignment not found');
@@ -294,7 +319,7 @@ class AssignmentService {
       throw new AppError(403, 'FORBIDDEN', 'Access denied');
     }
 
-    db.updateAssignment(assignmentId, { status: 'cancelled' });
+    await db.updateAssignment(assignmentId, { status: 'cancelled' });
 
     // Decrement trucks filled
     await bookingService.decrementTrucksFilled(assignment.bookingId);

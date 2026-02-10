@@ -25,10 +25,15 @@
 import { v4 as uuidv4 } from 'uuid';
 import { db, OrderRecord, TruckRequestRecord } from '../../shared/database/db';
 import { logger } from '../../shared/services/logger.service';
-import { emitToUser, emitToUsers, emitToRoom } from '../../shared/services/socket.service';
-import { sendPushNotification, sendBatchPushNotifications } from '../../shared/services/fcm.service';
+import { emitToUser } from '../../shared/services/socket.service';
+import { sendPushNotification } from '../../shared/services/fcm.service';
 import { cacheService } from '../../shared/services/cache.service';
 import { queueService } from '../../shared/services/queue.service';
+import { availabilityService } from '../../shared/services/availability.service';
+import { generateVehicleKey } from '../../shared/services/vehicle-key.service';
+import { routingService } from '../routing';
+import { redisService } from '../../shared/services/redis.service';
+import { pricingService } from '../pricing/pricing.service';
 
 // =============================================================================
 // CACHE KEYS & TTL (Optimized for fast lookups)
@@ -61,22 +66,46 @@ export interface VehicleRequirement {
 }
 
 /**
+ * Route Point for intermediate stops
+ * 
+ * IMPORTANT: Stops are defined BEFORE booking only!
+ * After booking: NO adding, removing, or reordering
+ */
+export interface RoutePointInput {
+  type: 'PICKUP' | 'STOP' | 'DROP';
+  latitude: number;
+  longitude: number;
+  address: string;
+  city?: string;
+  state?: string;
+}
+
+/**
  * Create order request from customer app
+ * 
+ * ROUTE POINTS:
+ * - Option 1: Full route with stops (routePoints array)
+ * - Option 2: Simple pickup/drop (legacy, backward compatible)
+ * 
+ * If routePoints is provided, pickup/drop are extracted from first/last points
  */
 export interface CreateOrderRequest {
   customerId: string;
   customerName: string;
   customerPhone: string;
   
-  // Locations
-  pickup: {
+  // Option 1: Full route with intermediate stops (NEW - preferred)
+  routePoints?: RoutePointInput[];
+  
+  // Option 2: Simple pickup/drop (LEGACY - backward compatible)
+  pickup?: {
     latitude: number;
     longitude: number;
     address: string;
     city?: string;
     state?: string;
   };
-  drop: {
+  drop?: {
     latitude: number;
     longitude: number;
     address: string;
@@ -93,6 +122,9 @@ export interface CreateOrderRequest {
   goodsType?: string;
   cargoWeightKg?: number;
   scheduledAt?: string;  // For scheduled bookings
+  
+  // SCALABILITY: Idempotency key prevents duplicate orders on network retry
+  idempotencyKey?: string;  // UUID from client (optional)
 }
 
 /**
@@ -111,10 +143,63 @@ export interface CreateOrderResponse {
     matchingTransporters: number;
   }[];
   expiresAt: string;
+  expiresIn: number;  // SCALABILITY: Duration in seconds - UI uses this for countdown timer
 }
 
 /**
- * Broadcast data sent to transporters
+ * Route Point for broadcast
+ */
+interface BroadcastRoutePoint {
+  type: 'PICKUP' | 'STOP' | 'DROP';
+  latitude: number;
+  longitude: number;
+  address: string;
+  city?: string;
+  stopIndex: number;
+}
+
+/**
+ * Route Leg for broadcast (ETA per leg)
+ */
+interface BroadcastRouteLeg {
+  fromIndex: number;
+  toIndex: number;
+  fromType: string;
+  toType: string;
+  fromAddress: string;
+  toAddress: string;
+  fromCity?: string;
+  toCity?: string;
+  distanceKm: number;
+  durationMinutes: number;
+  durationFormatted: string;
+  etaMinutes: number;  // Cumulative ETA from start
+}
+
+/**
+ * Route Breakdown for broadcast
+ */
+interface BroadcastRouteBreakdown {
+  legs: BroadcastRouteLeg[];
+  totalDistanceKm: number;
+  totalDurationMinutes: number;
+  totalDurationFormatted: string;
+  totalStops: number;
+  estimatedArrival?: string;
+}
+
+/**
+ * Broadcast data sent to transporters via WebSocket
+ * 
+ * IMPORTANT: Field names must match what Captain app's SocketIOService expects!
+ * Captain app parses these in handleNewBroadcast() with fallbacks.
+ * 
+ * ROUTE POINTS:
+ * - routePoints array includes all stops (PICKUP → STOP → STOP → DROP)
+ * - Driver sees full route before accepting
+ * - currentRouteIndex always 0 for new broadcasts
+ * 
+ * @see Captain app: SocketIOService.kt -> handleNewBroadcast()
  */
 interface BroadcastData {
   type: 'new_truck_request';
@@ -125,7 +210,18 @@ interface BroadcastData {
   // Customer info
   customerName: string;
   
-  // Locations
+  // =========================================================================
+  // ROUTE POINTS (NEW - with intermediate stops)
+  // =========================================================================
+  routePoints: BroadcastRoutePoint[];
+  totalStops: number;  // Number of intermediate stops (0, 1, or 2)
+  
+  // =========================================================================
+  // ROUTE BREAKDOWN (NEW - ETA per leg)
+  // =========================================================================
+  routeBreakdown: BroadcastRouteBreakdown;
+  
+  // Locations - nested format (legacy, for backward compatibility)
   pickup: {
     latitude: number;
     longitude: number;
@@ -139,13 +235,21 @@ interface BroadcastData {
     city?: string;
   };
   
+  // Locations - flat format (for Captain app compatibility)
+  pickupAddress: string;
+  pickupCity: string;
+  dropAddress: string;
+  dropCity: string;
+  
   // Vehicle requirements (THIS is what the transporter can fulfill)
   vehicleType: string;
   vehicleSubtype: string;
   pricePerTruck: number;
+  farePerTruck: number;  // Alias for Captain app
   
   // Trip info
   distanceKm: number;
+  distance: number;      // Alias for Captain app
   goodsType?: string;
   
   // Timing
@@ -162,12 +266,60 @@ class OrderService {
   // Timeout for broadcasts (1 minute - quick response needed)
   private readonly BROADCAST_TIMEOUT_MS = 1 * 60 * 1000;  // 60 seconds
   
-  // Active timers for order expiry
+  // Redis key patterns for distributed timers
+  private readonly TIMER_KEYS = {
+    ORDER_EXPIRY: (orderId: string) => `timer:order:${orderId}`,
+  };
+  
+  // Order timers map (for local timer cleanup)
   private orderTimers: Map<string, NodeJS.Timeout> = new Map();
   
   // ===========================================================================
   // CACHED LOOKUPS (Optimized for millions of requests)
   // ===========================================================================
+  
+  // ==========================================================================
+  // RATE LIMITING (Redis-based for cluster support)
+  // ==========================================================================
+  
+  /**
+   * Check if request is within rate limit
+   * 
+   * SCALABILITY: Uses Redis for distributed rate limiting
+   * - Works across all server instances
+   * - Atomic increment prevents race conditions
+   * - Automatic TTL cleanup
+   * 
+   * @param key Unique key for rate limiting (e.g., "order_create:userId")
+   * @param limit Maximum requests allowed
+   * @param windowSeconds Time window in seconds
+   * @returns { allowed: boolean, retryAfter: number }
+   */
+  async checkRateLimit(
+    key: string,
+    limit: number,
+    windowSeconds: number
+  ): Promise<{ allowed: boolean; retryAfter: number }> {
+    const result = await redisService.checkRateLimit(`ratelimit:order:${key}`, limit, windowSeconds);
+    
+    return {
+      allowed: result.allowed,
+      retryAfter: result.allowed ? 0 : result.resetIn
+    };
+  }
+  
+  /**
+   * Clean up expired rate limit entries
+   * NOTE: With Redis, TTL handles cleanup automatically - this is now a no-op
+   */
+  cleanupRateLimits(): void {
+    // Redis TTL handles cleanup automatically
+    // This method kept for backward compatibility
+  }
+
+  // ==========================================================================
+  // TRANSPORTER LOOKUP (CACHED)
+  // ==========================================================================
   
   /**
    * Get transporters by vehicle type (CACHED + AVAILABILITY FILTERED)
@@ -176,6 +328,9 @@ class OrderService {
    * IMPORTANT: Only returns transporters who are:
    * 1. Have matching vehicle type
    * 2. Are marked as "available" (online toggle is ON)
+   * 
+   * NOTE: cacheService.get() already handles JSON parsing, so we don't need
+   * to call JSON.parse() again on the cached value!
    */
   private async getTransportersByVehicleCached(
     vehicleType: string, 
@@ -183,28 +338,40 @@ class OrderService {
   ): Promise<string[]> {
     const cacheKey = `${CACHE_KEYS.TRANSPORTERS_BY_VEHICLE}${vehicleType}:${vehicleSubtype}`;
     
-    // Try cache first
-    const cached = await cacheService.get(cacheKey);
+    // Try cache first - cacheService.get<T>() already parses JSON!
     let transporterIds: string[];
     
-    if (cached) {
-      logger.debug(`Cache HIT: ${cacheKey}`);
-      transporterIds = JSON.parse(cached);
-    } else {
-      // Cache miss - query database
-      transporterIds = db.getTransportersWithVehicleType(vehicleType, vehicleSubtype);
+    try {
+      const cached = await cacheService.get<string[]>(cacheKey);
       
-      // Store in cache
-      await cacheService.set(cacheKey, JSON.stringify(transporterIds), CACHE_TTL.TRANSPORTERS);
-      logger.debug(`Cache SET: ${cacheKey} (${transporterIds.length} transporters)`);
+      if (cached && Array.isArray(cached)) {
+        logger.debug(`Cache HIT: ${cacheKey} (${cached.length} transporters)`);
+        transporterIds = cached;
+      } else {
+        // Cache miss - query database
+        transporterIds = await db.getTransportersWithVehicleType(vehicleType, vehicleSubtype);
+        
+        // Store in cache (cacheService.set() handles JSON.stringify internally)
+        await cacheService.set(cacheKey, transporterIds, CACHE_TTL.TRANSPORTERS);
+        logger.debug(`Cache SET: ${cacheKey} (${transporterIds.length} transporters)`);
+      }
+    } catch (error: any) {
+      // If cache fails, fall back to database
+      logger.warn(`Cache error for ${cacheKey}: ${error.message}. Falling back to DB.`);
+      transporterIds = await db.getTransportersWithVehicleType(vehicleType, vehicleSubtype);
     }
     
     // FILTER: Only include transporters who are AVAILABLE (online toggle ON)
-    const availableTransporters = transporterIds.filter(transporterId => {
-      const transporter = db.getUserById(transporterId);
-      // isAvailable defaults to true if not set
-      return transporter && transporter.isAvailable !== false;
-    });
+    // NOTE: db.getUserById is async, so we use Promise.all + filter pattern
+    const transporterAvailability = await Promise.all(
+      transporterIds.map(async (transporterId) => {
+        const transporter = await db.getUserById(transporterId);
+        return { transporterId, isAvailable: transporter && transporter.isAvailable !== false };
+      })
+    );
+    const availableTransporters = transporterAvailability
+      .filter(t => t.isAvailable)
+      .map(t => t.transporterId);
     
     if (availableTransporters.length < transporterIds.length) {
       const unavailableCount = transporterIds.length - availableTransporters.length;
@@ -237,18 +404,184 @@ class OrderService {
    * - For millions of users, this should be moved to a message queue
    * - Each vehicle type can be processed in parallel
    * - Database writes should be batched
+   * - Idempotency prevents duplicate processing on retry
+   * 
+   * ROUTE POINTS:
+   * - If routePoints provided, use them directly
+   * - If only pickup/drop provided, build routePoints from them
+   * - routePoints are IMMUTABLE after creation
    */
   async createOrder(request: CreateOrderRequest): Promise<CreateOrderResponse> {
+    // ==========================================================================
+    // PER-CUSTOMER ORDER DEBOUNCE (3 second cooldown)
+    // ==========================================================================
+    // SCALABILITY: Redis-based, works across all server instances
+    // EASY UNDERSTANDING: Prevents rapid-fire different orders from same customer
+    // MODULARITY: Independent of idempotency (which checks same request, this
+    //             checks same customer making ANY request too quickly)
+    // CODING STANDARDS: Uses Redis SETNX for atomic check-and-set
+    //
+    // NOTE: Idempotency = same request retried. Debounce = different requests
+    //       submitted too quickly. Both are needed for production safety.
+    // ==========================================================================
+    const DEBOUNCE_SECONDS = 3;
+    const debounceKey = `debounce:order:${request.customerId}`;
+    
+    try {
+      const debounceActive = await redisService.get(debounceKey);
+      if (debounceActive) {
+        logger.warn(`⚠️ ORDER DEBOUNCE: Customer ${request.customerId} tried to place order within ${DEBOUNCE_SECONDS}s cooldown`);
+        throw new Error(`Please wait a few seconds before placing another order.`);
+      }
+      // Set debounce key — auto-expires after 3 seconds
+      await redisService.set(debounceKey, '1', DEBOUNCE_SECONDS);
+    } catch (error: any) {
+      // If error is our debounce error, rethrow it
+      if (error.message.includes('Please wait')) throw error;
+      // If Redis fails, skip debounce (don't block orders)
+      logger.warn(`⚠️ Debounce check failed: ${error.message}. Proceeding without debounce.`);
+    }
+    
+    // ==========================================================================
+    // IDEMPOTENCY CHECK - Prevents duplicate orders on network retry
+    // ==========================================================================
+    // SCALABILITY: Uses Redis for fast lookup across all server instances
+    // EASY UNDERSTANDING: Same idempotency key = return cached response
+    // MODULARITY: Can be called multiple times safely
+    // ==========================================================================
+    if (request.idempotencyKey) {
+      const cacheKey = `idempotency:${request.customerId}:${request.idempotencyKey}`;
+      
+      try {
+        const cached = await redisService.get(cacheKey);
+        if (cached) {
+          const cachedResponse = JSON.parse(cached) as CreateOrderResponse;
+          logger.info(`✅ Idempotency HIT: Returning cached order ${cachedResponse.orderId.substring(0, 8)}... for key ${request.idempotencyKey.substring(0, 8)}...`);
+          return cachedResponse;
+        }
+        logger.debug(`🔍 Idempotency MISS: Processing new order for key ${request.idempotencyKey.substring(0, 8)}...`);
+      } catch (error: any) {
+        logger.warn(`⚠️ Idempotency cache error: ${error.message}. Proceeding with order creation.`);
+        // Continue with order creation even if cache fails
+      }
+    }
+    
     const orderId = uuidv4();
     const now = new Date();
     const expiresAt = new Date(now.getTime() + this.BROADCAST_TIMEOUT_MS).toISOString();
     
     // Calculate totals
     const totalTrucks = request.vehicleRequirements.reduce((sum, req) => sum + req.quantity, 0);
+    
+    // ==========================================================================
+    // SECURITY: Server-side price validation
+    // ==========================================================================
+    // Recalculate prices server-side to prevent client-side price tampering.
+    // The client-submitted pricePerTruck is compared against the server-calculated
+    // price. If the client price is lower (manipulated), we use the server price.
+    // A tolerance of 5% is allowed for rounding/timing differences (e.g., surge).
+    // ==========================================================================
+    const PRICE_TOLERANCE = 0.05; // 5% tolerance for rounding/surge timing
+    
+    for (const req of request.vehicleRequirements) {
+      try {
+        const serverEstimate = pricingService.calculateEstimate({
+          vehicleType: req.vehicleType,
+          vehicleSubtype: req.vehicleSubtype,
+          distanceKm: request.distanceKm,
+          trucksNeeded: req.quantity,
+          cargoWeightKg: request.cargoWeightKg
+        });
+        
+        const serverPrice = serverEstimate.pricePerTruck;
+        const clientPrice = req.pricePerTruck;
+        const priceDiff = (clientPrice - serverPrice) / serverPrice;
+        
+        if (priceDiff < -PRICE_TOLERANCE) {
+          // Client price is suspiciously low - use server price
+          logger.warn(`⚠️ PRICE TAMPER DETECTED: ${req.vehicleType}/${req.vehicleSubtype} ` +
+            `client=₹${clientPrice} vs server=₹${serverPrice} (diff=${(priceDiff * 100).toFixed(1)}%). ` +
+            `Using server price.`);
+          req.pricePerTruck = serverPrice;
+        } else if (Math.abs(priceDiff) > PRICE_TOLERANCE) {
+          // Price differs significantly but client paid more - log but allow
+          logger.info(`ℹ️ Price variance: ${req.vehicleType}/${req.vehicleSubtype} ` +
+            `client=₹${clientPrice} vs server=₹${serverPrice} (diff=${(priceDiff * 100).toFixed(1)}%)`);
+        }
+      } catch (error: any) {
+        logger.warn(`⚠️ Price validation failed for ${req.vehicleType}: ${error.message}. Using client price.`);
+        // If pricing service fails, allow client price to avoid blocking orders
+      }
+    }
+    
     const totalAmount = request.vehicleRequirements.reduce(
       (sum, req) => sum + (req.quantity * req.pricePerTruck), 
       0
     );
+    
+    // ==========================================================================
+    // BUILD ROUTE POINTS (with intermediate stops support)
+    // ==========================================================================
+    // 
+    // INPUT OPTIONS:
+    // 1. routePoints array (NEW) - directly use these
+    // 2. pickup + drop (LEGACY) - build routePoints from them
+    //
+    // OUTPUT: routePoints array with auto-assigned stopIndex
+    // ==========================================================================
+    
+    let routePoints: { type: 'PICKUP' | 'STOP' | 'DROP'; latitude: number; longitude: number; address: string; city?: string; state?: string; stopIndex: number }[];
+    let pickup: { latitude: number; longitude: number; address: string; city?: string; state?: string };
+    let drop: { latitude: number; longitude: number; address: string; city?: string; state?: string };
+    
+    if (request.routePoints && request.routePoints.length >= 2) {
+      // NEW: Use provided routePoints
+      routePoints = request.routePoints.map((point, index) => ({
+        ...point,
+        stopIndex: index
+      }));
+      
+      // Extract pickup (first) and drop (last) for backward compatibility
+      const firstPoint = request.routePoints[0];
+      const lastPoint = request.routePoints[request.routePoints.length - 1];
+      
+      pickup = {
+        latitude: firstPoint.latitude,
+        longitude: firstPoint.longitude,
+        address: firstPoint.address,
+        city: firstPoint.city,
+        state: firstPoint.state
+      };
+      
+      drop = {
+        latitude: lastPoint.latitude,
+        longitude: lastPoint.longitude,
+        address: lastPoint.address,
+        city: lastPoint.city,
+        state: lastPoint.state
+      };
+      
+      logger.info(`📍 Route has ${routePoints.length} points (${routePoints.filter(p => p.type === 'STOP').length} intermediate stops)`);
+    } else if (request.pickup && request.drop) {
+      // LEGACY: Build routePoints from pickup + drop
+      pickup = request.pickup;
+      drop = request.drop;
+      
+      routePoints = [
+        { type: 'PICKUP', ...pickup, stopIndex: 0 },
+        { type: 'DROP', ...drop, stopIndex: 1 }
+      ];
+      
+      logger.info(`📍 Route has 2 points (no intermediate stops)`);
+    } else {
+      // SCALABILITY: Use structured error code for monitoring
+      // EASY UNDERSTANDING: Clear validation error message
+      // MODULARITY: Consistent with other validation errors
+      // CODING STANDARDS: REST API error response pattern
+      throw new Error('Either routePoints OR both pickup and drop must be provided'); // TODO: Replace with ValidationError when imported
+    }
+    
+    const stopsCount = routePoints.filter(p => p.type === 'STOP').length;
     
     logger.info(`╔══════════════════════════════════════════════════════════════╗`);
     logger.info(`║  🚛 NEW MULTI-VEHICLE ORDER                                   ║`);
@@ -261,6 +594,10 @@ class OrderService {
     request.vehicleRequirements.forEach((req, i) => {
       logger.info(`║    ${i + 1}. ${req.quantity}x ${req.vehicleType} (${req.vehicleSubtype}) @ ₹${req.pricePerTruck}`);
     });
+    logger.info(`║  Route Points: ${routePoints.length} (${stopsCount} stops)`);
+    routePoints.forEach((point, i) => {
+      logger.info(`║    ${i}. [${point.type}] ${point.address.substring(0, 40)}...`);
+    });
     logger.info(`╚══════════════════════════════════════════════════════════════╝`);
     
     // 1. Create the parent Order
@@ -269,8 +606,16 @@ class OrderService {
       customerId: request.customerId,
       customerName: request.customerName,
       customerPhone: request.customerPhone,
-      pickup: request.pickup,
-      drop: request.drop,
+      
+      // Route points (NEW - with intermediate stops)
+      routePoints,
+      currentRouteIndex: 0,        // Start at pickup
+      stopWaitTimers: [],          // Empty until driver reaches stops
+      
+      // Legacy pickup/drop (for backward compatibility)
+      pickup,
+      drop,
+      
       distanceKm: request.distanceKm,
       totalTrucks,
       trucksFilled: 0,
@@ -282,7 +627,7 @@ class OrderService {
       expiresAt
     };
     
-    db.createOrder(order);
+    await db.createOrder(order);
     
     // 2. Create TruckRequests for each vehicle type
     const truckRequests: TruckRequestRecord[] = [];
@@ -311,7 +656,7 @@ class OrderService {
       }
       
       // Find matching transporters for this vehicle type
-      const matchingTransporters = db.getTransportersWithVehicleType(
+      const matchingTransporters = await db.getTransportersWithVehicleType(
         vehicleReq.vehicleType,
         vehicleReq.vehicleSubtype
       );
@@ -327,33 +672,75 @@ class OrderService {
     }
     
     // Batch create all truck requests
-    db.createTruckRequestsBatch(truckRequests);
+    await db.createTruckRequestsBatch(truckRequests);
     
     // 3. Broadcast to matching transporters (per vehicle type)
-    await this.broadcastToTransporters(orderId, request, truckRequests, expiresAt);
+    // IMPORTANT: Wrapped in try-catch - broadcast errors should NEVER fail the order creation!
+    // The order is already created, so even if broadcast fails, customer can still track it
+    try {
+      await this.broadcastToTransporters(orderId, request, truckRequests, expiresAt, pickup);
+    } catch (broadcastError: any) {
+      // Log the error but DON'T throw - order is already created successfully
+      logger.error(`⚠️ Broadcast error (order still created): ${broadcastError.message}`);
+      logger.error(broadcastError.stack);
+    }
     
     // 4. Set expiry timer
     this.setOrderExpiryTimer(orderId, this.BROADCAST_TIMEOUT_MS);
     
-    return {
+    // SCALABILITY: Calculate expiresIn for UI countdown timer
+    // EASY UNDERSTANDING: UI always matches backend TTL
+    const expiresIn = Math.floor(this.BROADCAST_TIMEOUT_MS / 1000); // 60 seconds
+    
+    // Build response
+    const orderResponse: CreateOrderResponse = {
       orderId,
       totalTrucks,
       totalAmount,
       truckRequests: responseRequests,
-      expiresAt
+      expiresAt,
+      expiresIn  // NEW: UI uses this for countdown (backend-driven)
     };
+    
+    // ==========================================================================
+    // IDEMPOTENCY CACHE - Store response for future retries
+    // ==========================================================================
+    // SCALABILITY: 5 minute TTL prevents duplicate processing
+    // EASY UNDERSTANDING: Client can safely retry failed requests
+    // MODULARITY: Automatic cleanup via Redis TTL
+    // ==========================================================================
+    if (request.idempotencyKey) {
+      const cacheKey = `idempotency:${request.customerId}:${request.idempotencyKey}`;
+      const ttl = 300; // 5 minutes
+      
+      try {
+        await redisService.set(cacheKey, JSON.stringify(orderResponse), ttl);
+        logger.info(`💾 Idempotency cached: ${cacheKey.substring(0, 50)}... (TTL: ${ttl}s)`);
+      } catch (error: any) {
+        logger.warn(`⚠️ Failed to cache idempotency response: ${error.message}`);
+        // Non-critical error, continue
+      }
+    }
+    
+    // Return response
+    return orderResponse;
   }
   
   /**
    * Broadcast truck requests to matching transporters
    * 
    * KEY: Each vehicle type goes ONLY to transporters with that type
+   * 
+   * CRITICAL FIX: Accepts `resolvedPickup` as parameter instead of using
+   * `request.pickup` which is OPTIONAL (undefined when routePoints used).
+   * The caller extracts pickup from routePoints or request.pickup.
    */
   private async broadcastToTransporters(
     orderId: string,
     request: CreateOrderRequest,
     truckRequests: TruckRequestRecord[],
-    expiresAt: string
+    expiresAt: string,
+    resolvedPickup: { latitude: number; longitude: number; address: string; city?: string; state?: string }
   ): Promise<void> {
     
     // Group requests by vehicle type for efficient broadcasting
@@ -367,82 +754,308 @@ class OrderService {
       requestsByType.get(key)!.push(tr);
     }
     
-    // Broadcast each vehicle type to matching transporters (PARALLEL for speed)
-    const broadcastPromises: Promise<void>[] = [];
-    
+    // Broadcast each vehicle type to matching transporters
     for (const [typeKey, requests] of requestsByType) {
       const [vehicleType, vehicleSubtype] = typeKey.split('_');
       
-      // Find transporters with this vehicle type (CACHED for speed)
-      const matchingTransporters = await this.getTransportersByVehicleCached(vehicleType, vehicleSubtype);
+      // =====================================================================
+      // PROXIMITY-BASED BATCH NOTIFY (Rapido-style optimization)
+      // =====================================================================
+      // 1. First try LIVE availability service (top 10 nearby by geohash)
+      // 2. If not enough, expand to database lookup
+      // 3. This reduces load and improves acceptance speed
+      // =====================================================================
+      
+      // Generate vehicle key for availability lookup
+      const vehicleKey = generateVehicleKey(vehicleType, vehicleSubtype);
+      
+      // STEP 1: Try live availability service first (nearby transporters)
+      // =====================================================================
+      // CRITICAL FIX: Use resolvedPickup (always defined) instead of
+      // request.pickup (undefined when routePoints is used).
+      //
+      // CRITICAL FIX: Use ASYNC getAvailableTransportersAsync() instead of
+      // sync getAvailableTransporters() which ALWAYS returns [] because
+      // Redis operations are async. The sync version logs a warning and
+      // fires the async search in the background (results are lost).
+      // =====================================================================
+      let matchingTransporters: string[] = [];
+      const pickupLat = resolvedPickup.latitude;
+      const pickupLng = resolvedPickup.longitude;
+      
+      // Get top 10 nearby from live availability (ASYNC — proper Redis GEORADIUS)
+      const nearbyTransporters = await availabilityService.getAvailableTransportersAsync(
+        vehicleKey,
+        pickupLat,
+        pickupLng,
+        10,  // Top 10 nearby first
+        50   // 50km radius
+      );
+      
+      if (nearbyTransporters.length > 0) {
+        logger.info(`🎯 Found ${nearbyTransporters.length} NEARBY transporters from live availability`);
+        matchingTransporters = nearbyTransporters;
+      }
+      
+      // STEP 2: If not enough nearby, fall back to database (all matching transporters)
+      if (matchingTransporters.length < 5) {
+        logger.info(`📡 Not enough nearby, expanding to database lookup...`);
+        const dbTransporters = await this.getTransportersByVehicleCached(vehicleType, vehicleSubtype);
+        
+        // Merge: nearby first, then others (avoid duplicates)
+        const nearbySet = new Set(matchingTransporters);
+        const additionalTransporters = dbTransporters.filter(t => !nearbySet.has(t));
+        matchingTransporters = [...matchingTransporters, ...additionalTransporters];
+      }
       
       if (matchingTransporters.length === 0) {
         logger.warn(`⚠️ No transporters found for ${vehicleType} (${vehicleSubtype})`);
         continue;
       }
       
-      logger.info(`📢 Broadcasting ${requests.length}x ${vehicleType} (${vehicleSubtype}) to ${matchingTransporters.length} transporters`);
+      const nearbyCount = nearbyTransporters.length;
+      logger.info(`📢 Broadcasting ${requests.length}x ${vehicleType} (${vehicleSubtype}) to ${matchingTransporters.length} transporters (${nearbyCount} nearby first)`);
       
       // Create broadcast data for this vehicle type
       // Send the FIRST request of this type (others are same type, just different trucks)
       const firstRequest = requests[0];
       
+      // Get order to access routePoints
+      const order = await db.getOrderById(orderId);
+      
+      // Build routePoints for broadcast (with city info)
+      const broadcastRoutePoints: BroadcastRoutePoint[] = order?.routePoints?.map(point => ({
+        type: point.type,
+        latitude: point.latitude,
+        longitude: point.longitude,
+        address: point.address,
+        city: point.city,
+        stopIndex: point.stopIndex
+      })) || [];
+      
+      // Count intermediate stops
+      const totalStops = broadcastRoutePoints.filter(p => p.type === 'STOP').length;
+      
+      // Get pickup and drop from routePoints or request
+      const pickupPoint = broadcastRoutePoints.find(p => p.type === 'PICKUP') || request.pickup;
+      const dropPoint = broadcastRoutePoints.find(p => p.type === 'DROP') || request.drop;
+      
+      // =======================================================================
+      // CALCULATE ROUTE BREAKDOWN (ETA per leg)
+      // =======================================================================
+      const routeBreakdownCalc = routingService.calculateRouteBreakdown(
+        order?.routePoints?.map(p => ({
+          type: p.type,
+          latitude: p.latitude,
+          longitude: p.longitude,
+          address: p.address,
+          city: p.city,
+          stopIndex: p.stopIndex
+        })) || [],
+        new Date()  // Departure time = now
+      );
+      
+      // Convert to broadcast format
+      const routeBreakdown: BroadcastRouteBreakdown = {
+        legs: routeBreakdownCalc.legs.map(leg => ({
+          fromIndex: leg.fromIndex,
+          toIndex: leg.toIndex,
+          fromType: leg.fromType,
+          toType: leg.toType,
+          fromAddress: leg.fromAddress,
+          toAddress: leg.toAddress,
+          fromCity: leg.fromCity,
+          toCity: leg.toCity,
+          distanceKm: leg.distanceKm,
+          durationMinutes: leg.durationMinutes,
+          durationFormatted: `${Math.floor(leg.durationMinutes / 60)} hrs ${leg.durationMinutes % 60} mins`,
+          etaMinutes: leg.etaToEndMinutes
+        })),
+        totalDistanceKm: routeBreakdownCalc.totalDistanceKm,
+        totalDurationMinutes: routeBreakdownCalc.totalDurationMinutes,
+        totalDurationFormatted: routeBreakdownCalc.totalDurationFormatted,
+        totalStops: routeBreakdownCalc.totalStops,
+        estimatedArrival: routeBreakdownCalc.estimatedArrival
+      };
+      
+      logger.info(`📍 Route breakdown: ${routeBreakdown.totalDistanceKm} km, ${routeBreakdown.totalDurationFormatted}, ${routeBreakdown.legs.length} legs`);
+      
+      // Build broadcast data compatible with Captain app's SocketIOService parser
+      // Captain app expects: pickupLocation/dropLocation OR pickup/drop (with fallbacks)
       const broadcastData: BroadcastData = {
         type: 'new_truck_request',
         orderId,
         truckRequestId: firstRequest.id,
         requestNumber: firstRequest.requestNumber,
         customerName: request.customerName,
+        
+        // =====================================================================
+        // ROUTE POINTS (NEW - with intermediate stops)
+        // =====================================================================
+        routePoints: broadcastRoutePoints,
+        totalStops,
+        
+        // =====================================================================
+        // ROUTE BREAKDOWN (NEW - ETA per leg)
+        // =====================================================================
+        routeBreakdown,
+        
+        // Both formats for maximum compatibility
         pickup: {
-          latitude: request.pickup.latitude,
-          longitude: request.pickup.longitude,
-          address: request.pickup.address,
-          city: request.pickup.city
+          latitude: pickupPoint?.latitude || 0,
+          longitude: pickupPoint?.longitude || 0,
+          address: pickupPoint?.address || '',
+          city: pickupPoint?.city
         },
         drop: {
-          latitude: request.drop.latitude,
-          longitude: request.drop.longitude,
-          address: request.drop.address,
-          city: request.drop.city
+          latitude: dropPoint?.latitude || 0,
+          longitude: dropPoint?.longitude || 0,
+          address: dropPoint?.address || '',
+          city: dropPoint?.city
         },
+        // Captain app also looks for these flat fields
+        pickupAddress: pickupPoint?.address || '',
+        pickupCity: pickupPoint?.city || '',
+        dropAddress: dropPoint?.address || '',
+        dropCity: dropPoint?.city || '',
         vehicleType,
         vehicleSubtype,
         pricePerTruck: firstRequest.pricePerTruck,
+        farePerTruck: firstRequest.pricePerTruck, // Alias for Captain app
         distanceKm: request.distanceKm,
+        distance: request.distanceKm, // Alias for Captain app
         goodsType: request.goodsType,
         expiresAt,
         createdAt: new Date().toISOString()
       };
       
-      // Also include how many trucks of this type are needed
-      const extendedBroadcast = {
-        ...broadcastData,
-        trucksNeededOfThisType: requests.length,
-        totalTrucksInOrder: truckRequests.length
-      };
-      
-      // WebSocket broadcast to all matching transporters (QUEUED for scalability)
-      // For small batches (<50), send directly; for large batches, use queue
-      if (matchingTransporters.length < 50) {
-        // Direct send for small batches (faster)
-        for (const transporterId of matchingTransporters) {
-          emitToUser(transporterId, 'new_broadcast', extendedBroadcast);
-        }
-        logger.info(`   📱 Direct broadcast to ${matchingTransporters.length} transporters`);
-      } else {
-        // Use queue for large batches (prevents blocking)
-        await queueService.queueBroadcastBatch(
-          matchingTransporters,
-          'new_broadcast',
-          extendedBroadcast
-        );
-        logger.info(`   📱 Queued broadcast to ${matchingTransporters.length} transporters`);
+      // Build requestedVehicles array with ALL vehicle types in the order
+      const requestedVehicles: any[] = [];
+      for (const [key, reqs] of requestsByType) {
+        const [vType, vSubtype] = key.split('_');
+        const firstReq = reqs[0];
+        requestedVehicles.push({
+          vehicleType: vType,
+          vehicleSubtype: vSubtype || '',
+          count: reqs.length,
+          filledCount: 0,
+          farePerTruck: firstReq.pricePerTruck,
+          capacityTons: 0
+        });
       }
       
-      // Update truck requests with notified transporters (batch update)
-      const requestIds = requests.map(r => r.id);
+      // Also include how many trucks of this type are needed
+      // IMPORTANT: Include BOTH orderId AND broadcastId for Captain app compatibility
+      // Captain app checks broadcastId first, then falls back to orderId
+      const extendedBroadcast = {
+        ...broadcastData,
+        broadcastId: orderId,  // CRITICAL: Captain app expects this field!
+        trucksNeededOfThisType: requests.length,
+        trucksNeeded: requests.length,  // Alias for Captain app
+        totalTrucksInOrder: truckRequests.length,
+        totalTrucksNeeded: truckRequests.length,
+        trucksFilled: 0,  // For Captain app
+        requestedVehicles: requestedVehicles  // ALL vehicle types in the order!
+      };
+      
+      logger.info(`📢 Including ${requestedVehicles.length} vehicle types in broadcast:`, requestedVehicles.map(rv => `${rv.vehicleType}/${rv.vehicleSubtype}:${rv.count}`));
+      
+      // =========================================================================
+      // PERSONALIZED BROADCAST - Each transporter sees their available capacity
+      // =========================================================================
+      // 
+      // CRITICAL: This is the core of partial fulfillment UX!
+      // 
+      // Rule: trucksYouCanProvide = MIN(transporter_available, trucks_still_needed)
+      // 
+      // Example (Order needs 5 "Open 17ft" trucks):
+      //   Transporter A (2 available) → sees "Request for 2 trucks"
+      //   Transporter B (1 available) → sees "Request for 1 truck"
+      //   Transporter C (10 available) → sees "Request for 5 trucks" (capped)
+      // 
+      // This ensures:
+      // 1. Transporters only see requests they can fulfill
+      // 2. No over-promising (can't accept more than they have)
+      // 3. Partial fulfillment is natural
+      // =========================================================================
+      
+      const trucksStillNeeded = requests.length; // How many of this type are still searching
+      
+      logger.info(`╔══════════════════════════════════════════════════════════════╗`);
+      logger.info(`║  📢 PERSONALIZED BROADCAST                                   ║`);
+      logger.info(`╠══════════════════════════════════════════════════════════════╣`);
+      logger.info(`║  Vehicle: ${vehicleType} ${vehicleSubtype}`);
+      logger.info(`║  Trucks Still Needed: ${trucksStillNeeded}`);
+      logger.info(`║  Matching Transporters: ${matchingTransporters.length}`);
+      logger.info(`╚══════════════════════════════════════════════════════════════╝`);
+      
+      // Get availability snapshot for all matching transporters
+      // CRITICAL FIX: Must await — db is Prisma instance, this is async!
+      // Without await, availabilitySnapshot is a Promise (empty map → no broadcasts sent)
+      const availabilitySnapshot = await db.getTransportersAvailabilitySnapshot(vehicleType, vehicleSubtype) as Array<{
+        transporterId: string;
+        transporterName: string;
+        totalOwned: number;
+        available: number;
+        inTransit: number;
+      }>;
+      
+      // Create a map for quick lookup
+      const availabilityMap = new Map(
+        availabilitySnapshot.map(t => [t.transporterId, t])
+      );
+      
+      // Send personalized broadcast to each transporter
+      let sentCount = 0;
+      let skippedNoAvailable = 0;
+      
+      for (const transporterId of matchingTransporters) {
+        const availability = availabilityMap.get(transporterId);
+        
+        // Skip if no available trucks (they shouldn't receive broadcast)
+        if (!availability || availability.available <= 0) {
+          skippedNoAvailable++;
+          continue;
+        }
+        
+        // Calculate personalized capacity
+        const trucksYouCanProvide = Math.min(availability.available, trucksStillNeeded);
+        
+        // Create personalized broadcast payload
+        const personalizedBroadcast = {
+          ...extendedBroadcast,
+          // =====================================================================
+          // PERSONALIZED FIELDS - Unique per transporter
+          // =====================================================================
+          trucksYouCanProvide,           // How many they can accept (1 to N)
+          maxTrucksYouCanProvide: trucksYouCanProvide, // Alias
+          yourAvailableTrucks: availability.available, // How many they have free
+          yourTotalTrucks: availability.totalOwned,    // How many they own of this type
+          
+          // =====================================================================
+          // ORDER FIELDS - Same for everyone
+          // =====================================================================
+          trucksStillNeeded,             // Total still needed for this type
+          trucksNeededOfThisType: trucksStillNeeded, // Alias
+          
+          // Personalization metadata
+          isPersonalized: true,
+          personalizedFor: transporterId
+        };
+        
+        // Send via WebSocket
+        emitToUser(transporterId, 'new_broadcast', personalizedBroadcast);
+        sentCount++;
+        
+        logger.info(`   📱 → ${availability.transporterName || transporterId.substring(0, 8)}: ` +
+          `${trucksYouCanProvide}/${trucksStillNeeded} trucks (has ${availability.available} available)`);
+      }
+      
+      logger.info(`   ✅ Sent personalized broadcasts: ${sentCount}, Skipped (no available): ${skippedNoAvailable}`)
+      
+      // Update truck requests with notified transporters
       for (const tr of requests) {
-        db.updateTruckRequest(tr.id, {
+        await db.updateTruckRequest(tr.id, {
           notifiedTransporters: matchingTransporters
         });
       }
@@ -464,56 +1077,36 @@ class OrderService {
   }
   
   /**
-   * Send push notifications asynchronously
-   * Does not block the main flow
+   * Set timer to expire order after timeout (Redis-based for cluster support)
+   * 
+   * SCALABILITY: Uses Redis timers instead of in-memory setTimeout
+   * - Works across multiple server instances
+   * - Survives server restarts
+   * - No duplicate processing (Redis locks)
    */
-  private async sendPushNotificationsAsync(
-    transporterIds: string[],
-    broadcastData: any
-  ): Promise<void> {
-    try {
-      const successCount = await sendBatchPushNotifications(transporterIds, {
-        title: `🚛 ${broadcastData.trucksNeededOfThisType}x ${broadcastData.vehicleType.toUpperCase()} Required!`,
-        body: `${broadcastData.pickup.city || broadcastData.pickup.address} → ${broadcastData.drop.city || broadcastData.drop.address} | ₹${broadcastData.pricePerTruck}/truck`,
-        data: {
-          type: 'new_truck_request',
-          orderId: broadcastData.orderId,
-          truckRequestId: broadcastData.truckRequestId,
-          vehicleType: broadcastData.vehicleType
-        }
-      });
-      
-      logger.info(`📱 FCM: Push notifications sent to ${successCount}/${transporterIds.length} transporters`);
-    } catch (error: any) {
-      logger.error(`FCM batch send failed: ${error.message}`);
-    }
-  }
-  
-  /**
-   * Set timer to expire order after timeout
-   */
-  private setOrderExpiryTimer(orderId: string, timeoutMs: number): void {
-    // Clear existing timer if any
-    if (this.orderTimers.has(orderId)) {
-      clearTimeout(this.orderTimers.get(orderId)!);
-    }
+  private async setOrderExpiryTimer(orderId: string, timeoutMs: number): Promise<void> {
+    // Cancel any existing timer
+    await redisService.cancelTimer(this.TIMER_KEYS.ORDER_EXPIRY(orderId));
     
-    const timer = setTimeout(() => {
-      this.handleOrderExpiry(orderId);
-    }, timeoutMs);
+    // Set new timer in Redis
+    const expiresAt = new Date(Date.now() + timeoutMs);
+    const timerData = {
+      orderId,
+      createdAt: new Date().toISOString()
+    };
     
-    this.orderTimers.set(orderId, timer);
-    logger.info(`⏱️ Order expiry timer set for ${orderId} (${timeoutMs / 1000}s)`);
+    await redisService.setTimer(this.TIMER_KEYS.ORDER_EXPIRY(orderId), timerData, expiresAt);
+    logger.info(`⏱️ Order expiry timer set for ${orderId} (${timeoutMs / 1000}s) [Redis-based]`);
   }
   
   /**
    * Handle order expiry
    * Mark unfilled truck requests as expired
    */
-  private async handleOrderExpiry(orderId: string): Promise<void> {
+  async handleOrderExpiry(orderId: string): Promise<void> {
     logger.info(`⏰ ORDER EXPIRED: ${orderId}`);
     
-    const order = db.getOrderById(orderId);
+    const order = await db.getOrderById(orderId);
     if (!order) return;
     
     // Only expire if not fully filled
@@ -522,20 +1115,20 @@ class OrderService {
     }
     
     // Get all truck requests for this order
-    const truckRequests = db.getTruckRequestsByOrder(orderId);
+    const truckRequests = await db.getTruckRequestsByOrder(orderId);
     const unfilled = truckRequests.filter(tr => tr.status === 'searching');
     
     if (unfilled.length > 0) {
       // Update unfilled requests to expired
       const unfilledIds = unfilled.map(tr => tr.id);
-      db.updateTruckRequestsBatch(unfilledIds, { status: 'expired' });
+      await db.updateTruckRequestsBatch(unfilledIds, { status: 'expired' });
       
       logger.info(`   ${unfilled.length} truck requests expired`);
     }
     
     // Update order status
     const newStatus = order.trucksFilled > 0 ? 'partially_filled' : 'expired';
-    db.updateOrder(orderId, { status: newStatus });
+    await db.updateOrder(orderId, { status: newStatus });
     
     // Notify customer
     emitToUser(order.customerId, 'order_expired', {
@@ -545,8 +1138,133 @@ class OrderService {
       status: newStatus
     });
     
-    // Cleanup timer
-    this.orderTimers.delete(orderId);
+    // Cleanup timer from Redis
+    await redisService.cancelTimer(this.TIMER_KEYS.ORDER_EXPIRY(orderId));
+  }
+  
+  /**
+   * Cancel an order (customer cancels)
+   * 
+   * IMPORTANT: This broadcasts 'order_cancelled' to ALL transporters who received the broadcast
+   * Captain app uses BroadcastOverlayManager.removeBroadcast(orderId) to remove it from UI
+   * 
+   * SCALABILITY NOTES:
+   * - Collects all notified transporters from truck requests
+   * - Broadcasts cancellation in batch (queued for >50 transporters)
+   * - Updates order status atomically
+   * - Clears expiry timer
+   * 
+   * @param orderId The order to cancel
+   * @param customerId The customer requesting cancellation (for verification)
+   * @param reason Optional cancellation reason
+   */
+  /**
+   * SCALABILITY: Properly uses async/await for database operations
+   * EASY UNDERSTANDING: Clear cancellation flow with proper error handling
+   * MODULARITY: Clean separation of concerns
+   */
+  async cancelOrder(
+    orderId: string,
+    customerId: string,
+    reason?: string
+  ): Promise<{ success: boolean; message: string; transportersNotified: number }> {
+    logger.info(`📛 CANCEL ORDER: ${orderId} by customer ${customerId}`);
+    
+    // CRITICAL FIX: Use await for async database operations
+    const order = await db.getOrderById(orderId);
+    
+    if (!order) {
+      return { success: false, message: 'Order not found', transportersNotified: 0 };
+    }
+    
+    // Verify ownership
+    if (order.customerId !== customerId) {
+      logger.warn(`⚠️ Unauthorized cancel attempt: ${customerId} is not owner of ${orderId}`);
+      return { success: false, message: 'You can only cancel your own orders', transportersNotified: 0 };
+    }
+    
+    // Check if already cancelled or completed
+    if (order.status === 'cancelled') {
+      return { success: false, message: 'Order already cancelled', transportersNotified: 0 };
+    }
+    
+    if (order.status === 'completed' || order.status === 'fully_filled') {
+      return { success: false, message: 'Cannot cancel a completed order', transportersNotified: 0 };
+    }
+    
+    // Get all truck requests for this order
+    const truckRequests = await db.getTruckRequestsByOrder(orderId);
+    
+    // Collect all notified transporters (unique)
+    const notifiedTransporters = new Set<string>();
+    for (const tr of truckRequests) {
+      if (tr.notifiedTransporters) {
+        tr.notifiedTransporters.forEach(t => notifiedTransporters.add(t));
+      }
+    }
+    
+    // CRITICAL FIX: Use await for database updates
+    await db.updateOrder(orderId, { 
+      status: 'cancelled',
+      cancelledAt: new Date().toISOString(),
+      cancellationReason: reason || 'Cancelled by customer'
+    });
+    
+    // Update all truck requests to cancelled
+    const requestIds = truckRequests.map(tr => tr.id);
+    await db.updateTruckRequestsBatch(requestIds, { status: 'cancelled' });
+    
+    // Clear expiry timer from Redis
+    await redisService.cancelTimer(this.TIMER_KEYS.ORDER_EXPIRY(orderId));
+    logger.info(`   ⏱️ Cleared expiry timer for ${orderId}`);
+    
+    // Broadcast cancellation to all notified transporters
+    const cancellationData = {
+      type: 'order_cancelled',
+      orderId,
+      reason: reason || 'Cancelled by customer',
+      cancelledAt: new Date().toISOString()
+    };
+    
+    const transporterIds = Array.from(notifiedTransporters);
+    
+    if (transporterIds.length > 0) {
+      // Use queue for large batches, direct for small
+      if (transporterIds.length < 50) {
+        for (const transporterId of transporterIds) {
+          emitToUser(transporterId, 'order_cancelled', cancellationData);
+        }
+        logger.info(`   📱 Direct cancellation broadcast to ${transporterIds.length} transporters`);
+      } else {
+        await queueService.queueBroadcastBatch(
+          transporterIds,
+          'order_cancelled',
+          cancellationData
+        );
+        logger.info(`   📱 Queued cancellation broadcast to ${transporterIds.length} transporters`);
+      }
+      
+      // Also send push notification for offline transporters
+      await queueService.queuePushNotificationBatch(
+        transporterIds,
+        {
+          title: '❌ Order Cancelled',
+          body: `Order #${orderId.slice(-8).toUpperCase()} was cancelled by customer`,
+          data: {
+            type: 'order_cancelled',
+            orderId
+          }
+        }
+      );
+    }
+    
+    logger.info(`✅ Order ${orderId} cancelled, notified ${transporterIds.length} transporters`);
+    
+    return {
+      success: true,
+      message: 'Order cancelled successfully',
+      transportersNotified: transporterIds.length
+    };
   }
   
   /**
@@ -565,7 +1283,7 @@ class OrderService {
     tripId?: string;
     message: string;
   }> {
-    const truckRequest = db.getTruckRequestById(truckRequestId);
+    const truckRequest = await db.getTruckRequestById(truckRequestId);
     
     if (!truckRequest) {
       return { success: false, message: 'Truck request not found' };
@@ -575,15 +1293,15 @@ class OrderService {
       return { success: false, message: `Request already ${truckRequest.status}` };
     }
     
-    const order = db.getOrderById(truckRequest.orderId);
+    const order = await db.getOrderById(truckRequest.orderId);
     if (!order) {
       return { success: false, message: 'Order not found' };
     }
     
     // Get details
-    const transporter = db.getUserById(transporterId);
-    const vehicle = db.getVehicleById(vehicleId);
-    const driver = db.getUserById(driverId);
+    const transporter = await db.getUserById(transporterId);
+    const vehicle = await db.getVehicleById(vehicleId);
+    const driver = await db.getUserById(driverId);
     
     if (!vehicle) {
       return { success: false, message: 'Vehicle not found' };
@@ -606,7 +1324,7 @@ class OrderService {
     const now = new Date().toISOString();
     
     // Update truck request
-    db.updateTruckRequest(truckRequestId, {
+    await db.updateTruckRequest(truckRequestId, {
       status: 'assigned',
       assignedTransporterId: transporterId,
       assignedTransporterName: transporter?.name || transporter?.businessName || '',
@@ -620,7 +1338,7 @@ class OrderService {
     });
     
     // Create assignment record
-    db.createAssignment({
+    await db.createAssignment({
       id: assignmentId,
       bookingId: truckRequest.orderId, // Legacy field
       truckRequestId,
@@ -646,13 +1364,13 @@ class OrderService {
       newStatus = 'fully_filled';
     }
     
-    db.updateOrder(order.id, {
+    await db.updateOrder(order.id, {
       trucksFilled: newTrucksFilled,
       status: newStatus
     });
     
     // Update vehicle status
-    db.updateVehicle(vehicleId, {
+    await db.updateVehicle(vehicleId, {
       status: 'in_transit',
       currentTripId: tripId,
       assignedDriverId: driverId
@@ -758,11 +1476,11 @@ class OrderService {
   /**
    * Get order details with all truck requests
    */
-  getOrderDetails(orderId: string): OrderRecord & { truckRequests: TruckRequestRecord[] } | null {
-    const order = db.getOrderById(orderId);
+  async getOrderDetails(orderId: string): Promise<(OrderRecord & { truckRequests: TruckRequestRecord[] }) | null> {
+    const order = await db.getOrderById(orderId);
     if (!order) return null;
     
-    const truckRequests = db.getTruckRequestsByOrder(orderId);
+    const truckRequests = await db.getTruckRequestsByOrder(orderId);
     
     return {
       ...order,
@@ -774,15 +1492,15 @@ class OrderService {
    * Get active truck requests for a transporter
    * Returns ONLY requests matching their vehicle types
    */
-  getActiveRequestsForTransporter(transporterId: string): TruckRequestRecord[] {
-    return db.getActiveTruckRequestsForTransporter(transporterId);
+  async getActiveRequestsForTransporter(transporterId: string): Promise<TruckRequestRecord[]> {
+    return await db.getActiveTruckRequestsForTransporter(transporterId);
   }
   
   /**
    * Get orders by customer
    */
-  getOrdersByCustomer(customerId: string): OrderRecord[] {
-    return db.getOrdersByCustomer(customerId);
+  async getOrdersByCustomer(customerId: string): Promise<OrderRecord[]> {
+    return await db.getOrdersByCustomer(customerId);
   }
 }
 

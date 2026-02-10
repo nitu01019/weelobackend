@@ -23,6 +23,8 @@ import { authMiddleware, roleGuard } from '../../shared/middleware/auth.middlewa
 import { db } from '../../shared/database/db';
 import { logger } from '../../shared/services/logger.service';
 import { cacheService } from '../../shared/services/cache.service';
+import { availabilityService } from '../../shared/services/availability.service';
+import { generateVehicleKey } from '../../shared/services/vehicle-key.service';
 
 const router = Router();
 
@@ -56,7 +58,7 @@ router.put(
       }
       
       // Update in database
-      db.updateUser(user.userId, {
+      await db.updateUser(user.userId, {
         isAvailable,
         availabilityUpdatedAt: new Date().toISOString()
       });
@@ -65,7 +67,7 @@ router.put(
       await cacheService.delete(`user:${user.userId}`);
       
       // Invalidate transporter cache for all vehicle types they own
-      const vehicles = db.getVehiclesByTransporter(user.userId);
+      const vehicles = await db.getVehiclesByTransporter(user.userId);
       const vehicleTypes = new Set(vehicles.map(v => v.vehicleType));
       for (const type of vehicleTypes) {
         await cacheService.delete(`trans:vehicle:${type}:*`);
@@ -100,7 +102,7 @@ router.get(
     try {
       const user = (req as any).user;
       
-      const transporter = db.getUserById(user.userId);
+      const transporter = await db.getUserById(user.userId);
       
       if (!transporter) {
         return res.status(404).json({
@@ -127,6 +129,167 @@ router.get(
   }
 );
 
+/**
+ * POST /api/v1/transporter/heartbeat
+ * Update transporter's live location and availability
+ * 
+ * CALL THIS EVERY 5 SECONDS from the Captain app
+ * 
+ * This powers the LIVE AVAILABILITY TABLE for proximity-based matching:
+ * - Geohash-indexed for fast nearby searches
+ * - Stale entries (>60 sec) auto-removed
+ * - Used to find top 10 nearby transporters for batch notify
+ * 
+ * Body: {
+ *   latitude: number,
+ *   longitude: number,
+ *   vehicleId?: string,    // Currently active vehicle (optional)
+ *   isOnTrip?: boolean     // Whether currently on a trip
+ * }
+ */
+router.post(
+  '/heartbeat',
+  authMiddleware,
+  roleGuard(['transporter', 'driver']),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const user = (req as any).user;
+      const { latitude, longitude, vehicleId, isOnTrip } = req.body;
+      
+      // Validate coordinates
+      if (typeof latitude !== 'number' || typeof longitude !== 'number') {
+        res.status(400).json({
+          success: false,
+          error: {
+            code: 'VALIDATION_ERROR',
+            message: 'latitude and longitude are required numbers'
+          }
+        });
+        return;
+      }
+      
+      // Get transporter's vehicles to determine vehicleKey
+      const vehicles = await db.getVehiclesByTransporter(user.userId);
+      
+      if (vehicles.length === 0) {
+        res.status(400).json({
+          success: false,
+          error: {
+            code: 'NO_VEHICLES',
+            message: 'No vehicles registered. Register a vehicle first.'
+          }
+        });
+        return;
+      }
+      
+      // Use specified vehicle or first available
+      const vehicle = vehicleId 
+        ? vehicles.find(v => v.id === vehicleId)
+        : vehicles.find(v => v.isActive && v.status === 'available') || vehicles[0];
+      
+      if (!vehicle) {
+        res.status(400).json({
+          success: false,
+          error: {
+            code: 'VEHICLE_NOT_FOUND',
+            message: 'Specified vehicle not found'
+          }
+        });
+        return;
+      }
+      
+      // Generate vehicle key if not present (legacy vehicle)
+      const vehicleKey = vehicle.vehicleKey || generateVehicleKey(vehicle.vehicleType, vehicle.vehicleSubtype);
+      
+      // Update availability service (geohash-indexed)
+      availabilityService.updateAvailability({
+        transporterId: user.userId,
+        driverId: user.role === 'driver' ? user.userId : undefined,
+        vehicleKey,
+        vehicleId: vehicle.id,
+        latitude,
+        longitude,
+        isOnTrip: isOnTrip || false
+      });
+      
+      res.json({
+        success: true,
+        data: {
+          registered: true,
+          vehicleKey,
+          vehicleId: vehicle.id,
+          isOnTrip: isOnTrip || false,
+          nextHeartbeatMs: availabilityService.HEARTBEAT_INTERVAL_MS
+        }
+      });
+      
+    } catch (error: any) {
+      logger.error(`Heartbeat error: ${error.message}`);
+      next(error);
+    }
+  }
+);
+
+/**
+ * DELETE /api/v1/transporter/heartbeat
+ * Mark transporter as offline (remove from availability)
+ * 
+ * Call this when:
+ * - App goes to background
+ * - User logs out
+ * - User toggles offline
+ */
+router.delete(
+  '/heartbeat',
+  authMiddleware,
+  roleGuard(['transporter', 'driver']),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const user = (req as any).user;
+      
+      // Remove from availability service
+      availabilityService.setOffline(user.userId);
+      
+      logger.info(`📴 Transporter ${user.userId} went offline`);
+      
+      res.json({
+        success: true,
+        data: {
+          offline: true,
+          timestamp: new Date().toISOString()
+        }
+      });
+      
+    } catch (error: any) {
+      logger.error(`Offline error: ${error.message}`);
+      next(error);
+    }
+  }
+);
+
+/**
+ * GET /api/v1/transporter/availability/stats
+ * Get live availability statistics (for admin/debugging)
+ */
+router.get(
+  '/availability/stats',
+  authMiddleware,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const stats = availabilityService.getStats();
+      
+      res.json({
+        success: true,
+        data: stats
+      });
+      
+    } catch (error: any) {
+      logger.error(`Availability stats error: ${error.message}`);
+      next(error);
+    }
+  }
+);
+
 // =============================================================================
 // PROFILE ENDPOINTS
 // =============================================================================
@@ -143,7 +306,7 @@ router.get(
     try {
       const user = (req as any).user;
       
-      const transporter = db.getUserById(user.userId);
+      const transporter = await db.getUserById(user.userId);
       
       if (!transporter) {
         return res.status(404).json({
@@ -156,8 +319,8 @@ router.get(
       }
       
       // Get vehicles count
-      const vehicles = db.getVehiclesByTransporter(user.userId);
-      const drivers = db.getDriversByTransporter(user.userId);
+      const vehicles = await db.getVehiclesByTransporter(user.userId);
+      const drivers = await db.getDriversByTransporter(user.userId);
       
       res.json({
         success: true,
@@ -207,12 +370,12 @@ router.put(
       if (email) updates.email = email;
       if (gstNumber) updates.gstNumber = gstNumber;
       
-      db.updateUser(user.userId, updates);
+      await db.updateUser(user.userId, updates);
       
       // Invalidate cache
       await cacheService.delete(`user:${user.userId}`);
       
-      const updated = db.getUserById(user.userId);
+      const updated = await db.getUserById(user.userId);
       
       logger.info(`Transporter ${user.userId} profile updated`);
       
@@ -254,7 +417,7 @@ router.get(
       const user = (req as any).user;
       
       // Get all assignments for this transporter
-      const assignments = db.getAssignmentsByTransporter(user.userId);
+      const assignments = await db.getAssignmentsByTransporter(user.userId);
       
       // Calculate stats
       const totalTrips = assignments.length;

@@ -145,3 +145,28 @@ export const trackingRateLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false
 });
+
+/**
+ * Places/Geocoding rate limiter - SCALABILITY PROTECTION
+ * 60 requests per minute per IP (1 per second)
+ * 
+ * Protects Google Maps API quota from abuse while allowing
+ * normal autocomplete usage (debounced to ~1 req/300ms on client)
+ */
+export const placesRateLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 60, // 1 per second average
+  keyGenerator: (req) => {
+    // Rate limit by IP for unauthenticated geocoding requests
+    return `places:${req.ip || 'unknown'}`;
+  },
+  message: {
+    success: false,
+    error: {
+      code: 'PLACES_RATE_LIMIT_EXCEEDED',
+      message: 'Too many geocoding requests. Please slow down.'
+    }
+  },
+  standardHeaders: true,
+  legacyHeaders: false
+});

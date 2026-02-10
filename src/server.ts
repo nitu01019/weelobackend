@@ -41,6 +41,7 @@ import cors from 'cors';
 import compression from 'compression';
 import { createServer as createHttpServer } from 'http';
 import { createServer as createHttpsServer } from 'https';
+import { SecureVersion } from 'tls';
 import { readFileSync, existsSync } from 'fs';
 
 // Core imports
@@ -55,15 +56,15 @@ import { initializeSocket, getConnectedUserCount, getConnectionStats } from './s
 import { errorHandler } from './shared/middleware/error.middleware';
 import { requestLogger } from './shared/middleware/request-logger.middleware';
 import { rateLimiter } from './shared/middleware/rate-limiter.middleware';
-import { 
-  requestIdMiddleware, 
-  securityHeaders, 
-  sanitizeInput, 
+import {
+  requestIdMiddleware,
+  securityHeaders,
+  sanitizeInput,
   preventParamPollution,
   blockSuspiciousRequests,
-  securityResponseHeaders 
+  securityResponseHeaders
 } from './shared/middleware/security.middleware';
-import { cache } from './shared/middleware/cache.middleware';
+// import { cache } from './shared/middleware/cache.middleware'; // TODO: Create cache middleware
 
 // Database
 import { db } from './shared/database/db';
@@ -83,14 +84,28 @@ import { notificationRouter } from './modules/notification/notification.routes';
 import orderRouter from './modules/order/order.routes';
 import transporterRouter from './modules/transporter/transporter.routes';
 import { truckHoldRouter } from './modules/truck-hold';
+import { customBookingRouter } from './modules/custom-booking';
+import geocodingRouter from './modules/routing/geocoding.routes';
 import { healthRoutes } from './shared/routes/health.routes';
 import { metricsMiddleware } from './shared/monitoring/metrics.service';
 import { fcmService } from './shared/services/fcm.service';
+import { redisService } from './shared/services/redis.service';
 
 // =============================================================================
 // ENVIRONMENT VALIDATION (Fail fast if config is invalid)
 // =============================================================================
 validateAndLogEnvironment();
+
+// =============================================================================
+// REDIS INITIALIZATION (CRITICAL for OTP and scaling)
+// =============================================================================
+// Initialize Redis connection for production OTP storage
+// Without this call, redisService stays in in-memory mode!
+redisService.initialize().then(() => {
+  logger.info('✅ RedisService initialized');
+}).catch((err) => {
+  logger.error('❌ RedisService initialization failed:', err);
+});
 
 // =============================================================================
 // EXPRESS APP INITIALIZATION
@@ -138,13 +153,13 @@ if (config.isProduction && hasSSLCertificates()) {
       cert: Buffer;
       ca?: Buffer;
       // Modern TLS settings
-      minVersion: string;
+      minVersion: SecureVersion;
       ciphers: string;
     } = {
       key: readFileSync(SSL_KEY_PATH),
       cert: readFileSync(SSL_CERT_PATH),
       // TLS 1.2 minimum (TLS 1.3 preferred)
-      minVersion: 'TLSv1.2',
+      minVersion: 'TLSv1.2' as SecureVersion,
       // Strong cipher suites only
       ciphers: [
         'TLS_AES_256_GCM_SHA384',
@@ -249,9 +264,9 @@ app.use(rateLimiter);
 // HEALTH CHECK
 // =============================================================================
 
-app.get('/health', (_req, res) => {
-  const stats = db.getStats();
-  const cacheStats = cache.getStats();
+app.get('/health', async (_req, res) => {
+  const stats = await db.getStats();
+  // const cacheStats = cache.getStats(); // TODO: Implement cache middleware
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
@@ -265,11 +280,11 @@ app.get('/health', (_req, res) => {
       bookings: stats.bookings,
       assignments: stats.assignments
     },
-    cache: {
-      size: cacheStats.size,
-      maxSize: cacheStats.maxSize,
-      utilizationPercent: Math.round((cacheStats.size / cacheStats.maxSize) * 100)
-    },
+    // cache: {
+    //   size: cacheStats.size,
+    //   maxSize: cacheStats.maxSize,
+    //   utilizationPercent: Math.round((cacheStats.size / cacheStats.maxSize) * 100)
+    // },
     security: {
       helmet: true,
       rateLimiting: true,
@@ -302,6 +317,10 @@ app.use(`${API_PREFIX}/driver-auth`, driverAuthRouter);
 
 // Profile routes (create/update profiles)
 app.use(`${API_PREFIX}/profile`, profileRouter);
+
+// Customer routes (wallet, trips, settings)
+import customerRouter from './modules/customer/customer.routes';
+app.use(`${API_PREFIX}/customer`, customerRouter);
 
 // Vehicle routes (register trucks)
 app.use(`${API_PREFIX}/vehicles`, vehicleRouter);
@@ -336,24 +355,30 @@ app.use(`${API_PREFIX}/notifications`, notificationRouter);
 // Truck Hold System (BookMyShow-style holding)
 app.use(`${API_PREFIX}/truck-hold`, truckHoldRouter);
 
+// Custom Booking System (Long-term contracts)
+app.use(`${API_PREFIX}/custom-booking`, customBookingRouter);
+
+// Geocoding & Places Search (Google Maps integration)
+app.use(`${API_PREFIX}/geocoding`, geocodingRouter);
+
 // =============================================================================
 // DATABASE DEBUG ROUTES (Development only)
 // =============================================================================
 
 if (config.isDevelopment) {
   // View all data (for debugging)
-  app.get(`${API_PREFIX}/debug/database`, (_req, res) => {
+  app.get(`${API_PREFIX}/debug/database`, async (_req, res) => {
     res.json({
       success: true,
-      data: db.getRawData()
+      data: await db.getRawData()
     });
   });
 
   // View stats
-  app.get(`${API_PREFIX}/debug/stats`, (_req, res) => {
+  app.get(`${API_PREFIX}/debug/stats`, async (_req, res) => {
     res.json({
       success: true,
-      data: db.getStats()
+      data: await db.getStats()
     });
   });
 }
@@ -382,11 +407,17 @@ app.use(errorHandler);
 
 const PORT = config.port || 3000;
 
-server.listen(PORT, '0.0.0.0', () => {
-  const stats = db.getStats();
+server.listen(PORT, '0.0.0.0', async () => {
+  const stats = await db.getStats();
   const protocol = isHttps ? 'https' : 'http';
   const securityStatus = isHttps ? '🔒 SECURE (TLS 1.2+)' : '⚠️  HTTP (dev only)';
-  
+
+  // CRITICAL FIX: Start cleanup job for expired orders (runs every 2 minutes)
+  // SCALABILITY: Prevents database bloat and ensures users can create new orders
+  import('./shared/jobs/cleanup-expired-orders.job').then(({ startCleanupJob }) => {
+    startCleanupJob();
+  });
+
   console.log('');
   console.log('╔════════════════════════════════════════════════════════════════════╗');
   console.log('║                                                                    ║');
@@ -446,14 +477,14 @@ process.on('unhandledRejection', (reason) => {
 
 const gracefulShutdown = (signal: string) => {
   logger.info(`${signal} received. Starting graceful shutdown...`);
-  
+
   server.close(() => {
     logger.info('HTTP server closed');
-    
+
     // Clear cache
-    cache.clear();
-    logger.info('Cache cleared');
-    
+    // cache.clear(); // TODO: Implement cache middleware
+    // logger.info('Cache cleared');
+
     // Close database connections (if any)
     logger.info('Graceful shutdown complete');
     process.exit(0);
@@ -473,7 +504,7 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 app.get('/api/v1/debug/sockets', (req, res) => {
   const { getConnectionStats } = require('./shared/services/socket.service');
   const stats = getConnectionStats();
-  
+
   // Get all connected user IDs
   const connectedUsers: any[] = [];
   const io = require('./shared/services/socket.service').getIO();
@@ -487,7 +518,7 @@ app.get('/api/v1/debug/sockets', (req, res) => {
       });
     });
   }
-  
+
   res.json({
     success: true,
     data: {
