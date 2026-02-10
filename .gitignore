@@ -50,3 +50,4 @@ docker-compose.override.yml
 # Coverage
 coverage/
 .nyc_output/
+AWS_DEPLOYMENT_REFERENCE.md
