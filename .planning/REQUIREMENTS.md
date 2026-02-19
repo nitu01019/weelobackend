@@ -132,66 +132,66 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| BCAST-01 | — | Pending |
-| BCAST-02 | — | Pending |
-| BCAST-03 | — | Pending |
-| BCAST-04 | — | Pending |
-| BCAST-05 | — | Pending |
-| CUST-01 | — | Pending |
-| CUST-02 | — | Pending |
-| CUST-03 | — | Pending |
-| CUST-04 | — | Pending |
-| ACPT-01 | — | Pending |
-| ACPT-02 | — | Pending |
-| ACPT-03 | — | Pending |
-| ACPT-04 | — | Pending |
-| IDEM-01 | — | Pending |
-| IDEM-02 | — | Pending |
-| IDEM-03 | — | Pending |
-| CNCL-01 | — | Pending |
-| CNCL-02 | — | Pending |
-| CNCL-03 | — | Pending |
-| CNCL-04 | — | Pending |
-| CNCL-05 | — | Pending |
-| CNCL-06 | — | Pending |
-| CNCL-07 | — | Pending |
-| TMOT-01 | — | Pending |
-| TMOT-02 | — | Pending |
-| TMOT-03 | — | Pending |
-| TMOT-04 | — | Pending |
-| TMOT-05 | — | Pending |
-| TIMR-01 | — | Pending |
-| TIMR-02 | — | Pending |
-| TIMR-03 | — | Pending |
-| TIMR-04 | — | Pending |
-| SECR-01 | — | Pending |
-| SECR-02 | — | Pending |
-| SECR-03 | — | Pending |
-| SECR-04 | — | Pending |
-| SECR-05 | — | Pending |
-| SECR-06 | — | Pending |
-| CICD-01 | — | Pending |
-| CICD-02 | — | Pending |
-| CICD-03 | — | Pending |
-| CICD-04 | — | Pending |
-| CICD-05 | — | Pending |
-| RDS-01 | — | Pending |
-| RDS-02 | — | Pending |
-| RDS-03 | — | Pending |
-| SOCK-01 | — | Pending |
-| SOCK-02 | — | Pending |
-| SOCK-03 | — | Pending |
-| SOCK-04 | — | Pending |
-| DRVR-01 | — | Pending |
-| DRVR-02 | — | Pending |
-| DRVR-03 | — | Pending |
-| DRVR-04 | — | Pending |
+| BCAST-01 | Phase 1 | Pending |
+| BCAST-02 | Phase 1 | Pending |
+| BCAST-03 | Phase 1 | Pending |
+| BCAST-04 | Phase 1 | Pending |
+| BCAST-05 | Phase 1 | Pending |
+| CUST-01 | Phase 1 | Pending |
+| CUST-02 | Phase 1 | Pending |
+| CUST-03 | Phase 1 | Pending |
+| CUST-04 | Phase 1 | Pending |
+| ACPT-01 | Phase 1 | Pending |
+| ACPT-02 | Phase 1 | Pending |
+| ACPT-03 | Phase 1 | Pending |
+| ACPT-04 | Phase 1 | Pending |
+| IDEM-01 | Phase 1 | Pending |
+| IDEM-02 | Phase 1 | Pending |
+| IDEM-03 | Phase 1 | Pending |
+| CNCL-01 | Phase 1 | Pending |
+| CNCL-02 | Phase 1 | Pending |
+| CNCL-03 | Phase 2 | Pending |
+| CNCL-04 | Phase 2 | Pending |
+| CNCL-05 | Phase 1 | Pending |
+| CNCL-06 | Phase 1 | Pending |
+| CNCL-07 | Phase 1 | Pending |
+| TMOT-01 | Phase 2 | Pending |
+| TMOT-02 | Phase 2 | Pending |
+| TMOT-03 | Phase 2 | Pending |
+| TMOT-04 | Phase 2 | Pending |
+| TMOT-05 | Phase 2 | Pending |
+| TIMR-01 | Phase 2 | Pending |
+| TIMR-02 | Phase 2 | Pending |
+| TIMR-03 | Phase 2 | Pending |
+| TIMR-04 | Phase 2 | Pending |
+| SECR-01 | Phase 3 | Pending |
+| SECR-02 | Phase 3 | Pending |
+| SECR-03 | Phase 3 | Pending |
+| SECR-04 | Phase 3 | Pending |
+| SECR-05 | Phase 3 | Pending |
+| SECR-06 | Phase 3 | Pending |
+| CICD-01 | Phase 4 | Pending |
+| CICD-02 | Phase 4 | Pending |
+| CICD-03 | Phase 4 | Pending |
+| CICD-04 | Phase 4 | Pending |
+| CICD-05 | Phase 4 | Pending |
+| RDS-01 | Phase 3 | Pending |
+| RDS-02 | Phase 3 | Pending |
+| RDS-03 | Phase 3 | Pending |
+| SOCK-01 | Phase 3 | Pending |
+| SOCK-02 | Phase 3 | Pending |
+| SOCK-03 | Phase 3 | Pending |
+| SOCK-04 | Phase 3 | Pending |
+| DRVR-01 | Phase 4 | Pending |
+| DRVR-02 | Phase 4 | Pending |
+| DRVR-03 | Phase 4 | Pending |
+| DRVR-04 | Phase 4 | Pending |
 
 **Coverage:**
 - v1 requirements: 52 total
-- Mapped to phases: 0 (pending roadmap creation)
-- Unmapped: 52
+- Mapped to phases: 52
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-02-19*
-*Last updated: 2026-02-19 after initial definition*
+*Last updated: 2026-02-19 — traceability populated after roadmap creation*
