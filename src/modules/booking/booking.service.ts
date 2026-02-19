@@ -1149,9 +1149,26 @@ class BookingService {
   // ==========================================================================
 
   /**
-   * Cancel booking
+   * Cancel booking — atomic, idempotent, race-safe
+   *
+   * Uses updateMany with status precondition to prevent cancel-vs-accept races.
+   * Already-cancelled bookings return success (idempotent).
    */
   async cancelBooking(bookingId: string, customerId: string): Promise<BookingRecord> {
+    // ATOMIC cancel: only succeeds if status is still cancellable
+    const updated = await prismaClient.booking.updateMany({
+      where: {
+        id: bookingId,
+        customerId,
+        status: { in: ['created', 'broadcasting', 'active', 'partially_filled'] as any }
+      },
+      data: {
+        status: 'cancelled' as any,
+        stateChangedAt: new Date()
+      }
+    });
+
+    // Fetch current state for response and post-cancel logic
     const booking = await db.getBookingById(bookingId);
 
     if (!booking) {
@@ -1162,23 +1179,40 @@ class BookingService {
       throw new AppError(403, 'FORBIDDEN', 'You can only cancel your own bookings');
     }
 
-    if (booking.status === 'cancelled' || booking.status === 'completed') {
-      throw new AppError(400, 'INVALID_STATUS', 'Booking cannot be cancelled');
+    // IDEMPOTENT: already cancelled is success (not error)
+    if (updated.count === 0 && booking.status === 'cancelled') {
+      logger.info('Idempotent cancel: booking already cancelled', { bookingId });
+      return booking;
     }
 
-    const updated = await db.updateBooking(bookingId, { status: 'cancelled', stateChangedAt: new Date() });
+    if (updated.count === 0) {
+      throw new AppError(409, 'BOOKING_CANNOT_CANCEL', `Cannot cancel booking in ${booking.status} state`);
+    }
 
-    // Clear all timers INCLUDING radius expansion keys (Req 3 + 5)
+    // === CANCEL WON: Full cleanup ===
+
+    // 1. Clear all timers INCLUDING radius expansion keys
     await this.clearBookingTimers(bookingId);
 
-    // Clear customer active broadcast key (one-per-customer enforcement)
+    // 2. Clear customer active broadcast key + idempotency keys
     await this.clearCustomerActiveBroadcast(customerId);
 
-    // ========================================
-    // NOTIFY ALL NOTIFIED TRANSPORTERS (Requirement 3 & 5)
-    // Emit BOOKING_EXPIRED to each transporter individually
-    // so they remove the broadcast card from their UI
-    // ========================================
+    // 3. Clear notified transporter set
+    await redisService.del(`broadcast:notified:${bookingId}`).catch(() => {});
+
+    // 4. Clear legacy client idempotency cache
+    try {
+      const latestIdempotencyKey = `idempotency:booking:${customerId}:latest`;
+      const storedKey = await redisService.get(latestIdempotencyKey) as string | null;
+      if (storedKey) {
+        await redisService.del(`idempotency:booking:${customerId}:${storedKey}`);
+        await redisService.del(latestIdempotencyKey);
+      }
+    } catch (err: any) {
+      logger.warn(`[CANCEL] Failed to clear legacy idempotency cache (non-critical)`, { error: err.message });
+    }
+
+    // 5. Notify all notified transporters
     if (booking.notifiedTransporters && booking.notifiedTransporters.length > 0) {
       for (const transporterId of booking.notifiedTransporters) {
         emitToUser(transporterId, SocketEvent.BOOKING_EXPIRED, {
@@ -1192,47 +1226,8 @@ class BookingService {
         });
       }
       logger.info(`[CANCEL] Sent BOOKING_EXPIRED to ${booking.notifiedTransporters.length} transporters`);
-    }
 
-    // Also emit to the booking room (for customer foreground)
-    emitToBooking(bookingId, SocketEvent.BOOKING_UPDATED, {
-      bookingId,
-      status: 'cancelled'
-    });
-
-    // ========================================
-    // CLEAR IDEMPOTENCY CACHE (Requirement 3 & 5)
-    // Ensures the customer can immediately create a new booking
-    // without being blocked by the dedup check
-    //
-    // FIX: No longer uses KEYS pattern scan (fails on ElastiCache Serverless).
-    // Instead, we rely on the createBooking bypass: if existing booking
-    // is cancelled/expired, idempotency is automatically bypassed.
-    // This is more reliable and production-safe.
-    // ========================================
-    try {
-      // Try direct key deletion using a known pattern
-      // We store the latest idempotency key per customer for quick cleanup
-      const latestIdempotencyKey = `idempotency:booking:${customerId}:latest`;
-      const storedKey = await redisService.get(latestIdempotencyKey) as string | null;
-      if (storedKey) {
-        const fullKey = `idempotency:booking:${customerId}:${storedKey}`;
-        await redisService.del(fullKey);
-        await redisService.del(latestIdempotencyKey);
-        logger.info(`[CANCEL] Cleared idempotency key for customer ${customerId}`);
-      }
-
-      // NOTE: Even if this fails, createBooking now bypasses idempotency
-      // for cancelled/expired bookings, so re-requests will always work.
-    } catch (err: any) {
-      // Non-critical: createBooking bypass handles this case
-      logger.warn(`[CANCEL] Failed to clear idempotency cache (non-critical)`, { error: err.message });
-    }
-
-    // ========================================
-    // FCM PUSH: Notify all transporters (for apps in background)
-    // ========================================
-    if (booking.notifiedTransporters.length > 0) {
+      // FCM push for background/closed apps
       queueService.queuePushNotificationBatch(
         booking.notifiedTransporters,
         {
@@ -1249,8 +1244,16 @@ class BookingService {
       });
     }
 
-    logger.info(`[CANCEL] ✅ Booking ${bookingId} cancelled, all broadcast state cleaned`);
-    return updated!;
+    // 6. Emit to the booking room (for customer foreground)
+    emitToBooking(bookingId, SocketEvent.BOOKING_UPDATED, {
+      bookingId,
+      status: 'cancelled'
+    });
+
+    // Re-fetch to get the updated record
+    const cancelledBooking = await db.getBookingById(bookingId);
+    logger.info(`[CANCEL] Booking ${bookingId} cancelled, all broadcast state cleaned`);
+    return cancelledBooking || booking;
   }
 
   /**

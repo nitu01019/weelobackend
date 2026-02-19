@@ -1313,59 +1313,70 @@ class OrderService {
   }
 
   /**
-   * Cancel an order (customer cancels)
-   * 
-   * IMPORTANT: This broadcasts 'order_cancelled' to ALL transporters who received the broadcast
-   * Captain app uses BroadcastOverlayManager.removeBroadcast(orderId) to remove it from UI
-   * 
-   * SCALABILITY NOTES:
-   * - Collects all notified transporters from truck requests
-   * - Broadcasts cancellation in batch (queued for >50 transporters)
-   * - Updates order status atomically
-   * - Clears expiry timer
-   * 
-   * @param orderId The order to cancel
-   * @param customerId The customer requesting cancellation (for verification)
-   * @param reason Optional cancellation reason
-   */
-  /**
-   * SCALABILITY: Properly uses async/await for database operations
-   * EASY UNDERSTANDING: Clear cancellation flow with proper error handling
-   * MODULARITY: Clean separation of concerns
+   * Cancel an order — atomic, idempotent, race-safe
+   *
+   * Uses updateMany with status precondition to prevent cancel-vs-accept races.
+   * Already-cancelled orders return success (idempotent).
    */
   async cancelOrder(
     orderId: string,
     customerId: string,
     reason?: string
   ): Promise<{ success: boolean; message: string; transportersNotified: number }> {
-    logger.info(`📛 CANCEL ORDER: ${orderId} by customer ${customerId}`);
+    logger.info(`CANCEL ORDER: ${orderId} by customer ${customerId}`);
 
-    // CRITICAL FIX: Use await for async database operations
+    // ATOMIC cancel: only succeeds if status is still cancellable
+    const updated = await prismaClient.order.updateMany({
+      where: {
+        id: orderId,
+        customerId,
+        status: { in: ['created', 'broadcasting', 'active', 'partially_filled'] as any }
+      },
+      data: {
+        status: 'cancelled' as any,
+        stateChangedAt: new Date(),
+        cancelledAt: new Date().toISOString(),
+        cancellationReason: reason || 'Cancelled by customer'
+      }
+    });
+
+    // Fetch current state
     const order = await db.getOrderById(orderId);
 
     if (!order) {
       return { success: false, message: 'Order not found', transportersNotified: 0 };
     }
 
-    // Verify ownership
     if (order.customerId !== customerId) {
-      logger.warn(`⚠️ Unauthorized cancel attempt: ${customerId} is not owner of ${orderId}`);
       return { success: false, message: 'You can only cancel your own orders', transportersNotified: 0 };
     }
 
-    // Check if already cancelled or completed
-    if (order.status === 'cancelled') {
-      return { success: false, message: 'Order already cancelled', transportersNotified: 0 };
+    // IDEMPOTENT: already cancelled is success
+    if (updated.count === 0 && order.status === 'cancelled') {
+      return { success: true, message: 'Order already cancelled', transportersNotified: 0 };
     }
 
-    if (order.status === 'completed' || order.status === 'fully_filled') {
-      return { success: false, message: 'Cannot cancel a completed order', transportersNotified: 0 };
+    if (updated.count === 0) {
+      return { success: false, message: `Cannot cancel order in ${order.status} state`, transportersNotified: 0 };
     }
 
-    // Get all truck requests for this order
+    // === CANCEL WON: Full cleanup ===
+
+    // 1. Cancel all associated TruckRequests atomically
     const truckRequests = await db.getTruckRequestsByOrder(orderId);
+    const requestIds = truckRequests.filter(tr => ['searching', 'held'].includes(tr.status)).map(tr => tr.id);
+    if (requestIds.length > 0) {
+      await db.updateTruckRequestsBatch(requestIds, { status: 'cancelled' });
+    }
 
-    // Collect all notified transporters (unique)
+    // 2. Clear expiry timer from Redis
+    await redisService.cancelTimer(this.TIMER_KEYS.ORDER_EXPIRY(orderId));
+    logger.info(`   Cleared expiry timer for ${orderId}`);
+
+    // 3. Clear customer active broadcast key + idempotency keys
+    await this.clearCustomerActiveBroadcast(customerId);
+
+    // 4. Collect and notify all notified transporters
     const notifiedTransporters = new Set<string>();
     for (const tr of truckRequests) {
       if (tr.notifiedTransporters) {
@@ -1373,26 +1384,6 @@ class OrderService {
       }
     }
 
-    // CRITICAL FIX: Use await for database updates
-    await db.updateOrder(orderId, {
-      status: 'cancelled',
-      stateChangedAt: new Date(),
-      cancelledAt: new Date().toISOString(),
-      cancellationReason: reason || 'Cancelled by customer'
-    });
-
-    // Update all truck requests to cancelled
-    const requestIds = truckRequests.map(tr => tr.id);
-    await db.updateTruckRequestsBatch(requestIds, { status: 'cancelled' });
-
-    // Clear expiry timer from Redis
-    await redisService.cancelTimer(this.TIMER_KEYS.ORDER_EXPIRY(orderId));
-    logger.info(`   ⏱️ Cleared expiry timer for ${orderId}`);
-
-    // Clear customer active broadcast key (one-per-customer enforcement)
-    await this.clearCustomerActiveBroadcast(customerId);
-
-    // Broadcast cancellation to all notified transporters
     const cancellationData = {
       type: 'order_cancelled',
       orderId,
@@ -1403,22 +1394,20 @@ class OrderService {
     const transporterIds = Array.from(notifiedTransporters);
 
     if (transporterIds.length > 0) {
-      // Use queue for large batches, direct for small
       if (transporterIds.length < 50) {
         for (const transporterId of transporterIds) {
           emitToUser(transporterId, 'order_cancelled', cancellationData);
         }
-        logger.info(`   📱 Direct cancellation broadcast to ${transporterIds.length} transporters`);
+        logger.info(`   Direct cancellation broadcast to ${transporterIds.length} transporters`);
       } else {
         await queueService.queueBroadcastBatch(
           transporterIds,
           'order_cancelled',
           cancellationData
         );
-        logger.info(`   📱 Queued cancellation broadcast to ${transporterIds.length} transporters`);
+        logger.info(`   Queued cancellation broadcast to ${transporterIds.length} transporters`);
       }
 
-      // Also send push notification for offline transporters
       await queueService.queuePushNotificationBatch(
         transporterIds,
         {
@@ -1429,10 +1418,20 @@ class OrderService {
             orderId
           }
         }
-      );
+      ).catch((err: any) => {
+        logger.warn(`FCM: Failed to queue cancellation push for order ${orderId}`, err);
+      });
     }
 
-    logger.info(`✅ Order ${orderId} cancelled, notified ${transporterIds.length} transporters`);
+    // 5. Notify customer
+    emitToUser(customerId, 'order_cancelled', {
+      orderId,
+      status: 'cancelled',
+      reason: reason || 'Cancelled by customer',
+      stateChangedAt: new Date().toISOString()
+    });
+
+    logger.info(`Order ${orderId} cancelled, notified ${transporterIds.length} transporters`);
 
     return {
       success: true,
