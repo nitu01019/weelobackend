@@ -24,6 +24,7 @@
 
 import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
+import { Prisma } from '@prisma/client';
 import { db, OrderRecord, TruckRequestRecord } from '../../shared/database/db';
 import { prismaClient } from '../../shared/database/prisma.service';
 import { logger } from '../../shared/services/logger.service';
@@ -504,7 +505,7 @@ class OrderService {
       roundCoord(idemDrop?.latitude || 0),
       roundCoord(idemDrop?.longitude || 0)
     ].join(':');
-    const idempotencyHash = crypto.createHash('sha256').update(idempotencyFingerprint).digest('hex').substring(0, 16);
+    const idempotencyHash = crypto.createHash('sha256').update(idempotencyFingerprint).digest('hex').substring(0, 32);
     const dedupeKey = `idem:broadcast:create:${request.customerId}:${idempotencyHash}`;
 
     const existingDedupeId = await redisService.get(dedupeKey);
@@ -818,7 +819,9 @@ class OrderService {
     // Return response
     return orderResponse;
     } finally {
-      await redisService.releaseLock(lockKey, request.customerId);
+      await redisService.releaseLock(lockKey, request.customerId).catch((err: any) => {
+        logger.warn('Failed to release customer broadcast lock', { customerId: request.customerId, error: err.message });
+      });
     }
   }
 
@@ -1681,7 +1684,7 @@ class OrderService {
             transporterPhone: transporter?.phone || '',
             now
           };
-        }, { isolationLevel: 'Serializable' as any });
+        }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
 
         // Transaction succeeded, break out of retry loop
         break;

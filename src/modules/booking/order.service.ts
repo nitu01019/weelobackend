@@ -22,6 +22,7 @@
  */
 
 import { v4 as uuid } from 'uuid';
+import { Prisma } from '@prisma/client';
 import { db, OrderRecord, TruckRequestRecord } from '../../shared/database/db';
 import { prismaClient } from '../../shared/database/prisma.service';
 import { AppError } from '../../shared/types/error.types';
@@ -148,7 +149,7 @@ async function processExpiredOrders(): Promise<void> {
         error: error.message 
       });
     } finally {
-      await redisService.releaseLock(lockKey, 'expiry-checker');
+      await redisService.releaseLock(lockKey, 'expiry-checker').catch(() => {});
     }
   }
 }
@@ -838,7 +839,7 @@ class OrderService {
             notifiedTransporters
           };
 
-        }, { isolationLevel: 'Serializable' as any });
+        }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
 
         // Transaction succeeded — break out of retry loop
         break;

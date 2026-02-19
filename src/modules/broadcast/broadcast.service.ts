@@ -10,6 +10,7 @@
  */
 
 import { v4 as uuidv4 } from 'uuid';
+import { Prisma } from '@prisma/client';
 import { db, BookingRecord, AssignmentRecord } from '../../shared/database/db';
 import { AppError } from '../../shared/types/error.types';
 import { logger } from '../../shared/services/logger.service';
@@ -585,7 +586,7 @@ class BroadcastService {
               vehicle,
               transporter
             };
-          }, { isolationLevel: 'Serializable' as any });
+          }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
           break;
         } catch (transactionError: any) {
           const isRetryableContention = transactionError?.code === 'P2034' || transactionError?.code === '40001';

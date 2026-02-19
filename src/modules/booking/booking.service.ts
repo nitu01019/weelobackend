@@ -155,7 +155,7 @@ async function processExpiredBookings(): Promise<void> {
         error: error.message
       });
     } finally {
-      await redisService.releaseLock(lockKey, 'expiry-checker');
+      await redisService.releaseLock(lockKey, 'expiry-checker').catch(() => {});
     }
   }
 }
@@ -196,7 +196,7 @@ async function processRadiusExpansionTimers(): Promise<void> {
         error: error.message
       });
     } finally {
-      await redisService.releaseLock(lockKey, 'radius-expander');
+      await redisService.releaseLock(lockKey, 'radius-expander').catch(() => {});
     }
   }
 }
@@ -306,7 +306,7 @@ class BookingService {
       roundCoord(data.drop.coordinates.latitude),
       roundCoord(data.drop.coordinates.longitude)
     ].join(':');
-    const idempotencyHash = crypto.createHash('sha256').update(idempotencyFingerprint).digest('hex').substring(0, 16);
+    const idempotencyHash = crypto.createHash('sha256').update(idempotencyFingerprint).digest('hex').substring(0, 32);
     const dedupeKey = `idem:broadcast:create:${customerId}:${idempotencyHash}`;
 
     const existingDedupeId = await redisService.get(dedupeKey);
@@ -552,7 +552,9 @@ class BookingService {
       timeoutSeconds: BOOKING_CONFIG.TIMEOUT_MS / 1000
     };
     } finally {
-      await redisService.releaseLock(lockKey, customerId);
+      await redisService.releaseLock(lockKey, customerId).catch((err: any) => {
+        logger.warn('Failed to release customer broadcast lock', { customerId, error: err.message });
+      });
     }
   }
 
