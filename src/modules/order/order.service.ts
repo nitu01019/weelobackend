@@ -798,7 +798,9 @@ class OrderService {
 
       try {
         await redisService.set(cacheKey, JSON.stringify(orderResponse), ttl);
-        logger.info(`💾 Idempotency cached: ${cacheKey.substring(0, 50)}... (TTL: ${ttl}s)`);
+        // Store pointer for cleanup on cancel/expiry
+        await redisService.set(`idempotency:order:${request.customerId}:latest`, request.idempotencyKey, ttl);
+        logger.info(`Idempotency cached: ${cacheKey.substring(0, 50)}... (TTL: ${ttl}s)`);
       } catch (error: any) {
         logger.warn(`⚠️ Failed to cache idempotency response: ${error.message}`);
         // Non-critical error, continue
@@ -1188,6 +1190,12 @@ class OrderService {
     if (latestIdemKey) {
       await redisService.del(latestIdemKey).catch(() => {});
       await redisService.del(`idem:broadcast:latest:${customerId}`).catch(() => {});
+    }
+    // Clean up client-supplied idempotency key
+    const latestClientIdemKey = await redisService.get(`idempotency:order:${customerId}:latest`).catch(() => null);
+    if (latestClientIdemKey) {
+      await redisService.del(`idempotency:${customerId}:${latestClientIdemKey}`).catch(() => {});
+      await redisService.del(`idempotency:order:${customerId}:latest`).catch(() => {});
     }
   }
 
@@ -1806,6 +1814,7 @@ class OrderService {
         clearTimeout(this.orderTimers.get(orderId)!);
         this.orderTimers.delete(orderId);
       }
+      await redisService.cancelTimer(this.TIMER_KEYS.ORDER_EXPIRY(orderId)).catch(() => {});
       await this.clearCustomerActiveBroadcast(customerId);
       logger.info(`Order ${orderId} fully filled! All ${orderTotalTrucks} trucks assigned.`);
     }
