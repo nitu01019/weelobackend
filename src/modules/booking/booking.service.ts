@@ -1212,6 +1212,35 @@ class BookingService {
       status: 'cancelled'
     });
 
+    // 7. Revert active assignments — release vehicles and notify drivers
+    try {
+      const activeAssignments = await prismaClient.assignment.findMany({
+        where: { bookingId, status: { in: ['pending', 'driver_accepted', 'driver_en_route'] as any } }
+      });
+      if (activeAssignments.length > 0) {
+        await prismaClient.assignment.updateMany({
+          where: { bookingId, status: { in: ['pending', 'driver_accepted', 'driver_en_route'] as any } },
+          data: { status: 'cancelled' as any }
+        });
+        for (const assignment of activeAssignments) {
+          if (assignment.vehicleId) {
+            await prismaClient.vehicle.update({
+              where: { id: assignment.vehicleId },
+              data: { status: 'available' as any, currentTripId: null, assignedDriverId: null }
+            }).catch(() => {});
+          }
+          if (assignment.driverId) {
+            emitToUser(assignment.driverId, 'trip_cancelled', {
+              bookingId, tripId: assignment.tripId, message: 'Trip cancelled by customer'
+            });
+          }
+        }
+        logger.info(`[CANCEL] Reverted ${activeAssignments.length} assignments, released vehicles`);
+      }
+    } catch (err: any) {
+      logger.warn(`[CANCEL] Failed to revert assignments (non-critical)`, { error: err.message });
+    }
+
     // Re-fetch to get the updated record
     const cancelledBooking = await db.getBookingById(bookingId);
     logger.info(`[CANCEL] Booking ${bookingId} cancelled, all broadcast state cleaned`);
