@@ -22,6 +22,7 @@
  * =============================================================================
  */
 
+import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { db, OrderRecord, TruckRequestRecord } from '../../shared/database/db';
 import { prismaClient } from '../../shared/database/prisma.service';
@@ -484,6 +485,46 @@ class OrderService {
       throw new Error('Request already in progress. Cancel it first.');
     }
 
+    // ========================================
+    // SERVER-GENERATED IDEMPOTENCY (double-tap / retry protection)
+    // ========================================
+    const roundCoord = (n: number) => Math.round(n * 1000) / 1000;
+    // Extract pickup/drop coords from routePoints or legacy fields
+    const idemPickup = request.routePoints?.[0] || request.pickup;
+    const idemDrop = request.routePoints?.[request.routePoints?.length ? request.routePoints.length - 1 : 0] || request.drop;
+    const truckTypesSorted = request.vehicleRequirements
+      .map(t => `${t.vehicleType}:${t.vehicleSubtype || ''}:${t.quantity}`)
+      .sort()
+      .join('|');
+    const idempotencyFingerprint = [
+      request.customerId,
+      truckTypesSorted,
+      roundCoord(idemPickup?.latitude || 0),
+      roundCoord(idemPickup?.longitude || 0),
+      roundCoord(idemDrop?.latitude || 0),
+      roundCoord(idemDrop?.longitude || 0)
+    ].join(':');
+    const idempotencyHash = crypto.createHash('sha256').update(idempotencyFingerprint).digest('hex').substring(0, 16);
+    const dedupeKey = `idem:broadcast:create:${request.customerId}:${idempotencyHash}`;
+
+    const existingDedupeId = await redisService.get(dedupeKey);
+    if (existingDedupeId) {
+      const existingDedupeOrder = await db.getOrderById(existingDedupeId);
+      if (existingDedupeOrder && !['cancelled', 'expired'].includes(existingDedupeOrder.status)) {
+        logger.info('Idempotent replay: returning existing order', { orderId: existingDedupeId, idempotencyHash });
+        const totalTrucks = request.vehicleRequirements.reduce((sum, req) => sum + req.quantity, 0);
+        const totalAmount = request.vehicleRequirements.reduce((sum, req) => sum + (req.quantity * req.pricePerTruck), 0);
+        return {
+          orderId: existingDedupeId,
+          totalTrucks,
+          totalAmount,
+          truckRequests: [],
+          expiresAt: existingDedupeOrder.expiresAt,
+          expiresIn: 0
+        };
+      }
+    }
+
     const orderId = uuidv4();
     const now = new Date();
     const expiresAt = new Date(now.getTime() + this.BROADCAST_TIMEOUT_MS).toISOString();
@@ -764,9 +805,13 @@ class OrderService {
       }
     }
 
+    // Store server-generated idempotency key
+    const orderTimeoutSeconds = Math.ceil(this.BROADCAST_TIMEOUT_MS / 1000);
+    await redisService.set(dedupeKey, orderId, orderTimeoutSeconds + 30);
+    await redisService.set(`idem:broadcast:latest:${request.customerId}`, dedupeKey, orderTimeoutSeconds + 30);
+
     // Set customer active broadcast key (one-per-customer enforcement)
-    const timeoutSeconds = Math.ceil(this.BROADCAST_TIMEOUT_MS / 1000);
-    await redisService.set(activeKey, orderId, timeoutSeconds + 60);
+    await redisService.set(activeKey, orderId, orderTimeoutSeconds + 60);
 
     // Return response
     return orderResponse;
@@ -1138,6 +1183,12 @@ class OrderService {
     await redisService.del(activeKey).catch((err: any) => {
       logger.warn('Failed to clear customer active broadcast key', { customerId, error: err.message });
     });
+    // Clean up server-generated idempotency key
+    const latestIdemKey = await redisService.get(`idem:broadcast:latest:${customerId}`).catch(() => null);
+    if (latestIdemKey) {
+      await redisService.del(latestIdemKey).catch(() => {});
+      await redisService.del(`idem:broadcast:latest:${customerId}`).catch(() => {});
+    }
   }
 
   private async setOrderExpiryTimer(orderId: string, timeoutMs: number): Promise<void> {

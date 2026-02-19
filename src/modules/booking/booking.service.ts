@@ -24,6 +24,7 @@
  * =============================================================================
  */
 
+import crypto from 'crypto';
 import { v4 as uuid } from 'uuid';
 import { db, BookingRecord } from '../../shared/database/db';
 import { prismaClient } from '../../shared/database/prisma.service';
@@ -285,6 +286,36 @@ class BookingService {
       throw new AppError(409, 'ORDER_ACTIVE_EXISTS', 'Request already in progress. Cancel it first.');
     }
 
+    // ========================================
+    // SERVER-GENERATED IDEMPOTENCY (double-tap / retry protection)
+    // ========================================
+    const roundCoord = (n: number) => Math.round(n * 1000) / 1000;
+    const idempotencyFingerprint = [
+      customerId,
+      data.vehicleType,
+      data.vehicleSubtype || '',
+      roundCoord(data.pickup.coordinates.latitude),
+      roundCoord(data.pickup.coordinates.longitude),
+      roundCoord(data.drop.coordinates.latitude),
+      roundCoord(data.drop.coordinates.longitude)
+    ].join(':');
+    const idempotencyHash = crypto.createHash('sha256').update(idempotencyFingerprint).digest('hex').substring(0, 16);
+    const dedupeKey = `idem:broadcast:create:${customerId}:${idempotencyHash}`;
+
+    const existingDedupeId = await redisService.get(dedupeKey);
+    if (existingDedupeId) {
+      const existingDedupeBooking = await db.getBookingById(existingDedupeId);
+      if (existingDedupeBooking && !['cancelled', 'expired'].includes(existingDedupeBooking.status)) {
+        logger.info('Idempotent replay: returning existing booking', { bookingId: existingDedupeId, idempotencyHash });
+        const matchingTransporters = await db.getTransportersWithVehicleType(data.vehicleType);
+        return {
+          ...existingDedupeBooking,
+          matchingTransportersCount: matchingTransporters.length,
+          timeoutSeconds: Math.floor(BOOKING_CONFIG.TIMEOUT_MS / 1000)
+        };
+      }
+    }
+
     // Get customer name
     const customer = await db.getUserById(customerId);
     const customerName = customer?.name || 'Customer';
@@ -505,9 +536,13 @@ class BookingService {
       logger.info(`🔒 Idempotency key stored for booking ${booking.id}`, { idempotencyKey });
     }
 
+    // Store server-generated idempotency key
+    const bookingTimeoutSeconds = Math.ceil(BOOKING_CONFIG.TIMEOUT_MS / 1000);
+    await redisService.set(dedupeKey, booking.id, bookingTimeoutSeconds + 30);
+    await redisService.set(`idem:broadcast:latest:${customerId}`, dedupeKey, bookingTimeoutSeconds + 30);
+
     // Set customer active broadcast key (one-per-customer enforcement)
-    const timeoutSeconds = Math.ceil(BOOKING_CONFIG.TIMEOUT_MS / 1000);
-    await redisService.set(activeKey, booking.id, timeoutSeconds + 60);
+    await redisService.set(activeKey, booking.id, bookingTimeoutSeconds + 60);
 
     return {
       ...booking,
@@ -699,6 +734,12 @@ class BookingService {
     await redisService.del(activeKey).catch((err: any) => {
       logger.warn('Failed to clear customer active broadcast key', { customerId, error: err.message });
     });
+    // Clean up server-generated idempotency key
+    const latestIdemKey = await redisService.get(`idem:broadcast:latest:${customerId}`).catch(() => null);
+    if (latestIdemKey) {
+      await redisService.del(latestIdemKey).catch(() => {});
+      await redisService.del(`idem:broadcast:latest:${customerId}`).catch(() => {});
+    }
   }
 
   private async clearBookingTimers(bookingId: string): Promise<void> {
