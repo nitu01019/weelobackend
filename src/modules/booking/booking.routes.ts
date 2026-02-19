@@ -76,24 +76,26 @@ router.get(
       if (completedIds.length > 0) {
         try {
           // Batch query: count rated assignments per booking (single DB call)
-          const ratedAssignments = await prismaClient.assignment.groupBy({
-            by: ['bookingId'],
-            where: {
-              bookingId: { in: completedIds },
-              status: 'completed',
-              customerRating: { not: null }
-            },
-            _count: { id: true }
-          });
-
-          const totalAssignments = await prismaClient.assignment.groupBy({
-            by: ['bookingId'],
-            where: {
-              bookingId: { in: completedIds },
-              status: 'completed'
-            },
-            _count: { id: true }
-          });
+          // Run both groupBy queries in parallel — they are independent
+          const [ratedAssignments, totalAssignments] = await Promise.all([
+            prismaClient.assignment.groupBy({
+              by: ['bookingId'],
+              where: {
+                bookingId: { in: completedIds },
+                status: 'completed',
+                customerRating: { not: null }
+              },
+              _count: { id: true }
+            }),
+            prismaClient.assignment.groupBy({
+              by: ['bookingId'],
+              where: {
+                bookingId: { in: completedIds },
+                status: 'completed'
+              },
+              _count: { id: true }
+            })
+          ]);
 
           const ratedMap = new Map(ratedAssignments.map(r => [r.bookingId, r._count.id]));
           const totalMap = new Map(totalAssignments.map(t => [t.bookingId, t._count.id]));
