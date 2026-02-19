@@ -675,23 +675,28 @@ class AssignmentService {
   async handleAssignmentTimeout(timerData: AssignmentTimerData): Promise<void> {
     const { assignmentId, driverId, driverName, transporterId, vehicleId, vehicleNumber, bookingId, tripId } = timerData;
 
-    // Fetch current assignment — skip if already responded
-    const assignment = await db.getAssignmentById(assignmentId);
-    if (!assignment) {
-      logger.warn(`Assignment ${assignmentId} not found for timeout handling`);
-      return;
-    }
-
-    // Skip if driver already accepted/declined/completed
-    if (assignment.status !== 'pending') {
-      logger.info(`Assignment ${assignmentId} already ${assignment.status}, skipping timeout`);
-      return;
-    }
-
     logger.info(`⏰ TIMEOUT: Assignment ${assignmentId} — driver ${driverName} didn't respond`);
 
-    // 1. Update status to driver_declined (timed out = effectively declined)
-    await db.updateAssignment(assignmentId, { status: 'driver_declined' });
+    // 1. Atomic status update with precondition — prevents race with concurrent accept/decline
+    // If driver accepted concurrently, this no-ops (count === 0) and we skip gracefully
+    const updated = await prismaClient.assignment.updateMany({
+      where: { id: assignmentId, status: 'pending' },
+      data: { status: 'driver_declined' }
+    });
+
+    if (updated.count === 0) {
+      // Driver already accepted/declined before timeout fired — skip
+      const assignment = await db.getAssignmentById(assignmentId);
+      logger.info(`Assignment ${assignmentId} already ${assignment?.status ?? 'gone'}, timeout no-op`);
+      return;
+    }
+
+    // Fetch assignment for notification data
+    const assignment = await db.getAssignmentById(assignmentId);
+    if (!assignment) {
+      logger.warn(`Assignment ${assignmentId} not found after timeout update`);
+      return;
+    }
 
     // 2. Release vehicle back to available
     if (vehicleId) {

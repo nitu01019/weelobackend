@@ -650,7 +650,6 @@ class AuthService {
    * Hash token to create a safe key for Redis storage
    */
   private hashToken(token: string): string {
-    const crypto = require('crypto');
     return crypto.createHash('sha256').update(token).digest('hex').substring(0, 32);
   }
 

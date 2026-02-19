@@ -1415,11 +1415,15 @@ class BookingService {
       const bookings = await db.getActiveBookingsForTransporter(transporterId);
       const now = new Date();
 
-      // Filter: only unexpired bookings
+      // Filter: only unexpired bookings created within last 30 minutes (prevents huge fan-out)
+      const thirtyMinsAgo = new Date(now.getTime() - 30 * 60 * 1000);
       const activeBookings = bookings.filter(b => {
         if (!b.expiresAt) return true; // No expiry = still active
-        return new Date(b.expiresAt) > now;
-      });
+        if (new Date(b.expiresAt) <= now) return false; // Already expired
+        // Only deliver recent bookings — old ones are unlikely to still need trucks
+        const createdAt = b.createdAt ? new Date(b.createdAt) : now;
+        return createdAt >= thirtyMinsAgo;
+      }).slice(0, 20); // Cap at 20 to prevent unbounded fan-out
 
       if (activeBookings.length === 0) {
         logger.info(`[RE-BROADCAST] Transporter ${transporterId} came online — 0 active bookings to deliver`);
