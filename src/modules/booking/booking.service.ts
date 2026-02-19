@@ -27,7 +27,8 @@
 import crypto from 'crypto';
 import { v4 as uuid } from 'uuid';
 import { db, BookingRecord } from '../../shared/database/db';
-import { prismaClient } from '../../shared/database/prisma.service';
+import { Prisma } from '@prisma/client';
+import { prismaClient, BookingStatus, AssignmentStatus, VehicleStatus } from '../../shared/database/prisma.service';
 import { AppError } from '../../shared/types/error.types';
 import { logger } from '../../shared/services/logger.service';
 import { emitToUser, emitToBooking, SocketEvent, isUserConnected } from '../../shared/services/socket.service';
@@ -147,8 +148,9 @@ async function processExpiredBookings(): Promise<void> {
     }
 
     try {
-      await bookingService.handleBookingTimeout(timer.data.bookingId, timer.data.customerId);
+      // Cancel timer FIRST to prevent re-processing if handleBookingTimeout throws
       await redisService.cancelTimer(timer.key);
+      await bookingService.handleBookingTimeout(timer.data.bookingId, timer.data.customerId);
     } catch (error: any) {
       logger.error('Failed to process expired booking', {
         bookingId: timer.data.bookingId,
@@ -187,8 +189,9 @@ async function processRadiusExpansionTimers(): Promise<void> {
     if (!lock.acquired) continue;
 
     try {
-      await bookingService.advanceRadiusStep(timer.data);
+      // Cancel timer FIRST to prevent re-processing if advanceRadiusStep throws
       await redisService.cancelTimer(timer.key);
+      await bookingService.advanceRadiusStep(timer.data);
     } catch (error: any) {
       logger.error('[RADIUS EXPANSION] Failed to advance step', {
         bookingId: timer.data.bookingId,
@@ -282,17 +285,6 @@ class BookingService {
     }
 
     try {
-    // DB authoritative check (covers Redis failure edge case)
-    const existingBooking = await prismaClient.booking.findFirst({
-      where: { customerId, status: { in: ['created', 'broadcasting', 'active', 'partially_filled'] as any } }
-    });
-    const existingOrder = await prismaClient.order.findFirst({
-      where: { customerId, status: { in: ['created', 'broadcasting', 'active', 'partially_filled'] as any } }
-    });
-    if (existingBooking || existingOrder) {
-      throw new AppError(409, 'ORDER_ACTIVE_EXISTS', 'Request already in progress. Cancel it first.');
-    }
-
     // ========================================
     // SERVER-GENERATED IDEMPOTENCY (double-tap / retry protection)
     // ========================================
@@ -375,41 +367,68 @@ class BookingService {
     logger.info(`║  Timeout: ${BOOKING_CONFIG.TIMEOUT_MS / 1000} seconds`);
     logger.info(`╚══════════════════════════════════════════════════════════════╝`);
 
-    // Create booking
-    const booking = await db.createBooking({
-      id: uuid(),
-      customerId,
-      customerName,
-      customerPhone,
-      pickup: {
-        latitude: data.pickup.coordinates.latitude,
-        longitude: data.pickup.coordinates.longitude,
-        address: data.pickup.address,
-        city: data.pickup.city,
-        state: data.pickup.state
-      },
-      drop: {
-        latitude: data.drop.coordinates.latitude,
-        longitude: data.drop.coordinates.longitude,
-        address: data.drop.address,
-        city: data.drop.city,
-        state: data.drop.state
-      },
-      vehicleType: data.vehicleType,
-      vehicleSubtype: data.vehicleSubtype,
-      trucksNeeded: data.trucksNeeded,
-      trucksFilled: 0,
-      distanceKm: data.distanceKm,
-      pricePerTruck: data.pricePerTruck,
-      totalAmount: data.pricePerTruck * data.trucksNeeded,
-      goodsType: data.goodsType,
-      weight: data.weight,
-      status: 'created',
-      stateChangedAt: new Date(),
-      notifiedTransporters: matchingTransporters,
-      scheduledAt: data.scheduledAt,
-      expiresAt
-    });
+    // ========================================
+    // SERIALIZABLE TRANSACTION: DB check + create (TOCTOU-safe)
+    // Prevents duplicate active bookings when Redis lock fails.
+    // PostgreSQL serializable isolation aborts one transaction on conflict.
+    // ========================================
+    const bookingId = uuid();
+    await prismaClient.$transaction(async (tx) => {
+      // DB authoritative check (covers Redis failure edge case)
+      const existingBooking = await tx.booking.findFirst({
+        where: { customerId, status: { in: [BookingStatus.created, BookingStatus.broadcasting, BookingStatus.active, BookingStatus.partially_filled] } }
+      });
+      const existingOrder = await tx.order.findFirst({
+        where: { customerId, status: { in: ['created', 'broadcasting', 'active', 'partially_filled'] } }
+      });
+      if (existingBooking || existingOrder) {
+        throw new AppError(409, 'ORDER_ACTIVE_EXISTS', 'Request already in progress. Cancel it first.');
+      }
+
+      // Create booking atomically with the check
+      await tx.booking.create({
+        data: {
+          id: bookingId,
+          customerId,
+          customerName,
+          customerPhone,
+          pickup: {
+            latitude: data.pickup.coordinates.latitude,
+            longitude: data.pickup.coordinates.longitude,
+            address: data.pickup.address,
+            city: data.pickup.city,
+            state: data.pickup.state
+          } as any,
+          drop: {
+            latitude: data.drop.coordinates.latitude,
+            longitude: data.drop.coordinates.longitude,
+            address: data.drop.address,
+            city: data.drop.city,
+            state: data.drop.state
+          } as any,
+          vehicleType: data.vehicleType,
+          vehicleSubtype: data.vehicleSubtype,
+          trucksNeeded: data.trucksNeeded,
+          trucksFilled: 0,
+          distanceKm: data.distanceKm,
+          pricePerTruck: data.pricePerTruck,
+          totalAmount: data.pricePerTruck * data.trucksNeeded,
+          goodsType: data.goodsType,
+          weight: data.weight,
+          status: BookingStatus.created,
+          stateChangedAt: new Date(),
+          notifiedTransporters: matchingTransporters,
+          scheduledAt: data.scheduledAt,
+          expiresAt
+        }
+      });
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+
+    // Fetch as BookingRecord (converts JSON fields + dates for downstream use)
+    const booking = await db.getBookingById(bookingId);
+    if (!booking) {
+      throw new AppError(500, 'BOOKING_CREATE_FAILED', 'Failed to create booking');
+    }
 
     // Emit lifecycle state: created
     emitToUser(customerId, 'broadcast_state_changed', {
@@ -476,11 +495,21 @@ class BookingService {
     // Store in Redis SET so later steps only broadcast to NEW transporters
     // ========================================
     if (matchingTransporters.length > 0) {
-      await redisService.sAdd(RADIUS_KEYS.NOTIFIED_SET(booking.id), ...matchingTransporters).catch((e: any) => {
-        logger.warn('[RADIUS] Failed to track notified transporters', { bookingId: booking.id, error: e.message });
-      });
+      const notifiedSetKey = RADIUS_KEYS.NOTIFIED_SET(booking.id);
+      const ttlSeconds = Math.ceil(BOOKING_CONFIG.TIMEOUT_MS / 1000) + 120;
+      try {
+        await redisService.sAdd(notifiedSetKey, ...matchingTransporters);
+      } catch (e: any) {
+        // Retry once — incomplete notified set causes duplicate broadcasts on radius expansion
+        logger.warn('[RADIUS] sAdd failed, retrying once', { bookingId: booking.id, error: e.message });
+        await redisService.sAdd(notifiedSetKey, ...matchingTransporters).catch((retryErr: any) => {
+          logger.error('[RADIUS] Failed to track notified transporters after retry — radius expansion may send duplicate broadcasts', {
+            bookingId: booking.id, error: retryErr.message, transporterCount: matchingTransporters.length
+          });
+        });
+      }
       // Set TTL on the notified set (same as booking timeout + buffer)
-      await redisService.expire(RADIUS_KEYS.NOTIFIED_SET(booking.id), Math.ceil(BOOKING_CONFIG.TIMEOUT_MS / 1000) + 120).catch(() => { });
+      await redisService.expire(notifiedSetKey, ttlSeconds).catch(() => {});
     }
 
     // ========================================
@@ -1124,10 +1153,10 @@ class BookingService {
       where: {
         id: bookingId,
         customerId,
-        status: { in: ['created', 'broadcasting', 'active', 'partially_filled'] as any }
+        status: { in: [BookingStatus.created, BookingStatus.broadcasting, BookingStatus.active, BookingStatus.partially_filled] }
       },
       data: {
-        status: 'cancelled' as any,
+        status: BookingStatus.cancelled,
         stateChangedAt: new Date()
       }
     });
@@ -1217,18 +1246,18 @@ class BookingService {
     // 7. Revert active assignments — release vehicles and notify drivers
     try {
       const activeAssignments = await prismaClient.assignment.findMany({
-        where: { bookingId, status: { in: ['pending', 'driver_accepted', 'driver_en_route'] as any } }
+        where: { bookingId, status: { in: [AssignmentStatus.pending, AssignmentStatus.driver_accepted, AssignmentStatus.en_route_pickup] } }
       });
       if (activeAssignments.length > 0) {
         await prismaClient.assignment.updateMany({
-          where: { bookingId, status: { in: ['pending', 'driver_accepted', 'driver_en_route'] as any } },
-          data: { status: 'cancelled' as any }
+          where: { bookingId, status: { in: [AssignmentStatus.pending, AssignmentStatus.driver_accepted, AssignmentStatus.en_route_pickup] } },
+          data: { status: AssignmentStatus.cancelled }
         });
         for (const assignment of activeAssignments) {
           if (assignment.vehicleId) {
             await prismaClient.vehicle.update({
               where: { id: assignment.vehicleId },
-              data: { status: 'available' as any, currentTripId: null, assignedDriverId: null }
+              data: { status: VehicleStatus.available, currentTripId: null, assignedDriverId: null }
             }).catch(() => {});
           }
           if (assignment.driverId) {

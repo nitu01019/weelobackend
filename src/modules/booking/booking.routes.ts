@@ -80,6 +80,7 @@ router.get(
             by: ['bookingId'],
             where: {
               bookingId: { in: completedIds },
+              status: 'completed',
               customerRating: { not: null }
             },
             _count: { id: true }
