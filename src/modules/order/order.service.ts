@@ -457,6 +457,33 @@ class OrderService {
       }
     }
 
+    // ========================================
+    // ONE-ACTIVE-BROADCAST-PER-CUSTOMER GUARD
+    // ========================================
+    const activeKey = `customer:active-broadcast:${request.customerId}`;
+    const existingBroadcastId = await redisService.get(activeKey);
+    if (existingBroadcastId) {
+      throw new Error('Request already in progress. Cancel it first.');
+    }
+
+    const lockKey = `customer-broadcast-create:${request.customerId}`;
+    const lock = await redisService.acquireLock(lockKey, request.customerId, 10);
+    if (!lock.acquired) {
+      throw new Error('Request already in progress. Cancel it first.');
+    }
+
+    try {
+    // DB authoritative check (covers Redis failure edge case)
+    const existingBooking = await prismaClient.booking.findFirst({
+      where: { customerId: request.customerId, status: { in: ['created', 'broadcasting', 'active', 'partially_filled'] as any } }
+    });
+    const existingOrder = await prismaClient.order.findFirst({
+      where: { customerId: request.customerId, status: { in: ['created', 'broadcasting', 'active', 'partially_filled'] as any } }
+    });
+    if (existingBooking || existingOrder) {
+      throw new Error('Request already in progress. Cancel it first.');
+    }
+
     const orderId = uuidv4();
     const now = new Date();
     const expiresAt = new Date(now.getTime() + this.BROADCAST_TIMEOUT_MS).toISOString();
@@ -737,8 +764,15 @@ class OrderService {
       }
     }
 
+    // Set customer active broadcast key (one-per-customer enforcement)
+    const timeoutSeconds = Math.ceil(this.BROADCAST_TIMEOUT_MS / 1000);
+    await redisService.set(activeKey, orderId, timeoutSeconds + 60);
+
     // Return response
     return orderResponse;
+    } finally {
+      await redisService.releaseLock(lockKey, request.customerId);
+    }
   }
 
   /**
@@ -1099,6 +1133,13 @@ class OrderService {
    * - Survives server restarts
    * - No duplicate processing (Redis locks)
    */
+  private async clearCustomerActiveBroadcast(customerId: string): Promise<void> {
+    const activeKey = `customer:active-broadcast:${customerId}`;
+    await redisService.del(activeKey).catch((err: any) => {
+      logger.warn('Failed to clear customer active broadcast key', { customerId, error: err.message });
+    });
+  }
+
   private async setOrderExpiryTimer(orderId: string, timeoutMs: number): Promise<void> {
     // Cancel any existing timer
     await redisService.cancelTimer(this.TIMER_KEYS.ORDER_EXPIRY(orderId));
@@ -1215,6 +1256,9 @@ class OrderService {
 
     // Cleanup timer from Redis
     await redisService.cancelTimer(this.TIMER_KEYS.ORDER_EXPIRY(orderId));
+
+    // Clear customer active broadcast key (one-per-customer enforcement)
+    await this.clearCustomerActiveBroadcast(order.customerId);
   }
 
   /**
@@ -1293,6 +1337,9 @@ class OrderService {
     // Clear expiry timer from Redis
     await redisService.cancelTimer(this.TIMER_KEYS.ORDER_EXPIRY(orderId));
     logger.info(`   ⏱️ Cleared expiry timer for ${orderId}`);
+
+    // Clear customer active broadcast key (one-per-customer enforcement)
+    await this.clearCustomerActiveBroadcast(customerId);
 
     // Broadcast cancellation to all notified transporters
     const cancellationData = {
@@ -1703,12 +1750,13 @@ class OrderService {
       }
     }).catch(err => logger.warn(`FCM to customer failed: ${err.message}`));
 
-    // If fully filled, cancel expiry timer
+    // If fully filled, cancel expiry timer and clear active key
     if (newStatus === 'fully_filled') {
       if (this.orderTimers.has(orderId)) {
         clearTimeout(this.orderTimers.get(orderId)!);
         this.orderTimers.delete(orderId);
       }
+      await this.clearCustomerActiveBroadcast(customerId);
       logger.info(`Order ${orderId} fully filled! All ${orderTotalTrucks} trucks assigned.`);
     }
 

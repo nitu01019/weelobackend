@@ -258,6 +258,33 @@ class BookingService {
       }
     }
 
+    // ========================================
+    // ONE-ACTIVE-BROADCAST-PER-CUSTOMER GUARD
+    // ========================================
+    const activeKey = `customer:active-broadcast:${customerId}`;
+    const existingBroadcastId = await redisService.get(activeKey);
+    if (existingBroadcastId) {
+      throw new AppError(409, 'ORDER_ACTIVE_EXISTS', 'Request already in progress. Cancel it first.');
+    }
+
+    const lockKey = `customer-broadcast-create:${customerId}`;
+    const lock = await redisService.acquireLock(lockKey, customerId, 10);
+    if (!lock.acquired) {
+      throw new AppError(409, 'ORDER_ACTIVE_EXISTS', 'Request already in progress. Cancel it first.');
+    }
+
+    try {
+    // DB authoritative check (covers Redis failure edge case)
+    const existingBooking = await prismaClient.booking.findFirst({
+      where: { customerId, status: { in: ['created', 'broadcasting', 'active', 'partially_filled'] as any } }
+    });
+    const existingOrder = await prismaClient.order.findFirst({
+      where: { customerId, status: { in: ['created', 'broadcasting', 'active', 'partially_filled'] as any } }
+    });
+    if (existingBooking || existingOrder) {
+      throw new AppError(409, 'ORDER_ACTIVE_EXISTS', 'Request already in progress. Cancel it first.');
+    }
+
     // Get customer name
     const customer = await db.getUserById(customerId);
     const customerName = customer?.name || 'Customer';
@@ -478,11 +505,18 @@ class BookingService {
       logger.info(`🔒 Idempotency key stored for booking ${booking.id}`, { idempotencyKey });
     }
 
+    // Set customer active broadcast key (one-per-customer enforcement)
+    const timeoutSeconds = Math.ceil(BOOKING_CONFIG.TIMEOUT_MS / 1000);
+    await redisService.set(activeKey, booking.id, timeoutSeconds + 60);
+
     return {
       ...booking,
       matchingTransportersCount: matchingTransporters.length,
       timeoutSeconds: BOOKING_CONFIG.TIMEOUT_MS / 1000
     };
+    } finally {
+      await redisService.releaseLock(lockKey, customerId);
+    }
   }
 
   /**
@@ -576,6 +610,9 @@ class BookingService {
     // Clear timers
     this.clearBookingTimers(bookingId);
 
+    // Clear customer active broadcast key (one-per-customer enforcement)
+    await this.clearCustomerActiveBroadcast(customerId);
+
     // Notify all transporters that this broadcast is no longer available
     // WebSocket (for apps in foreground)
     for (const transporterId of booking.notifiedTransporters) {
@@ -657,6 +694,13 @@ class BookingService {
    * Clear all timers for a booking (Redis-based)
    * Also cleans up progressive radius expansion keys
    */
+  private async clearCustomerActiveBroadcast(customerId: string): Promise<void> {
+    const activeKey = `customer:active-broadcast:${customerId}`;
+    await redisService.del(activeKey).catch((err: any) => {
+      logger.warn('Failed to clear customer active broadcast key', { customerId, error: err.message });
+    });
+  }
+
   private async clearBookingTimers(bookingId: string): Promise<void> {
     await Promise.all([
       redisService.cancelTimer(TIMER_KEYS.BOOKING_EXPIRY(bookingId)),
@@ -1086,6 +1130,9 @@ class BookingService {
     // Clear all timers INCLUDING radius expansion keys (Req 3 + 5)
     await this.clearBookingTimers(bookingId);
 
+    // Clear customer active broadcast key (one-per-customer enforcement)
+    await this.clearCustomerActiveBroadcast(customerId);
+
     // ========================================
     // NOTIFY ALL NOTIFIED TRANSPORTERS (Requirement 3 & 5)
     // Emit BOOKING_EXPIRED to each transporter individually
@@ -1204,9 +1251,10 @@ class BookingService {
       trucksNeeded: booking.trucksNeeded
     });
 
-    // If fully filled, cancel timeout and notify
+    // If fully filled, cancel timeout, clear active key, and notify
     if (newStatus === 'fully_filled') {
       await this.cancelBookingTimeout(bookingId);
+      await this.clearCustomerActiveBroadcast(booking.customerId);
 
       // Send fully filled event to customer
       emitToUser(booking.customerId, SocketEvent.BOOKING_FULLY_FILLED, {
