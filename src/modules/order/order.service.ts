@@ -24,6 +24,7 @@
 
 import { v4 as uuidv4 } from 'uuid';
 import { db, OrderRecord, TruckRequestRecord } from '../../shared/database/db';
+import { prismaClient } from '../../shared/database/prisma.service';
 import { logger } from '../../shared/services/logger.service';
 import { emitToUser } from '../../shared/services/socket.service';
 import { sendPushNotification } from '../../shared/services/fcm.service';
@@ -1333,193 +1334,364 @@ class OrderService {
     tripId?: string;
     message: string;
   }> {
-    const truckRequest = await db.getTruckRequestById(truckRequestId);
+    const MAX_RETRIES = 3;
+    let txResult: {
+      assignmentId: string;
+      tripId: string;
+      newTrucksFilled: number;
+      newStatus: OrderRecord['status'];
+      orderId: string;
+      customerId: string;
+      orderPickup: OrderRecord['pickup'];
+      orderDrop: OrderRecord['drop'];
+      orderDistanceKm: number;
+      orderCustomerName: string;
+      orderCustomerPhone: string;
+      orderTotalTrucks: number;
+      truckRequestPricePerTruck: number;
+      vehicleNumber: string;
+      vehicleType: string;
+      vehicleSubtype: string;
+      driverName: string;
+      driverPhone: string;
+      transporterName: string;
+      transporterPhone: string;
+      now: string;
+    } | null = null;
 
-    if (!truckRequest) {
-      return { success: false, message: 'Truck request not found' };
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        txResult = await prismaClient.$transaction(async (tx) => {
+          // ----- Read all data inside the transaction -----
+          const truckRequest = await tx.truckRequest.findUnique({
+            where: { id: truckRequestId }
+          });
+
+          if (!truckRequest) {
+            throw new Error('EARLY_RETURN:Truck request not found');
+          }
+
+          if (truckRequest.status !== 'searching') {
+            throw new Error(`EARLY_RETURN:Request already ${truckRequest.status}`);
+          }
+
+          const order = await tx.order.findUnique({
+            where: { id: truckRequest.orderId }
+          });
+          if (!order) {
+            throw new Error('EARLY_RETURN:Order not found');
+          }
+
+          const transporter = await tx.user.findUnique({
+            where: { id: transporterId }
+          });
+
+          const vehicle = await tx.vehicle.findUnique({
+            where: { id: vehicleId }
+          });
+          if (!vehicle) {
+            throw new Error('EARLY_RETURN:Vehicle not found');
+          }
+
+          const driver = await tx.user.findUnique({
+            where: { id: driverId }
+          });
+          if (!driver) {
+            throw new Error('EARLY_RETURN:Driver not found');
+          }
+
+          // Verify vehicle type matches
+          if (vehicle.vehicleType !== truckRequest.vehicleType) {
+            throw new Error(
+              `EARLY_RETURN:Vehicle type mismatch. Request requires ${truckRequest.vehicleType}, vehicle is ${vehicle.vehicleType}`
+            );
+          }
+
+          // ----- Optimistic lock: update truck request only if still 'searching' -----
+          const truckRequestUpdate = await tx.truckRequest.updateMany({
+            where: { id: truckRequestId, status: 'searching' },
+            data: {
+              status: 'assigned',
+              assignedTransporterId: transporterId,
+              assignedTransporterName: transporter?.name || transporter?.businessName || '',
+              assignedVehicleId: vehicleId,
+              assignedVehicleNumber: vehicle.vehicleNumber,
+              assignedDriverId: driverId,
+              assignedDriverName: driver.name,
+              assignedDriverPhone: driver.phone,
+              tripId: uuidv4(),
+              assignedAt: new Date().toISOString()
+            }
+          });
+
+          if (truckRequestUpdate.count === 0) {
+            throw new Error('EARLY_RETURN:This request is no longer available');
+          }
+
+          // Fetch the updated truck request to get generated tripId
+          const updatedTruckRequest = await tx.truckRequest.findUnique({
+            where: { id: truckRequestId }
+          });
+          const tripId = updatedTruckRequest!.tripId!;
+          const assignmentId = uuidv4();
+          const now = new Date().toISOString();
+
+          // ----- Create assignment record inside transaction -----
+          await tx.assignment.create({
+            data: {
+              id: assignmentId,
+              bookingId: truckRequest.orderId, // Legacy field
+              truckRequestId,
+              orderId: truckRequest.orderId,
+              transporterId,
+              transporterName: transporter?.name || '',
+              vehicleId,
+              vehicleNumber: vehicle.vehicleNumber,
+              vehicleType: vehicle.vehicleType,
+              vehicleSubtype: vehicle.vehicleSubtype,
+              driverId,
+              driverName: driver.name,
+              driverPhone: driver.phone || '',
+              tripId,
+              status: 'pending',
+              assignedAt: now
+            }
+          });
+
+          // ----- Optimistic lock: update order progress only if trucksFilled hasn't changed -----
+          const orderUpdate = await tx.order.updateMany({
+            where: { id: order.id, trucksFilled: order.trucksFilled },
+            data: {
+              trucksFilled: { increment: 1 }
+            }
+          });
+
+          if (orderUpdate.count === 0) {
+            // Another concurrent request incremented trucksFilled first; retry
+            throw new Error('RETRY:Order state changed concurrently');
+          }
+
+          const newTrucksFilled = order.trucksFilled + 1;
+          const newStatus: OrderRecord['status'] = newTrucksFilled >= order.totalTrucks
+            ? 'fully_filled'
+            : 'partially_filled';
+
+          await tx.order.update({
+            where: { id: order.id },
+            data: { status: newStatus as any }
+          });
+
+          // ----- Update vehicle status inside transaction -----
+          await tx.vehicle.update({
+            where: { id: vehicleId },
+            data: {
+              status: 'in_transit',
+              currentTripId: tripId,
+              assignedDriverId: driverId
+            }
+          });
+
+          // Parse JSON fields for notification use outside the transaction
+          const pickup = typeof order.pickup === 'string'
+            ? JSON.parse(order.pickup as string)
+            : order.pickup;
+          const drop = typeof order.drop === 'string'
+            ? JSON.parse(order.drop as string)
+            : order.drop;
+
+          return {
+            assignmentId,
+            tripId,
+            newTrucksFilled,
+            newStatus,
+            orderId: order.id,
+            customerId: order.customerId,
+            orderPickup: pickup as OrderRecord['pickup'],
+            orderDrop: drop as OrderRecord['drop'],
+            orderDistanceKm: order.distanceKm,
+            orderCustomerName: order.customerName,
+            orderCustomerPhone: order.customerPhone,
+            orderTotalTrucks: order.totalTrucks,
+            truckRequestPricePerTruck: truckRequest.pricePerTruck,
+            vehicleNumber: vehicle.vehicleNumber,
+            vehicleType: vehicle.vehicleType,
+            vehicleSubtype: vehicle.vehicleSubtype,
+            driverName: driver.name,
+            driverPhone: driver.phone || '',
+            transporterName: transporter?.name || transporter?.businessName || '',
+            transporterPhone: transporter?.phone || '',
+            now
+          };
+        }, { isolationLevel: 'Serializable' as any });
+
+        // Transaction succeeded, break out of retry loop
+        break;
+      } catch (error: any) {
+        // Handle EARLY_RETURN errors (validation failures — no retry)
+        if (error?.message?.startsWith('EARLY_RETURN:')) {
+          return {
+            success: false,
+            message: error.message.replace('EARLY_RETURN:', '')
+          };
+        }
+
+        // Handle retryable serialization conflicts (P2034 / 40001)
+        const isRetryableContention =
+          error?.code === 'P2034' ||
+          error?.code === '40001' ||
+          error?.message?.startsWith('RETRY:');
+
+        if (!isRetryableContention || attempt >= MAX_RETRIES) {
+          logger.error(`acceptTruckRequest failed after ${attempt} attempt(s)`, {
+            truckRequestId,
+            vehicleId,
+            driverId,
+            error: error.message
+          });
+          throw error;
+        }
+
+        logger.warn('[OrderAccept] Contention retry', {
+          truckRequestId,
+          vehicleId,
+          driverId,
+          attempt,
+          maxAttempts: MAX_RETRIES,
+          code: error.code || 'RETRY'
+        });
+      }
     }
 
-    if (truckRequest.status !== 'searching') {
-      return { success: false, message: `Request already ${truckRequest.status}` };
-    }
-
-    const order = await db.getOrderById(truckRequest.orderId);
-    if (!order) {
-      return { success: false, message: 'Order not found' };
-    }
-
-    // Get details
-    const transporter = await db.getUserById(transporterId);
-    const vehicle = await db.getVehicleById(vehicleId);
-    const driver = await db.getUserById(driverId);
-
-    if (!vehicle) {
-      return { success: false, message: 'Vehicle not found' };
-    }
-
-    if (!driver) {
-      return { success: false, message: 'Driver not found' };
-    }
-
-    // Verify vehicle type matches
-    if (vehicle.vehicleType !== truckRequest.vehicleType) {
+    if (!txResult) {
       return {
         success: false,
-        message: `Vehicle type mismatch. Request requires ${truckRequest.vehicleType}, vehicle is ${vehicle.vehicleType}`
+        message: 'Unable to finalize assignment after retries'
       };
     }
 
-    const assignmentId = uuidv4();
-    const tripId = uuidv4();
-    const now = new Date().toISOString();
+    // =====================================================================
+    // All notifications OUTSIDE the transaction (side-effects are not
+    // rolled back on serialization retry, so they must happen after commit)
+    // =====================================================================
 
-    // Update truck request
-    await db.updateTruckRequest(truckRequestId, {
-      status: 'assigned',
-      assignedTransporterId: transporterId,
-      assignedTransporterName: transporter?.name || transporter?.businessName || '',
-      assignedVehicleId: vehicleId,
-      assignedVehicleNumber: vehicle.vehicleNumber,
-      assignedDriverId: driverId,
-      assignedDriverName: driver.name,
-      assignedDriverPhone: driver.phone,
+    const {
+      assignmentId,
       tripId,
-      assignedAt: now
-    });
+      newTrucksFilled,
+      newStatus,
+      orderId,
+      customerId,
+      orderPickup,
+      orderDrop,
+      orderDistanceKm,
+      orderCustomerName,
+      orderCustomerPhone,
+      orderTotalTrucks,
+      truckRequestPricePerTruck,
+      vehicleNumber,
+      vehicleType,
+      vehicleSubtype,
+      driverName,
+      driverPhone,
+      transporterName,
+      transporterPhone,
+      now
+    } = txResult;
 
-    // Create assignment record
-    await db.createAssignment({
-      id: assignmentId,
-      bookingId: truckRequest.orderId, // Legacy field
-      truckRequestId,
-      orderId: truckRequest.orderId,
-      transporterId,
-      transporterName: transporter?.name || '',
-      vehicleId,
-      vehicleNumber: vehicle.vehicleNumber,
-      vehicleType: vehicle.vehicleType,
-      vehicleSubtype: vehicle.vehicleSubtype,
-      driverId,
-      driverName: driver.name,
-      driverPhone: driver.phone,
-      tripId,
-      status: 'pending',
-      assignedAt: now
-    });
-
-    // Update order progress
-    const newTrucksFilled = order.trucksFilled + 1;
-    let newStatus: OrderRecord['status'] = 'partially_filled';
-    if (newTrucksFilled >= order.totalTrucks) {
-      newStatus = 'fully_filled';
-    }
-
-    await db.updateOrder(order.id, {
-      trucksFilled: newTrucksFilled,
-      status: newStatus
-    });
-
-    // Update vehicle status
-    await db.updateVehicle(vehicleId, {
-      status: 'in_transit',
-      currentTripId: tripId,
-      assignedDriverId: driverId
-    });
-
-    logger.info(`✅ Truck request ${truckRequestId} accepted`);
-    logger.info(`   Vehicle: ${vehicle.vehicleNumber} (${vehicle.vehicleType})`);
-    logger.info(`   Driver: ${driver.name} (${driver.phone})`);
-    logger.info(`   Order progress: ${newTrucksFilled}/${order.totalTrucks}`);
+    logger.info(`Truck request ${truckRequestId} accepted`);
+    logger.info(`   Vehicle: ${vehicleNumber} (${vehicleType})`);
+    logger.info(`   Driver: ${driverName} (${driverPhone})`);
+    logger.info(`   Order progress: ${newTrucksFilled}/${orderTotalTrucks}`);
 
     // ============== NOTIFY DRIVER ==============
     const driverNotification = {
       type: 'trip_assigned',
       assignmentId,
       tripId,
-      orderId: order.id,
+      orderId,
       truckRequestId,
-      pickup: order.pickup,
-      drop: order.drop,
-      vehicleNumber: vehicle.vehicleNumber,
-      farePerTruck: truckRequest.pricePerTruck,
-      distanceKm: order.distanceKm,
-      customerName: order.customerName,
-      customerPhone: order.customerPhone,
+      pickup: orderPickup,
+      drop: orderDrop,
+      vehicleNumber,
+      farePerTruck: truckRequestPricePerTruck,
+      distanceKm: orderDistanceKm,
+      customerName: orderCustomerName,
+      customerPhone: orderCustomerPhone,
       assignedAt: now,
-      message: `New trip assigned! ${order.pickup.address} → ${order.drop.address}`
+      message: `New trip assigned! ${orderPickup.address} → ${orderDrop.address}`
     };
 
     emitToUser(driverId, 'trip_assigned', driverNotification);
-    logger.info(`📢 Notified driver ${driver.name} about trip assignment`);
+    logger.info(`Notified driver ${driverName} about trip assignment`);
 
     // Push notification to driver
     sendPushNotification(driverId, {
-      title: '🚛 New Trip Assigned!',
-      body: `${order.pickup.city || order.pickup.address} → ${order.drop.city || order.drop.address}`,
+      title: 'New Trip Assigned!',
+      body: `${orderPickup.city || orderPickup.address} → ${orderDrop.city || orderDrop.address}`,
       data: {
         type: 'trip_assigned',
         tripId,
         assignmentId,
-        orderId: order.id
+        orderId
       }
     }).catch(err => logger.warn(`FCM to driver failed: ${err.message}`));
 
     // ============== NOTIFY CUSTOMER ==============
     const customerNotification = {
       type: 'truck_confirmed',
-      orderId: order.id,
+      orderId,
       truckRequestId,
       assignmentId,
       truckNumber: newTrucksFilled,
-      totalTrucks: order.totalTrucks,
+      totalTrucks: orderTotalTrucks,
       trucksConfirmed: newTrucksFilled,
-      remainingTrucks: order.totalTrucks - newTrucksFilled,
-      isFullyFilled: newTrucksFilled >= order.totalTrucks,
+      remainingTrucks: orderTotalTrucks - newTrucksFilled,
+      isFullyFilled: newTrucksFilled >= orderTotalTrucks,
       driver: {
-        name: driver.name,
-        phone: driver.phone
+        name: driverName,
+        phone: driverPhone
       },
       vehicle: {
-        number: vehicle.vehicleNumber,
-        type: vehicle.vehicleType,
-        subtype: vehicle.vehicleSubtype
+        number: vehicleNumber,
+        type: vehicleType,
+        subtype: vehicleSubtype
       },
       transporter: {
-        name: transporter?.name || transporter?.businessName || '',
-        phone: transporter?.phone || ''
+        name: transporterName,
+        phone: transporterPhone
       },
-      message: `Truck ${newTrucksFilled}/${order.totalTrucks} confirmed!`
+      message: `Truck ${newTrucksFilled}/${orderTotalTrucks} confirmed!`
     };
 
-    emitToUser(order.customerId, 'truck_confirmed', customerNotification);
-    logger.info(`📢 Notified customer - ${newTrucksFilled}/${order.totalTrucks} trucks confirmed`);
+    emitToUser(customerId, 'truck_confirmed', customerNotification);
+    logger.info(`Notified customer - ${newTrucksFilled}/${orderTotalTrucks} trucks confirmed`);
 
     // Push notification to customer
-    sendPushNotification(order.customerId, {
-      title: `🚛 Truck ${newTrucksFilled}/${order.totalTrucks} Confirmed!`,
-      body: `${vehicle.vehicleNumber} (${driver.name}) assigned`,
+    sendPushNotification(customerId, {
+      title: `Truck ${newTrucksFilled}/${orderTotalTrucks} Confirmed!`,
+      body: `${vehicleNumber} (${driverName}) assigned`,
       data: {
         type: 'truck_confirmed',
-        orderId: order.id,
+        orderId,
         trucksConfirmed: newTrucksFilled,
-        totalTrucks: order.totalTrucks
+        totalTrucks: orderTotalTrucks
       }
     }).catch(err => logger.warn(`FCM to customer failed: ${err.message}`));
 
     // If fully filled, cancel expiry timer
     if (newStatus === 'fully_filled') {
-      if (this.orderTimers.has(order.id)) {
-        clearTimeout(this.orderTimers.get(order.id)!);
-        this.orderTimers.delete(order.id);
+      if (this.orderTimers.has(orderId)) {
+        clearTimeout(this.orderTimers.get(orderId)!);
+        this.orderTimers.delete(orderId);
       }
-      logger.info(`🎉 Order ${order.id} fully filled! All ${order.totalTrucks} trucks assigned.`);
+      logger.info(`Order ${orderId} fully filled! All ${orderTotalTrucks} trucks assigned.`);
     }
 
     return {
       success: true,
       assignmentId,
       tripId,
-      message: `Successfully assigned. ${newTrucksFilled}/${order.totalTrucks} trucks filled.`
+      message: `Successfully assigned. ${newTrucksFilled}/${orderTotalTrucks} trucks filled.`
     };
   }
 
