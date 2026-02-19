@@ -12,6 +12,14 @@
 import { PrismaClient, UserRole, VehicleStatus, BookingStatus, OrderStatus, TruckRequestStatus, AssignmentStatus } from '@prisma/client';
 import { logger } from '../services/logger.service';
 
+// =============================================================================
+// PAGINATION SAFETY — Prevents unbounded queries from exhausting memory
+// =============================================================================
+// All list queries use this as a default limit when no explicit limit is provided.
+// Callers can override by passing their own limit, but it's capped at MAX_PAGE_SIZE.
+const DEFAULT_PAGE_SIZE = 50;
+const MAX_PAGE_SIZE = 500;
+
 // Re-export types for compatibility
 export { UserRole, VehicleStatus, BookingStatus, OrderStatus, TruckRequestStatus, AssignmentStatus };
 
@@ -209,16 +217,79 @@ export interface TrackingRecord {
   lastUpdated: string;
 }
 
+// =============================================================================
+// CONNECTION POOL CONFIGURATION
+// =============================================================================
+// 
+// SCALABILITY: Prisma defaults to 2-5 connections — too low for production
+// with millions of concurrent users. We configure optimal pool size.
+// 
+// EASY UNDERSTANDING:
+// - connection_limit = max simultaneous DB connections per ECS instance
+// - pool_timeout = seconds to wait for a free connection before erroring
+// - Configurable via env vars (DB_CONNECTION_LIMIT, DB_POOL_TIMEOUT)
+// 
+// MODULARITY: Pool config is centralized here, not scattered across services
+// 
+// FORMULA: For N ECS instances, total connections = N × connection_limit
+// RDS default max_connections ≈ 100-400 depending on instance size
+// With 4 ECS instances × 20 = 80 connections (safe under RDS limits)
+// =============================================================================
+
+const DB_POOL_CONFIG = {
+  connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT || '20', 10),
+  poolTimeout: parseInt(process.env.DB_POOL_TIMEOUT || '10', 10),
+};
+
 // Prisma client singleton
 let prisma: PrismaClient;
 
 function getPrismaClient(): PrismaClient {
   if (!prisma) {
+    // Build pooled DATABASE_URL with connection limits
+    const databaseUrl = process.env.DATABASE_URL || '';
+    const separator = databaseUrl.includes('?') ? '&' : '?';
+    const pooledUrl = `${databaseUrl}${separator}connection_limit=${DB_POOL_CONFIG.connectionLimit}&pool_timeout=${DB_POOL_CONFIG.poolTimeout}`;
+
     prisma = new PrismaClient({
       log: process.env.NODE_ENV === 'development' 
         ? ['query', 'error', 'warn'] 
         : ['error', 'warn'],
+      datasources: {
+        db: {
+          url: pooledUrl,
+        },
+      },
     });
+
+    // =========================================================================
+    // SLOW QUERY LOGGING — Detect performance bottlenecks in production
+    // =========================================================================
+    // Logs any query taking > SLOW_QUERY_THRESHOLD_MS.
+    // Uses Prisma $use middleware (runs on every query, ~0.01ms overhead).
+    // Threshold configurable via env var (default 200ms — same as pg_stat_statements).
+    const SLOW_QUERY_THRESHOLD_MS = parseInt(process.env.SLOW_QUERY_THRESHOLD_MS || '200', 10);
+
+    prisma.$use(async (params, next) => {
+      const start = Date.now();
+      const result = await next(params);
+      const durationMs = Date.now() - start;
+
+      if (durationMs > SLOW_QUERY_THRESHOLD_MS) {
+        logger.warn(`🐢 [SlowQuery] ${params.model}.${params.action} took ${durationMs}ms (threshold: ${SLOW_QUERY_THRESHOLD_MS}ms)`, {
+          model: params.model,
+          action: params.action,
+          durationMs,
+          // Don't log args in production — may contain PII
+          ...(process.env.NODE_ENV === 'development' && { args: JSON.stringify(params.args).substring(0, 200) }),
+        });
+      }
+
+      return result;
+    });
+
+    logger.info(`🗄️ Prisma connection pool configured: limit=${DB_POOL_CONFIG.connectionLimit}, timeout=${DB_POOL_CONFIG.poolTimeout}s`);
+    logger.info(`🐢 Slow query logging enabled: threshold=${SLOW_QUERY_THRESHOLD_MS}ms`);
 
     // SCALABILITY: Graceful shutdown - properly close DB connections
     const shutdown = async () => {
@@ -576,8 +647,12 @@ class PrismaDatabaseService {
     return booking ? this.toBookingRecord(booking) : undefined;
   }
 
-  async getBookingsByCustomer(customerId: string): Promise<BookingRecord[]> {
-    const bookings = await this.prisma.booking.findMany({ where: { customerId } });
+  async getBookingsByCustomer(customerId: string, limit: number = DEFAULT_PAGE_SIZE): Promise<BookingRecord[]> {
+    const bookings = await this.prisma.booking.findMany({
+      where: { customerId },
+      take: Math.min(limit, MAX_PAGE_SIZE),
+      orderBy: { createdAt: 'desc' }
+    });
     return bookings.map(b => this.toBookingRecord(b));
   }
 
@@ -649,8 +724,12 @@ class PrismaDatabaseService {
     return order ? this.toOrderRecord(order) : undefined;
   }
 
-  async getOrdersByCustomer(customerId: string): Promise<OrderRecord[]> {
-    const orders = await this.prisma.order.findMany({ where: { customerId } });
+  async getOrdersByCustomer(customerId: string, limit: number = DEFAULT_PAGE_SIZE): Promise<OrderRecord[]> {
+    const orders = await this.prisma.order.findMany({
+      where: { customerId },
+      take: Math.min(limit, MAX_PAGE_SIZE),
+      orderBy: { createdAt: 'desc' }
+    });
     return orders.map(o => this.toOrderRecord(o));
   }
 
@@ -959,13 +1038,21 @@ class PrismaDatabaseService {
     return assignments.map(a => this.toAssignmentRecord(a));
   }
 
-  async getAssignmentsByDriver(driverId: string): Promise<AssignmentRecord[]> {
-    const assignments = await this.prisma.assignment.findMany({ where: { driverId } });
+  async getAssignmentsByDriver(driverId: string, limit: number = DEFAULT_PAGE_SIZE): Promise<AssignmentRecord[]> {
+    const assignments = await this.prisma.assignment.findMany({
+      where: { driverId },
+      take: Math.min(limit, MAX_PAGE_SIZE),
+      orderBy: { assignedAt: 'desc' }
+    });
     return assignments.map(a => this.toAssignmentRecord(a));
   }
 
-  async getAssignmentsByTransporter(transporterId: string): Promise<AssignmentRecord[]> {
-    const assignments = await this.prisma.assignment.findMany({ where: { transporterId } });
+  async getAssignmentsByTransporter(transporterId: string, limit: number = DEFAULT_PAGE_SIZE): Promise<AssignmentRecord[]> {
+    const assignments = await this.prisma.assignment.findMany({
+      where: { transporterId },
+      take: Math.min(limit, MAX_PAGE_SIZE),
+      orderBy: { assignedAt: 'desc' }
+    });
     return assignments.map(a => this.toAssignmentRecord(a));
   }
 

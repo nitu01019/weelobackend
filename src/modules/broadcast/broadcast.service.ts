@@ -11,9 +11,12 @@
 
 import { v4 as uuidv4 } from 'uuid';
 import { db, BookingRecord, AssignmentRecord } from '../../shared/database/db';
+import { AppError } from '../../shared/types/error.types';
 import { logger } from '../../shared/services/logger.service';
 import { emitToUser, emitToRoom, emitToAllTransporters, emitToAll } from '../../shared/services/socket.service';
 import { sendPushNotification } from '../../shared/services/fcm.service';
+import { redisService } from '../../shared/services/redis.service';
+import { prismaClient } from '../../shared/database/prisma.service';
 
 // =============================================================================
 // BROADCAST EXPIRY EVENTS - For real-time timeout handling
@@ -51,6 +54,10 @@ interface AcceptBroadcastParams {
   vehicleId: string;
   estimatedArrival?: string;
   notes?: string;
+  metadata?: Record<string, unknown>;
+  actorUserId: string;
+  actorRole: string;
+  idempotencyKey?: string;
 }
 
 interface DeclineBroadcastParams {
@@ -64,6 +71,17 @@ interface GetHistoryParams {
   page: number;
   limit: number;
   status?: string;
+}
+
+interface AcceptBroadcastResult {
+  assignmentId: string;
+  tripId: string;
+  status: 'assigned';
+  trucksConfirmed: number;
+  totalTrucksNeeded: number;
+  isFullyFilled: boolean;
+  resultCode?: string;
+  replayed?: boolean;
 }
 
 interface CreateBroadcastParams {
@@ -97,6 +115,22 @@ interface CreateBroadcastParams {
 }
 
 class BroadcastService {
+  private readonly acceptMetrics = {
+    attempts: 0,
+    success: 0,
+    idempotentReplay: 0,
+    lockContention: 0
+  };
+
+  private readonly acceptFailureMetrics: Record<string, number> = {};
+
+  private incrementAcceptMetric(metric: keyof BroadcastService['acceptMetrics']): void {
+    this.acceptMetrics[metric] += 1;
+  }
+
+  private incrementAcceptFailureMetric(code: string): void {
+    this.acceptFailureMetrics[code] = (this.acceptFailureMetrics[code] || 0) + 1;
+  }
   
   /**
    * Get active broadcasts for a driver/transporter
@@ -299,165 +333,446 @@ class BroadcastService {
    * - Uses async notifications (non-blocking)
    * - Idempotent - safe to retry
    * - Transaction-safe with database
-   */
-  async acceptBroadcast(broadcastId: string, params: AcceptBroadcastParams) {
-    const { driverId, vehicleId } = params;
-    
-    const booking = await db.getBookingById(broadcastId);
-    
-    if (!booking) {
-      throw new Error('Broadcast not found');
-    }
-    
-    if (booking.trucksFilled >= booking.trucksNeeded) {
-      throw new Error('Broadcast already filled');
-    }
-    
-    if (new Date(booking.expiresAt) < new Date()) {
-      throw new Error('Broadcast has expired');
-    }
-    
-    // Get driver and vehicle info
-    const driver = await db.getUserById(driverId);
-    const vehicle = await db.getVehicleById(vehicleId);
-    const transporter = driver?.transporterId ? await db.getUserById(driver.transporterId) : null;
-    
-    // Create assignment
-    const assignmentId = uuidv4();
-    const tripId = uuidv4();
-    const now = new Date().toISOString();
-    
-    const assignment: AssignmentRecord = {
-      id: assignmentId,
-      bookingId: broadcastId,
-      tripId,
-      transporterId: driver?.transporterId || driverId,
-      transporterName: transporter?.name || '',
-      driverId,
-      driverName: driver?.name || 'Driver',
-      driverPhone: driver?.phone || '',
+  */
+  async acceptBroadcast(broadcastId: string, params: AcceptBroadcastParams): Promise<AcceptBroadcastResult> {
+    const { driverId, vehicleId, idempotencyKey, actorUserId, actorRole, metadata } = params;
+    const lockKey = `broadcast-accept:${broadcastId}`;
+    const lockHolder = `${driverId}:${vehicleId}:${Date.now()}`;
+    const idempotencyCacheKey = idempotencyKey
+      ? `idem:broadcast:accept:${broadcastId}:${driverId}:${vehicleId}:${idempotencyKey}`
+      : null;
+    let lockAcquired = false;
+
+    this.incrementAcceptMetric('attempts');
+    logger.info('[BroadcastAccept] Attempt', {
+      broadcastId,
       vehicleId,
-      vehicleNumber: vehicle?.vehicleNumber || '',
-      vehicleType: vehicle?.vehicleType || booking.vehicleType,
-      vehicleSubtype: vehicle?.vehicleSubtype || booking.vehicleSubtype || '',
-      status: 'pending', // Driver needs to accept
-      assignedAt: now
-    };
-    
-    await db.createAssignment(assignment);
-    
-    // Update booking - determine new status
-    const newTrucksFilled = booking.trucksFilled + 1;
-    let newStatus: BookingRecord['status'] = 'partially_filled';
-    if (newTrucksFilled >= booking.trucksNeeded) {
-      newStatus = 'fully_filled';
+      driverId,
+      actorUserId,
+      actorRole,
+      metadataKeys: metadata ? Object.keys(metadata) : [],
+      idempotencyKey: idempotencyKey || null
+    });
+
+    if (idempotencyCacheKey) {
+      try {
+        const cached = await redisService.getJSON<AcceptBroadcastResult>(idempotencyCacheKey);
+        if (cached) {
+          this.incrementAcceptMetric('idempotentReplay');
+          logger.info('[BroadcastAccept] Idempotent replay from cache', {
+            broadcastId,
+            vehicleId,
+            driverId,
+            resultCode: 'IDEMPOTENT_REPLAY'
+          });
+          return {
+            ...cached,
+            resultCode: 'IDEMPOTENT_REPLAY',
+            replayed: true
+          };
+        }
+      } catch (error: any) {
+        logger.warn('[BroadcastAccept] Idempotency cache read failed', {
+          broadcastId,
+          vehicleId,
+          driverId,
+          error: error.message
+        });
+      }
     }
-    
-    await db.updateBooking(broadcastId, {
-      trucksFilled: newTrucksFilled,
-      status: newStatus
-    });
-    
-    logger.info(`✅ Broadcast ${broadcastId} accepted - Driver: ${driverId}, Vehicle: ${vehicleId}`);
-    logger.info(`   📊 Progress: ${newTrucksFilled}/${booking.trucksNeeded} trucks assigned`);
-    
-    // ============== NOTIFY DRIVER ==============
-    // Send notification to driver about the trip assignment
-    const driverNotification = {
-      type: 'trip_assignment',
-      assignmentId,
-      tripId,
-      bookingId: broadcastId,
-      pickup: booking.pickup,
-      drop: booking.drop,
-      vehicleNumber: vehicle?.vehicleNumber || '',
-      farePerTruck: booking.pricePerTruck,
-      distanceKm: booking.distanceKm,
-      customerName: booking.customerName,
-      customerPhone: booking.customerPhone,
-      assignedAt: now,
-      message: `New trip assigned! ${booking.pickup.address} → ${booking.drop.address}`
-    };
-    
-    // WebSocket notification to driver
-    emitToUser(driverId, 'trip_assigned', driverNotification);
-    logger.info(`📢 Notified driver ${driverId} (${driver?.name}) about trip assignment`);
-    
-    // Push notification to driver (async, non-blocking)
-    sendPushNotification(driverId, {
-      title: '🚛 New Trip Assigned!',
-      body: `${booking.pickup.city || booking.pickup.address} → ${booking.drop.city || booking.drop.address}`,
-      data: {
-        type: 'trip_assignment',
-        tripId,
-        assignmentId,
-        bookingId: broadcastId
+
+    try {
+      const lock = await redisService.acquireLock(lockKey, lockHolder, 8);
+      lockAcquired = lock.acquired;
+      if (!lockAcquired) {
+        this.incrementAcceptMetric('lockContention');
+        logger.warn('[BroadcastAccept] Lock contention detected', {
+          broadcastId,
+          vehicleId,
+          driverId
+        });
       }
-    }).catch(err => {
-      logger.warn(`FCM to driver ${driverId} failed: ${err.message}`);
-    });
-    
-    // ============== NOTIFY CUSTOMER ==============
-    // Send real-time update to customer about truck confirmation
-    const customerNotification = {
-      type: 'truck_confirmed',
-      bookingId: broadcastId,
-      assignmentId,
-      truckNumber: newTrucksFilled,
-      totalTrucksNeeded: booking.trucksNeeded,
-      trucksConfirmed: newTrucksFilled,
-      remainingTrucks: booking.trucksNeeded - newTrucksFilled,
-      isFullyFilled: newTrucksFilled >= booking.trucksNeeded,
-      driver: {
-        name: driver?.name || 'Driver',
-        phone: driver?.phone || ''
-      },
-      vehicle: {
-        number: vehicle?.vehicleNumber || '',
-        type: vehicle?.vehicleType || booking.vehicleType,
-        subtype: vehicle?.vehicleSubtype || booking.vehicleSubtype
-      },
-      transporter: {
-        name: transporter?.name || transporter?.businessName || '',
-        phone: transporter?.phone || ''
-      },
-      message: `Truck ${newTrucksFilled}/${booking.trucksNeeded} confirmed! ${vehicle?.vehicleNumber || 'Vehicle'} assigned.`
-    };
-    
-    // WebSocket notification to customer
-    emitToUser(booking.customerId, 'truck_confirmed', customerNotification);
-    logger.info(`📢 Notified customer ${booking.customerId} - ${newTrucksFilled}/${booking.trucksNeeded} trucks confirmed`);
-    
-    // Also emit to booking room for any listeners
-    emitToRoom(`booking:${broadcastId}`, 'booking_updated', {
-      bookingId: broadcastId,
-      status: newStatus,
-      trucksFilled: newTrucksFilled,
-      trucksNeeded: booking.trucksNeeded
-    });
-    
-    // Push notification to customer (async)
-    sendPushNotification(booking.customerId, {
-      title: `🚛 Truck ${newTrucksFilled}/${booking.trucksNeeded} Confirmed!`,
-      body: `${vehicle?.vehicleNumber || 'Vehicle'} (${driver?.name || 'Driver'}) assigned to your booking`,
-      data: {
-        type: 'truck_confirmed',
-        bookingId: broadcastId,
-        trucksConfirmed: newTrucksFilled,
-        totalTrucks: booking.trucksNeeded
+    } catch (error: any) {
+      logger.warn('[BroadcastAccept] Lock acquisition failed, proceeding with transactional safety', {
+        broadcastId,
+        vehicleId,
+        driverId,
+        error: error.message
+      });
+    }
+
+    try {
+      const activeStatuses = ['pending', 'driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit'] as const;
+      const maxTransactionAttempts = 3;
+      let txResult: any = null;
+
+      for (let attempt = 1; attempt <= maxTransactionAttempts; attempt += 1) {
+        try {
+          txResult = await prismaClient.$transaction(async (tx) => {
+            const booking = await tx.booking.findUnique({ where: { id: broadcastId } });
+            if (!booking) {
+              throw new AppError(404, 'INVALID_ASSIGNMENT_STATE', 'Broadcast not found');
+            }
+
+            const actor = await tx.user.findUnique({ where: { id: actorUserId } });
+            if (!actor || !actor.isActive) {
+              throw new AppError(403, 'INVALID_ASSIGNMENT_STATE', 'Assignment actor is not active');
+            }
+            if (actorRole !== 'driver' && actorRole !== 'transporter') {
+              throw new AppError(403, 'INVALID_ASSIGNMENT_STATE', 'Unsupported actor role for assignment');
+            }
+            if (actorRole === 'driver' && actor.id !== driverId) {
+              throw new AppError(403, 'DRIVER_NOT_IN_FLEET', 'Drivers can only assign themselves');
+            }
+            if (actorRole === 'transporter' && actor.role === 'transporter' && actor.id === driverId) {
+              throw new AppError(409, 'INVALID_ASSIGNMENT_STATE', 'Transporter must provide a fleet driver for assignment');
+            }
+
+            const driver = await tx.user.findUnique({ where: { id: driverId } });
+            if (!driver || driver.role !== 'driver' || !driver.transporterId) {
+              throw new AppError(403, 'DRIVER_NOT_IN_FLEET', 'Driver is not eligible for this assignment');
+            }
+
+            if (actorRole === 'transporter' && actor.id !== driver.transporterId) {
+              throw new AppError(403, 'DRIVER_NOT_IN_FLEET', 'Driver does not belong to this transporter');
+            }
+
+            const vehicle = await tx.vehicle.findUnique({ where: { id: vehicleId } });
+            if (!vehicle) {
+              throw new AppError(403, 'VEHICLE_NOT_IN_FLEET', 'Vehicle is not eligible for this assignment');
+            }
+
+            if (vehicle.transporterId !== driver.transporterId) {
+              throw new AppError(403, 'VEHICLE_NOT_IN_FLEET', 'Vehicle does not belong to the same fleet as driver');
+            }
+
+            if (actorRole === 'transporter' && actor.id !== vehicle.transporterId) {
+              throw new AppError(403, 'VEHICLE_NOT_IN_FLEET', 'Vehicle does not belong to this transporter');
+            }
+
+            const transporter = await tx.user.findUnique({ where: { id: driver.transporterId } });
+            if (!transporter) {
+              throw new AppError(409, 'INVALID_ASSIGNMENT_STATE', 'Transporter context missing for assignment');
+            }
+
+            const existingAssignment = await tx.assignment.findFirst({
+              where: {
+                bookingId: broadcastId,
+                driverId,
+                vehicleId,
+                status: { in: activeStatuses as any }
+              },
+              orderBy: { assignedAt: 'desc' }
+            });
+
+            if (existingAssignment) {
+              return {
+                replayed: true,
+                assignmentId: existingAssignment.id,
+                tripId: existingAssignment.tripId,
+                trucksConfirmed: booking.trucksFilled,
+                totalTrucksNeeded: booking.trucksNeeded,
+                isFullyFilled: booking.trucksFilled >= booking.trucksNeeded,
+                booking,
+                driver,
+                vehicle,
+                transporter
+              };
+            }
+
+            if (new Date(booking.expiresAt).getTime() < Date.now()) {
+              throw new AppError(409, 'BROADCAST_EXPIRED', 'Broadcast has expired');
+            }
+            if (booking.trucksFilled >= booking.trucksNeeded) {
+              throw new AppError(409, 'BROADCAST_FILLED', 'Broadcast already filled');
+            }
+            if (booking.status !== 'active' && booking.status !== 'partially_filled') {
+              throw new AppError(409, 'INVALID_ASSIGNMENT_STATE', 'Broadcast is not accepting assignments');
+            }
+
+            const activeAssignment = await tx.assignment.findFirst({
+              where: {
+                driverId,
+                status: { in: activeStatuses as any }
+              },
+              orderBy: { assignedAt: 'desc' }
+            });
+            if (activeAssignment) {
+              throw new AppError(
+                409,
+                'DRIVER_BUSY',
+                'Driver already has an active trip. Assign a different driver.'
+              );
+            }
+
+            const bookingUpdate = await tx.booking.updateMany({
+              where: {
+                id: broadcastId,
+                trucksFilled: booking.trucksFilled
+              },
+              data: {
+                trucksFilled: { increment: 1 }
+              }
+            });
+            if (bookingUpdate.count !== 1) {
+              const latestBooking = await tx.booking.findUnique({
+                where: { id: broadcastId },
+                select: {
+                  expiresAt: true,
+                  status: true,
+                  trucksFilled: true,
+                  trucksNeeded: true
+                }
+              });
+              if (!latestBooking) {
+                throw new AppError(404, 'INVALID_ASSIGNMENT_STATE', 'Broadcast not found');
+              }
+              if (new Date(latestBooking.expiresAt).getTime() < Date.now()) {
+                throw new AppError(409, 'BROADCAST_EXPIRED', 'Broadcast has expired');
+              }
+              if (latestBooking.trucksFilled >= latestBooking.trucksNeeded || latestBooking.status === 'fully_filled') {
+                throw new AppError(409, 'BROADCAST_FILLED', 'Broadcast already filled');
+              }
+              throw new AppError(409, 'INVALID_ASSIGNMENT_STATE', 'Broadcast state changed. Retry assignment.');
+            }
+
+            const newTrucksFilled = booking.trucksFilled + 1;
+            const newStatus: BookingRecord['status'] = newTrucksFilled >= booking.trucksNeeded ? 'fully_filled' : 'partially_filled';
+            await tx.booking.update({
+              where: { id: broadcastId },
+              data: { status: newStatus as any }
+            });
+
+            const now = new Date().toISOString();
+            const assignmentId = uuidv4();
+            const tripId = uuidv4();
+            const assignment: AssignmentRecord = {
+              id: assignmentId,
+              bookingId: broadcastId,
+              tripId,
+              transporterId: driver.transporterId,
+              transporterName: transporter.name || transporter.businessName || 'Transporter',
+              driverId,
+              driverName: driver.name || 'Driver',
+              driverPhone: driver.phone || '',
+              vehicleId,
+              vehicleNumber: vehicle.vehicleNumber || '',
+              vehicleType: vehicle.vehicleType || booking.vehicleType,
+              vehicleSubtype: vehicle.vehicleSubtype || booking.vehicleSubtype || '',
+              status: 'pending',
+              assignedAt: now
+            };
+            await tx.assignment.create({
+              data: {
+                ...assignment,
+                status: assignment.status as any
+              }
+            });
+
+            return {
+              replayed: false,
+              assignmentId,
+              tripId,
+              trucksConfirmed: newTrucksFilled,
+              totalTrucksNeeded: booking.trucksNeeded,
+              isFullyFilled: newTrucksFilled >= booking.trucksNeeded,
+              booking: {
+                ...booking,
+                trucksFilled: newTrucksFilled,
+                status: newStatus
+              },
+              driver,
+              vehicle,
+              transporter
+            };
+          }, { isolationLevel: 'Serializable' as any });
+          break;
+        } catch (transactionError: any) {
+          const isRetryableContention = transactionError?.code === 'P2034' || transactionError?.code === '40001';
+          if (!isRetryableContention || attempt >= maxTransactionAttempts) {
+            throw transactionError;
+          }
+          this.incrementAcceptMetric('lockContention');
+          logger.warn('[BroadcastAccept] Contention retry', {
+            broadcastId,
+            vehicleId,
+            driverId,
+            attempt,
+            maxAttempts: maxTransactionAttempts,
+            code: transactionError.code
+          });
+        }
       }
-    }).catch(err => {
-      logger.warn(`FCM to customer ${booking.customerId} failed: ${err.message}`);
-    });
-    
-    return {
-      assignmentId,
-      tripId,
-      status: 'assigned',
-      trucksConfirmed: newTrucksFilled,
-      totalTrucksNeeded: booking.trucksNeeded,
-      isFullyFilled: newTrucksFilled >= booking.trucksNeeded
-    };
+
+      if (!txResult) {
+        throw new AppError(409, 'INVALID_ASSIGNMENT_STATE', 'Unable to finalize assignment after retries');
+      }
+
+      const result: AcceptBroadcastResult = {
+        assignmentId: txResult.assignmentId,
+        tripId: txResult.tripId,
+        status: 'assigned',
+        trucksConfirmed: txResult.trucksConfirmed,
+        totalTrucksNeeded: txResult.totalTrucksNeeded,
+        isFullyFilled: txResult.isFullyFilled,
+        resultCode: txResult.replayed ? 'IDEMPOTENT_REPLAY' : 'ASSIGNED',
+        replayed: txResult.replayed
+      };
+
+      if (txResult.replayed) {
+        this.incrementAcceptMetric('idempotentReplay');
+        logger.info('[BroadcastAccept] Replay detected in transaction', {
+          broadcastId,
+          vehicleId,
+          driverId,
+          resultCode: 'IDEMPOTENT_REPLAY'
+        });
+      } else {
+        this.incrementAcceptMetric('success');
+        const booking = txResult.booking as any;
+        const driver = txResult.driver as any;
+        const vehicle = txResult.vehicle as any;
+        const transporter = txResult.transporter as any;
+        const now = new Date().toISOString();
+        const pickup = (booking.pickup || {}) as any;
+        const drop = (booking.drop || {}) as any;
+
+        logger.info('[BroadcastAccept] Success', {
+          broadcastId,
+          vehicleId,
+          driverId,
+          assignmentId: result.assignmentId,
+          tripId: result.tripId,
+          trucksConfirmed: result.trucksConfirmed,
+          totalTrucksNeeded: result.totalTrucksNeeded,
+          resultCode: result.resultCode
+        });
+
+        const driverNotification = {
+          type: 'trip_assignment',
+          assignmentId: result.assignmentId,
+          tripId: result.tripId,
+          bookingId: broadcastId,
+          pickup,
+          drop,
+          vehicleNumber: vehicle?.vehicleNumber || '',
+          farePerTruck: booking.pricePerTruck,
+          distanceKm: booking.distanceKm,
+          customerName: booking.customerName,
+          customerPhone: booking.customerPhone,
+          assignedAt: now,
+          message: `New trip assigned! ${pickup.address || 'Pickup'} → ${drop.address || 'Drop'}`
+        };
+
+        emitToUser(driverId, 'trip_assigned', driverNotification);
+
+        sendPushNotification(driverId, {
+          title: '🚛 New Trip Assigned!',
+          body: `${pickup.city || pickup.address || 'Pickup'} → ${drop.city || drop.address || 'Drop'}`,
+          data: {
+            type: 'trip_assignment',
+            tripId: result.tripId,
+            assignmentId: result.assignmentId,
+            bookingId: broadcastId
+          }
+        }).catch(err => {
+          logger.warn(`FCM to driver ${driverId} failed: ${err.message}`);
+        });
+
+        const customerNotification = {
+          type: 'truck_confirmed',
+          bookingId: broadcastId,
+          assignmentId: result.assignmentId,
+          truckNumber: result.trucksConfirmed,
+          totalTrucksNeeded: booking.trucksNeeded,
+          trucksConfirmed: result.trucksConfirmed,
+          remainingTrucks: booking.trucksNeeded - result.trucksConfirmed,
+          isFullyFilled: result.isFullyFilled,
+          driver: {
+            name: driver?.name || 'Driver',
+            phone: driver?.phone || ''
+          },
+          vehicle: {
+            number: vehicle?.vehicleNumber || '',
+            type: vehicle?.vehicleType || booking.vehicleType,
+            subtype: vehicle?.vehicleSubtype || booking.vehicleSubtype
+          },
+          transporter: {
+            name: transporter?.name || transporter?.businessName || '',
+            phone: transporter?.phone || ''
+          },
+          message: `Truck ${result.trucksConfirmed}/${booking.trucksNeeded} confirmed! ${vehicle?.vehicleNumber || 'Vehicle'} assigned.`
+        };
+
+        emitToUser(booking.customerId, 'truck_confirmed', customerNotification);
+        emitToRoom(`booking:${broadcastId}`, 'booking_updated', {
+          bookingId: broadcastId,
+          status: booking.status,
+          trucksFilled: result.trucksConfirmed,
+          trucksNeeded: booking.trucksNeeded
+        });
+
+        sendPushNotification(booking.customerId, {
+          title: `🚛 Truck ${result.trucksConfirmed}/${booking.trucksNeeded} Confirmed!`,
+          body: `${vehicle?.vehicleNumber || 'Vehicle'} (${driver?.name || 'Driver'}) assigned to your booking`,
+          data: {
+            type: 'truck_confirmed',
+            bookingId: broadcastId,
+            trucksConfirmed: result.trucksConfirmed,
+            totalTrucks: booking.trucksNeeded
+          }
+        }).catch(err => {
+          logger.warn(`FCM to customer ${booking.customerId} failed: ${err.message}`);
+        });
+      }
+
+      if (idempotencyCacheKey) {
+        try {
+          const cachePayload: AcceptBroadcastResult = {
+            assignmentId: result.assignmentId,
+            tripId: result.tripId,
+            status: result.status,
+            trucksConfirmed: result.trucksConfirmed,
+            totalTrucksNeeded: result.totalTrucksNeeded,
+            isFullyFilled: result.isFullyFilled
+          };
+          await redisService.setJSON(idempotencyCacheKey, cachePayload, 24 * 60 * 60);
+        } catch (error: any) {
+          logger.warn('[BroadcastAccept] Idempotency cache write failed', {
+            broadcastId,
+            vehicleId,
+            driverId,
+            error: error.message
+          });
+        }
+      }
+
+      return result;
+    } catch (error: any) {
+      const code = error instanceof AppError ? error.code : 'INVALID_ASSIGNMENT_STATE';
+      this.incrementAcceptFailureMetric(code);
+      logger.warn('[BroadcastAccept] Failed', {
+        broadcastId,
+        vehicleId,
+        driverId,
+        resultCode: code,
+        message: error?.message || 'Unknown error'
+      });
+      throw error;
+    } finally {
+      if (lockAcquired) {
+        try {
+          await redisService.releaseLock(lockKey, lockHolder);
+        } catch (error: any) {
+          logger.warn('[BroadcastAccept] Lock release failed', {
+            broadcastId,
+            vehicleId,
+            driverId,
+            error: error.message
+          });
+        }
+      }
+    }
   }
   
   /**

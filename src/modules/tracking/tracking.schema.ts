@@ -173,3 +173,29 @@ export interface BatchUploadResult {
  * Driver online status - used for fleet monitoring
  */
 export type DriverOnlineStatus = 'ONLINE' | 'OFFLINE' | 'UNKNOWN';
+
+// =============================================================================
+// TRIP STATUS UPDATE (Driver progression: pickup → loading → transit → complete)
+// =============================================================================
+
+/**
+ * Valid trip status values sent by Captain app's DriverTripNavigationScreen.
+ * 
+ * STATUS FLOW (driver clicks buttons in order):
+ *   heading_to_pickup → at_pickup → loading_complete → in_transit → completed
+ * 
+ * NOTE: 'loading_complete' is a tracking-only status (stored in Redis, not Prisma).
+ *       The Prisma Assignment enum jumps from at_pickup → in_transit.
+ *       loading_complete is an intermediate UI step for the customer to see progress.
+ */
+export const tripStatusUpdateSchema = z.object({
+  status: z.enum([
+    'heading_to_pickup',
+    'at_pickup',
+    'loading_complete',
+    'in_transit',
+    'completed'
+  ])
+});
+
+export type TripStatusUpdateInput = z.infer<typeof tripStatusUpdateSchema>;

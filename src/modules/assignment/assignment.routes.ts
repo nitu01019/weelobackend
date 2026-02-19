@@ -163,9 +163,9 @@ router.patch(
   roleGuard(['driver']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      // For now, treat decline same as cancel from driver side
-      // In production, this would trigger reassignment flow
-      await assignmentService.cancelAssignment(
+      // Driver explicitly declines → notify transporter for reassignment
+      // Uses declineAssignment (not cancelAssignment) for proper status + notifications
+      await assignmentService.declineAssignment(
         req.params.id,
         req.user!.userId
       );

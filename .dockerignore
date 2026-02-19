@@ -45,8 +45,7 @@ logs/
 # Uploads (will be created in container)
 uploads/
 
-# Docker
-Dockerfile
+# Docker (keep Dockerfile.production accessible during build)
 docker-compose*.yml
 .dockerignore
 

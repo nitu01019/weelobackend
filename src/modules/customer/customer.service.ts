@@ -48,18 +48,18 @@ class CustomerService {
       return cached;
     }
     
-    // EASY UNDERSTANDING: Return mock wallet for now
     // TODO: Implement real wallet in database
+    // Returns stub data — clearly marked as not yet implemented
+    logger.warn('[CUSTOMER] Wallet endpoint is a stub — returning placeholder data', { userId });
     const wallet = {
       id: `wallet-${userId}`,
       userId,
       balance: 0,
       currency: 'INR',
+      _stub: true, // Signals to client this is placeholder data
       createdAt: new Date(),
       updatedAt: new Date()
     };
-    
-    logger.info('[CUSTOMER] Wallet returned', { userId });
     
     // SCALABILITY: Cache for next time
     await cacheService.set(cacheKey, wallet, this.CACHE_TTL);
@@ -107,8 +107,9 @@ class CustomerService {
       return cached;
     }
     
-    // EASY UNDERSTANDING: Return mock settings for now
     // TODO: Store in database or preferences
+    // Returns stub data — clearly marked as not yet implemented
+    logger.warn('[CUSTOMER] Settings endpoint is a stub — returning placeholder data', { userId });
     const settings = {
       id: `settings-${userId}`,
       userId,
@@ -118,11 +119,10 @@ class CustomerService {
       language: 'en',
       theme: 'light',
       preferredVehicleTypes: ['truck', 'tractor', 'jcb', 'tempo'],
+      _stub: true, // Signals to client this is placeholder data
       createdAt: new Date(),
       updatedAt: new Date()
     };
-    
-    logger.info('[CUSTOMER] Settings returned', { userId });
     
     // Cache
     await cacheService.set(cacheKey, settings, this.CACHE_TTL);
@@ -136,17 +136,18 @@ class CustomerService {
    * MODULARITY: Clear function responsibility
    */
   async updateSettings(userId: string, data: any) {
-    // TODO: Store updated settings in database
+    // TODO: Store updated settings in database — currently returns stub
+    logger.warn('[CUSTOMER] updateSettings is a stub — changes are NOT persisted', { userId });
     const updated = {
       id: `settings-${userId}`,
       userId,
       ...data,
+      _stub: true, // Signals to client this is placeholder data
       updatedAt: new Date()
     };
     
     // SCALABILITY: Invalidate cache
     await cacheService.delete(`settings:${userId}`);
-    logger.info('[CUSTOMER] Settings updated', { userId });
     
     return updated;
   }

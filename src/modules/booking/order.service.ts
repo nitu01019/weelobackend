@@ -26,7 +26,10 @@ import { db, OrderRecord, TruckRequestRecord } from '../../shared/database/db';
 import { AppError } from '../../shared/types/error.types';
 import { logger } from '../../shared/services/logger.service';
 import { emitToUser, emitToBooking, SocketEvent } from '../../shared/services/socket.service';
+import { queueService } from '../../shared/services/queue.service';
+import { redisService } from '../../shared/services/redis.service';
 import { CreateOrderInput, TruckSelection } from './booking.schema';
+import { transporterOnlineService } from '../../shared/services/transporter-online.service';
 
 // =============================================================================
 // CONFIGURATION
@@ -36,15 +39,33 @@ const ORDER_CONFIG = {
   // Timeout in milliseconds (1 minute for quick response)
   TIMEOUT_MS: 1 * 60 * 1000,  // 60 seconds
   
-  // How often to check for expired orders
-  EXPIRY_CHECK_INTERVAL_MS: 30 * 1000,  // Every 30 seconds
+  // How often to check for expired orders (Redis-based)
+  EXPIRY_CHECK_INTERVAL_MS: 5 * 1000,  // Every 5 seconds
   
   // Countdown notification interval
   COUNTDOWN_INTERVAL_MS: 60 * 1000,  // Every 1 minute
 };
 
-// Store active timers for cleanup
-const orderTimers = new Map<string, NodeJS.Timeout>();
+// =============================================================================
+// REDIS KEY PATTERNS (for distributed timers)
+// =============================================================================
+// 
+// SCALABILITY: Redis keys are shared across all ECS instances
+// EASY UNDERSTANDING: Clear naming convention — timer:booking-order:{orderId}
+// MODULARITY: Separate prefix from booking.service.ts timers (timer:booking:)
+// =============================================================================
+const TIMER_KEYS = {
+  ORDER_EXPIRY: (orderId: string) => `timer:booking-order:${orderId}`,
+};
+
+// Timer data interface
+interface OrderTimerData {
+  orderId: string;
+  customerId: string;
+  createdAt: string;
+}
+
+// Store countdown timers locally (UI-only, non-critical — see startCountdownNotifications)
 const countdownTimers = new Map<string, NodeJS.Timeout>();
 
 // =============================================================================
@@ -68,6 +89,74 @@ interface CreateOrderResult {
   };
   timeoutSeconds: number;
 }
+
+// =============================================================================
+// EXPIRY CHECKER (Runs on every server instance - Redis ensures no duplicates)
+// =============================================================================
+// 
+// SCALABILITY: Every ECS instance runs this checker, but Redis distributed locks
+//   ensure only ONE instance processes each expired order (no duplicates)
+// EASY UNDERSTANDING: Same pattern as booking.service.ts expiry checker
+// MODULARITY: Independent from OrderService — runs as a background job
+// =============================================================================
+
+let orderExpiryCheckerInterval: NodeJS.Timeout | null = null;
+
+/**
+ * Start the order expiry checker
+ * This runs on every server instance but uses Redis locks to prevent duplicate processing
+ */
+function startOrderExpiryChecker(): void {
+  if (orderExpiryCheckerInterval) return;
+  
+  orderExpiryCheckerInterval = setInterval(async () => {
+    try {
+      await processExpiredOrders();
+    } catch (error: any) {
+      logger.error('Order expiry checker error', { error: error.message });
+    }
+  }, ORDER_CONFIG.EXPIRY_CHECK_INTERVAL_MS);
+  
+  logger.info('📅 Order expiry checker started (Redis-based, cluster-safe)');
+}
+
+/**
+ * Process all expired order timers
+ * Uses Redis distributed lock to prevent multiple instances processing the same order
+ * 
+ * SCALABILITY: Lock prevents duplicate expiry handling across ECS instances
+ * EASY UNDERSTANDING: Scan expired → lock → handle → unlock
+ * CODING STANDARDS: Same pattern as processExpiredBookings() in booking.service.ts
+ */
+async function processExpiredOrders(): Promise<void> {
+  const expiredTimers = await redisService.getExpiredTimers<OrderTimerData>('timer:booking-order:');
+  
+  for (const timer of expiredTimers) {
+    // Try to acquire lock for this order (prevents duplicate processing)
+    const lockKey = `lock:booking-order-expiry:${timer.data.orderId}`;
+    const lock = await redisService.acquireLock(lockKey, 'expiry-checker', 30);
+    
+    if (!lock.acquired) {
+      // Another instance is processing this order
+      continue;
+    }
+    
+    try {
+      await orderService.handleOrderTimeout(timer.data.orderId, timer.data.customerId);
+      await redisService.cancelTimer(timer.key);
+    } catch (error: any) {
+      logger.error('Failed to process expired order', { 
+        orderId: timer.data.orderId, 
+        error: error.message 
+      });
+    } finally {
+      await redisService.releaseLock(lockKey, 'expiry-checker');
+    }
+  }
+}
+
+// Start expiry checker when module loads
+startOrderExpiryChecker();
 
 // =============================================================================
 // ORDER SERVICE
@@ -208,7 +297,7 @@ class OrderService {
     // ==========================================================================
     // STEP 6: Start timeout timer
     // ==========================================================================
-    this.startOrderTimeout(orderId, customerId);
+    await this.startOrderTimeout(orderId, customerId);
     this.startCountdownNotifications(orderId, customerId);
 
     const processingTime = Date.now() - startTime;
@@ -301,10 +390,14 @@ class OrderService {
     // Process each vehicle type group
     for (const group of groupedRequests) {
       // Find transporters with this vehicle type
-      const transporterIds = await db.getTransportersWithVehicleType(
+      const allTransporterIdsForType = await db.getTransportersWithVehicleType(
         group.vehicleType,
         group.vehicleSubtype
       );
+      
+      // Phase 3 optimization: Filter to only ONLINE transporters using Redis set
+      // O(1) per transporter instead of N+1 DB queries
+      const transporterIds = await transporterOnlineService.filterOnline(allTransporterIdsForType);
       
       group.transporterIds = transporterIds;
       
@@ -361,10 +454,11 @@ class OrderService {
         };
         
         // Emit to all transporters in this group
+        // Phase 3: Removed per-transporter db.getUserById() — already filtered by Redis online set.
+        // Name lookup is non-critical for broadcast; transporter ID is logged instead.
         for (const transporterId of transporterIds) {
-          const transporter = await db.getUserById(transporterId);
           emitToUser(transporterId, SocketEvent.NEW_BROADCAST, broadcastPayload);
-          logger.info(`📢 Notified: ${transporter?.name || transporterId} for ${group.vehicleType} ${group.vehicleSubtype} (${group.requests.length} trucks)`);
+          logger.info(`📢 Notified: ${transporterId.substring(0, 8)}... for ${group.vehicleType} ${group.vehicleSubtype} (${group.requests.length} trucks)`);
         }
       } else {
         logger.warn(`⚠️ No transporters found for ${group.vehicleType} ${group.vehicleSubtype}`);
@@ -379,25 +473,43 @@ class OrderService {
   }
 
   /**
-   * Start timeout timer for order
+   * Start timeout timer for order (Redis-based for cluster support)
+   * Auto-expires order if not fully filled within timeout
+   * 
+   * SCALABILITY: Uses Redis timers instead of in-memory setTimeout
+   * - Works across multiple server instances (ECS tasks)
+   * - Survives server restarts (timers persist in Redis)
+   * - No duplicate processing (Redis distributed locks)
+   * 
+   * EASY UNDERSTANDING: Same pattern as booking.service.ts
+   * MODULARITY: Timer key prefix separates from booking timers
    */
-  private startOrderTimeout(orderId: string, customerId: string): void {
-    if (orderTimers.has(orderId)) {
-      clearTimeout(orderTimers.get(orderId)!);
-    }
-
-    const timer = setTimeout(async () => {
-      await this.handleOrderTimeout(orderId, customerId);
-    }, ORDER_CONFIG.TIMEOUT_MS);
-
-    orderTimers.set(orderId, timer);
-    logger.info(`⏱️ Timeout timer started for order ${orderId} (${ORDER_CONFIG.TIMEOUT_MS / 1000}s)`);
+  private async startOrderTimeout(orderId: string, customerId: string): Promise<void> {
+    // Cancel any existing timer for this order
+    await redisService.cancelTimer(TIMER_KEYS.ORDER_EXPIRY(orderId));
+    
+    // Set new timer in Redis
+    const expiresAt = new Date(Date.now() + ORDER_CONFIG.TIMEOUT_MS);
+    const timerData: OrderTimerData = {
+      orderId,
+      customerId,
+      createdAt: new Date().toISOString()
+    };
+    
+    await redisService.setTimer(TIMER_KEYS.ORDER_EXPIRY(orderId), timerData, expiresAt);
+    
+    logger.info(`⏱️ Timeout timer started for order ${orderId} (${ORDER_CONFIG.TIMEOUT_MS / 1000}s) [Redis-based]`);
   }
 
   /**
-   * Handle order timeout
+   * Handle order timeout - called when timer expires
+   * Made public for the expiry checker to call
+   * 
+   * SCALABILITY: Called by Redis expiry checker (cluster-safe)
+   * EASY UNDERSTANDING: Check status → expire unfilled → notify all parties
+   * MODULARITY: Same notification pattern as booking.service.ts
    */
-  private async handleOrderTimeout(orderId: string, customerId: string): Promise<void> {
+  async handleOrderTimeout(orderId: string, customerId: string): Promise<void> {
     const order = await db.getOrderById(orderId);
     
     if (!order) {
@@ -451,14 +563,38 @@ class OrderService {
     // Clear timers
     this.clearOrderTimers(orderId);
 
-    // Notify transporters that order is no longer available
+    // Collect all notified transporters
     const allNotifiedTransporters = new Set<string>();
     requests.forEach(r => r.notifiedTransporters.forEach(t => allNotifiedTransporters.add(t)));
     
+    // Notify transporters via WebSocket (for apps in foreground)
     for (const transporterId of allNotifiedTransporters) {
       emitToUser(transporterId, SocketEvent.BOOKING_EXPIRED, {
         orderId,
         message: 'This order has expired'
+      });
+    }
+
+    // ========================================
+    // FCM PUSH: Notify transporters of expiry (for apps in background)
+    // ========================================
+    // SCALABILITY: Queued via queueService — reliable with retry
+    // EASY UNDERSTANDING: Transporters need to clear this order from their UI
+    // MODULARITY: Fire-and-forget, doesn't block timeout handling
+    const transporterIds = Array.from(allNotifiedTransporters);
+    if (transporterIds.length > 0) {
+      queueService.queuePushNotificationBatch(
+        transporterIds,
+        {
+          title: '⏰ Order Expired',
+          body: `Order request has expired`,
+          data: {
+            type: 'booking_expired',
+            orderId
+          }
+        }
+      ).catch(err => {
+        logger.warn(`FCM: Failed to queue expiry push for order ${orderId}`, err);
       });
     }
   }
@@ -497,13 +633,17 @@ class OrderService {
   }
 
   /**
-   * Clear all timers for an order
+   * Clear all timers for an order (Redis-based)
+   * 
+   * SCALABILITY: Cancels Redis timer (works across all instances)
+   * EASY UNDERSTANDING: Redis timer + local countdown (if any)
+   * MODULARITY: Same pattern as booking.service.ts clearBookingTimers()
    */
-  private clearOrderTimers(orderId: string): void {
-    if (orderTimers.has(orderId)) {
-      clearTimeout(orderTimers.get(orderId)!);
-      orderTimers.delete(orderId);
-    }
+  private async clearOrderTimers(orderId: string): Promise<void> {
+    // Cancel Redis-based expiry timer
+    await redisService.cancelTimer(TIMER_KEYS.ORDER_EXPIRY(orderId));
+    
+    // Clear local countdown timer (UI-only, non-critical)
     if (countdownTimers.has(orderId)) {
       clearInterval(countdownTimers.get(orderId)!);
       countdownTimers.delete(orderId);
@@ -512,9 +652,12 @@ class OrderService {
 
   /**
    * Cancel order timeout (called when fully filled)
+   * 
+   * SCALABILITY: Cancels distributed Redis timer
+   * EASY UNDERSTANDING: Order is fully filled → no need for expiry timer
    */
-  cancelOrderTimeout(orderId: string): void {
-    this.clearOrderTimers(orderId);
+  async cancelOrderTimeout(orderId: string): Promise<void> {
+    await this.clearOrderTimers(orderId);
     logger.info(`⏱️ Timeout cancelled for order ${orderId}`);
   }
 
@@ -702,7 +845,7 @@ class OrderService {
     // STEP 7: Handle completion or partial fill
     if (newStatus === 'fully_filled') {
       // All trucks filled - Cancel timeout and celebrate!
-      this.cancelOrderTimeout(order.id);
+      await this.cancelOrderTimeout(order.id);
       
       emitToUser(order.customerId, SocketEvent.BOOKING_FULLY_FILLED, {
         orderId: order.id,

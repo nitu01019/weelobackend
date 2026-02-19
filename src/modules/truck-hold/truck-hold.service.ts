@@ -79,6 +79,7 @@ import { db } from '../../shared/database/db';
 import { logger } from '../../shared/services/logger.service';
 import { socketService } from '../../shared/services/socket.service';
 import { redisService } from '../../shared/services/redis.service';
+import { queueService } from '../../shared/services/queue.service';
 
 // =============================================================================
 // TYPES & INTERFACES
@@ -922,7 +923,29 @@ class TruckHoldService {
         };
         
         socketService.emitToUser(driver.id, 'trip_assigned', driverNotification);
-        logger.info(`   📢 Notified driver ${driver.name}`);
+        
+        // =====================================================================
+        // FCM PUSH BACKUP: Driver may have app in background (no WebSocket)
+        // =====================================================================
+        // SCALABILITY: Queued via queueService — reliable with retry
+        // EASY UNDERSTANDING: WebSocket = foreground, FCM = background
+        // MODULARITY: Fire-and-forget, doesn't block assignment flow
+        // =====================================================================
+        queueService.queuePushNotification(driver.id, {
+          title: '🚛 New Trip Assigned!',
+          body: `${order.pickup.address} → ${order.drop.address}`,
+          data: {
+            type: 'trip_assigned',
+            assignmentId,
+            tripId,
+            orderId: order.id,
+            vehicleNumber: vehicle.vehicleNumber
+          }
+        }).catch(err => {
+          logger.warn(`FCM: Failed to queue trip_assigned push for driver ${driver.id}`, err);
+        });
+        
+        logger.info(`   📢 Notified driver ${driver.name} (WebSocket + FCM)`);
       }
       
       // =========================================================================
@@ -965,7 +988,31 @@ class TruckHoldService {
       };
       
       socketService.emitToUser(order.customerId, 'trucks_confirmed', customerNotification);
-      logger.info(`📢 Notified customer - ${newTrucksFilled}/${order.totalTrucks} trucks confirmed`);
+      
+      // =====================================================================
+      // FCM PUSH BACKUP: Customer may have app in background (no WebSocket)
+      // Phase 5: Customer notification chain — guaranteed delivery
+      // =====================================================================
+      queueService.queuePushNotification(order.customerId, {
+        title: newTrucksFilled >= order.totalTrucks
+          ? '✅ All Trucks Confirmed!'
+          : '🚛 Trucks Confirmed!',
+        body: newTrucksFilled >= order.totalTrucks
+          ? `All ${order.totalTrucks} trucks assigned. Track now!`
+          : `${validatedVehicles.length} truck(s) confirmed. ${newTrucksFilled}/${order.totalTrucks} total.`,
+        data: {
+          type: 'trucks_confirmed',
+          orderId: order.id,
+          trucksConfirmed: String(validatedVehicles.length),
+          totalTrucksConfirmed: String(newTrucksFilled),
+          totalTrucksNeeded: String(order.totalTrucks),
+          isFullyFilled: String(newTrucksFilled >= order.totalTrucks)
+        }
+      }).catch(err => {
+        logger.warn(`FCM: Failed to queue trucks_confirmed push for customer ${order.customerId}`, err);
+      });
+      
+      logger.info(`📢 Notified customer - ${newTrucksFilled}/${order.totalTrucks} trucks confirmed (WebSocket + FCM)`);
       
       // =========================================================================
       // STEP 7: Mark hold as confirmed and broadcast

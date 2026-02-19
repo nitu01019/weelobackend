@@ -189,23 +189,36 @@ class DriverAuthService {
     };
     
     // Store with TTL (auto-cleanup by Redis)
+    // SCALABILITY: Try Redis first, fallback to PostgreSQL (cross-task safe)
     const ttlSeconds = config.otp.expiryMinutes * 60;
-    await redisService.setJSON(key, otpEntry, ttlSeconds);
+    let storedInRedis = false;
+    try {
+      await redisService.setJSON(key, otpEntry, ttlSeconds);
+      storedInRedis = true;
+      logger.info('[DRIVER AUTH] OTP stored in Redis', { driverPhone: maskForLogging(driverPhone, 2, 4) });
+    } catch (redisError: any) {
+      logger.warn('[DRIVER AUTH] Redis unavailable for OTP storage, using PostgreSQL fallback', {
+        error: redisError.message,
+        driverPhone: maskForLogging(driverPhone, 2, 4)
+      });
+    }
+    
+    // ALWAYS store in PostgreSQL as cross-task backup
+    try {
+      await db.prisma?.$executeRawUnsafe(
+        `INSERT INTO "OtpStore" (phone, role, otp, expires_at, attempts) 
+         VALUES ($1, $2, $3, $4, 0) 
+         ON CONFLICT (phone, role) DO UPDATE SET otp = $3, expires_at = $4, attempts = 0`,
+        driverPhone, 'driver', hashedOtp, expiresAt.toISOString()
+      );
+      logger.info('[DRIVER AUTH] OTP stored in PostgreSQL (cross-task backup)', { driverPhone: maskForLogging(driverPhone, 2, 4) });
+    } catch (dbError: any) {
+      if (!storedInRedis) {
+        logger.error('[DRIVER AUTH] ❌ CRITICAL: OTP not stored in Redis OR PostgreSQL', { error: dbError.message });
+      }
+    }
 
     // 5. Send OTP to TRANSPORTER's phone via SMS
-    // Driver asks transporter for this OTP verbally or via other means
-    
-    // CRITICAL DEBUG: Console log to verify the actual number SMS is being sent to
-    console.log('\n');
-    console.log('╔═══════════════════════════════════════════════════════╗');
-    console.log('║          🔍 DRIVER AUTH - OTP SENDING DEBUG           ║');
-    console.log('╠═══════════════════════════════════════════════════════╣');
-    console.log(`║  Driver Phone (input):     ${driverPhone.padEnd(28)}║`);
-    console.log(`║  Transporter Phone (dest): ${transporter.phone.padEnd(28)}║`);
-    console.log(`║  Same number?:             ${(driverPhone === transporter.phone ? 'YES ❌' : 'NO ✅').padEnd(28)}║`);
-    console.log('╚═══════════════════════════════════════════════════════╝');
-    console.log('\n');
-    
     try {
       await smsService.sendOtp(transporter.phone, otp);
       logger.info('[DRIVER AUTH] OTP SMS sent to transporter', {
@@ -274,7 +287,56 @@ class DriverAuthService {
     role: string;
   }> {
     const key = REDIS_KEYS.DRIVER_OTP(driverPhone);
-    const stored = await redisService.getJSON<DriverOtpEntry>(key);
+    
+    // SCALABILITY: Try Redis first, fallback to PostgreSQL (cross-task safe)
+    let stored: DriverOtpEntry | null = null;
+    try {
+      stored = await redisService.getJSON<DriverOtpEntry>(key);
+      if (stored) {
+        logger.info('[DRIVER AUTH] OTP fetched from Redis', { phone: maskForLogging(driverPhone, 2, 4) });
+      }
+    } catch (redisError: any) {
+      logger.warn('[DRIVER AUTH] Redis unavailable during OTP verification, trying PostgreSQL', {
+        error: redisError.message,
+        phone: maskForLogging(driverPhone, 2, 4)
+      });
+    }
+    
+    // FALLBACK: Check PostgreSQL if Redis didn't have the OTP
+    if (!stored) {
+      try {
+        const dbResult: any[] | null = await db.prisma?.$queryRawUnsafe(
+          `SELECT otp, expires_at, attempts FROM "OtpStore" 
+           WHERE phone = $1 AND role = $2 LIMIT 1`,
+          driverPhone, 'driver'
+        );
+        if (dbResult && dbResult.length > 0) {
+          const row = dbResult[0];
+          stored = {
+            hashedOtp: row.otp,
+            driverId: '',
+            driverName: '',
+            transporterId: '',
+            transporterPhone: '',
+            transporterName: '',
+            expiresAt: row.expires_at instanceof Date ? row.expires_at.toISOString() : String(row.expires_at),
+            attempts: row.attempts || 0
+          };
+          // Lookup driver to fill in missing fields
+          try {
+            const driver = await db.getUserByPhone(driverPhone, 'driver');
+            if (driver) {
+              stored.driverId = driver.id;
+              stored.driverName = driver.name || 'Driver';
+              stored.transporterId = driver.transporterId || '';
+            }
+          } catch { /* best effort */ }
+          logger.info('[DRIVER AUTH] OTP fetched from PostgreSQL fallback', { phone: maskForLogging(driverPhone, 2, 4) });
+        }
+      } catch (dbError: any) {
+        logger.error('[DRIVER AUTH] PostgreSQL OTP fallback also failed', { error: dbError.message });
+      }
+    }
 
     // 1. Check if OTP exists
     if (!stored) {
@@ -288,9 +350,12 @@ class DriverAuthService {
       );
     }
 
-    // 2. Check if OTP is expired (Redis TTL handles this, but double-check)
+    // 2. Check if OTP is expired
     if (new Date() > new Date(stored.expiresAt)) {
-      await redisService.del(key);
+      await Promise.allSettled([
+        redisService.del(key),
+        db.prisma?.$executeRawUnsafe(`DELETE FROM "OtpStore" WHERE phone = $1 AND role = $2`, driverPhone, 'driver')
+      ]);
       logger.warn('[DRIVER AUTH] OTP verification failed - expired', { 
         phone: maskForLogging(driverPhone, 2, 4) 
       });
@@ -301,11 +366,18 @@ class DriverAuthService {
       );
     }
 
-    // 3. Check attempts (max configured attempts) - using atomic increment
+    // 3. Check attempts
     const maxAttempts = config.otp.maxAttempts;
-    const currentAttempts = await redisService.getOtpAttempts(key);
+    let currentAttempts = stored.attempts || 0;
+    try {
+      currentAttempts = await redisService.getOtpAttempts(key);
+    } catch { /* Use DB-stored attempts */ }
+    
     if (currentAttempts >= maxAttempts) {
-      await redisService.deleteOtpWithAttempts(key);
+      await Promise.allSettled([
+        redisService.deleteOtpWithAttempts(key),
+        db.prisma?.$executeRawUnsafe(`DELETE FROM "OtpStore" WHERE phone = $1 AND role = $2`, driverPhone, 'driver')
+      ]);
       logger.warn('[DRIVER AUTH] OTP verification failed - max attempts exceeded', { 
         phone: maskForLogging(driverPhone, 2, 4),
         attempts: currentAttempts
@@ -321,18 +393,35 @@ class DriverAuthService {
     const isValid = await bcrypt.compare(otp, stored.hashedOtp);
 
     if (!isValid) {
-      // ATOMIC increment attempts - prevents race conditions
-      // Even if 100 concurrent requests come in, each gets a unique attempt number
-      const attemptResult = await redisService.incrementOtpAttempts(key, maxAttempts);
+      let attemptsRemaining = maxAttempts - currentAttempts - 1;
+      let maxReached = false;
+      
+      try {
+        const attemptResult = await redisService.incrementOtpAttempts(key, maxAttempts);
+        attemptsRemaining = attemptResult.remaining;
+        maxReached = !attemptResult.allowed;
+      } catch {
+        maxReached = attemptsRemaining <= 0;
+      }
+      
+      // Always increment DB attempts (cross-task consistency)
+      try {
+        await db.prisma?.$executeRawUnsafe(
+          `UPDATE "OtpStore" SET attempts = attempts + 1 WHERE phone = $1 AND role = $2`,
+          driverPhone, 'driver'
+        );
+      } catch { /* best effort */ }
       
       logger.warn('[DRIVER AUTH] OTP verification failed - invalid OTP', { 
         phone: maskForLogging(driverPhone, 2, 4),
-        attemptsRemaining: attemptResult.remaining
+        attemptsRemaining
       });
       
-      // If max attempts reached after this increment, delete OTP
-      if (!attemptResult.allowed) {
-        await redisService.deleteOtpWithAttempts(key);
+      if (maxReached) {
+        await Promise.allSettled([
+          redisService.deleteOtpWithAttempts(key),
+          db.prisma?.$executeRawUnsafe(`DELETE FROM "OtpStore" WHERE phone = $1 AND role = $2`, driverPhone, 'driver')
+        ]);
         throw new AppError(
           400,
           'OTP_MAX_ATTEMPTS',
@@ -343,12 +432,15 @@ class DriverAuthService {
       throw new AppError(
         400,
         'OTP_INVALID',
-        `Invalid OTP. ${attemptResult.remaining} attempt${attemptResult.remaining !== 1 ? 's' : ''} remaining.`
+        `Invalid OTP. ${attemptsRemaining} attempt${attemptsRemaining !== 1 ? 's' : ''} remaining.`
       );
     }
 
-    // 5. OTP verified - delete it immediately (single use) along with attempts counter
-    await redisService.deleteOtpWithAttempts(key);
+    // 5. OTP verified - delete from BOTH Redis and PostgreSQL (single use)
+    await Promise.allSettled([
+      redisService.deleteOtpWithAttempts(key),
+      db.prisma?.$executeRawUnsafe(`DELETE FROM "OtpStore" WHERE phone = $1 AND role = $2`, driverPhone, 'driver')
+    ]);
 
     // 6. Get fresh driver and transporter data from database
     const driver = await this.findDriverByPhone(driverPhone);

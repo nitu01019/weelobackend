@@ -67,8 +67,8 @@ router.post('/register-token', authMiddleware, async (req: Request, res: Respons
     const userId = req.user!.userId;
     const userRole = req.user!.role;
 
-    // Register token
-    fcmService.registerToken(userId, token);
+    // Register token (Redis-backed for scalability across ECS instances)
+    await fcmService.registerToken(userId, token);
 
     // Subscribe to role-based topics
     if (userRole === 'transporter') {
@@ -128,7 +128,7 @@ router.delete('/unregister-token', authMiddleware, async (req: Request, res: Res
 
     const userId = req.user!.userId;
     
-    fcmService.removeToken(userId, token);
+    await fcmService.removeToken(userId, token);
 
     logger.info(`FCM token removed for user ${userId}`);
 

@@ -28,12 +28,31 @@ import jwt from 'jsonwebtoken';
 import { config } from '../../config/environment';
 import { logger } from './logger.service';
 import { redisService } from './redis.service';
+import {
+  TRANSPORTER_PRESENCE_KEY,
+  PRESENCE_TTL_SECONDS as TRANSPORTER_PRESENCE_TTL,
+  ONLINE_TRANSPORTERS_SET
+} from './transporter-online.service';
+
+// Lazy import to avoid circular dependency (socket.service ↔ driver.service)
+let _driverService: any = null;
+function getDriverService() {
+  if (!_driverService) {
+    _driverService = require('../../modules/driver/driver.service').driverService;
+  }
+  return _driverService;
+}
 
 let io: Server | null = null;
 
 // Track user connections
 const userSockets = new Map<string, Set<string>>();  // userId -> Set of socketIds
 const socketUsers = new Map<string, string>();        // socketId -> userId
+
+// Max WebSocket connections per user — prevents memory exhaustion from malicious clients.
+// Normal usage: 1-2 connections (app foreground + background reconnect).
+// 5 allows multi-device + reconnect overlap without abuse.
+const MAX_CONNECTIONS_PER_USER = 5;
 
 // =============================================================================
 // REDIS PUB/SUB CHANNELS - For Multi-Server Scaling
@@ -119,6 +138,11 @@ export const SocketEvent = {
   
   ERROR: 'error',
 
+  // Driver presence events
+  HEARTBEAT: 'heartbeat',                       // Driver sends every 12s
+  DRIVER_ONLINE: 'driver_online',               // Driver came online
+  DRIVER_OFFLINE: 'driver_offline',             // Driver went offline
+  
   // Client -> Server
   JOIN_BOOKING: 'join_booking',
   LEAVE_BOOKING: 'leave_booking',
@@ -219,11 +243,28 @@ export function initializeSocket(server: HttpServer): Server {
     logger.info(`   📱 Phone: ${phone}`);
     logger.info(`   🏷️ Role: ${role}`);
 
-    // Track user connection
+    // Track user connection (with limit to prevent abuse)
     if (!userSockets.has(userId)) {
       userSockets.set(userId, new Set());
     }
-    userSockets.get(userId)!.add(socket.id);
+    const userSocketSet = userSockets.get(userId)!;
+    
+    // Enforce connection limit — disconnect oldest if exceeded
+    if (userSocketSet.size >= MAX_CONNECTIONS_PER_USER) {
+      const oldestSocketId = userSocketSet.values().next().value;
+      if (oldestSocketId) {
+        logger.warn(`[Socket] Connection limit (${MAX_CONNECTIONS_PER_USER}) exceeded for ${userId}, disconnecting oldest: ${oldestSocketId}`);
+        const oldSocket = io?.sockets.sockets.get(oldestSocketId);
+        if (oldSocket) {
+          oldSocket.emit(SocketEvent.ERROR, { message: 'Connection limit exceeded. Disconnecting oldest session.' });
+          oldSocket.disconnect(true);
+        }
+        userSocketSet.delete(oldestSocketId);
+        socketUsers.delete(oldestSocketId);
+      }
+    }
+    
+    userSocketSet.add(socket.id);
     socketUsers.set(socket.id, userId);
 
     // Join user's personal room
@@ -287,6 +328,112 @@ export function initializeSocket(server: HttpServer): Server {
       }
       socketUsers.delete(socket.id);
     });
+
+    // ================================================================
+    // HEARTBEAT — Extends Redis presence TTL (no DB write)
+    // ================================================================
+    // Captain app sends every 12 seconds:
+    //   { type: "heartbeat", lat, lng, battery, speed }
+    //
+    // DRIVERS: Extends driver:presence:{id} TTL to 35s
+    // TRANSPORTERS: Extends transporter:presence:{id} TTL to 60s
+    //
+    // If heartbeat stops → key expires → auto-offline.
+    //
+    // GUARD: Only extends if presence key exists. This prevents
+    // ghost-online: toggle OFF → DELs key → stale heartbeat arrives
+    // → key doesn't exist → heartbeat ignored → stays offline ✅
+    // ================================================================
+    socket.on(SocketEvent.HEARTBEAT, (data: any) => {
+      if (role === 'driver') {
+        // Driver heartbeat → extends driver:presence:{id}
+        try {
+          getDriverService().handleHeartbeat(userId, {
+            lat: data?.lat,
+            lng: data?.lng,
+            battery: data?.battery,
+            speed: data?.speed
+          });
+        } catch (e: any) {
+          logger.warn(`[Socket] Heartbeat error for driver ${userId}: ${e.message}`);
+        }
+      } else if (role === 'transporter') {
+        // Transporter heartbeat → extends transporter:presence:{id}
+        // Same guard pattern as driver.service.ts handleHeartbeat():
+        // Only extend TTL if presence key exists (prevents ghost-online)
+        (async () => {
+          try {
+            const presenceKey = TRANSPORTER_PRESENCE_KEY(userId);
+            const presenceExists = await redisService.exists(presenceKey);
+            if (!presenceExists) {
+              // No presence key — transporter is offline, ignore stale heartbeat
+              return;
+            }
+
+            // Extend TTL — zero DB writes, only Redis SET
+            const presenceData = JSON.stringify({
+              transporterId: userId,
+              lastHeartbeat: new Date().toISOString()
+            });
+            await redisService.set(presenceKey, presenceData, TRANSPORTER_PRESENCE_TTL);
+          } catch (e: any) {
+            // Non-critical — heartbeat failure shouldn't crash anything
+            logger.warn(`[Socket] Heartbeat error for transporter ${userId}: ${e.message}`);
+          }
+        })();
+      }
+    });
+
+    // ================================================================
+    // PRESENCE RESTORATION ON RECONNECT
+    // ================================================================
+    // If user was ONLINE before disconnect (DB isAvailable=true),
+    // auto-restore Redis presence without requiring button press.
+    //
+    // DRIVERS: Restores driver:presence:{id} + onlineDrivers set
+    // TRANSPORTERS: Restores transporter:presence:{id} + online:transporters set
+    // ================================================================
+    if (role === 'driver') {
+      (async () => {
+        try {
+          const restored = await getDriverService().restorePresence(userId);
+          if (restored) {
+            logger.info(`[Socket] ✅ Driver ${userId} presence restored on reconnect`);
+          }
+        } catch (e: any) {
+          logger.warn(`[Socket] Failed to restore driver presence: ${e.message}`);
+        }
+      })();
+    } else if (role === 'transporter') {
+      (async () => {
+        try {
+          const { prismaClient } = await import('../database/prisma.service');
+          const transporter = await prismaClient.user.findUnique({
+            where: { id: userId },
+            select: { isAvailable: true }
+          });
+
+          if (transporter?.isAvailable) {
+            // Restore Redis presence
+            const presenceData = JSON.stringify({
+              transporterId: userId,
+              restored: true,
+              lastHeartbeat: new Date().toISOString()
+            });
+            await redisService.set(
+              TRANSPORTER_PRESENCE_KEY(userId),
+              presenceData,
+              TRANSPORTER_PRESENCE_TTL
+            );
+            await redisService.sAdd(ONLINE_TRANSPORTERS_SET, userId);
+
+            logger.info(`[Socket] ✅ Transporter ${userId} presence restored on reconnect`);
+          }
+        } catch (e: any) {
+          logger.warn(`[Socket] Failed to restore transporter presence: ${e.message}`);
+        }
+      })();
+    }
 
     // Handle ping from client (for connection quality)
     socket.on('ping', () => {

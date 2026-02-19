@@ -25,6 +25,7 @@ import { metrics, metricsHandler } from '../monitoring/metrics.service';
 import { circuitBreakerRegistry } from '../resilience/circuit-breaker';
 import { defaultQueue, bookingQueue, trackingQueue, authQueue } from '../resilience/request-queue';
 import { cacheService } from '../services/cache.service';
+import { redisService } from '../services/redis.service';
 import { logger } from '../services/logger.service';
 import { getConnectionStats, getIO } from '../services/socket.service';
 import { smsService } from '../../modules/auth/sms.service';
@@ -73,6 +74,25 @@ router.get('/health/ready', async (_req: Request, res: Response) => {
       checks.cache = testValue === 'ok';
     } catch {
       checks.cache = false;
+    }
+
+    // Check Redis connectivity (real Redis vs in-memory fallback)
+    try {
+      checks.redis = redisService.isConnected();
+      // If using real Redis, do a PING to verify it's responsive
+      if (redisService.isRedisEnabled()) {
+        const pingStart = Date.now();
+        await redisService.set('health:ping', 'pong', 10);
+        const pingResult = await redisService.get('health:ping');
+        const pingMs = Date.now() - pingStart;
+        checks.redis = pingResult === 'pong';
+        // Log slow Redis responses (>50ms PING is concerning)
+        if (pingMs > 50) {
+          logger.warn(`⚠️ Redis PING took ${pingMs}ms (expected <5ms)`);
+        }
+      }
+    } catch {
+      checks.redis = false;
     }
     
     // Check circuit breakers

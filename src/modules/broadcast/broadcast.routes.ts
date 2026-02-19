@@ -15,10 +15,27 @@
  */
 
 import { Router, Request, Response, NextFunction } from 'express';
+import { z } from 'zod';
 import { broadcastService } from './broadcast.service';
 import { authMiddleware, roleGuard } from '../../shared/middleware/auth.middleware';
+import { validateSchema } from '../../shared/utils/validation.utils';
 
 const router = Router();
+
+const acceptBroadcastBodySchema = z.object({
+  driverId: z.string().uuid('Invalid driver ID').optional(),
+  vehicleId: z.string().uuid('Invalid vehicle ID'),
+  estimatedArrival: z.union([z.string(), z.number().int().min(1).max(720)]).optional(),
+  notes: z.string().trim().max(500).optional(),
+  metadata: z.record(z.string(), z.unknown()).optional()
+});
+
+const idempotencyKeyHeaderSchema = z
+  .string()
+  .trim()
+  .min(8)
+  .max(128)
+  .regex(/^[A-Za-z0-9:_-]+$/, 'Invalid idempotency key format');
 
 /**
  * @route   GET /broadcasts/active
@@ -86,15 +103,28 @@ router.post(
   roleGuard(['driver', 'transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const { driverId, vehicleId, estimatedArrival, notes } = req.body;
+      const body = validateSchema(acceptBroadcastBodySchema, req.body);
+      const idempotencyKeyHeader = req.header('X-Idempotency-Key');
+      const idempotencyKey = idempotencyKeyHeader
+        ? validateSchema(idempotencyKeyHeaderSchema, idempotencyKeyHeader)
+        : undefined;
+      const actorUserId = req.user!.userId;
+      const actorRole = req.user!.role;
+      const effectiveDriverId = actorRole === 'driver'
+        ? actorUserId
+        : (body.driverId || actorUserId);
       
       const result = await broadcastService.acceptBroadcast(
         req.params.broadcastId,
         {
-          driverId: driverId || req.user!.userId,
-          vehicleId,
-          estimatedArrival,
-          notes
+          driverId: effectiveDriverId,
+          vehicleId: body.vehicleId,
+          estimatedArrival: body.estimatedArrival?.toString(),
+          notes: body.notes,
+          metadata: body.metadata,
+          actorUserId,
+          actorRole,
+          idempotencyKey
         }
       );
       
@@ -103,7 +133,9 @@ router.post(
         message: 'Broadcast accepted successfully',
         assignmentId: result.assignmentId,
         tripId: result.tripId,
-        status: 'ASSIGNED'
+        status: 'ASSIGNED',
+        resultCode: result.resultCode || 'ASSIGNED',
+        replayed: result.replayed === true
       });
     } catch (error) {
       next(error);

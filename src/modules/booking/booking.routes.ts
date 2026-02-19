@@ -18,6 +18,8 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { bookingService } from './booking.service';
 import { orderService } from './order.service';
 import { authMiddleware, roleGuard } from '../../shared/middleware/auth.middleware';
+import { prismaClient } from '../../shared/database/prisma.service';
+import { logger } from '../../shared/services/logger.service';
 import { validateRequest } from '../../shared/utils/validation.utils';
 import { createBookingSchema, createOrderSchema, getBookingsQuerySchema } from './booking.schema';
 const router = Router();
@@ -63,10 +65,63 @@ router.get(
     try {
       const query = getBookingsQuerySchema.parse(req.query);
       const result = await bookingService.getCustomerBookings(req.user!.userId, query);
+
+      // Enrich completed bookings with rating status (non-blocking)
+      // Allows Customer app to show "Rate" badge on unrated completed bookings
+      const completedIds = result.bookings
+        .filter(b => b.status === 'completed')
+        .map(b => b.id);
+
+      let ratingStatusMap: Record<string, boolean> = {};
+      if (completedIds.length > 0) {
+        try {
+          // Batch query: count rated assignments per booking (single DB call)
+          const ratedAssignments = await prismaClient.assignment.groupBy({
+            by: ['bookingId'],
+            where: {
+              bookingId: { in: completedIds },
+              customerRating: { not: null }
+            },
+            _count: { id: true }
+          });
+
+          const totalAssignments = await prismaClient.assignment.groupBy({
+            by: ['bookingId'],
+            where: {
+              bookingId: { in: completedIds },
+              status: 'completed'
+            },
+            _count: { id: true }
+          });
+
+          const ratedMap = new Map(ratedAssignments.map(r => [r.bookingId, r._count.id]));
+          const totalMap = new Map(totalAssignments.map(t => [t.bookingId, t._count.id]));
+
+          for (const id of completedIds) {
+            const rated = ratedMap.get(id) || 0;
+            const total = totalMap.get(id) || 0;
+            // isRated = true only if ALL completed assignments have been rated
+            ratingStatusMap[id] = total > 0 && rated >= total;
+          }
+        } catch (err) {
+          // Graceful: if rating check fails, default to not-rated (show Rate button)
+          logger.warn('[BOOKINGS] Rating status check failed, defaulting', { error: (err as Error).message });
+        }
+      }
+
+      // Merge isRated into booking responses
+      const enrichedBookings = result.bookings.map(b => ({
+        ...b,
+        isRated: b.status === 'completed' ? (ratingStatusMap[b.id] ?? false) : undefined,
+        hasUnratedTrips: b.status === 'completed' ? !(ratingStatusMap[b.id] ?? false) : undefined
+      }));
       
       res.json({
         success: true,
-        data: result
+        data: {
+          ...result,
+          bookings: enrichedBookings
+        }
       });
     } catch (error) {
       next(error);

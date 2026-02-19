@@ -18,16 +18,14 @@ import { z } from 'zod';
  * Schema for updating driver availability
  */
 export const updateAvailabilitySchema = z.object({
-  body: z.object({
-    isOnline: z.boolean({
-      required_error: 'isOnline status is required',
-      invalid_type_error: 'isOnline must be a boolean'
-    }),
-    currentLocation: z.object({
-      latitude: z.number().min(-90).max(90),
-      longitude: z.number().min(-180).max(180)
-    }).optional()
-  })
+  isOnline: z.boolean({
+    required_error: 'isOnline status is required',
+    invalid_type_error: 'isOnline must be a boolean'
+  }),
+  currentLocation: z.object({
+    latitude: z.number().min(-90).max(90),
+    longitude: z.number().min(-180).max(180)
+  }).optional().nullable().transform(val => val ?? undefined)
 });
 
 /**
@@ -48,14 +46,12 @@ export const getEarningsQuerySchema = z.object({
 
 /**
  * Schema for updating trip status by driver
+ * 
+ * @deprecated Use tripStatusUpdateSchema from tracking.schema.ts instead.
+ *             The actual route is PUT /tracking/trip/:tripId/status
+ *             with statuses: heading_to_pickup, at_pickup, loading_complete, in_transit, completed
  */
-export const updateTripStatusSchema = z.object({
-  body: z.object({
-    tripId: z.string().uuid('Invalid trip ID'),
-    status: z.enum(['started', 'arrived_pickup', 'loaded', 'in_transit', 'arrived_drop', 'completed']),
-    notes: z.string().max(500).optional()
-  })
-});
+// Removed: updateTripStatusSchema — moved to tracking module (tracking.schema.ts)
 
 /**
  * Schema for transporter creating a driver
@@ -81,8 +77,8 @@ export const createDriverSchema = z.object({
 // TYPE EXPORTS
 // =============================================================================
 
-export type UpdateAvailabilityInput = z.infer<typeof updateAvailabilitySchema>['body'];
+export type UpdateAvailabilityInput = z.infer<typeof updateAvailabilitySchema>;
 export type GetTripsQuery = z.infer<typeof getTripsQuerySchema>;
 export type GetEarningsQuery = z.infer<typeof getEarningsQuerySchema>;
-export type UpdateTripStatusInput = z.infer<typeof updateTripStatusSchema>['body'];
+// Removed: UpdateTripStatusInput — use TripStatusUpdateInput from tracking.schema.ts
 export type CreateDriverInput = z.infer<typeof createDriverSchema>;

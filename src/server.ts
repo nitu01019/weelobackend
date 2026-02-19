@@ -227,12 +227,9 @@ app.use(securityHeaders);
 app.use(securityResponseHeaders);
 
 // CORS - Configure based on environment
+// Uses config.cors.origin from environment.ts for consistency
 app.use(cors({
-  origin: config.isDevelopment ? '*' : [
-    'https://weelo.app',
-    'https://captain.weelo.app',
-    /\.weelo\.app$/
-  ],
+  origin: config.isDevelopment ? '*' : config.cors.origin,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-ID'],
   credentials: true,
@@ -266,7 +263,6 @@ app.use(rateLimiter);
 
 app.get('/health', async (_req, res) => {
   const stats = await db.getStats();
-  // const cacheStats = cache.getStats(); // TODO: Implement cache middleware
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
@@ -280,11 +276,10 @@ app.get('/health', async (_req, res) => {
       bookings: stats.bookings,
       assignments: stats.assignments
     },
-    // cache: {
-    //   size: cacheStats.size,
-    //   maxSize: cacheStats.maxSize,
-    //   utilizationPercent: Math.round((cacheStats.size / cacheStats.maxSize) * 100)
-    // },
+    redis: {
+      connected: redisService.isConnected(),
+      mode: redisService.isRedisEnabled() ? 'redis' : 'memory'
+    },
     security: {
       helmet: true,
       rateLimiting: true,
@@ -361,6 +356,10 @@ app.use(`${API_PREFIX}/custom-booking`, customBookingRouter);
 // Geocoding & Places Search (Google Maps integration)
 app.use(`${API_PREFIX}/geocoding`, geocodingRouter);
 
+// Rating routes (customer submits ratings, driver views ratings)
+import ratingRouter from './modules/rating/rating.routes';
+app.use(`${API_PREFIX}/rating`, ratingRouter);
+
 // =============================================================================
 // DATABASE DEBUG ROUTES (Development only)
 // =============================================================================
@@ -407,7 +406,24 @@ app.use(errorHandler);
 
 const PORT = config.port || 3000;
 
+// =============================================================================
+// TRUST PROXY - Required for rate limiting behind AWS ALB
+// =============================================================================
+// Without this, req.ip returns ALB's internal IP — all users share one rate limit bucket.
+// '1' = trust the first proxy (ALB). Required for correct client IP extraction.
+app.set('trust proxy', 1);
+
 server.listen(PORT, '0.0.0.0', async () => {
+  // ==========================================================================
+  // SERVER TIMEOUTS - Prevent stalled request accumulation
+  // ==========================================================================
+  // keepAliveTimeout MUST be > ALB idle timeout (60s) to prevent 502 errors.
+  // headersTimeout MUST be > keepAliveTimeout for proper sequencing.
+  // timeout = max time for a single request to complete.
+  server.timeout = 30000;           // 30s max request time
+  server.keepAliveTimeout = 65000;  // 65s > ALB idle timeout (60s)
+  server.headersTimeout = 66000;    // 66s > keepAliveTimeout
+
   const stats = await db.getStats();
   const protocol = isHttps ? 'https' : 'http';
   const securityStatus = isHttps ? '🔒 SECURE (TLS 1.2+)' : '⚠️  HTTP (dev only)';
@@ -469,23 +485,38 @@ process.on('uncaughtException', (error) => {
 
 process.on('unhandledRejection', (reason) => {
   logger.error('Unhandled rejection', reason);
+  // Exit to prevent zombie process with corrupt state.
+  // ECS/cluster will restart the worker automatically.
+  process.exit(1);
 });
 
 // =============================================================================
 // GRACEFUL SHUTDOWN
 // =============================================================================
 
-const gracefulShutdown = (signal: string) => {
+const gracefulShutdown = async (signal: string) => {
   logger.info(`${signal} received. Starting graceful shutdown...`);
 
-  server.close(() => {
+  server.close(async () => {
     logger.info('HTTP server closed');
 
-    // Clear cache
-    // cache.clear(); // TODO: Implement cache middleware
-    // logger.info('Cache cleared');
+    // Close Redis connection (flush pending operations)
+    try {
+      await redisService.shutdown();
+      logger.info('Redis connection closed');
+    } catch (err) {
+      logger.error('Error closing Redis connection', err);
+    }
 
-    // Close database connections (if any)
+    // Close Prisma/database connection pool
+    try {
+      const { prismaClient } = require('./shared/database/prisma.service');
+      await prismaClient.$disconnect();
+      logger.info('Database connection closed');
+    } catch (err) {
+      logger.error('Error closing database connection', err);
+    }
+
     logger.info('Graceful shutdown complete');
     process.exit(0);
   });
@@ -501,29 +532,32 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 // DEBUG: Socket connections endpoint
-app.get('/api/v1/debug/sockets', (req, res) => {
-  const { getConnectionStats } = require('./shared/services/socket.service');
-  const stats = getConnectionStats();
+// SECURITY: Only available in development — exposes connected user data
+if (config.isDevelopment) {
+  app.get('/api/v1/debug/sockets', (req, res) => {
+    const { getConnectionStats } = require('./shared/services/socket.service');
+    const stats = getConnectionStats();
 
-  // Get all connected user IDs
-  const connectedUsers: any[] = [];
-  const io = require('./shared/services/socket.service').getIO();
-  if (io) {
-    io.sockets.sockets.forEach((socket: any) => {
-      connectedUsers.push({
-        socketId: socket.id,
-        userId: socket.data.userId,
-        role: socket.data.role,
-        phone: socket.data.phone
+    // Get all connected user IDs
+    const connectedUsers: any[] = [];
+    const io = require('./shared/services/socket.service').getIO();
+    if (io) {
+      io.sockets.sockets.forEach((socket: any) => {
+        connectedUsers.push({
+          socketId: socket.id,
+          userId: socket.data.userId,
+          role: socket.data.role,
+          phone: socket.data.phone
+        });
       });
-    });
-  }
-
-  res.json({
-    success: true,
-    data: {
-      stats,
-      connectedUsers
     }
+
+    res.json({
+      success: true,
+      data: {
+        stats,
+        connectedUsers
+      }
+    });
   });
-});
+}

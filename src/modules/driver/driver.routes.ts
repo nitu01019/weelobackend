@@ -462,6 +462,61 @@ router.get(
 );
 
 // =============================================================================
+// DRIVER PERFORMANCE
+// =============================================================================
+
+/**
+ * GET /api/v1/driver/performance
+ * Get driver performance metrics (acceptance rate, completion rate, rating, distance)
+ * 
+ * SCALABILITY:
+ *   - All queries use indexed columns (driverId, driverId+status)
+ *   - COUNT queries → O(log n), sub-50ms at millions of rows
+ *   - Can add Redis cache (5min TTL) at scale
+ * 
+ * DATA ISOLATION:
+ *   - Every query is WHERE driverId = ? — driver only sees their own data
+ * 
+ * RESPONSE:
+ *   { success: true, data: { rating, totalRatings, acceptanceRate,
+ *     onTimeDeliveryRate, completionRate, totalTrips, totalDistance } }
+ */
+router.get(
+  '/performance',
+  authMiddleware,
+  roleGuard(['driver', 'transporter']),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      let targetDriverId = req.user!.userId;
+
+      // Phase 5: Transporter can query a specific driver's performance
+      // Usage: GET /api/v1/driver/performance?driverId=xxx
+      if (req.user!.role === 'transporter' && req.query.driverId) {
+        const requestedDriverId = req.query.driverId as string;
+        // Verify driver belongs to this transporter
+        const driver = await fleetCacheService.getDriver(requestedDriverId);
+        if (!driver || driver.transporterId !== req.user!.userId) {
+          return res.status(403).json({
+            success: false,
+            error: { code: 'FORBIDDEN', message: 'This driver does not belong to you' }
+          });
+        }
+        targetDriverId = requestedDriverId;
+      }
+
+      const performance = await driverService.getPerformance(targetDriverId);
+
+      res.json({
+        success: true,
+        data: performance
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// =============================================================================
 // DRIVER AVAILABILITY
 // =============================================================================
 
@@ -525,6 +580,36 @@ router.get(
 );
 
 /**
+ * GET /api/v1/driver/online-drivers
+ * Get currently online drivers for a transporter (real-time from Redis)
+ * 
+ * Uses Redis SET + presence key verification for accurate status.
+ * No caching — always returns real-time data.
+ */
+router.get(
+  '/online-drivers',
+  authMiddleware,
+  roleGuard(['transporter']),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const transporterId = req.user!.userId;
+      
+      const onlineDriverIds = await driverService.getOnlineDriverIds(transporterId);
+      
+      res.json({
+        success: true,
+        data: {
+          onlineDriverIds,
+          total: onlineDriverIds.length
+        }
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
  * PUT /api/v1/driver/availability
  * Update driver availability status
  * 
@@ -578,10 +663,26 @@ router.get(
   roleGuard(['driver', 'transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const userId = req.user!.userId;
+      let targetDriverId = req.user!.userId;
+
+      // Phase 5: Transporter can query a specific driver's earnings
+      // Usage: GET /api/v1/driver/earnings?driverId=xxx&period=month
+      if (req.user!.role === 'transporter' && req.query.driverId) {
+        const requestedDriverId = req.query.driverId as string;
+        // Verify driver belongs to this transporter
+        const driver = await fleetCacheService.getDriver(requestedDriverId);
+        if (!driver || driver.transporterId !== req.user!.userId) {
+          return res.status(403).json({
+            success: false,
+            error: { code: 'FORBIDDEN', message: 'This driver does not belong to you' }
+          });
+        }
+        targetDriverId = requestedDriverId;
+      }
+
       const query = getEarningsQuerySchema.parse(req.query);
       
-      const earnings = await driverService.getEarnings(userId, query.period);
+      const earnings = await driverService.getEarnings(targetDriverId, query.period);
       
       res.json({
         success: true,
@@ -607,10 +708,26 @@ router.get(
   roleGuard(['driver', 'transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const userId = req.user!.userId;
+      let targetDriverId = req.user!.userId;
+
+      // Phase 5: Transporter can query a specific driver's trips
+      // Usage: GET /api/v1/driver/trips?driverId=xxx&status=completed
+      if (req.user!.role === 'transporter' && req.query.driverId) {
+        const requestedDriverId = req.query.driverId as string;
+        // Verify driver belongs to this transporter
+        const driver = await fleetCacheService.getDriver(requestedDriverId);
+        if (!driver || driver.transporterId !== req.user!.userId) {
+          return res.status(403).json({
+            success: false,
+            error: { code: 'FORBIDDEN', message: 'This driver does not belong to you' }
+          });
+        }
+        targetDriverId = requestedDriverId;
+      }
+
       const { status, limit = 20, offset = 0 } = req.query;
       
-      const trips = await driverService.getTrips(userId, {
+      const trips = await driverService.getTrips(targetDriverId, {
         status: status as string,
         limit: Number(limit),
         offset: Number(offset)
@@ -636,8 +753,22 @@ router.get(
   roleGuard(['driver', 'transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const userId = req.user!.userId;
-      const activeTrip = await driverService.getActiveTrip(userId);
+      let targetDriverId = req.user!.userId;
+
+      // Phase 5: Transporter can query a specific driver's active trip
+      if (req.user!.role === 'transporter' && req.query.driverId) {
+        const requestedDriverId = req.query.driverId as string;
+        const driver = await fleetCacheService.getDriver(requestedDriverId);
+        if (!driver || driver.transporterId !== req.user!.userId) {
+          return res.status(403).json({
+            success: false,
+            error: { code: 'FORBIDDEN', message: 'This driver does not belong to you' }
+          });
+        }
+        targetDriverId = requestedDriverId;
+      }
+
+      const activeTrip = await driverService.getActiveTrip(targetDriverId);
       
       res.json({
         success: true,
@@ -1015,7 +1146,7 @@ router.put(
  * Converts old S3 URLs to presigned URLs for existing photos
  * Useful after bucket policy changes or initial setup
  */
-router.post('/regenerate-urls', async (req: Request, res: Response) => {
+router.post('/regenerate-urls', authMiddleware, roleGuard(['transporter']), async (req: Request, res: Response) => {
   try {
     logger.info('[ADMIN] Regenerating presigned URLs...');
     
