@@ -36,15 +36,14 @@ import { transporterOnlineService } from '../../shared/services/transporter-onli
 // CONFIGURATION
 // =============================================================================
 
+const BROADCAST_TIMEOUT_SECONDS = parseInt(process.env.BROADCAST_TIMEOUT_SECONDS || '120', 10);
+
 const ORDER_CONFIG = {
-  // Timeout in milliseconds (1 minute for quick response)
-  TIMEOUT_MS: 1 * 60 * 1000,  // 60 seconds
-  
+  // Timeout: env-configurable, default 120s. Unified with booking path.
+  TIMEOUT_MS: BROADCAST_TIMEOUT_SECONDS * 1000,
+
   // How often to check for expired orders (Redis-based)
   EXPIRY_CHECK_INTERVAL_MS: 5 * 1000,  // Every 5 seconds
-  
-  // Countdown notification interval
-  COUNTDOWN_INTERVAL_MS: 60 * 1000,  // Every 1 minute
 };
 
 // =============================================================================
@@ -66,8 +65,6 @@ interface OrderTimerData {
   createdAt: string;
 }
 
-// Store countdown timers locally (UI-only, non-critical — see startCountdownNotifications)
-const countdownTimers = new Map<string, NodeJS.Timeout>();
 
 // =============================================================================
 // TYPES
@@ -299,7 +296,7 @@ class OrderService {
     // STEP 6: Start timeout timer
     // ==========================================================================
     await this.startOrderTimeout(orderId, customerId);
-    this.startCountdownNotifications(orderId, customerId);
+
 
     const processingTime = Date.now() - startTime;
     logger.info(`✅ Order ${orderId} created in ${processingTime}ms`);
@@ -601,54 +598,11 @@ class OrderService {
   }
 
   /**
-   * Start countdown notifications
-   */
-  private startCountdownNotifications(orderId: string, customerId: string): void {
-    let remainingMs = ORDER_CONFIG.TIMEOUT_MS;
-
-    const countdownInterval = setInterval(async () => {
-      remainingMs -= ORDER_CONFIG.COUNTDOWN_INTERVAL_MS;
-      
-      if (remainingMs <= 0) {
-        clearInterval(countdownInterval);
-        return;
-      }
-
-      const order = await db.getOrderById(orderId);
-      if (!order || ['fully_filled', 'completed', 'cancelled', 'expired'].includes(order.status)) {
-        clearInterval(countdownInterval);
-        return;
-      }
-
-      emitToUser(customerId, SocketEvent.BROADCAST_COUNTDOWN, {
-        orderId,
-        remainingSeconds: Math.floor(remainingMs / 1000),
-        totalTrucks: order.totalTrucks,
-        trucksFilled: order.trucksFilled,
-        status: order.status
-      });
-
-    }, ORDER_CONFIG.COUNTDOWN_INTERVAL_MS);
-
-    countdownTimers.set(orderId, countdownInterval as unknown as NodeJS.Timeout);
-  }
-
-  /**
    * Clear all timers for an order (Redis-based)
-   * 
-   * SCALABILITY: Cancels Redis timer (works across all instances)
-   * EASY UNDERSTANDING: Redis timer + local countdown (if any)
-   * MODULARITY: Same pattern as booking.service.ts clearBookingTimers()
    */
   private async clearOrderTimers(orderId: string): Promise<void> {
     // Cancel Redis-based expiry timer
     await redisService.cancelTimer(TIMER_KEYS.ORDER_EXPIRY(orderId));
-    
-    // Clear local countdown timer (UI-only, non-critical)
-    if (countdownTimers.has(orderId)) {
-      clearInterval(countdownTimers.get(orderId)!);
-      countdownTimers.delete(orderId);
-    }
   }
 
   /**

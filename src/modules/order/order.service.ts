@@ -267,7 +267,7 @@ interface BroadcastData {
 class OrderService {
 
   // Timeout for broadcasts (1 minute - quick response needed)
-  private readonly BROADCAST_TIMEOUT_MS = 1 * 60 * 1000;  // 60 seconds
+  private readonly BROADCAST_TIMEOUT_MS = parseInt(process.env.BROADCAST_TIMEOUT_SECONDS || '120', 10) * 1000;
 
   // Redis key patterns for distributed timers
   private readonly TIMER_KEYS = {

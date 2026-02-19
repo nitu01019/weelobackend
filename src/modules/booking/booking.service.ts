@@ -46,16 +46,14 @@ import { buildBroadcastPayload, getRemainingTimeoutSeconds } from './booking-pay
 // CONFIGURATION - Easy to adjust for testing vs production
 // =============================================================================
 
+const BROADCAST_TIMEOUT_SECONDS = parseInt(process.env.BROADCAST_TIMEOUT_SECONDS || '120', 10);
+
 const BOOKING_CONFIG = {
-  // Timeout: Must be > total progressive radius time (4 steps × 15s = 60s)
-  // Set to 120s to give transporters time to respond after final expansion
-  TIMEOUT_MS: 2 * 60 * 1000,  // 120 seconds
+  // Timeout: env-configurable, default 120s. Must be > progressive radius time (4 × 15s = 60s)
+  TIMEOUT_MS: BROADCAST_TIMEOUT_SECONDS * 1000,
 
   // How often to check for expired bookings (Redis-based)
   EXPIRY_CHECK_INTERVAL_MS: 5 * 1000,  // Every 5 seconds
-
-  // Countdown notification interval (notify customer of remaining time)
-  COUNTDOWN_INTERVAL_MS: 60 * 1000,  // Every 1 minute
 };
 
 // =============================================================================
@@ -518,11 +516,6 @@ class BookingService {
       logger.info(`[RADIUS] Skipping progressive expansion — DB fallback already covered all transporters`);
     }
 
-    // ========================================
-    // START COUNTDOWN NOTIFICATIONS (optional)
-    // ========================================
-    this.startCountdownNotifications(booking.id, customerId);
-
     logger.info(`✅ Booking ${booking.id} created, ${matchingTransporters.length} transporters notified (step 1/${RADIUS_EXPANSION_CONFIG.steps.length})`);
 
     // SCALABILITY: Store idempotency key to prevent duplicate bookings
@@ -683,46 +676,6 @@ class BookingService {
         logger.warn(`FCM: Failed to queue expiry push for booking ${bookingId}`, err);
       });
     }
-  }
-
-  /**
-   * Start countdown notifications to customer
-   * 
-   * NOTE: Countdown is still local per-instance as it's just UI updates
-   * If user reconnects to different server, they get fresh countdown from booking state
-   */
-  private startCountdownNotifications(bookingId: string, customerId: string): void {
-    // For countdown, we can use local interval as it's just for UI updates
-    // The actual expiry is handled by Redis-based timer
-    let remainingMs = BOOKING_CONFIG.TIMEOUT_MS;
-
-    const countdownInterval = setInterval(async () => {
-      remainingMs -= BOOKING_CONFIG.COUNTDOWN_INTERVAL_MS;
-
-      if (remainingMs <= 0) {
-        clearInterval(countdownInterval);
-        return;
-      }
-
-      const booking = await db.getBookingById(bookingId);
-      if (!booking || ['fully_filled', 'completed', 'cancelled', 'expired'].includes(booking.status)) {
-        clearInterval(countdownInterval);
-        return;
-      }
-
-      // Send countdown update
-      emitToUser(customerId, SocketEvent.BROADCAST_COUNTDOWN, {
-        bookingId,
-        remainingSeconds: Math.floor(remainingMs / 1000),
-        trucksNeeded: booking.trucksNeeded,
-        trucksFilled: booking.trucksFilled,
-        status: booking.status
-      });
-
-    }, BOOKING_CONFIG.COUNTDOWN_INTERVAL_MS);
-
-    // Store reference locally (countdown is per-instance, not critical)
-    // The Redis timer handles the actual expiry
   }
 
   /**
