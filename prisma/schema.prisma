@@ -50,7 +50,9 @@ enum VehicleStatus {
 
 // Booking status (legacy single-truck bookings)
 enum BookingStatus {
-  active           // Looking for transporters
+  created          // Initial state before broadcasting
+  broadcasting     // Actively sending to transporters
+  active           // Looking for transporters (awaiting responses)
   partially_filled // Some trucks assigned
   fully_filled     // All trucks assigned
   in_progress      // Trip started
@@ -61,7 +63,9 @@ enum BookingStatus {
 
 // Order status (new multi-truck system)
 enum OrderStatus {
-  active           // Looking for transporters
+  created          // Initial state before broadcasting
+  broadcasting     // Actively sending to transporters
+  active           // Looking for transporters (awaiting responses)
   partially_filled // Some trucks assigned
   fully_filled     // All trucks assigned
   in_progress      // Trip started
@@ -147,7 +151,7 @@ model User {
   // Driver profile completion fields
   address              String?
   preferredVehicleType String?
-  preferredLanguage    String?  @default("en")
+  preferredLanguage    String?  // null = not yet selected → shows language screen
   licenseFrontPhoto    String?  // S3 URL
   licenseBackPhoto     String?  // S3 URL
   isProfileCompleted   Boolean  @default(false)
@@ -193,6 +197,12 @@ model User {
   // Customer wallet and settings (for customer role only)
   wallet   Wallet?           @relation("UserWallet")
   settings CustomerSettings? @relation("UserSettings")
+
+  // Rating relations
+  ratingsGiven    Rating[] @relation("CustomerRatings")   // Ratings this user gave (as customer)
+  ratingsReceived Rating[] @relation("DriverRatings")     // Ratings this user received (as driver)
+  avgRating       Float?   // Denormalized: cached average rating (updated on each new rating)
+  totalRatings    Int      @default(0) // Total number of ratings received as driver
 
   // =========================================
   // INDEXES FOR SCALABILITY
@@ -329,7 +339,8 @@ model Booking {
   // =========================================
   // STATUS
   // =========================================
-  status BookingStatus @default(active)
+  status         BookingStatus @default(active)
+  stateChangedAt DateTime?     @default(now()) // Timestamp of last state transition
 
   // =========================================
   // BROADCAST TRACKING
@@ -410,7 +421,8 @@ model Order {
   // =========================================
   // STATUS
   // =========================================
-  status OrderStatus @default(active)
+  status         OrderStatus @default(active)
+  stateChangedAt DateTime?   @default(now()) // Timestamp of last state transition
 
   // =========================================
   // CANCELLATION
@@ -584,6 +596,12 @@ model Assignment {
   // STATUS
   // =========================================
   status AssignmentStatus @default(pending)
+
+  // =========================================
+  // RATING (denormalized for fast trip list display)
+  // =========================================
+  customerRating Int?     // 1-5 stars (copied from Rating record for fast access)
+  rating         Rating?  // Full rating record relation
 
   // =========================================
   // TIMESTAMPS
@@ -849,5 +867,62 @@ model CustomBookingRequest {
   @@index([status, createdAt])    // Admin dashboard query
   @@index([customerPhone])        // Search by phone
   @@index([pickupCity, dropCity]) // Route search
+}
+
+// =============================================================================
+// RATING MODEL
+// =============================================================================
+//
+// Customer rates driver after trip completion (per assignment, not per booking)
+// One rating per customer per assignment (enforced by @@unique)
+// Supports star rating (1-5), predefined tags, and optional comment
+// =============================================================================
+
+model Rating {
+  id String @id @default(uuid())
+
+  // =========================================
+  // WHO RATED (customer)
+  // =========================================
+  customerId String
+  customer   User   @relation("CustomerRatings", fields: [customerId], references: [id])
+
+  // =========================================
+  // WHO WAS RATED (driver)
+  // =========================================
+  driverId String
+  driver   User   @relation("DriverRatings", fields: [driverId], references: [id])
+
+  // =========================================
+  // WHICH TRIP
+  // =========================================
+  assignmentId String     @unique // One rating per assignment
+  assignment   Assignment @relation(fields: [assignmentId], references: [id])
+
+  // Optional booking/order reference for analytics
+  bookingId String?
+  orderId   String?
+
+  // =========================================
+  // RATING DATA
+  // =========================================
+  stars   Int       // 1-5 star rating
+  comment String?   // Optional text feedback (max 500 chars)
+  tags    String[]  // Quick feedback tags: ["polite", "on_time", "safe_driving"]
+
+  // =========================================
+  // TIMESTAMPS
+  // =========================================
+  createdAt DateTime @default(now())
+
+  // =========================================
+  // CONSTRAINTS & INDEXES
+  // =========================================
+  @@unique([customerId, assignmentId]) // One rating per customer per trip
+  @@index([driverId])                  // Fast driver rating lookup
+  @@index([assignmentId])              // Fast trip rating lookup
+  @@index([driverId, createdAt])       // Driver ratings over time (analytics)
+  @@index([stars])                     // Rating distribution analytics
+  @@index([customerId])               // Customer's given ratings
 }
 

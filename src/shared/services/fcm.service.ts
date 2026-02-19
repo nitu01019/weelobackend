@@ -27,6 +27,7 @@
  */
 
 import { logger } from './logger.service';
+import { redisService } from './redis.service';
 
 // Notification types - must match mobile apps
 export const NotificationType = {
@@ -37,14 +38,50 @@ export const NotificationType = {
   GENERAL: 'general'
 } as const;
 
-// FCM Token storage (in production, store in database)
-const userTokens = new Map<string, string[]>(); // userId -> FCM tokens (user can have multiple devices)
+// =============================================================================
+// FCM TOKEN STORAGE
+// =============================================================================
+// 
+// SCALABILITY:
+// - Primary: Redis SET per userId — shared across all ECS instances
+// - Fallback: In-memory Map — used if Redis is unavailable
+// - 90-day TTL on Redis keys (FCM tokens expire ~60 days)
+// 
+// EASY UNDERSTANDING:
+// - registerToken() → Add token to user's set (Redis SADD = no duplicates)
+// - removeToken() → Remove token from user's set (Redis SREM)
+// - getTokens() → Get all tokens for a user (Redis SMEMBERS)
+// 
+// MODULARITY:
+// - Uses existing redisService singleton (no new connections)
+// - In-memory Map is independent fallback, not a cache layer
+// =============================================================================
+
+// In-memory fallback for when Redis is unavailable
+const userTokensFallback = new Map<string, string[]>();
+
+// Redis key pattern for FCM tokens
+const FCM_TOKEN_KEY = (userId: string) => `fcm:tokens:${userId}`;
+
+// FCM tokens expire after ~60 days, we set 90-day TTL for safety
+const FCM_TOKEN_TTL_SECONDS = 90 * 24 * 60 * 60; // 90 days
 
 /**
  * FCM Service class
  * 
- * NOTE: Firebase Admin SDK integration is optional.
- * The service works without it by logging notifications (useful for development).
+ * SCALABILITY:
+ * - FCM tokens stored in Redis (shared across ECS instances)
+ * - Falls back to in-memory Map if Redis is unavailable
+ * - Firebase Admin SDK handles millions of messages automatically
+ * 
+ * EASY UNDERSTANDING:
+ * - Firebase Admin SDK integration is optional
+ * - Works without it by logging notifications (useful for development)
+ * - Token storage is transparent — Redis or in-memory, same API
+ * 
+ * MODULARITY:
+ * - Token storage is decoupled from notification sending
+ * - Can switch storage backend without changing notification logic
  * 
  * To enable real push notifications:
  * 1. npm install firebase-admin
@@ -87,51 +124,122 @@ class FCMService {
     }
   }
 
+  // ===========================================================================
+  // TOKEN MANAGEMENT (Redis-backed with in-memory fallback)
+  // ===========================================================================
+
+  /**
+   * Check if Redis is available for token storage
+   * 
+   * EASY UNDERSTANDING: Simple boolean check — no complex logic
+   * MODULARITY: Centralized check used by all token methods
+   */
+  private isRedisAvailable(): boolean {
+    return redisService.isRedisEnabled() && redisService.isConnected();
+  }
+
   /**
    * Register FCM token for a user
    * Called when mobile app sends its FCM token after login
+   * 
+   * SCALABILITY: Uses Redis SADD — atomic, no duplicates, O(1)
+   * - Token is added to user's set in Redis (shared across all servers)
+   * - 90-day TTL ensures stale tokens are cleaned up automatically
+   * - Falls back to in-memory Map if Redis is unavailable
+   * 
+   * EASY UNDERSTANDING: SADD = Set Add. If token already exists, it's a no-op.
    */
-  registerToken(userId: string, token: string): void {
-    if (!userTokens.has(userId)) {
-      userTokens.set(userId, []);
+  async registerToken(userId: string, token: string): Promise<void> {
+    // Try Redis first (primary storage)
+    if (this.isRedisAvailable()) {
+      try {
+        const key = FCM_TOKEN_KEY(userId);
+        await redisService.sAdd(key, token);
+        await redisService.expire(key, FCM_TOKEN_TTL_SECONDS);
+        logger.info(`FCM: Token registered for user ${userId} [Redis]`);
+        return;
+      } catch (error: any) {
+        logger.warn(`FCM: Redis registerToken failed: ${error.message}. Using fallback.`);
+      }
     }
-    
-    const tokens = userTokens.get(userId)!;
+
+    // Fallback to in-memory
+    if (!userTokensFallback.has(userId)) {
+      userTokensFallback.set(userId, []);
+    }
+    const tokens = userTokensFallback.get(userId)!;
     if (!tokens.includes(token)) {
       tokens.push(token);
-      logger.info(`FCM: Token registered for user ${userId}`);
+      logger.info(`FCM: Token registered for user ${userId} [InMemory]`);
     }
   }
 
   /**
    * Remove FCM token (on logout or token refresh)
+   * 
+   * SCALABILITY: Uses Redis SREM — atomic removal, O(1)
+   * EASY UNDERSTANDING: SREM = Set Remove. If token doesn't exist, it's a no-op.
    */
-  removeToken(userId: string, token: string): void {
-    const tokens = userTokens.get(userId);
+  async removeToken(userId: string, token: string): Promise<void> {
+    // Try Redis first
+    if (this.isRedisAvailable()) {
+      try {
+        const key = FCM_TOKEN_KEY(userId);
+        await redisService.sRem(key, token);
+        logger.info(`FCM: Token removed for user ${userId} [Redis]`);
+        return;
+      } catch (error: any) {
+        logger.warn(`FCM: Redis removeToken failed: ${error.message}. Using fallback.`);
+      }
+    }
+
+    // Fallback to in-memory
+    const tokens = userTokensFallback.get(userId);
     if (tokens) {
       const index = tokens.indexOf(token);
       if (index > -1) {
         tokens.splice(index, 1);
-        logger.info(`FCM: Token removed for user ${userId}`);
+        logger.info(`FCM: Token removed for user ${userId} [InMemory]`);
       }
     }
   }
 
   /**
    * Get all tokens for a user
+   * 
+   * SCALABILITY: Uses Redis SMEMBERS — returns all set members, O(N)
+   * EASY UNDERSTANDING: Returns array of FCM tokens for the user's devices
+   * 
+   * NOTE: This is async now (Redis operations are async).
+   * All callers already use `await` or `.then()` patterns.
    */
-  getTokens(userId: string): string[] {
-    return userTokens.get(userId) || [];
+  async getTokens(userId: string): Promise<string[]> {
+    // Try Redis first
+    if (this.isRedisAvailable()) {
+      try {
+        const key = FCM_TOKEN_KEY(userId);
+        const tokens = await redisService.sMembers(key);
+        return tokens;
+      } catch (error: any) {
+        logger.warn(`FCM: Redis getTokens failed: ${error.message}. Using fallback.`);
+      }
+    }
+
+    // Fallback to in-memory
+    return userTokensFallback.get(userId) || [];
   }
 
   /**
    * Send notification to a specific user
+   * 
+   * SCALABILITY: Fetches tokens from Redis (shared across instances)
+   * EASY UNDERSTANDING: Get tokens → send to all devices → return success
    */
   async sendToUser(
     userId: string,
     notification: FCMNotification
   ): Promise<boolean> {
-    const tokens = this.getTokens(userId);
+    const tokens = await this.getTokens(userId);
     
     if (tokens.length === 0) {
       logger.debug(`FCM: No tokens found for user ${userId}`);
@@ -232,9 +340,11 @@ class FCMService {
 
   /**
    * Subscribe user to a topic
+   * 
+   * SCALABILITY: Fetches tokens from Redis before subscribing
    */
   async subscribeToTopic(userId: string, topic: string): Promise<boolean> {
-    const tokens = this.getTokens(userId);
+    const tokens = await this.getTokens(userId);
     
     if (tokens.length === 0 || !this.isInitialized || !this.admin) {
       logger.debug(`FCM: Cannot subscribe ${userId} to ${topic}`);

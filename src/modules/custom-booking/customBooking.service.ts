@@ -16,30 +16,29 @@
  * =============================================================================
  */
 
-import { PrismaClient, CustomBookingStatus } from '@prisma/client';
+import { CustomBookingStatus } from '@prisma/client';
+import { prismaClient as prisma } from '../../shared/database/prisma.service';
 import { logger } from '../../shared/services/logger.service';
 import { redisService } from '../../shared/services/redis.service';
 import { queueService } from '../../shared/services/queue.service';
-
-const prisma = new PrismaClient();
 
 // =============================================================================
 // CACHE CONFIGURATION (SCALABILITY: Reduces DB load for millions of users)
 // =============================================================================
 
 const CACHE_TTL = {
-  CUSTOMER_REQUESTS_LIST: 300,    // 5 minutes - frequently accessed
-  REQUEST_DETAIL: 600,            // 10 minutes - less frequently updated
-  ADMIN_PENDING_LIST: 120,        // 2 minutes - needs to be fresh for ops
+    CUSTOMER_REQUESTS_LIST: 300,    // 5 minutes - frequently accessed
+    REQUEST_DETAIL: 600,            // 10 minutes - less frequently updated
+    ADMIN_PENDING_LIST: 120,        // 2 minutes - needs to be fresh for ops
 };
 
 const CACHE_KEYS = {
-  customerRequestsList: (customerId: string, page: number) => 
-    `custom-booking:customer:${customerId}:list:page:${page}`,
-  requestDetail: (requestId: string) => 
-    `custom-booking:request:${requestId}`,
-  customerRequestsCount: (customerId: string) => 
-    `custom-booking:customer:${customerId}:count`,
+    customerRequestsList: (customerId: string, page: number) =>
+        `custom-booking:customer:${customerId}:list:page:${page}`,
+    requestDetail: (requestId: string) =>
+        `custom-booking:request:${requestId}`,
+    customerRequestsCount: (customerId: string) =>
+        `custom-booking:customer:${customerId}:count`,
 };
 
 /**
@@ -47,32 +46,34 @@ const CACHE_KEYS = {
  * SCALABILITY: Targeted cache invalidation - only affected keys
  */
 async function invalidateCustomerCache(customerId: string): Promise<void> {
-  try {
-    // Get all page keys for this customer and delete them
-    const pattern = `custom-booking:customer:${customerId}:*`;
-    const keys = await redisService.keys(pattern);
-    
-    if (keys.length > 0) {
-      for (const key of keys) {
-        await redisService.del(key);
-      }
-      logger.debug(`[CustomBooking] Invalidated ${keys.length} cache keys for customer ${customerId}`);
+    try {
+        // Get all page keys for this customer and delete them
+        const pattern = `custom-booking:customer:${customerId}:*`;
+        let count = 0;
+
+        for await (const key of redisService.scanIterator(pattern)) {
+            await redisService.del(key);
+            count++;
+        }
+
+        if (count > 0) {
+            logger.debug(`[CustomBooking] Invalidated ${count} cache keys for customer ${customerId}`);
+        }
+    } catch (error) {
+        // Cache invalidation failure shouldn't break the flow
+        logger.warn('[CustomBooking] Cache invalidation failed:', error);
     }
-  } catch (error) {
-    // Cache invalidation failure shouldn't break the flow
-    logger.warn('[CustomBooking] Cache invalidation failed:', error);
-  }
 }
 
 /**
  * Invalidate single request cache
  */
 async function invalidateRequestCache(requestId: string): Promise<void> {
-  try {
-    await redisService.del(CACHE_KEYS.requestDetail(requestId));
-  } catch (error) {
-    logger.warn('[CustomBooking] Request cache invalidation failed:', error);
-  }
+    try {
+        await redisService.del(CACHE_KEYS.requestDetail(requestId));
+    } catch (error) {
+        logger.warn('[CustomBooking] Request cache invalidation failed:', error);
+    }
 }
 
 // =============================================================================
@@ -163,12 +164,12 @@ export async function createCustomBookingRequest(input: CreateCustomBookingInput
     // ASYNC EVENT PUBLISHING (Non-blocking - returns immediately)
     // SCALABILITY: Background processing for notifications/analytics
     // ==========================================================================
-    
+
     // 1. Invalidate customer's cache (so next list fetch gets fresh data)
-    invalidateCustomerCache(input.customerId).catch(err => 
+    invalidateCustomerCache(input.customerId).catch(err =>
         logger.warn('[CustomBooking] Cache invalidation failed:', err)
     );
-    
+
     // 2. Queue async events for background processing
     try {
         // Notify admin about new custom booking request
@@ -184,7 +185,7 @@ export async function createCustomBookingRequest(input: CreateCustomBookingInput
             startDate: input.startDate,
             createdAt: new Date().toISOString()
         });
-        
+
         // Queue confirmation notification to customer
         await queueService.add('notifications', 'custom_booking_confirmation', {
             userId: input.customerId,
@@ -192,7 +193,7 @@ export async function createCustomBookingRequest(input: CreateCustomBookingInput
             requestId: request.id,
             message: `Your custom booking request for ${totalTrucks} trucks has been submitted. Our team will contact you shortly.`
         });
-        
+
         logger.debug(`[CustomBooking] Queued async events for request ${request.id}`);
     } catch (error) {
         // Queue failure shouldn't break the request creation
@@ -215,7 +216,7 @@ export async function getCustomerRequests(
     limit: number = 10
 ) {
     const cacheKey = CACHE_KEYS.customerRequestsList(customerId, page);
-    
+
     // Try cache first (only for first few pages)
     if (page <= 3) {
         try {
@@ -229,7 +230,7 @@ export async function getCustomerRequests(
             logger.warn('[CustomBooking] Cache read failed:', error);
         }
     }
-    
+
     // Fetch from database
     const skip = (page - 1) * limit;
 
@@ -252,13 +253,13 @@ export async function getCustomerRequests(
             totalPages: Math.ceil(total / limit)
         }
     };
-    
+
     // Cache the result (only first few pages)
     if (page <= 3) {
         try {
             await redisService.set(
-                cacheKey, 
-                JSON.stringify(result), 
+                cacheKey,
+                JSON.stringify(result),
                 CACHE_TTL.CUSTOMER_REQUESTS_LIST
             );
             logger.debug(`[CustomBooking] Cached customer ${customerId} page ${page}`);
@@ -278,7 +279,7 @@ export async function getCustomerRequests(
  */
 export async function getRequestById(requestId: string, customerId: string) {
     const cacheKey = CACHE_KEYS.requestDetail(requestId);
-    
+
     // Try cache first
     try {
         const cached = await redisService.get(cacheKey);
@@ -293,7 +294,7 @@ export async function getRequestById(requestId: string, customerId: string) {
     } catch (error) {
         logger.warn('[CustomBooking] Cache read failed:', error);
     }
-    
+
     // Fetch from database
     const request = await prisma.customBookingRequest.findFirst({
         where: {
@@ -305,7 +306,7 @@ export async function getRequestById(requestId: string, customerId: string) {
     if (!request) {
         throw new Error('Request not found');
     }
-    
+
     // Cache the result
     try {
         await redisService.set(
@@ -324,29 +325,28 @@ export async function getRequestById(requestId: string, customerId: string) {
  * Cancel a pending request
  */
 export async function cancelRequest(requestId: string, customerId: string) {
-    const request = await prisma.customBookingRequest.findFirst({
+    // Atomic cancel: status precondition in WHERE prevents TOCTOU race condition
+    // (findFirst + update would allow two concurrent cancels to both succeed)
+    const result = await prisma.customBookingRequest.updateMany({
         where: {
             id: requestId,
             customerId,
             status: { in: ['pending', 'under_review'] }
-        }
-    });
-
-    if (!request) {
-        throw new Error('Request not found or cannot be cancelled');
-    }
-
-    const updated = await prisma.customBookingRequest.update({
-        where: { id: requestId },
+        },
         data: {
             status: 'cancelled',
             updatedAt: new Date()
         }
     });
 
+    if (result.count === 0) {
+        throw new Error('Request not found or cannot be cancelled');
+    }
+
     logger.info(`Custom booking request cancelled: ${requestId}`);
 
-    return updated;
+    // Return the updated record for API response
+    return prisma.customBookingRequest.findUnique({ where: { id: requestId } });
 }
 
 // =============================================================================

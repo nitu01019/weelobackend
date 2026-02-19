@@ -5,10 +5,9 @@
  * SAME STANDARDS: Follows existing job patterns
  */
 
-import { PrismaClient } from '@prisma/client';
 import { logger } from '../services/logger.service';
-
-const prisma = new PrismaClient();
+import { prismaClient as prisma } from '../database/prisma.service';
+import { redisService } from '../services/redis.service';
 
 /**
  * Cleanup expired orders - runs every 2 minutes
@@ -16,6 +15,22 @@ const prisma = new PrismaClient();
  * MODULARITY: Can be called manually or via cron
  */
 export async function cleanupExpiredOrders(): Promise<void> {
+  // Distributed lock — prevents duplicate processing across ECS instances / cluster workers.
+  // Lock TTL (25s) < interval (120s) so lock always releases before next run.
+  const lockKey = 'lock:cleanup-expired-orders';
+  let lockAcquired = false;
+  try {
+    const lockResult = await redisService.acquireLock(lockKey, 'cleanup-job', 25);
+    lockAcquired = lockResult.acquired;
+    if (!lockAcquired) {
+      // Another instance is already running this job
+      return;
+    }
+  } catch (lockErr: any) {
+    // Redis down — proceed without lock (better to double-process than skip)
+    logger.warn(`[CleanupJob] Lock acquisition failed, proceeding without lock: ${lockErr.message}`);
+  }
+
   try {
     const now = new Date();
     logger.info(`🧹 [CleanupJob] Starting expired orders cleanup at ${now.toISOString()}`);
@@ -67,6 +82,15 @@ export async function cleanupExpiredOrders(): Promise<void> {
     
   } catch (error) {
     logger.error(`❌ [CleanupJob] Error cleaning up expired orders: ${error}`);
+  } finally {
+    // Release lock so other instances can run next interval
+    if (lockAcquired) {
+      try {
+        await redisService.releaseLock(lockKey, 'cleanup-job');
+      } catch (_) {
+        // Lock will auto-expire in 25s anyway
+      }
+    }
   }
 }
 

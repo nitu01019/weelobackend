@@ -9,11 +9,11 @@
  * - Location tracking updates
  * - Assignment status changes
  * 
- * MULTI-SERVER SCALING (Redis Pub/Sub):
- * - Events emitted on one server are broadcast to all servers
- * - Each server handles its own connected clients
- * - Redis acts as the message broker between servers
- * - Seamless horizontal scaling - just add more servers!
+ * MULTI-SERVER SCALING (Socket.IO Redis Adapter):
+ * - io.to(room).emit() is synchronized across all server instances
+ * - No manual pub/sub fanout code required
+ * - Redis adapter acts as the transport between ECS tasks
+ * - Seamless horizontal scaling - just add more servers
  * 
  * SECURITY:
  * - JWT authentication required
@@ -24,10 +24,25 @@
 
 import { Server as HttpServer } from 'http';
 import { Server, Socket } from 'socket.io';
+import { createAdapter } from '@socket.io/redis-adapter';
 import jwt from 'jsonwebtoken';
 import { config } from '../../config/environment';
 import { logger } from './logger.service';
 import { redisService } from './redis.service';
+import {
+  TRANSPORTER_PRESENCE_KEY,
+  PRESENCE_TTL_SECONDS as TRANSPORTER_PRESENCE_TTL,
+  ONLINE_TRANSPORTERS_SET
+} from './transporter-online.service';
+
+// Lazy import to avoid circular dependency (socket.service ↔ driver.service)
+let _driverService: any = null;
+function getDriverService() {
+  if (!_driverService) {
+    _driverService = require('../../modules/driver/driver.service').driverService;
+  }
+  return _driverService;
+}
 
 let io: Server | null = null;
 
@@ -35,40 +50,15 @@ let io: Server | null = null;
 const userSockets = new Map<string, Set<string>>();  // userId -> Set of socketIds
 const socketUsers = new Map<string, string>();        // socketId -> userId
 
-// =============================================================================
-// REDIS PUB/SUB CHANNELS - For Multi-Server Scaling
-// =============================================================================
-
-/**
- * Redis channels for cross-server communication
- * 
- * WHY REDIS PUB/SUB IS REQUIRED:
- * - When you have multiple server instances behind a load balancer
- * - User A might be connected to Server 1
- * - User B might be connected to Server 2
- * - When Server 1 needs to notify User B, it publishes to Redis
- * - Server 2 receives the message and delivers to User B
- * 
- * CHANNEL STRATEGY:
- * - socket:user:{userId}     → Messages for specific user
- * - socket:room:{roomName}   → Messages for room (booking:123, order:456)
- * - socket:broadcast         → Messages for all connected clients
- * - socket:transporters      → Messages for all transporters
- */
-const REDIS_CHANNELS = {
-  USER: (userId: string) => `socket:user:${userId}`,
-  ROOM: (roomName: string) => `socket:room:${roomName}`,
-  BROADCAST: 'socket:broadcast',
-  TRANSPORTERS: 'socket:transporters',
-  // Pattern for subscribing to all user channels
-  USER_PATTERN: 'socket:user:*',
-  ROOM_PATTERN: 'socket:room:*',
-};
+// Max WebSocket connections per user — prevents memory exhaustion from malicious clients.
+// Normal usage: 1-2 connections (app foreground + background reconnect).
+// 5 allows multi-device + reconnect overlap without abuse.
+const MAX_CONNECTIONS_PER_USER = 5;
 
 // Server instance ID (for debugging multi-server issues)
 const SERVER_INSTANCE_ID = `server_${process.pid}_${Date.now().toString(36)}`;
 
-// Flag to track if Redis pub/sub is initialized
+// Flag to track if Redis adapter is initialized
 let redisPubSubInitialized = false;
 
 /**
@@ -119,6 +109,12 @@ export const SocketEvent = {
   
   ERROR: 'error',
 
+  // Driver presence events
+  HEARTBEAT: 'heartbeat',                       // Driver sends every 12s
+  DRIVER_ONLINE: 'driver_online',               // Driver came online
+  DRIVER_OFFLINE: 'driver_offline',             // Driver went offline
+  DRIVER_TIMEOUT: 'driver_timeout',             // Driver didn't accept in time
+  
   // Client -> Server
   JOIN_BOOKING: 'join_booking',
   LEAVE_BOOKING: 'leave_booking',
@@ -209,7 +205,7 @@ export function initializeSocket(server: HttpServer): Server {
   });
 
   // Connection handler
-  io.on('connection', (socket: Socket) => {
+  io.on('connection', async (socket: Socket) => {
     const userId = socket.data.userId;
     const role = socket.data.role;
     const phone = socket.data.phone;
@@ -219,15 +215,47 @@ export function initializeSocket(server: HttpServer): Server {
     logger.info(`   📱 Phone: ${phone}`);
     logger.info(`   🏷️ Role: ${role}`);
 
-    // Track user connection
+    // Track user connection (with limit to prevent abuse)
     if (!userSockets.has(userId)) {
       userSockets.set(userId, new Set());
     }
-    userSockets.get(userId)!.add(socket.id);
+    const userSocketSet = userSockets.get(userId)!;
+
+    // Enforce connection limit cross-instance via Redis counter
+    const connKey = `socket:conncount:${userId}`;
+    let globalCount = 0;
+    try {
+      globalCount = await redisService.incr(connKey);
+      await redisService.expire(connKey, 3600); // 1hr TTL (auto-cleanup)
+    } catch {
+      // Redis unavailable — fall back to local count
+      globalCount = userSocketSet.size + 1;
+    }
+
+    if (globalCount > MAX_CONNECTIONS_PER_USER) {
+      // Decrement since we won't be keeping this connection
+      try { await redisService.incrBy(connKey, -1); } catch {}
+      const oldestSocketId = userSocketSet.values().next().value;
+      if (oldestSocketId) {
+        logger.warn(`[Socket] Global connection limit (${MAX_CONNECTIONS_PER_USER}) exceeded for ${userId}, disconnecting oldest: ${oldestSocketId}`);
+        const oldSocket = io?.sockets.sockets.get(oldestSocketId);
+        if (oldSocket) {
+          oldSocket.emit(SocketEvent.ERROR, { message: 'Connection limit exceeded. Disconnecting oldest session.' });
+          oldSocket.disconnect(true);
+        }
+        userSocketSet.delete(oldestSocketId);
+        socketUsers.delete(oldestSocketId);
+        // Re-add this new connection
+        try { await redisService.incr(connKey); } catch {}
+      }
+    }
+
+    userSocketSet.add(socket.id);
     socketUsers.set(socket.id, userId);
 
     // Join user's personal room
     socket.join(`user:${userId}`);
+    socket.join(`role:${role}`);
 
     // Send confirmation
     socket.emit(SocketEvent.CONNECTED, {
@@ -284,9 +312,117 @@ export function initializeSocket(server: HttpServer): Server {
         if (userSockets.get(userId)?.size === 0) {
           userSockets.delete(userId);
         }
+        // Decrement Redis connection counter (cross-instance tracking)
+        try { redisService.incrBy(`socket:conncount:${userId}`, -1).catch(() => {}); } catch {}
       }
       socketUsers.delete(socket.id);
     });
+
+    // ================================================================
+    // HEARTBEAT — Extends Redis presence TTL (no DB write)
+    // ================================================================
+    // Captain app sends every 12 seconds:
+    //   { type: "heartbeat", lat, lng, battery, speed }
+    //
+    // DRIVERS: Extends driver:presence:{id} TTL to 35s
+    // TRANSPORTERS: Extends transporter:presence:{id} TTL to 60s
+    //
+    // If heartbeat stops → key expires → auto-offline.
+    //
+    // GUARD: Only extends if presence key exists. This prevents
+    // ghost-online: toggle OFF → DELs key → stale heartbeat arrives
+    // → key doesn't exist → heartbeat ignored → stays offline ✅
+    // ================================================================
+    socket.on(SocketEvent.HEARTBEAT, (data: any) => {
+      if (role === 'driver') {
+        // Driver heartbeat → extends driver:presence:{id}
+        try {
+          getDriverService().handleHeartbeat(userId, {
+            lat: data?.lat,
+            lng: data?.lng,
+            battery: data?.battery,
+            speed: data?.speed
+          });
+        } catch (e: any) {
+          logger.warn(`[Socket] Heartbeat error for driver ${userId}: ${e.message}`);
+        }
+      } else if (role === 'transporter') {
+        // Transporter heartbeat → extends transporter:presence:{id}
+        // Same guard pattern as driver.service.ts handleHeartbeat():
+        // Only extend TTL if presence key exists (prevents ghost-online)
+        (async () => {
+          try {
+            const presenceKey = TRANSPORTER_PRESENCE_KEY(userId);
+            const presenceExists = await redisService.exists(presenceKey);
+            if (!presenceExists) {
+              // No presence key — transporter is offline, ignore stale heartbeat
+              return;
+            }
+
+            // Extend TTL — zero DB writes, only Redis SET
+            const presenceData = JSON.stringify({
+              transporterId: userId,
+              lastHeartbeat: new Date().toISOString()
+            });
+            await redisService.set(presenceKey, presenceData, TRANSPORTER_PRESENCE_TTL);
+          } catch (e: any) {
+            // Non-critical — heartbeat failure shouldn't crash anything
+            logger.warn(`[Socket] Heartbeat error for transporter ${userId}: ${e.message}`);
+          }
+        })();
+      }
+    });
+
+    // ================================================================
+    // PRESENCE RESTORATION ON RECONNECT
+    // ================================================================
+    // If user was ONLINE before disconnect (DB isAvailable=true),
+    // auto-restore Redis presence without requiring button press.
+    //
+    // DRIVERS: Restores driver:presence:{id} + onlineDrivers set
+    // TRANSPORTERS: Restores transporter:presence:{id} + online:transporters set
+    // ================================================================
+    if (role === 'driver') {
+      (async () => {
+        try {
+          const restored = await getDriverService().restorePresence(userId);
+          if (restored) {
+            logger.info(`[Socket] ✅ Driver ${userId} presence restored on reconnect`);
+          }
+        } catch (e: any) {
+          logger.warn(`[Socket] Failed to restore driver presence: ${e.message}`);
+        }
+      })();
+    } else if (role === 'transporter') {
+      (async () => {
+        try {
+          const { prismaClient } = await import('../database/prisma.service');
+          const transporter = await prismaClient.user.findUnique({
+            where: { id: userId },
+            select: { isAvailable: true }
+          });
+
+          if (transporter?.isAvailable) {
+            // Restore Redis presence
+            const presenceData = JSON.stringify({
+              transporterId: userId,
+              restored: true,
+              lastHeartbeat: new Date().toISOString()
+            });
+            await redisService.set(
+              TRANSPORTER_PRESENCE_KEY(userId),
+              presenceData,
+              TRANSPORTER_PRESENCE_TTL
+            );
+            await redisService.sAdd(ONLINE_TRANSPORTERS_SET, userId);
+
+            logger.info(`[Socket] ✅ Transporter ${userId} presence restored on reconnect`);
+          }
+        } catch (e: any) {
+          logger.warn(`[Socket] Failed to restore transporter presence: ${e.message}`);
+        }
+      })();
+    }
 
     // Handle ping from client (for connection quality)
     socket.on('ping', () => {
@@ -306,184 +442,48 @@ export function initializeSocket(server: HttpServer): Server {
     });
   });
 
-  logger.info('✅ Socket.IO initialized with optimized settings');
-  
-  // Initialize Redis Pub/Sub for multi-server scaling
-  initializeRedisPubSub();
-  
+  logger.info('Socket.IO initialized with optimized settings');
+
+  // Wire @socket.io/redis-adapter for cross-instance delivery
+  // All io.to(room).emit() calls automatically sync across ECS tasks
+  setupRedisAdapter(io);
+
   return io;
 }
 
 // =============================================================================
-// REDIS PUB/SUB INITIALIZATION - Multi-Server Communication
+// REDIS ADAPTER SETUP - Replaces manual pub/sub with @socket.io/redis-adapter
 // =============================================================================
 
 /**
- * Initialize Redis Pub/Sub for cross-server socket events
- * 
- * This allows multiple server instances to communicate:
- * - Server 1 emits to user X → publishes to Redis
- * - Server 2 (where user X is connected) receives → delivers to user X
+ * Set up @socket.io/redis-adapter for automatic cross-instance delivery.
+ * With the adapter, every io.to(room).emit() call automatically reaches
+ * clients connected to other ECS tasks — no manual publishToRedis needed.
  */
-async function initializeRedisPubSub(): Promise<void> {
-  if (redisPubSubInitialized) {
-    logger.warn('[Socket] Redis Pub/Sub already initialized');
+async function setupRedisAdapter(socketServer: Server): Promise<void> {
+  const redisUrl = process.env.REDIS_URL;
+  if (process.env.REDIS_ENABLED !== 'true' || !redisUrl) {
+    logger.info('[Socket] No Redis — single-instance mode');
     return;
   }
-  
+
   try {
-    // Subscribe to broadcast channel (all clients)
-    await redisService.subscribe(REDIS_CHANNELS.BROADCAST, (message) => {
-      handleRedisBroadcast(message);
-    });
-    
-    // Subscribe to transporters channel
-    await redisService.subscribe(REDIS_CHANNELS.TRANSPORTERS, (message) => {
-      handleRedisTransporterBroadcast(message);
-    });
-    
+    const Redis = require('ioredis');
+    const useTls = redisUrl.startsWith('rediss://');
+    const tlsOpts = useTls ? { tls: { rejectUnauthorized: false } } : {};
+
+    const pubClient = new Redis(redisUrl, { ...tlsOpts, lazyConnect: true });
+    const subClient = new Redis(redisUrl, { ...tlsOpts, lazyConnect: true });
+
+    await Promise.all([pubClient.connect(), subClient.connect()]);
+
+    socketServer.adapter(createAdapter(pubClient, subClient));
     redisPubSubInitialized = true;
-    logger.info(`🔴 [Socket] Redis Pub/Sub initialized (Instance: ${SERVER_INSTANCE_ID})`);
-    logger.info('   📡 Subscribed to: broadcast, transporters channels');
-    logger.info('   🌐 Multi-server socket scaling ENABLED');
-    
+    logger.info(`[Socket] Redis adapter initialized (Instance: ${SERVER_INSTANCE_ID})`);
+    logger.info('   Cross-instance WebSocket delivery ENABLED');
   } catch (error: any) {
-    logger.error(`[Socket] Failed to initialize Redis Pub/Sub: ${error.message}`);
-    logger.warn('[Socket] Falling back to single-server mode');
-  }
-}
-
-/**
- * Handle broadcast messages from Redis (for all clients)
- */
-function handleRedisBroadcast(message: string): void {
-  try {
-    const { event, data, sourceServer } = JSON.parse(message);
-    
-    // Skip if this message originated from this server (avoid duplicate delivery)
-    if (sourceServer === SERVER_INSTANCE_ID) {
-      return;
-    }
-    
-    logger.debug(`[Socket] Received broadcast from ${sourceServer}: ${event}`);
-    
-    // Emit to all local clients
-    if (io) {
-      io.emit(event, data);
-    }
-  } catch (error: any) {
-    logger.error(`[Socket] Error handling Redis broadcast: ${error.message}`);
-  }
-}
-
-/**
- * Handle transporter broadcast messages from Redis
- */
-function handleRedisTransporterBroadcast(message: string): void {
-  try {
-    const { event, data, sourceServer } = JSON.parse(message);
-    
-    if (sourceServer === SERVER_INSTANCE_ID) {
-      return;
-    }
-    
-    logger.debug(`[Socket] Received transporter broadcast from ${sourceServer}: ${event}`);
-    
-    // Emit to all local transporters
-    if (io) {
-      io.sockets.sockets.forEach(socket => {
-        if (socket.data.role === 'transporter') {
-          socket.emit(event, data);
-        }
-      });
-    }
-  } catch (error: any) {
-    logger.error(`[Socket] Error handling transporter broadcast: ${error.message}`);
-  }
-}
-
-/**
- * Publish a message to Redis for cross-server delivery
- */
-async function publishToRedis(channel: string, event: string, data: any): Promise<void> {
-  try {
-    const message = JSON.stringify({
-      event,
-      data,
-      sourceServer: SERVER_INSTANCE_ID,
-      timestamp: Date.now()
-    });
-    
-    await redisService.publish(channel, message);
-    logger.debug(`[Socket] Published ${event} to Redis channel: ${channel}`);
-  } catch (error: any) {
-    logger.error(`[Socket] Failed to publish to Redis: ${error.message}`);
-  }
-}
-
-/**
- * Subscribe to a user-specific channel for cross-server messages
- * Called when a user connects to this server
- */
-async function subscribeToUserChannel(userId: string): Promise<void> {
-  const channel = REDIS_CHANNELS.USER(userId);
-  
-  try {
-    await redisService.subscribe(channel, (message) => {
-      try {
-        const { event, data, sourceServer } = JSON.parse(message);
-        
-        // Skip if from this server
-        if (sourceServer === SERVER_INSTANCE_ID) {
-          return;
-        }
-        
-        logger.debug(`[Socket] Received user message from ${sourceServer} for ${userId}: ${event}`);
-        
-        // Deliver to local user sockets
-        if (io) {
-          io.to(`user:${userId}`).emit(event, data);
-        }
-      } catch (e: any) {
-        logger.error(`[Socket] Error handling user message: ${e.message}`);
-      }
-    });
-    
-    logger.debug(`[Socket] Subscribed to user channel: ${channel}`);
-  } catch (error: any) {
-    logger.error(`[Socket] Failed to subscribe to user channel: ${error.message}`);
-  }
-}
-
-/**
- * Subscribe to a room-specific channel for cross-server messages
- */
-async function subscribeToRoomChannel(roomName: string): Promise<void> {
-  const channel = REDIS_CHANNELS.ROOM(roomName);
-  
-  try {
-    await redisService.subscribe(channel, (message) => {
-      try {
-        const { event, data, sourceServer } = JSON.parse(message);
-        
-        if (sourceServer === SERVER_INSTANCE_ID) {
-          return;
-        }
-        
-        logger.debug(`[Socket] Received room message from ${sourceServer} for ${roomName}: ${event}`);
-        
-        // Deliver to local room
-        if (io) {
-          io.to(roomName).emit(event, data);
-        }
-      } catch (e: any) {
-        logger.error(`[Socket] Error handling room message: ${e.message}`);
-      }
-    });
-    
-    logger.debug(`[Socket] Subscribed to room channel: ${channel}`);
-  } catch (error: any) {
-    logger.error(`[Socket] Failed to subscribe to room channel: ${error.message}`);
+    logger.error(`[Socket] Failed to initialize Redis adapter: ${error.message}`);
+    logger.warn('[Socket] Falling back to single-instance mode');
   }
 }
 
@@ -491,89 +491,48 @@ async function subscribeToRoomChannel(roomName: string): Promise<void> {
  * Emit to a specific user (by userId)
  * Used to send notifications to specific transporters
  * 
- * MULTI-SERVER: Also publishes to Redis so other servers can deliver
+ * MULTI-SERVER: Socket.IO Redis adapter handles cross-instance delivery
  */
 export function emitToUser(userId: string, event: string, data: any): void {
   if (!io) {
-    logger.error(`❌ [emitToUser] Socket.IO not initialized! Cannot emit ${event} to ${userId}`);
+    logger.error(`[emitToUser] Socket.IO not initialized! Cannot emit ${event} to ${userId}`);
     return;
   }
-  
-  // Check if user has any connected sockets on THIS server
-  const userSocketSet = userSockets.get(userId);
-  const localSocketCount = userSocketSet?.size || 0;
-  
-  logger.info(`╔══════════════════════════════════════════════════════════════╗`);
-  logger.info(`║  📤 EMIT TO USER                                             ║`);
-  logger.info(`╠══════════════════════════════════════════════════════════════╣`);
-  logger.info(`║  User ID: ${userId}`);
-  logger.info(`║  Event: ${event}`);
-  logger.info(`║  Local sockets: ${localSocketCount}`);
-  logger.info(`║  Socket IDs: ${userSocketSet ? [...userSocketSet].join(', ') : 'none'}`);
-  logger.info(`╚══════════════════════════════════════════════════════════════╝`);
-  
-  // Emit to local sockets
-  if (localSocketCount > 0) {
-    logger.info(`📤 Emitting ${event} to user room 'user:${userId}' (${localSocketCount} socket(s))`);
-    io.to(`user:${userId}`).emit(event, data);
-    logger.info(`✅ Emit completed to ${localSocketCount} socket(s)`);
-  } else {
-    logger.warn(`⚠️ User ${userId} has NO local sockets - broadcast will NOT be received in real-time!`);
-  }
-  
-  // ALWAYS publish to Redis - user might be on another server
-  // The receiving server will skip if sourceServer matches
-  publishToRedis(REDIS_CHANNELS.USER(userId), event, data);
-  
-  if (localSocketCount === 0) {
-    logger.warn(`[Socket] User ${userId} not connected - they will NOT see the broadcast until they reconnect`);
-  }
+
+  // With @socket.io/redis-adapter, this automatically reaches all instances
+  io.to(`user:${userId}`).emit(event, data);
+
+  const localSocketCount = userSockets.get(userId)?.size || 0;
+  logger.debug(`[Socket] Emitted ${event} to user:${userId} (${localSocketCount} local sockets)`);
 }
 
 /**
  * Emit to all sockets in a booking room
- * MULTI-SERVER: Also publishes to Redis
+ * MULTI-SERVER: Socket.IO Redis adapter handles cross-instance delivery
  */
 export function emitToBooking(bookingId: string, event: string, data: any): void {
   if (!io) return;
-  
-  // Emit to local room
   io.to(`booking:${bookingId}`).emit(event, data);
-  
-  // Publish to Redis for cross-server delivery
-  publishToRedis(REDIS_CHANNELS.ROOM(`booking:${bookingId}`), event, data);
-  
-  logger.debug(`Emitted ${event} to booking ${bookingId} (local + Redis)`);
+  logger.debug(`Emitted ${event} to booking ${bookingId}`);
 }
 
 /**
  * Emit to all sockets in a trip room
- * MULTI-SERVER: Also publishes to Redis
+ * MULTI-SERVER: Socket.IO Redis adapter handles cross-instance delivery
  */
 export function emitToTrip(tripId: string, event: string, data: any): void {
   if (!io) return;
-  
-  // Emit to local room
   io.to(`trip:${tripId}`).emit(event, data);
-  
-  // Publish to Redis for cross-server delivery
-  publishToRedis(REDIS_CHANNELS.ROOM(`trip:${tripId}`), event, data);
 }
 
 /**
  * Emit to all connected clients
- * MULTI-SERVER: Publishes to Redis broadcast channel
+ * MULTI-SERVER: Socket.IO Redis adapter handles cross-instance delivery
  */
 export function emitToAll(event: string, data: any): void {
   if (!io) return;
-  
-  // Emit to local clients
   io.emit(event, data);
-  
-  // Publish to Redis for cross-server delivery
-  publishToRedis(REDIS_CHANNELS.BROADCAST, event, data);
-  
-  logger.debug(`Broadcast ${event} to all clients (local + Redis)`);
+  logger.debug(`Broadcast ${event} to all clients`);
 }
 
 /**
@@ -600,18 +559,12 @@ export function getIO(): Server | null {
 /**
  * Emit to all sockets in an order room
  * Used for multi-truck request updates
- * MULTI-SERVER: Also publishes to Redis
+ * MULTI-SERVER: Socket.IO Redis adapter handles cross-instance delivery
  */
 export function emitToOrder(orderId: string, event: string, data: any): void {
   if (!io) return;
-  
-  // Emit to local room
   io.to(`order:${orderId}`).emit(event, data);
-  
-  // Publish to Redis for cross-server delivery
-  publishToRedis(REDIS_CHANNELS.ROOM(`order:${orderId}`), event, data);
-  
-  logger.debug(`Emitted ${event} to order ${orderId} (local + Redis)`);
+  logger.debug(`Emitted ${event} to order ${orderId}`);
 }
 
 /**
@@ -649,67 +602,42 @@ export function getConnectionStats(): ConnectionStats {
 /**
  * Broadcast to multiple users efficiently
  * Used when notifying many transporters about a new order
- * MULTI-SERVER: Also publishes to Redis for each user
+ * MULTI-SERVER: Socket.IO Redis adapter handles cross-instance delivery
  */
 export function emitToUsers(userIds: string[], event: string, data: any): void {
   if (!io || userIds.length === 0) return;
-  
-  let localDeliveries = 0;
-  
-  // Emit to local sockets and publish to Redis
-  for (const userId of userIds) {
-    const userSocketSet = userSockets.get(userId);
-    
-    if (userSocketSet && userSocketSet.size > 0) {
-      io.to(`user:${userId}`).emit(event, data);
-      localDeliveries++;
-    }
-    
-    // Always publish to Redis for cross-server delivery
-    publishToRedis(REDIS_CHANNELS.USER(userId), event, data);
+
+  const uniqueUserIds = Array.from(new Set(userIds));
+  for (const userId of uniqueUserIds) {
+    io.to(`user:${userId}`).emit(event, data);
   }
-  
-  logger.debug(`Batch emitted ${event} to ${userIds.length} users (${localDeliveries} local, all via Redis)`);
+
+  logger.debug(`Batch emitted ${event} to ${uniqueUserIds.length} users`);
 }
 
 /**
  * Emit to a specific room (e.g., booking:123, trip:456)
  * Used for group notifications like booking updates
- * MULTI-SERVER: Also publishes to Redis
+ * MULTI-SERVER: Socket.IO Redis adapter handles cross-instance delivery
  */
 export function emitToRoom(room: string, event: string, data: any): void {
   if (!io) return;
-  
-  // Emit to local room
+
   io.to(room).emit(event, data);
-  
-  // Publish to Redis for cross-server delivery
-  publishToRedis(REDIS_CHANNELS.ROOM(room), event, data);
-  
-  logger.debug(`Emitted ${event} to room ${room} (local + Redis)`);
+
+  logger.debug(`Emitted ${event} to room ${room}`);
 }
 
 /**
  * Broadcast to all transporters
  * Used for system-wide announcements
- * MULTI-SERVER: Publishes to Redis transporters channel
+ * MULTI-SERVER: Socket.IO Redis adapter handles cross-instance delivery
  */
 export function emitToAllTransporters(event: string, data: any): void {
   if (!io) return;
-  
-  // Emit to local transporters
-  let localCount = 0;
-  io.sockets.sockets.forEach(socket => {
-    if (socket.data.role === 'transporter') {
-      socket.emit(event, data);
-      localCount++;
-    }
-  });
-  
-  // Publish to Redis for cross-server delivery
-  publishToRedis(REDIS_CHANNELS.TRANSPORTERS, event, data);
-  
-  logger.debug(`Broadcast ${event} to transporters (${localCount} local + Redis)`);
+
+  io.to('role:transporter').emit(event, data);
+  logger.debug(`Broadcast ${event} to transporters`);
 }
 
 // Types
@@ -758,6 +686,6 @@ export const socketService = {
   // Server instance ID (for debugging)
   getServerInstanceId: () => SERVER_INSTANCE_ID,
   
-  // Redis Pub/Sub status
+  // Redis adapter status
   isRedisPubSubEnabled: () => redisPubSubInitialized,
 };

@@ -26,6 +26,7 @@
  * =============================================================================
  */
 
+import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
 // REMOVED: bcrypt (unnecessary for OTPs, was causing 5-second delay)
 // OTPs are temporary (5min auto-delete) + max 3 attempts = secure without hashing
@@ -95,12 +96,21 @@ interface AuthUser {
 }
 
 class AuthService {
-  // 4 PRINCIPLES: In-memory fallback for OTP when Redis is unavailable
-  // SCALABILITY: Works for single instance, migrate to distributed cache when scaling
-  // EASY UNDERSTANDING: Clear fallback pattern
-  // MODULARITY: Isolated from main Redis logic
-  // CODING STANDARDS: Industry-standard graceful degradation
-  private otpMemoryStore = new Map<string, OtpEntry>();
+  // ==========================================================================
+  // OTP STORAGE STRATEGY (Multi-Task Safe)
+  // ==========================================================================
+  // PRIMARY: Redis (shared across all ECS tasks, auto-expires with TTL)
+  // FALLBACK: PostgreSQL database (shared across all tasks, manual cleanup)
+  // 
+  // WHY NOT IN-MEMORY:
+  // With 2+ ECS tasks behind ALB, in-memory is per-process. OTP stored on
+  // Task A cannot be verified on Task B → "Invalid OTP" error every time.
+  //
+  // SCALABILITY: Both Redis and PostgreSQL are shared across all tasks
+  // EASY UNDERSTANDING: Try Redis → fallback to DB → never lose an OTP
+  // MODULARITY: Fallback is transparent to the caller
+  // CODING STANDARDS: Graceful degradation with shared state
+  // ==========================================================================
   
   /**
    * Send OTP to phone number
@@ -131,8 +141,10 @@ class AuthService {
     
     // Store ONLY hashed OTP in Redis with TTL
     const key = REDIS_KEYS.OTP(phone, role);
+    // Hash OTP with SHA-256 before storing (fast, prevents plaintext exposure in Redis/DB)
+    const otpHash = crypto.createHash('sha256').update(otp).digest('hex');
     const otpEntry: OtpEntry = {
-      otp: otp, // Plain OTP (instant, secure with TTL + max 3 attempts)
+      otp: otpHash,
       expiresAt: expiresAt.toISOString(),
       attempts: 0
     };
@@ -140,25 +152,44 @@ class AuthService {
     // Store with TTL (auto-expires)
     const ttlSeconds = config.otp.expiryMinutes * 60;
     
-    // 4 PRINCIPLES: Try Redis first, fallback to memory
-    // SCALABILITY: Redis for production scale, memory for development/fallback
-    // EASY UNDERSTANDING: Clear try-catch pattern
-    // MODULARITY: Doesn't affect SMS sending logic
-    // CODING STANDARDS: Graceful degradation (industry standard)
+    // SCALABILITY: Try Redis first, fallback to PostgreSQL (NEVER in-memory)
+    // With 2+ ECS tasks, in-memory is per-process and causes "Invalid OTP" errors.
+    // PostgreSQL is shared across all tasks — OTP stored by Task A can be verified by Task B.
+    let storedInRedis = false;
     try {
+      const redisStart = Date.now();
       await redisService.setJSON(key, otpEntry, ttlSeconds);
-      logger.info('OTP stored in Redis', { phone: maskForLogging(phone, 2, 4) });
+      storedInRedis = true;
+      logger.info('OTP stored in Redis', { phone: maskForLogging(phone, 2, 4), durationMs: Date.now() - redisStart });
     } catch (redisError: any) {
-      logger.warn('⚠️  Redis unavailable, using in-memory OTP storage (development mode)', { 
+      logger.warn('⚠️  Redis unavailable for OTP storage, using PostgreSQL fallback', { 
         error: redisError.message,
         phone: maskForLogging(phone, 2, 4)
       });
-      this.otpMemoryStore.set(key, otpEntry);
-      // Auto-cleanup after TTL
-      setTimeout(() => {
-        this.otpMemoryStore.delete(key);
-        logger.debug('Memory OTP expired and cleaned up', { phone: maskForLogging(phone, 2, 4) });
-      }, ttlSeconds * 1000);
+    }
+    
+    // ALWAYS store in PostgreSQL as backup (ensures cross-task availability)
+    // If Redis worked, this is a backup. If Redis failed, this is the primary.
+    try {
+      await db.prisma?.$executeRawUnsafe(
+        `INSERT INTO "OtpStore" (phone, role, otp, expires_at, attempts) 
+         VALUES ($1, $2, $3, $4, 0) 
+         ON CONFLICT (phone, role) DO UPDATE SET otp = $3, expires_at = $4, attempts = 0`,
+        phone, role, otpHash, expiresAt.toISOString()
+      );
+      logger.info('OTP stored in PostgreSQL (cross-task backup)', { phone: maskForLogging(phone, 2, 4) });
+    } catch (dbError: any) {
+      if (!storedInRedis) {
+        logger.error('❌ CRITICAL: OTP could not be stored in Redis OR PostgreSQL', {
+          redisError: 'unavailable',
+          dbError: dbError.message,
+          phone: maskForLogging(phone, 2, 4)
+        });
+        // Abort — sending OTP that can't be verified is worse than failing fast
+        throw new AppError(503, 'SERVICE_UNAVAILABLE', 'OTP service temporarily unavailable. Please try again in a moment.');
+      } else {
+        logger.warn('OTP DB backup failed (Redis is primary)', { error: dbError.message });
+      }
     }
     
     // ==========================================================================
@@ -231,19 +262,45 @@ class AuthService {
   }> {
     const key = REDIS_KEYS.OTP(phone, role);
     
-    // 4 PRINCIPLES: Try Redis first, fallback to memory
-    // SCALABILITY: Redis for production, memory for fallback
-    // EASY UNDERSTANDING: Clear fallback logic
-    // MODULARITY: Transparent to caller
-    // CODING STANDARDS: Graceful degradation pattern
+    // SCALABILITY: Try Redis first, fallback to PostgreSQL (NEVER in-memory)
+    // With 2+ ECS tasks, both send and verify must use shared storage.
     let stored: OtpEntry | null = null;
+    const fetchStart = Date.now();
     try {
       stored = await redisService.getJSON<OtpEntry>(key);
-    } catch (redisError) {
-      logger.warn('Redis unavailable during OTP verification, checking memory', { 
-        phone: maskForLogging(phone, 2, 4)
+      if (stored) {
+        logger.info('OTP fetched from Redis', { phone: maskForLogging(phone, 2, 4), durationMs: Date.now() - fetchStart });
+      }
+    } catch (redisError: any) {
+      logger.warn('Redis unavailable during OTP verification, trying PostgreSQL', { 
+        phone: maskForLogging(phone, 2, 4),
+        error: redisError.message
       });
-      stored = this.otpMemoryStore.get(key) || null;
+    }
+    
+    // FALLBACK: If Redis didn't have the OTP, check PostgreSQL
+    if (!stored) {
+      try {
+        const dbResult: any[] | null = await db.prisma?.$queryRawUnsafe(
+          `SELECT otp, expires_at, attempts FROM "OtpStore" 
+           WHERE phone = $1 AND role = $2 LIMIT 1`,
+          phone, role
+        );
+        if (dbResult && dbResult.length > 0) {
+          const row = dbResult[0];
+          stored = {
+            otp: row.otp,
+            expiresAt: row.expires_at instanceof Date ? row.expires_at.toISOString() : String(row.expires_at),
+            attempts: row.attempts || 0
+          };
+          logger.info('OTP fetched from PostgreSQL fallback', { phone: maskForLogging(phone, 2, 4), durationMs: Date.now() - fetchStart });
+        }
+      } catch (dbError: any) {
+        logger.error('PostgreSQL OTP fallback also failed', { 
+          error: dbError.message,
+          phone: maskForLogging(phone, 2, 4) 
+        });
+      }
     }
     
     // Check if OTP exists
@@ -255,9 +312,12 @@ class AuthService {
       throw new AppError(400, 'INVALID_OTP', 'Invalid or expired OTP. Please request a new one.');
     }
     
-    // Check if OTP is expired (Redis TTL handles this, but double-check)
+    // Check if OTP is expired
     if (new Date() > new Date(stored.expiresAt)) {
-      await redisService.del(key);
+      await Promise.allSettled([
+        redisService.del(key),
+        db.prisma?.$executeRawUnsafe(`DELETE FROM "OtpStore" WHERE phone = $1 AND role = $2`, phone, role)
+      ]);
       logger.warn('OTP verification failed - expired', { 
         phone: maskForLogging(phone, 2, 4), 
         role 
@@ -265,11 +325,18 @@ class AuthService {
       throw new AppError(400, 'OTP_EXPIRED', 'OTP has expired. Please request a new one.');
     }
     
-    // Check attempts (max configured attempts) - using atomic increment
+    // Check attempts
     const maxAttempts = config.otp.maxAttempts;
-    const currentAttempts = await redisService.getOtpAttempts(key);
+    let currentAttempts = stored.attempts || 0;
+    try {
+      currentAttempts = await redisService.getOtpAttempts(key);
+    } catch { /* Use DB-stored attempts */ }
+    
     if (currentAttempts >= maxAttempts) {
-      await redisService.deleteOtpWithAttempts(key);
+      await Promise.allSettled([
+        redisService.deleteOtpWithAttempts(key),
+        db.prisma?.$executeRawUnsafe(`DELETE FROM "OtpStore" WHERE phone = $1 AND role = $2`, phone, role)
+      ]);
       logger.warn('OTP verification failed - max attempts exceeded', { 
         phone: maskForLogging(phone, 2, 4), 
         role,
@@ -278,33 +345,57 @@ class AuthService {
       throw new AppError(400, 'MAX_ATTEMPTS', 'Too many failed attempts. Please request a new OTP.');
     }
     
-    // Verify OTP (instant comparison, no bcrypt overhead)
-    // PERFORMANCE: Plain comparison < 1ms (was 100-500ms with bcrypt)
-    // SECURITY: Still secure (TTL + max 3 attempts + rate limiting)
-    const isValid = otp === stored.otp;
+    // Verify OTP — hash input and compare with stored hash (timing-safe)
+    const inputHash = crypto.createHash('sha256').update(otp).digest('hex');
+    const isValid = crypto.timingSafeEqual(Buffer.from(inputHash), Buffer.from(stored.otp));
     
     if (!isValid) {
-      // ATOMIC increment attempts - prevents race conditions
-      // Even if 100 concurrent requests come in, each gets a unique attempt number
-      const attemptResult = await redisService.incrementOtpAttempts(key, maxAttempts);
+      let attemptsRemaining = maxAttempts - currentAttempts - 1;
+      let maxReached = false;
+      
+      try {
+        const attemptResult = await redisService.incrementOtpAttempts(key, maxAttempts);
+        attemptsRemaining = attemptResult.remaining;
+        maxReached = !attemptResult.allowed;
+      } catch {
+        maxReached = attemptsRemaining <= 0;
+      }
+      
+      // Always increment DB attempts (cross-task consistency)
+      try {
+        await db.prisma?.$executeRawUnsafe(
+          `UPDATE "OtpStore" SET attempts = attempts + 1 WHERE phone = $1 AND role = $2`,
+          phone, role
+        );
+      } catch { /* best effort */ }
       
       logger.warn('OTP verification failed - invalid OTP', { 
         phone: maskForLogging(phone, 2, 4), 
         role,
-        attemptsRemaining: attemptResult.remaining
+        attemptsRemaining
       });
       
-      // If max attempts reached after this increment, delete OTP
-      if (!attemptResult.allowed) {
-        await redisService.deleteOtpWithAttempts(key);
+      if (maxReached) {
+        await Promise.allSettled([
+          redisService.deleteOtpWithAttempts(key),
+          db.prisma?.$executeRawUnsafe(`DELETE FROM "OtpStore" WHERE phone = $1 AND role = $2`, phone, role)
+        ]);
         throw new AppError(400, 'MAX_ATTEMPTS', 'Too many failed attempts. Please request a new OTP.');
       }
       
-      throw new AppError(400, 'INVALID_OTP', `Invalid OTP. ${attemptResult.remaining} attempt${attemptResult.remaining !== 1 ? 's' : ''} remaining.`);
+      throw new AppError(400, 'INVALID_OTP', `Invalid OTP. ${attemptsRemaining} attempt${attemptsRemaining !== 1 ? 's' : ''} remaining.`);
     }
     
-    // OTP verified - delete it immediately (single use) along with attempts counter
-    await redisService.deleteOtpWithAttempts(key);
+    // OTP verified - delete from BOTH Redis and PostgreSQL (single use)
+    const deleteStart = Date.now();
+    await Promise.allSettled([
+      redisService.deleteOtpWithAttempts(key),
+      db.prisma?.$executeRawUnsafe(
+        `DELETE FROM "OtpStore" WHERE phone = $1 AND role = $2`,
+        phone, role
+      )
+    ]);
+    logger.info('OTP cleanup completed (Redis + DB)', { phone: maskForLogging(phone, 2, 4), durationMs: Date.now() - deleteStart });
     
     // Find or create user in DATABASE
     let dbUser: any = null;
@@ -559,7 +650,6 @@ class AuthService {
    * Hash token to create a safe key for Redis storage
    */
   private hashToken(token: string): string {
-    const crypto = require('crypto');
     return crypto.createHash('sha256').update(token).digest('hex').substring(0, 32);
   }
 

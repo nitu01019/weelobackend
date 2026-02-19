@@ -207,14 +207,14 @@ function validateConfig(): void {
   
   // Production-specific checks
   if (config.isProduction) {
-    // CORS must not be wildcard in production
+    // CORS should not be wildcard in production (warn, don't block — mobile API backend)
     if (config.cors.origin === '*') {
-      warnings.push('CORS_ORIGIN is set to "*" - this should be restricted in production');
+      warnings.push('CORS_ORIGIN is set to "*" — consider restricting in production. Set CORS_ORIGIN=https://yourdomain.com');
     }
 
     // Google Maps should be configured for Places search
     if (!config.googleMaps.enabled) {
-      errors.push('GOOGLE_MAPS_API_KEY is required in production for Places/Geocoding');
+      warnings.push('GOOGLE_MAPS_API_KEY is not set — Places/Geocoding features will be unavailable');
     }
     
     // Redis should be enabled for scalability

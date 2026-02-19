@@ -40,8 +40,11 @@ class TwilioProvider implements SmsProvider {
       const twilio = require('twilio');
       const client = twilio(accountSid, authToken);
       
+      // SMS Retriever API format: <#> prefix + app hash suffix
+      const appHash = process.env.SMS_RETRIEVER_HASH || '';
+      const hashSuffix = appHash ? `\n${appHash}` : '';
       await client.messages.create({
-        body: `Your Weelo verification code is: ${otp}. Valid for ${config.otp.expiryMinutes} minutes.`,
+        body: `<#> Your Weelo verification code is: ${otp}. Valid for ${config.otp.expiryMinutes} minutes.${hashSuffix}`,
         from: phoneNumber,
         to: formattedPhone
       });
@@ -125,7 +128,13 @@ class AWSSNSProvider implements SmsProvider {
       
       const client = new SNSClient(clientConfig);
       
-      const message = `Your Weelo verification code is: ${otp}. Valid for ${config.otp.expiryMinutes} minutes. Do not share this code.`;
+      // SMS Retriever API format: Must start with <#> and end with app hash
+      // The app hash is computed from the signing certificate + package name
+      // This enables zero-permission OTP auto-read on Android
+      // App hash is logged by AppSignatureHelper.kt on first run — update SMS_RETRIEVER_HASH env var
+      const appHash = process.env.SMS_RETRIEVER_HASH || '';
+      const hashSuffix = appHash ? `\n${appHash}` : '';
+      const message = `<#> Your Weelo verification code is: ${otp}. Valid for ${config.otp.expiryMinutes} minutes.${hashSuffix}`;
       
       const command = new PublishCommand({
         PhoneNumber: formattedPhone,

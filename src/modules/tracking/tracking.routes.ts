@@ -12,10 +12,17 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { trackingService } from './tracking.service';
 import { authMiddleware, roleGuard } from '../../shared/middleware/auth.middleware';
 import { validateRequest } from '../../shared/utils/validation.utils';
+import { googleMapsService } from '../../shared/services/google-maps.service';
+import { redisService } from '../../shared/services/redis.service';
+import { db } from '../../shared/database/db';
+
+// Redis key builders (matching tracking.service.ts)
+const DRIVER_LOCATION_KEY = (driverId: string) => `driver:location:${driverId}`;
 import { 
   updateLocationSchema, 
   getTrackingQuerySchema, 
   batchLocationSchema,
+  tripStatusUpdateSchema,
   DriverOnlineStatus 
 } from './tracking.schema';
 import { z } from 'zod';
@@ -68,6 +75,103 @@ router.get(
       res.json({
         success: true,
         data: tracking
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// =============================================================================
+// GET /tracking/booking/:bookingId/eta — Batch Real Google Maps ETA
+// =============================================================================
+//
+// Phase 5: Returns real driving-time ETA for each active truck.
+// Uses Google Directions API with aggressive caching (1hr TTL).
+//
+// ⚠️ IMPORTANT: This route MUST be BEFORE /booking/:bookingId
+// Express matches routes in order. If /booking/:bookingId comes first,
+// "/booking/abc/eta" matches with bookingId="abc" and never reaches /eta.
+//
+// SCALABILITY:
+//   - Cache means 1000 requests for same route = 1 Google API call
+//   - Promise.allSettled — one truck failure doesn't block others
+//   - Only calculates for active trucks (not completed/cancelled)
+//
+// DATA ISOLATION:
+//   - Customer can only see their own booking's ETA
+//   - Transporter can see ETA for bookings with their assignments
+//
+// REQUEST: GET /tracking/booking/:bookingId/eta
+// RESPONSE: { success, data: { etas: { [tripId]: { durationMinutes, distanceKm, durationText } } } }
+// =============================================================================
+
+router.get(
+  '/booking/:bookingId/eta',
+  authMiddleware,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { bookingId } = req.params;
+
+      // Get booking to verify access + get drop location
+      const booking = await db.getBookingById(bookingId);
+      if (!booking) {
+        return res.status(404).json({
+          success: false,
+          error: { code: 'BOOKING_NOT_FOUND', message: 'Booking not found' }
+        });
+      }
+
+      // Access check: customer owns this booking
+      if (req.user!.role === 'customer' && booking.customerId !== req.user!.userId) {
+        return res.status(403).json({
+          success: false,
+          error: { code: 'FORBIDDEN', message: 'Access denied' }
+        });
+      }
+
+      // Get drop location from booking
+      // booking.drop stores { latitude, longitude, address, city }
+      const dropLat = booking.drop?.latitude || booking.drop?.lat;
+      const dropLng = booking.drop?.longitude || booking.drop?.lng;
+      if (!dropLat || !dropLng) {
+        return res.json({
+          success: true,
+          data: { etas: {} }
+        });
+      }
+
+      // Get all active truck positions from Redis
+      const assignments = await db.getAssignmentsByBooking(bookingId);
+      const activeTrucks: Array<{ tripId: string; lat: number; lng: number }> = [];
+
+      for (const assignment of assignments) {
+        // Skip completed/cancelled
+        if (['completed', 'cancelled', 'driver_declined'].includes(assignment.status)) continue;
+
+        // Get current location from Redis (real-time)
+        const location = await redisService.getJSON<any>(
+          DRIVER_LOCATION_KEY(assignment.driverId)
+        );
+
+        if (location && location.latitude && location.longitude) {
+          activeTrucks.push({
+            tripId: assignment.tripId,
+            lat: location.latitude,
+            lng: location.longitude
+          });
+        }
+      }
+
+      // Batch ETA calculation via Google Maps
+      const etas = await googleMapsService.getBatchETA(
+        activeTrucks,
+        { lat: dropLat, lng: dropLng }
+      );
+
+      res.json({
+        success: true,
+        data: { etas }
       });
     } catch (error) {
       next(error);
@@ -159,6 +263,60 @@ router.get(
       res.json({
         success: true,
         data: fleet
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// =============================================================================
+// TRIP STATUS UPDATE (Driver Progression)
+// =============================================================================
+
+/**
+ * @route   PUT /tracking/trip/:tripId/status
+ * @desc    Update trip status (driver clicks: Reached Pickup → Loading Complete → Start Trip → Complete)
+ * @access  Driver only (assigned driver)
+ * 
+ * STATUS FLOW:
+ *   heading_to_pickup → at_pickup → loading_complete → in_transit → completed
+ * 
+ * WHAT HAPPENS ON EACH CALL:
+ *   1. Assignment looked up by tripId (@unique index → O(1))
+ *   2. Validates driver owns this trip
+ *   3. Updates Postgres Assignment record (for statuses in Prisma enum)
+ *   4. Updates Redis tracking data (for customer live tracking)
+ *   5. WebSocket broadcast to booking room + trip room (real-time UI)
+ *   6. FCM push to customer (even if app is closed/backgrounded)
+ * 
+ * REQUEST: { status: "at_pickup" | "loading_complete" | "in_transit" | "completed" | ... }
+ * RESPONSE: { success: true, message: "Status updated to at_pickup" }
+ * 
+ * SCALABILITY:
+ *   - @unique tripId index → O(1) lookup
+ *   - Redis O(1) update
+ *   - FCM queued (fire-and-forget)
+ *   - Single API call per status change
+ */
+router.put(
+  '/trip/:tripId/status',
+  authMiddleware,
+  roleGuard(['driver']),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { tripId } = req.params;
+      const data = tripStatusUpdateSchema.parse(req.body);
+
+      await trackingService.updateTripStatus(
+        tripId,
+        req.user!.userId,
+        data
+      );
+
+      res.json({
+        success: true,
+        message: `Status updated to ${data.status}`
       });
     } catch (error) {
       next(error);

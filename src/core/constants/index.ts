@@ -47,6 +47,8 @@ export const ROLE_DISPLAY_NAMES: Record<UserRole, string> = {
  * Booking lifecycle states
  */
 export enum BookingStatus {
+  CREATED = 'created',           // Initial state before broadcasting
+  BROADCASTING = 'broadcasting', // Actively sending to transporters
   PENDING = 'pending',           // Created, waiting for transporter
   CONFIRMED = 'confirmed',       // Transporter accepted
   ASSIGNED = 'assigned',         // Driver assigned
@@ -62,6 +64,8 @@ export enum BookingStatus {
  * Allowed status transitions
  */
 export const BOOKING_STATUS_TRANSITIONS: Record<BookingStatus, BookingStatus[]> = {
+  [BookingStatus.CREATED]: [BookingStatus.BROADCASTING, BookingStatus.CANCELLED],
+  [BookingStatus.BROADCASTING]: [BookingStatus.PENDING, BookingStatus.CANCELLED],
   [BookingStatus.PENDING]: [BookingStatus.CONFIRMED, BookingStatus.CANCELLED],
   [BookingStatus.CONFIRMED]: [BookingStatus.ASSIGNED, BookingStatus.CANCELLED],
   [BookingStatus.ASSIGNED]: [BookingStatus.DRIVER_EN_ROUTE, BookingStatus.CANCELLED],
@@ -295,7 +299,9 @@ export const SOCKET_EVENTS = {
   
   // Broadcast
   BROADCAST_REQUEST: 'broadcast_request',
-  BROADCAST_RESPONSE: 'broadcast_response'
+  BROADCAST_RESPONSE: 'broadcast_response',
+  BROADCAST_STATE_CHANGED: 'broadcast_state_changed',
+  BROADCAST_CANCELLED: 'broadcast_cancelled'
 } as const;
 
 // =============================================================================
