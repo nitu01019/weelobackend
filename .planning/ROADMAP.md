@@ -29,14 +29,14 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. Different customers can each have their own active broadcast concurrently without blocking each other
   4. A customer can cancel their active broadcast at any time, and the cancellation wins over a simultaneous accept — transporter sees "Request cancelled", not "Accepted"
   5. Double-tapping search or retrying a search request creates exactly one broadcast — idempotency key prevents duplicates
-**Plans**: TBD
+**Plans**: 5 plans
 
 Plans:
-- [ ] 01-01: Add explicit broadcast lifecycle states (Created, Broadcasting, Awaiting, Terminal variants) with DB-persisted transitions and timestamps
-- [ ] 01-02: Fix atomic acceptance on Order path — apply updateMany optimistic lock to acceptTruckRequest to eliminate double-assignment race
-- [ ] 01-03: Enforce one-active-broadcast-per-customer — server-side findFirst check plus Redis distributed lock on broadcast creation (both Booking and Order paths)
-- [ ] 01-04: Implement idempotent search initiation — server-generated idempotency key with Redis TTL dedup on createBroadcast
-- [ ] 01-05: Implement race-safe cancel endpoint — UPDATE WHERE status IN (active, partially_filled) RETURNING * inside Prisma transaction, idempotent on repeat calls
+- [ ] 01-01-PLAN.md — Add explicit broadcast lifecycle states with DB-persisted transitions, timestamps, and WebSocket events
+- [ ] 01-02-PLAN.md — Fix atomic acceptance on Order path with Serializable transaction + updateMany optimistic lock
+- [ ] 01-03-PLAN.md — Enforce one-active-broadcast-per-customer with Redis lock + DB check on both paths
+- [ ] 01-04-PLAN.md — Implement server-generated idempotency key with Redis TTL dedup on broadcast creation
+- [ ] 01-05-PLAN.md — Implement race-safe atomic cancel with idempotent behavior and full Redis cleanup
 
 ### Phase 2: Cancel and Timeout Cleanup Hardening
 **Goal**: All terminal-state transitions (cancel, timeout, fully_filled) completely remove broadcast state from Redis and the ECS deployment cycle does not orphan timers or countdown intervals
@@ -102,7 +102,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Broadcast Lifecycle Correctness | 0/5 | Not started | - |
+| 1. Broadcast Lifecycle Correctness | 0/5 | Planned | - |
 | 2. Cancel and Timeout Cleanup Hardening | 0/5 | Not started | - |
 | 3. AWS Infrastructure Hardening | 0/5 | Not started | - |
 | 4. CI/CD Pipeline and Driver Visibility | 0/4 | Not started | - |
