@@ -183,7 +183,7 @@ describe('Phase 1: Backend Hardening — Redis Key Management', () => {
       await simulateTransporterOnline(TRANSPORTER_ID_1);
 
       const ttl = await redisService.ttl(TRANSPORTER_PRESENCE_KEY(TRANSPORTER_ID_1));
-      // TTL should be close to PRESENCE_TTL_SECONDS (60s), allow small tolerance
+      // TTL should be close to PRESENCE_TTL_SECONDS, allow small tolerance
       expect(ttl).toBeGreaterThan(0);
       expect(ttl).toBeLessThanOrEqual(PRESENCE_TTL_SECONDS);
     });
@@ -362,7 +362,7 @@ describe('Gap 3 Fix: Heartbeat Presence Refresh', () => {
     expect(parsed.latitude).toBe(28.6139);
     expect(parsed.longitude).toBe(77.2090);
 
-    // Verify TTL was refreshed (close to 60s)
+    // Verify TTL was refreshed (close to PRESENCE_TTL_SECONDS)
     const ttl = await redisService.ttl(TRANSPORTER_PRESENCE_KEY(TRANSPORTER_ID_1));
     expect(ttl).toBeGreaterThan(55);
   });

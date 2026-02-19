@@ -398,14 +398,14 @@ class BookingService {
             address: data.pickup.address,
             city: data.pickup.city,
             state: data.pickup.state
-          } as any,
+          } as Prisma.JsonObject,
           drop: {
             latitude: data.drop.coordinates.latitude,
             longitude: data.drop.coordinates.longitude,
             address: data.drop.address,
             city: data.drop.city,
             state: data.drop.state
-          } as any,
+          } as Prisma.JsonObject,
           vehicleType: data.vehicleType,
           vehicleSubtype: data.vehicleSubtype,
           trucksNeeded: data.trucksNeeded,

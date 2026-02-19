@@ -113,6 +113,7 @@ export const SocketEvent = {
   HEARTBEAT: 'heartbeat',                       // Driver sends every 12s
   DRIVER_ONLINE: 'driver_online',               // Driver came online
   DRIVER_OFFLINE: 'driver_offline',             // Driver went offline
+  DRIVER_TIMEOUT: 'driver_timeout',             // Driver didn't accept in time
   
   // Client -> Server
   JOIN_BOOKING: 'join_booking',

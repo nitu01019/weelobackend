@@ -707,7 +707,7 @@ class AssignmentService {
     await bookingService.decrementTrucksFilled(bookingId);
 
     // 4. Notify transporter: driver timed out (WebSocket)
-    emitToUser(transporterId, 'driver_timeout', {
+    emitToUser(transporterId, SocketEvent.DRIVER_TIMEOUT, {
       assignmentId,
       tripId,
       driverId,

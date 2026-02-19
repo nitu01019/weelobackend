@@ -185,6 +185,8 @@ class AuthService {
           dbError: dbError.message,
           phone: maskForLogging(phone, 2, 4)
         });
+        // Abort — sending OTP that can't be verified is worse than failing fast
+        throw new AppError(503, 'SERVICE_UNAVAILABLE', 'OTP service temporarily unavailable. Please try again in a moment.');
       } else {
         logger.warn('OTP DB backup failed (Redis is primary)', { error: dbError.message });
       }
