@@ -163,6 +163,15 @@ async function processExpiredBookings(): Promise<void> {
 // Start expiry checker when module loads
 startBookingExpiryChecker();
 
+/** Stop the booking expiry checker (for graceful shutdown) */
+export function stopBookingExpiryChecker(): void {
+  if (expiryCheckerInterval) {
+    clearInterval(expiryCheckerInterval);
+    expiryCheckerInterval = null;
+    logger.info('Booking expiry checker stopped');
+  }
+}
+
 /**
  * Process radius expansion timers — called from the same expiry checker interval.
  * When a radius step timer expires, advances to the next step and broadcasts

@@ -156,6 +156,15 @@ async function processExpiredOrders(): Promise<void> {
 // Start expiry checker when module loads
 startOrderExpiryChecker();
 
+/** Stop the order expiry checker (for graceful shutdown) */
+export function stopOrderExpiryChecker(): void {
+  if (orderExpiryCheckerInterval) {
+    clearInterval(orderExpiryCheckerInterval);
+    orderExpiryCheckerInterval = null;
+    logger.info('Order expiry checker stopped');
+  }
+}
+
 // =============================================================================
 // ORDER SERVICE
 // =============================================================================

@@ -497,6 +497,17 @@ process.on('unhandledRejection', (reason) => {
 const gracefulShutdown = async (signal: string) => {
   logger.info(`${signal} received. Starting graceful shutdown...`);
 
+  // Stop expiry checker intervals first (prevents new work during shutdown)
+  try {
+    const { stopBookingExpiryChecker } = require('./modules/booking/booking.service');
+    const { stopOrderExpiryChecker } = require('./modules/booking/order.service');
+    stopBookingExpiryChecker();
+    stopOrderExpiryChecker();
+    logger.info('Expiry checkers stopped');
+  } catch (err) {
+    logger.error('Error stopping expiry checkers', err);
+  }
+
   server.close(async () => {
     logger.info('HTTP server closed');
 

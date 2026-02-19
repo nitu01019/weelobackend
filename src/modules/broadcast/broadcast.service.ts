@@ -1064,17 +1064,28 @@ class BroadcastService {
    * 
    * IMPORTANT: Call this from server.ts after initializing the service
    */
+  private expiryCheckerInterval: NodeJS.Timeout | null = null;
+
   startExpiryChecker(): void {
+    if (this.expiryCheckerInterval) return;
     // Check every 5 seconds
-    setInterval(async () => {
+    this.expiryCheckerInterval = setInterval(async () => {
       try {
         await this.checkAndExpireBroadcasts();
       } catch (error: any) {
         logger.error(`Expiry checker error: ${error.message}`);
       }
     }, 5000);
-    
-    logger.info('✅ Broadcast expiry checker started (5 second interval)');
+
+    logger.info('Broadcast expiry checker started (5 second interval)');
+  }
+
+  stopExpiryChecker(): void {
+    if (this.expiryCheckerInterval) {
+      clearInterval(this.expiryCheckerInterval);
+      this.expiryCheckerInterval = null;
+      logger.info('Broadcast expiry checker stopped');
+    }
   }
 
   /**
