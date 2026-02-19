@@ -613,12 +613,20 @@ class OrderService {
       totalAmount,
       goodsType: request.goodsType,
       cargoWeightKg: request.cargoWeightKg,
-      status: 'active',
+      status: 'created',
+      stateChangedAt: new Date(),
       scheduledAt: request.scheduledAt,
       expiresAt
     };
 
     await db.createOrder(order);
+
+    // Emit lifecycle state: created
+    emitToUser(request.customerId, 'broadcast_state_changed', {
+      orderId,
+      status: 'created',
+      stateChangedAt: new Date().toISOString()
+    });
 
     // 2. Create TruckRequests for each vehicle type
     const truckRequests: TruckRequestRecord[] = [];
@@ -676,8 +684,24 @@ class OrderService {
       logger.error(broadcastError.stack);
     }
 
+    // Transition: created -> broadcasting (transporters have been notified)
+    await db.updateOrder(orderId, { status: 'broadcasting', stateChangedAt: new Date() });
+    emitToUser(request.customerId, 'broadcast_state_changed', {
+      orderId,
+      status: 'broadcasting',
+      stateChangedAt: new Date().toISOString()
+    });
+
     // 4. Set expiry timer
     this.setOrderExpiryTimer(orderId, this.BROADCAST_TIMEOUT_MS);
+
+    // Transition: broadcasting -> active (timer started, awaiting responses)
+    await db.updateOrder(orderId, { status: 'active', stateChangedAt: new Date() });
+    emitToUser(request.customerId, 'broadcast_state_changed', {
+      orderId,
+      status: 'active',
+      stateChangedAt: new Date().toISOString()
+    });
 
     // SCALABILITY: Calculate expiresIn for UI countdown timer
     // EASY UNDERSTANDING: UI always matches backend TTL
@@ -1119,7 +1143,7 @@ class OrderService {
 
     // Update order status
     const newStatus = order.trucksFilled > 0 ? 'partially_filled' : 'expired';
-    await db.updateOrder(orderId, { status: newStatus });
+    await db.updateOrder(orderId, { status: newStatus, stateChangedAt: new Date() });
 
     // Notify customer
     emitToUser(order.customerId, 'order_expired', {
@@ -1257,6 +1281,7 @@ class OrderService {
     // CRITICAL FIX: Use await for database updates
     await db.updateOrder(orderId, {
       status: 'cancelled',
+      stateChangedAt: new Date(),
       cancelledAt: new Date().toISOString(),
       cancellationReason: reason || 'Cancelled by customer'
     });
@@ -1478,7 +1503,7 @@ class OrderService {
 
           await tx.order.update({
             where: { id: order.id },
-            data: { status: newStatus as any }
+            data: { status: newStatus as any, stateChangedAt: new Date() }
           });
 
           // ----- Update vehicle status inside transaction -----

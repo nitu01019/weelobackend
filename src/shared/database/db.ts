@@ -173,10 +173,11 @@ export interface BookingRecord {
   goodsType?: string;
   weight?: string;
   
-  status: 'active' | 'partially_filled' | 'fully_filled' | 'in_progress' | 'completed' | 'cancelled' | 'expired';
-  
+  status: 'created' | 'broadcasting' | 'active' | 'partially_filled' | 'fully_filled' | 'in_progress' | 'completed' | 'cancelled' | 'expired';
+  stateChangedAt?: Date | string;
+
   notifiedTransporters: string[];
-  
+
   scheduledAt?: string;
   expiresAt: string;
   createdAt: string;
@@ -218,8 +219,9 @@ export interface OrderRecord {
   weight?: string;
   cargoWeightKg?: number;
   
-  status: 'active' | 'partially_filled' | 'fully_filled' | 'in_progress' | 'completed' | 'cancelled' | 'expired';
-  
+  status: 'created' | 'broadcasting' | 'active' | 'partially_filled' | 'fully_filled' | 'in_progress' | 'completed' | 'cancelled' | 'expired';
+  stateChangedAt?: Date | string;
+
   cancelledAt?: string;
   cancellationReason?: string;
   

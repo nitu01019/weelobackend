@@ -339,10 +339,18 @@ class BookingService {
       totalAmount: data.pricePerTruck * data.trucksNeeded,
       goodsType: data.goodsType,
       weight: data.weight,
-      status: 'active',
+      status: 'created',
+      stateChangedAt: new Date(),
       notifiedTransporters: matchingTransporters,
       scheduledAt: data.scheduledAt,
       expiresAt
+    });
+
+    // Emit lifecycle state: created
+    emitToUser(customerId, 'broadcast_state_changed', {
+      bookingId: booking.id,
+      status: 'created',
+      stateChangedAt: new Date().toISOString()
     });
 
     // ========================================
@@ -361,7 +369,7 @@ class BookingService {
       });
 
       // Mark as expired immediately
-      await db.updateBooking(booking.id, { status: 'expired' });
+      await db.updateBooking(booking.id, { status: 'expired', stateChangedAt: new Date() });
 
       return {
         ...booking,
@@ -389,6 +397,14 @@ class BookingService {
     for (const transporterId of matchingTransporters) {
       emitToUser(transporterId, SocketEvent.NEW_BROADCAST, broadcastPayload);
     }
+
+    // Transition: created -> broadcasting (transporters have been notified)
+    await db.updateBooking(booking.id, { status: 'broadcasting', stateChangedAt: new Date() });
+    emitToUser(customerId, 'broadcast_state_changed', {
+      bookingId: booking.id,
+      status: 'broadcasting',
+      stateChangedAt: new Date().toISOString()
+    });
 
     // ========================================
     // TRACK NOTIFIED TRANSPORTERS FOR PROGRESSIVE RADIUS (Requirement 6)
@@ -423,6 +439,14 @@ class BookingService {
     // START TIMEOUT TIMER
     // ========================================
     this.startBookingTimeout(booking.id, customerId);
+
+    // Transition: broadcasting -> active (timer started, awaiting responses)
+    await db.updateBooking(booking.id, { status: 'active', stateChangedAt: new Date() });
+    emitToUser(customerId, 'broadcast_state_changed', {
+      bookingId: booking.id,
+      status: 'active',
+      stateChangedAt: new Date().toISOString()
+    });
 
     // ========================================
     // START PROGRESSIVE RADIUS EXPANSION (Requirement 6)
@@ -511,7 +535,7 @@ class BookingService {
     // Check if partially filled
     if (booking.trucksFilled > 0 && booking.trucksFilled < booking.trucksNeeded) {
       // Partially filled - notify customer
-      await db.updateBooking(bookingId, { status: 'expired' });
+      await db.updateBooking(bookingId, { status: 'expired', stateChangedAt: new Date() });
 
       emitToUser(customerId, SocketEvent.BOOKING_EXPIRED, {
         bookingId,
@@ -531,7 +555,7 @@ class BookingService {
 
     } else if (booking.trucksFilled === 0) {
       // No trucks filled - "No vehicle available"
-      await db.updateBooking(bookingId, { status: 'expired' });
+      await db.updateBooking(bookingId, { status: 'expired', stateChangedAt: new Date() });
 
       emitToUser(customerId, SocketEvent.NO_VEHICLES_AVAILABLE, {
         bookingId,
@@ -1057,7 +1081,7 @@ class BookingService {
       throw new AppError(400, 'INVALID_STATUS', 'Booking cannot be cancelled');
     }
 
-    const updated = await db.updateBooking(bookingId, { status: 'cancelled' });
+    const updated = await db.updateBooking(bookingId, { status: 'cancelled', stateChangedAt: new Date() });
 
     // Clear all timers INCLUDING radius expansion keys (Req 3 + 5)
     await this.clearBookingTimers(bookingId);
@@ -1157,7 +1181,8 @@ class BookingService {
 
     const updated = await db.updateBooking(bookingId, {
       trucksFilled: newFilled,
-      status: newStatus
+      status: newStatus,
+      stateChangedAt: new Date()
     });
 
     // Notify customer via WebSocket
@@ -1235,7 +1260,8 @@ class BookingService {
 
     const updated = await db.updateBooking(bookingId, {
       trucksFilled: newFilled,
-      status: newStatus
+      status: newStatus,
+      stateChangedAt: new Date()
     });
 
     // Notify via WebSocket

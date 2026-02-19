@@ -50,7 +50,9 @@ enum VehicleStatus {
 
 // Booking status (legacy single-truck bookings)
 enum BookingStatus {
-  active           // Looking for transporters
+  created          // Initial state before broadcasting
+  broadcasting     // Actively sending to transporters
+  active           // Looking for transporters (awaiting responses)
   partially_filled // Some trucks assigned
   fully_filled     // All trucks assigned
   in_progress      // Trip started
@@ -61,7 +63,9 @@ enum BookingStatus {
 
 // Order status (new multi-truck system)
 enum OrderStatus {
-  active           // Looking for transporters
+  created          // Initial state before broadcasting
+  broadcasting     // Actively sending to transporters
+  active           // Looking for transporters (awaiting responses)
   partially_filled // Some trucks assigned
   fully_filled     // All trucks assigned
   in_progress      // Trip started
@@ -335,7 +339,8 @@ model Booking {
   // =========================================
   // STATUS
   // =========================================
-  status BookingStatus @default(active)
+  status         BookingStatus @default(active)
+  stateChangedAt DateTime?     @default(now()) // Timestamp of last state transition
 
   // =========================================
   // BROADCAST TRACKING
@@ -416,7 +421,8 @@ model Order {
   // =========================================
   // STATUS
   // =========================================
-  status OrderStatus @default(active)
+  status         OrderStatus @default(active)
+  stateChangedAt DateTime?   @default(now()) // Timestamp of last state transition
 
   // =========================================
   // CANCELLATION
