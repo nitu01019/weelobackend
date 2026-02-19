@@ -214,7 +214,9 @@ class AssignmentService {
         throw new AppError(400, 'DRIVER_BUSY',
           `Driver ${driver.name} already has an active trip. Please assign a different driver.`);
       }
-      await db.createAssignment(assignment);
+      // CRITICAL: use tx (transaction context) not db (global client) so the
+      // Serializable isolation actually prevents concurrent duplicate assignments.
+      await tx.assignment.create({ data: assignment as any });
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
 
     // =========================================================================
@@ -724,10 +726,13 @@ class AssignmentService {
     });
 
     // 5. Notify driver: assignment expired (WebSocket)
+    // Use 'driver_declined' to match the DB status; include reason:'timeout' so
+    // the driver app can show a user-friendly "expired" message without a schema mismatch.
     emitToUser(driverId, SocketEvent.ASSIGNMENT_STATUS_CHANGED, {
       assignmentId,
       tripId,
-      status: 'expired',
+      status: 'driver_declined',
+      reason: 'timeout',
       message: 'Trip assignment expired — you didn\'t respond in time'
     });
 

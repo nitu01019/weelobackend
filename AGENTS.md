@@ -201,6 +201,21 @@ curl -s http://weelo-alb-380596483.ap-south-1.elb.amazonaws.com/health | python3
 
 ## 🔄 Session Log
 
+### 2026-02-20 — CodeRabbit Round 8 Fixes ✅ PUSHED
+
+- ✅ `assignment.service.ts:218` — CRITICAL: `db.createAssignment` inside Serializable `$transaction` replaced with `tx.assignment.create` — now actually uses tx context, preventing concurrent duplicate assignments
+- ✅ `assignment.service.ts:726` — `status: 'expired'` → `status: 'driver_declined', reason: 'timeout'` — driver WebSocket event now matches DB state
+- ✅ `prisma/migrations/...migration.sql` — `stateChangedAt` backfilled from `createdAt` not `CURRENT_TIMESTAMP` — existing rows now have correct timestamps
+- ✅ `.planning/.../01-05-PLAN.md` — Added H1 heading after front matter (MD041)
+- ✅ tsc — 0 errors, Tests — 54/54 passed
+- 🔄 Waiting for CodeRabbit Round 8 verdict
+
+### 2026-02-20 — CodeRabbit Round 7 Fixes ✅ PUSHED
+
+- ✅ `booking.routes.ts` — rating groupBy queries parallelized with `Promise.all`
+- ✅ `AGENTS.md` — `gh auth token` pattern, MD040/MD031/MD022 fixes
+- ✅ tsc — 0 errors, Tests — 54/54 passed, pushed `5ec4dae`
+
 ### 2026-02-20 — CodeRabbit Round 6 Fixes ✅ PUSHED
 
 - ✅ `cancelBooking` — timers deleted BEFORE atomic `updateMany` (race condition fix)
