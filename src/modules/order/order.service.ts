@@ -26,7 +26,7 @@ import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { Prisma } from '@prisma/client';
 import { db, OrderRecord, TruckRequestRecord } from '../../shared/database/db';
-import { prismaClient } from '../../shared/database/prisma.service';
+import { prismaClient, OrderStatus, AssignmentStatus, VehicleStatus, BookingStatus, TruckRequestStatus } from '../../shared/database/prisma.service';
 import { logger } from '../../shared/services/logger.service';
 import { emitToUser } from '../../shared/services/socket.service';
 import { sendPushNotification } from '../../shared/services/fcm.service';
@@ -275,9 +275,6 @@ class OrderService {
     ORDER_EXPIRY: (orderId: string) => `timer:order:${orderId}`,
   };
 
-  // Order timers map (for local timer cleanup)
-  private orderTimers: Map<string, NodeJS.Timeout> = new Map();
-
   // ===========================================================================
   // CACHED LOOKUPS (Optimized for millions of requests)
   // ===========================================================================
@@ -477,10 +474,10 @@ class OrderService {
     try {
     // DB authoritative check (covers Redis failure edge case)
     const existingBooking = await prismaClient.booking.findFirst({
-      where: { customerId: request.customerId, status: { in: ['created', 'broadcasting', 'active', 'partially_filled'] as any } }
+      where: { customerId: request.customerId, status: { in: [BookingStatus.created, BookingStatus.broadcasting, BookingStatus.active, BookingStatus.partially_filled] } }
     });
     const existingOrder = await prismaClient.order.findFirst({
-      where: { customerId: request.customerId, status: { in: ['created', 'broadcasting', 'active', 'partially_filled'] as any } }
+      where: { customerId: request.customerId, status: { in: [OrderStatus.created, OrderStatus.broadcasting, OrderStatus.active, OrderStatus.partially_filled] } }
     });
     if (existingBooking || existingOrder) {
       throw new Error('Request already in progress. Cancel it first.');
@@ -688,7 +685,19 @@ class OrderService {
       expiresAt
     };
 
-    await db.createOrder(order);
+    // Narrow serializable transaction: duplicate-check + insert (prevents race condition)
+    await prismaClient.$transaction(async (tx) => {
+      const dupBooking = await tx.booking.findFirst({
+        where: { customerId: request.customerId, status: { in: [BookingStatus.created, BookingStatus.broadcasting, BookingStatus.active, BookingStatus.partially_filled] } }
+      });
+      const dupOrder = await tx.order.findFirst({
+        where: { customerId: request.customerId, status: { in: [OrderStatus.created, OrderStatus.broadcasting, OrderStatus.active, OrderStatus.partially_filled] } }
+      });
+      if (dupBooking || dupOrder) {
+        throw new Error('Request already in progress. Cancel it first.');
+      }
+      await db.createOrder(order);
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
 
     // Emit lifecycle state: created
     emitToUser(request.customerId, 'broadcast_state_changed', {
@@ -1227,8 +1236,8 @@ class OrderService {
     const order = await db.getOrderById(orderId);
     if (!order) return;
 
-    // Only expire if not fully filled
-    if (order.status === 'fully_filled' || order.status === 'completed') {
+    // Only expire if still in an expirable state
+    if (order.status === OrderStatus.fully_filled || order.status === OrderStatus.completed || order.status === OrderStatus.cancelled) {
       return;
     }
 
@@ -1341,10 +1350,10 @@ class OrderService {
       where: {
         id: orderId,
         customerId,
-        status: { in: ['created', 'broadcasting', 'active', 'partially_filled'] as any }
+        status: { in: [OrderStatus.created, OrderStatus.broadcasting, OrderStatus.active, OrderStatus.partially_filled] }
       },
       data: {
-        status: 'cancelled' as any,
+        status: OrderStatus.cancelled,
         stateChangedAt: new Date(),
         cancelledAt: new Date().toISOString(),
         cancellationReason: reason || 'Cancelled by customer'
@@ -1363,7 +1372,7 @@ class OrderService {
     }
 
     // IDEMPOTENT: already cancelled is success
-    if (updated.count === 0 && order.status === 'cancelled') {
+    if (updated.count === 0 && order.status === OrderStatus.cancelled) {
       return { success: true, message: 'Order already cancelled', transportersNotified: 0 };
     }
 
@@ -1377,7 +1386,7 @@ class OrderService {
     const truckRequests = await db.getTruckRequestsByOrder(orderId);
     const requestIds = truckRequests.filter(tr => ['searching', 'held'].includes(tr.status)).map(tr => tr.id);
     if (requestIds.length > 0) {
-      await db.updateTruckRequestsBatch(requestIds, { status: 'cancelled' });
+      await db.updateTruckRequestsBatch(requestIds, { status: TruckRequestStatus.cancelled });
     }
 
     // 2. Clear expiry timer from Redis
@@ -1445,18 +1454,18 @@ class OrderService {
     // 6. Revert active assignments — release vehicles and notify drivers
     try {
       const activeAssignments = await prismaClient.assignment.findMany({
-        where: { orderId, status: { in: ['pending', 'driver_accepted', 'driver_en_route'] as any } }
+        where: { orderId, status: { in: [AssignmentStatus.pending, AssignmentStatus.driver_accepted, AssignmentStatus.en_route_pickup, AssignmentStatus.at_pickup, AssignmentStatus.in_transit] } }
       });
       if (activeAssignments.length > 0) {
         await prismaClient.assignment.updateMany({
-          where: { orderId, status: { in: ['pending', 'driver_accepted', 'driver_en_route'] as any } },
-          data: { status: 'cancelled' as any }
+          where: { orderId, status: { in: [AssignmentStatus.pending, AssignmentStatus.driver_accepted, AssignmentStatus.en_route_pickup, AssignmentStatus.at_pickup, AssignmentStatus.in_transit] } },
+          data: { status: AssignmentStatus.cancelled }
         });
         for (const assignment of activeAssignments) {
           if (assignment.vehicleId) {
             await prismaClient.vehicle.update({
               where: { id: assignment.vehicleId },
-              data: { status: 'available' as any, currentTripId: null, assignedDriverId: null }
+              data: { status: VehicleStatus.available, currentTripId: null, assignedDriverId: null }
             }).catch(() => {});
           }
           if (assignment.driverId) {
@@ -1615,7 +1624,7 @@ class OrderService {
               driverName: driver.name,
               driverPhone: driver.phone || '',
               tripId,
-              status: 'pending',
+              status: AssignmentStatus.pending,
               assignedAt: now
             }
           });
@@ -1634,20 +1643,20 @@ class OrderService {
           }
 
           const newTrucksFilled = order.trucksFilled + 1;
-          const newStatus: OrderRecord['status'] = newTrucksFilled >= order.totalTrucks
-            ? 'fully_filled'
-            : 'partially_filled';
+          const newStatus = newTrucksFilled >= order.totalTrucks
+            ? OrderStatus.fully_filled
+            : OrderStatus.partially_filled;
 
           await tx.order.update({
             where: { id: order.id },
-            data: { status: newStatus as any, stateChangedAt: new Date() }
+            data: { status: newStatus, stateChangedAt: new Date() }
           });
 
           // ----- Update vehicle status inside transaction -----
           await tx.vehicle.update({
             where: { id: vehicleId },
             data: {
-              status: 'in_transit',
+              status: VehicleStatus.in_transit,
               currentTripId: tripId,
               assignedDriverId: driverId
             }
@@ -1842,10 +1851,6 @@ class OrderService {
 
     // If fully filled, cancel expiry timer and clear active key
     if (newStatus === 'fully_filled') {
-      if (this.orderTimers.has(orderId)) {
-        clearTimeout(this.orderTimers.get(orderId)!);
-        this.orderTimers.delete(orderId);
-      }
       await redisService.cancelTimer(this.TIMER_KEYS.ORDER_EXPIRY(orderId)).catch(() => {});
       await this.clearCustomerActiveBroadcast(customerId);
       logger.info(`Order ${orderId} fully filled! All ${orderTotalTrucks} trucks assigned.`);

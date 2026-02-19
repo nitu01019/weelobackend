@@ -26,6 +26,7 @@
  * =============================================================================
  */
 
+import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
 // REMOVED: bcrypt (unnecessary for OTPs, was causing 5-second delay)
 // OTPs are temporary (5min auto-delete) + max 3 attempts = secure without hashing
@@ -140,8 +141,10 @@ class AuthService {
     
     // Store ONLY hashed OTP in Redis with TTL
     const key = REDIS_KEYS.OTP(phone, role);
+    // Hash OTP with SHA-256 before storing (fast, prevents plaintext exposure in Redis/DB)
+    const otpHash = crypto.createHash('sha256').update(otp).digest('hex');
     const otpEntry: OtpEntry = {
-      otp: otp, // Plain OTP (instant, secure with TTL + max 3 attempts)
+      otp: otpHash,
       expiresAt: expiresAt.toISOString(),
       attempts: 0
     };
@@ -172,7 +175,7 @@ class AuthService {
         `INSERT INTO "OtpStore" (phone, role, otp, expires_at, attempts) 
          VALUES ($1, $2, $3, $4, 0) 
          ON CONFLICT (phone, role) DO UPDATE SET otp = $3, expires_at = $4, attempts = 0`,
-        phone, role, otp, expiresAt.toISOString()
+        phone, role, otpHash, expiresAt.toISOString()
       );
       logger.info('OTP stored in PostgreSQL (cross-task backup)', { phone: maskForLogging(phone, 2, 4) });
     } catch (dbError: any) {
@@ -340,8 +343,9 @@ class AuthService {
       throw new AppError(400, 'MAX_ATTEMPTS', 'Too many failed attempts. Please request a new OTP.');
     }
     
-    // Verify OTP (instant comparison, no bcrypt overhead)
-    const isValid = otp === stored.otp;
+    // Verify OTP — hash input and compare with stored hash (timing-safe)
+    const inputHash = crypto.createHash('sha256').update(otp).digest('hex');
+    const isValid = crypto.timingSafeEqual(Buffer.from(inputHash), Buffer.from(stored.otp));
     
     if (!isValid) {
       let attemptsRemaining = maxAttempts - currentAttempts - 1;

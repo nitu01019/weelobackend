@@ -100,6 +100,8 @@ interface IRedisClient {
 
   // Lists (for queues - PRODUCTION SCALABILITY)
   lPush(key: string, value: string): Promise<number>;
+  rPush(key: string, value: string): Promise<number>;
+  lTrim(key: string, start: number, stop: number): Promise<void>;
   rPop(key: string): Promise<string | null>;
   lLen(key: string): Promise<number>;
   brPop(key: string, timeoutSeconds: number): Promise<string | null>;
@@ -304,6 +306,33 @@ class InMemoryRedisClient implements IRedisClient {
 
     entry.value.unshift(value);
     return entry.value.length;
+  }
+
+  /**
+   * Push value to right of list (append)
+   * SCALABILITY: Used for location history append
+   */
+  async rPush(key: string, value: string): Promise<number> {
+    let entry = this.store.get(key);
+    if (!entry || entry.type !== 'list') {
+      entry = { value: [] as string[], type: 'list' };
+      this.store.set(key, entry);
+    }
+    entry.value.push(value);
+    return entry.value.length;
+  }
+
+  /**
+   * Trim list to specified range
+   * SCALABILITY: Used to cap location history at 1000 points
+   */
+  async lTrim(key: string, start: number, stop: number): Promise<void> {
+    const entry = this.store.get(key);
+    if (!entry || entry.type !== 'list') return;
+    const len = entry.value.length;
+    const normalStart = start < 0 ? Math.max(0, len + start) : start;
+    const normalStop = stop < 0 ? len + stop : Math.min(stop, len - 1);
+    entry.value = entry.value.slice(normalStart, normalStop + 1);
   }
 
   /**
@@ -822,6 +851,14 @@ class RealRedisClient implements IRedisClient {
     return this.client.lpush(key, value);
   }
 
+  async rPush(key: string, value: string): Promise<number> {
+    return this.client.rpush(key, value);
+  }
+
+  async lTrim(key: string, start: number, stop: number): Promise<void> {
+    await this.client.ltrim(key, start, stop);
+  }
+
   /**
    * Pop value from right of list (queue tail) - FIFO
    * SCALABILITY: Used by RedisQueue for job consumption
@@ -1198,6 +1235,14 @@ class RedisService {
     return this.client.lPush(key, value);
   }
 
+  async rPush(key: string, value: string): Promise<number> {
+    return this.client.rPush(key, value);
+  }
+
+  async lTrim(key: string, start: number, stop: number): Promise<void> {
+    await this.client.lTrim(key, start, stop);
+  }
+
   /**
    * Pop value from right of list (queue tail) - FIFO
    * SCALABILITY: Used by RedisQueue for job consumption
@@ -1258,6 +1303,14 @@ class RedisService {
    * Increment counter with TTL (for rate limiting)
    * Returns current count after increment
    */
+  async incr(key: string): Promise<number> {
+    return this.client.incr(key);
+  }
+
+  async incrBy(key: string, amount: number): Promise<number> {
+    return this.client.incrBy(key, amount);
+  }
+
   async incrementWithTTL(key: string, ttlSeconds: number): Promise<number> {
     const count = await this.client.incr(key);
 

@@ -9,7 +9,9 @@
  */
 
 import { v4 as uuid } from 'uuid';
+import { Prisma } from '@prisma/client';
 import { db, AssignmentRecord } from '../../shared/database/db';
+import { prismaClient } from '../../shared/database/prisma.service';
 import { AppError } from '../../shared/types/error.types';
 import { logger } from '../../shared/services/logger.service';
 import { emitToUser, emitToBooking, SocketEvent } from '../../shared/services/socket.service';
@@ -81,6 +83,14 @@ function startAssignmentExpiryChecker(): void {
   }, ASSIGNMENT_CONFIG.EXPIRY_CHECK_INTERVAL_MS);
   
   logger.info('📅 Assignment expiry checker started (Redis-based, cluster-safe)');
+}
+
+export function stopAssignmentExpiryChecker(): void {
+  if (assignmentExpiryCheckerInterval) {
+    clearInterval(assignmentExpiryCheckerInterval);
+    assignmentExpiryCheckerInterval = null;
+    logger.info('Assignment expiry checker stopped');
+  }
 }
 
 /**
@@ -165,25 +175,19 @@ class AssignmentService {
       throw new AppError(403, 'FORBIDDEN', 'This driver does not belong to you');
     }
 
-    // =================================================================
-    // RULE: ONE ACTIVE TRIP PER DRIVER
-    // Driver can only have one active assignment at a time
-    // This prevents double-booking of drivers
-    // =================================================================
-    const activeAssignment = await db.getActiveAssignmentByDriver(data.driverId);
-    if (activeAssignment) {
-      logger.warn(`⚠️ Driver ${driver.name} already has active trip: ${activeAssignment.tripId}`);
-      throw new AppError(400, 'DRIVER_BUSY', 
-        `Driver ${driver.name} already has an active trip. Please assign a different driver.`);
-    }
-
-    // Get transporter info
+    // Get transporter info (outside transaction — read-only, no race risk)
     const transporter = await db.getUserById(transporterId);
 
-    // Create assignment
+    // =================================================================
+    // RULE: ONE ACTIVE TRIP PER DRIVER
+    // Wrap check + create in Serializable transaction to prevent
+    // race condition where two concurrent requests both pass the check
+    // and both create assignments for the same driver.
+    // =================================================================
     const tripId = uuid();
+    const assignmentId = uuid();
     const assignment: AssignmentRecord = {
-      id: uuid(),
+      id: assignmentId,
       bookingId: data.bookingId,
       transporterId,
       transporterName: transporter?.businessName || transporter?.name || 'Transporter',
@@ -199,7 +203,19 @@ class AssignmentService {
       assignedAt: new Date().toISOString()
     };
 
-    await db.createAssignment(assignment);
+    await prismaClient.$transaction(async (tx) => {
+      // Re-check inside transaction with Serializable isolation
+      const activeStatuses = ['pending', 'driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit'];
+      const activeAssignment = await tx.assignment.findFirst({
+        where: { driverId: data.driverId, status: { in: activeStatuses as any } }
+      });
+      if (activeAssignment) {
+        logger.warn(`⚠️ Driver ${driver.name} already has active trip: ${activeAssignment.tripId}`);
+        throw new AppError(400, 'DRIVER_BUSY',
+          `Driver ${driver.name} already has an active trip. Please assign a different driver.`);
+      }
+      await db.createAssignment(assignment);
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
 
     // =========================================================================
     // START 60-SECOND TIMEOUT TIMER (Redis-based)
@@ -450,6 +466,18 @@ class AssignmentService {
     return updated!;
   }
 
+  // Valid assignment status transitions (prevents backward/invalid moves)
+  private static readonly VALID_TRANSITIONS: Record<string, string[]> = {
+    pending:          ['driver_accepted', 'driver_declined', 'cancelled'],
+    driver_accepted:  ['en_route_pickup', 'cancelled'],
+    en_route_pickup:  ['at_pickup', 'cancelled'],
+    at_pickup:        ['in_transit', 'cancelled'],
+    in_transit:       ['completed', 'cancelled'],
+    completed:        [],
+    driver_declined:  [],
+    cancelled:        [],
+  };
+
   async updateStatus(
     assignmentId: string,
     driverId: string,
@@ -463,6 +491,13 @@ class AssignmentService {
 
     if (assignment.driverId !== driverId) {
       throw new AppError(403, 'FORBIDDEN', 'This assignment is not for you');
+    }
+
+    // Validate status transition
+    const allowedNext = AssignmentService.VALID_TRANSITIONS[assignment.status] ?? [];
+    if (!allowedNext.includes(data.status)) {
+      throw new AppError(400, 'INVALID_TRANSITION',
+        `Cannot transition assignment from '${assignment.status}' to '${data.status}'`);
     }
 
     const updates: Partial<AssignmentRecord> = {

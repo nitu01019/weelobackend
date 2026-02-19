@@ -76,6 +76,7 @@
 
 import { v4 as uuidv4 } from 'uuid';
 import { db } from '../../shared/database/db';
+import { prismaClient } from '../../shared/database/prisma.service';
 import { logger } from '../../shared/services/logger.service';
 import { socketService } from '../../shared/services/socket.service';
 import { redisService } from '../../shared/services/redis.service';
@@ -227,9 +228,11 @@ class HoldStore {
   async add(hold: TruckHold): Promise<boolean> {
     try {
       // 1. Try to acquire locks for all truck requests atomically
+      // Sort IDs to prevent deadlocks when concurrent requests lock same trucks in different orders
+      const sortedTruckIds = [...hold.truckRequestIds].sort();
       const lockResults: boolean[] = [];
       
-      for (const truckId of hold.truckRequestIds) {
+      for (const truckId of sortedTruckIds) {
         const lockKey = REDIS_KEYS.TRUCK_LOCK(truckId);
         const lockResult = await redisService.acquireLock(
           lockKey.replace('lock:', ''), // acquireLock adds 'lock:' prefix
@@ -239,15 +242,17 @@ class HoldStore {
         lockResults.push(lockResult.acquired);
         
         if (!lockResult.acquired) {
-          // Someone else got this truck - release any locks we got
+          // Someone else got this truck - release any locks we got (in same sorted order)
           for (let i = 0; i < lockResults.length - 1; i++) {
             if (lockResults[i]) {
               await redisService.releaseLock(
-                REDIS_KEYS.TRUCK_LOCK(hold.truckRequestIds[i]).replace('lock:', ''),
+                REDIS_KEYS.TRUCK_LOCK(sortedTruckIds[i]).replace('lock:', ''),
                 hold.transporterId
               );
             }
           }
+          // 50ms backoff before caller can retry (reduces contention)
+          await new Promise(resolve => setTimeout(resolve, 50));
           logger.warn(`[HoldStore] Failed to acquire lock for truck ${truckId}`);
           return false;
         }
@@ -638,13 +643,11 @@ class TruckHoldService {
         });
       }
       
-      // 3. Update order's filled count
-      const order = await db.getOrderById(hold.orderId);
-      if (order) {
-        await db.updateOrder(hold.orderId, {
-          trucksFilled: (order.trucksFilled || 0) + hold.quantity
-        });
-      }
+      // 3. Update order's filled count (atomic increment — prevents race condition)
+      await prismaClient.order.update({
+        where: { id: hold.orderId },
+        data: { trucksFilled: { increment: hold.quantity } }
+      });
       
       // 4. Mark hold as confirmed (async - Redis)
       await holdStore.updateStatus(holdId, 'confirmed');
@@ -949,18 +952,18 @@ class TruckHoldService {
       }
       
       // =========================================================================
-      // STEP 5: Update order progress
+      // STEP 5: Update order progress (atomic increment — prevents race condition)
       // =========================================================================
-      const newTrucksFilled = (order.trucksFilled || 0) + validatedVehicles.length;
+      const updatedOrder = await prismaClient.order.update({
+        where: { id: hold.orderId },
+        data: { trucksFilled: { increment: validatedVehicles.length } }
+      });
+      const newTrucksFilled = updatedOrder.trucksFilled;
       let newStatus: 'active' | 'partially_filled' | 'fully_filled' = 'partially_filled';
-      if (newTrucksFilled >= order.totalTrucks) {
+      if (newTrucksFilled >= updatedOrder.totalTrucks) {
         newStatus = 'fully_filled';
       }
-      
-      await db.updateOrder(hold.orderId, {
-        trucksFilled: newTrucksFilled,
-        status: newStatus
-      });
+      await db.updateOrder(hold.orderId, { status: newStatus });
       
       // =========================================================================
       // STEP 6: Notify customer about truck confirmation

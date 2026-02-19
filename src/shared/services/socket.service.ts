@@ -204,7 +204,7 @@ export function initializeSocket(server: HttpServer): Server {
   });
 
   // Connection handler
-  io.on('connection', (socket: Socket) => {
+  io.on('connection', async (socket: Socket) => {
     const userId = socket.data.userId;
     const role = socket.data.role;
     const phone = socket.data.phone;
@@ -219,12 +219,24 @@ export function initializeSocket(server: HttpServer): Server {
       userSockets.set(userId, new Set());
     }
     const userSocketSet = userSockets.get(userId)!;
-    
-    // Enforce connection limit — disconnect oldest if exceeded
-    if (userSocketSet.size >= MAX_CONNECTIONS_PER_USER) {
+
+    // Enforce connection limit cross-instance via Redis counter
+    const connKey = `socket:conncount:${userId}`;
+    let globalCount = 0;
+    try {
+      globalCount = await redisService.incr(connKey);
+      await redisService.expire(connKey, 3600); // 1hr TTL (auto-cleanup)
+    } catch {
+      // Redis unavailable — fall back to local count
+      globalCount = userSocketSet.size + 1;
+    }
+
+    if (globalCount > MAX_CONNECTIONS_PER_USER) {
+      // Decrement since we won't be keeping this connection
+      try { await redisService.incrBy(connKey, -1); } catch {}
       const oldestSocketId = userSocketSet.values().next().value;
       if (oldestSocketId) {
-        logger.warn(`[Socket] Connection limit (${MAX_CONNECTIONS_PER_USER}) exceeded for ${userId}, disconnecting oldest: ${oldestSocketId}`);
+        logger.warn(`[Socket] Global connection limit (${MAX_CONNECTIONS_PER_USER}) exceeded for ${userId}, disconnecting oldest: ${oldestSocketId}`);
         const oldSocket = io?.sockets.sockets.get(oldestSocketId);
         if (oldSocket) {
           oldSocket.emit(SocketEvent.ERROR, { message: 'Connection limit exceeded. Disconnecting oldest session.' });
@@ -232,9 +244,11 @@ export function initializeSocket(server: HttpServer): Server {
         }
         userSocketSet.delete(oldestSocketId);
         socketUsers.delete(oldestSocketId);
+        // Re-add this new connection
+        try { await redisService.incr(connKey); } catch {}
       }
     }
-    
+
     userSocketSet.add(socket.id);
     socketUsers.set(socket.id, userId);
 
@@ -297,6 +311,8 @@ export function initializeSocket(server: HttpServer): Server {
         if (userSockets.get(userId)?.size === 0) {
           userSockets.delete(userId);
         }
+        // Decrement Redis connection counter (cross-instance tracking)
+        try { redisService.incrBy(`socket:conncount:${userId}`, -1).catch(() => {}); } catch {}
       }
       socketUsers.delete(socket.id);
     });

@@ -25,6 +25,7 @@
  */
 
 import { db } from '../../shared/database/db';
+import { prismaClient } from '../../shared/database/prisma.service';
 import { cacheService } from '../../shared/services/cache.service';
 import { logger } from '../../shared/services/logger.service';
 
@@ -81,9 +82,8 @@ class CustomerService {
       return cached;
     }
     
-    // Count bookings from in-memory DB
-    const allBookings = await db.getBookings();
-    const count = allBookings.filter(b => b.customerId === userId).length;
+    // Count bookings using DB query (not loading all into memory)
+    const count = await prismaClient.booking.count({ where: { customerId: userId } });
     
     // Cache for 5 minutes (trips don't change often)
     await cacheService.set(cacheKey, count, 5 * 60);

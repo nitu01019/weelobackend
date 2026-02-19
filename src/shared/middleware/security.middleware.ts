@@ -186,11 +186,9 @@ export function blockSuspiciousRequests(
     /\$\{.*\}/,         // Template injection
   ];
 
-  const requestString = JSON.stringify({
-    url: req.url,
-    body: req.body,
-    query: req.query,
-  });
+  // Only check URL path + query params — NOT body (body check causes false positives
+  // on legitimate data like addresses with special chars, template strings, etc.)
+  const requestString = `${req.url} ${JSON.stringify(req.query)}`;
 
   for (const pattern of suspiciousPatterns) {
     if (pattern.test(requestString)) {

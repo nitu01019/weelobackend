@@ -111,15 +111,8 @@ class RedisRateLimitStore {
     const redisKey = this.getKey(key);
 
     try {
-      const current = await redisService.get(redisKey);
-      if (current && parseInt(current, 10) > 0) {
-        // Use set with existing TTL to avoid resetting the window
-        const ttl = await redisService.ttl(redisKey);
-        const newValue = Math.max(0, parseInt(current, 10) - 1);
-        if (ttl > 0) {
-          await redisService.set(redisKey, newValue.toString(), ttl);
-        }
-      }
+      // Atomic decrement — avoids read-modify-write race condition
+      await redisService.incrBy(redisKey, -1);
     } catch (error: any) {
       logger.warn(`[RateLimit] Redis decrement failed for ${key}: ${error.message}`);
       // Non-critical — just means one extra request counted

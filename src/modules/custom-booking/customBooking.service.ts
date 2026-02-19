@@ -16,12 +16,11 @@
  * =============================================================================
  */
 
-import { PrismaClient, CustomBookingStatus } from '@prisma/client';
+import { CustomBookingStatus } from '@prisma/client';
+import { prismaClient as prisma } from '../../shared/database/prisma.service';
 import { logger } from '../../shared/services/logger.service';
 import { redisService } from '../../shared/services/redis.service';
 import { queueService } from '../../shared/services/queue.service';
-
-const prisma = new PrismaClient();
 
 // =============================================================================
 // CACHE CONFIGURATION (SCALABILITY: Reduces DB load for millions of users)
@@ -326,29 +325,28 @@ export async function getRequestById(requestId: string, customerId: string) {
  * Cancel a pending request
  */
 export async function cancelRequest(requestId: string, customerId: string) {
-    const request = await prisma.customBookingRequest.findFirst({
+    // Atomic cancel: status precondition in WHERE prevents TOCTOU race condition
+    // (findFirst + update would allow two concurrent cancels to both succeed)
+    const result = await prisma.customBookingRequest.updateMany({
         where: {
             id: requestId,
             customerId,
             status: { in: ['pending', 'under_review'] }
-        }
-    });
-
-    if (!request) {
-        throw new Error('Request not found or cannot be cancelled');
-    }
-
-    const updated = await prisma.customBookingRequest.update({
-        where: { id: requestId },
+        },
         data: {
             status: 'cancelled',
             updatedAt: new Date()
         }
     });
 
+    if (result.count === 0) {
+        throw new Error('Request not found or cannot be cancelled');
+    }
+
     logger.info(`Custom booking request cancelled: ${requestId}`);
 
-    return updated;
+    // Return the updated record for API response
+    return prisma.customBookingRequest.findUnique({ where: { id: requestId } });
 }
 
 // =============================================================================

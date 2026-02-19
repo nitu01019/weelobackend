@@ -497,15 +497,23 @@ process.on('unhandledRejection', (reason) => {
 const gracefulShutdown = async (signal: string) => {
   logger.info(`${signal} received. Starting graceful shutdown...`);
 
-  // Stop expiry checker intervals first (prevents new work during shutdown)
+  // Stop all background intervals first (prevents new work during shutdown)
   try {
     const { stopBookingExpiryChecker } = require('./modules/booking/booking.service');
     const { stopOrderExpiryChecker } = require('./modules/booking/order.service');
+    const { stopAssignmentExpiryChecker } = require('./modules/assignment/assignment.service');
+    const { broadcastService } = require('./modules/broadcast/broadcast.service');
+    const { stopStaleTransporterCleanup } = require('./shared/services/transporter-online.service');
+    const { trackingService } = require('./modules/tracking/tracking.service');
     stopBookingExpiryChecker();
     stopOrderExpiryChecker();
-    logger.info('Expiry checkers stopped');
+    stopAssignmentExpiryChecker();
+    broadcastService?.stopExpiryChecker?.();
+    stopStaleTransporterCleanup();
+    trackingService?.stopDriverOfflineChecker?.();
+    logger.info('All background intervals stopped');
   } catch (err) {
-    logger.error('Error stopping expiry checkers', err);
+    logger.error('Error stopping background intervals', err);
   }
 
   server.close(async () => {

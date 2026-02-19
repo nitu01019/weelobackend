@@ -157,12 +157,9 @@ class DriverAuthService {
       );
     }
 
-    // DEBUG: Log actual phone numbers to identify the issue
-    logger.info('[DRIVER AUTH DEBUG] Phone numbers check', {
+    logger.info('[DRIVER AUTH] Phone numbers check', {
       driverPhone: maskForLogging(driverPhone, 2, 4),
       transporterPhone: maskForLogging(transporter.phone, 2, 4),
-      driverPhoneFull: driverPhone,
-      transporterPhoneFull: transporter.phone,
       arePhonesSame: driverPhone === transporter.phone
     });
 
@@ -225,7 +222,6 @@ class DriverAuthService {
         driverId: driver.id,
         driverPhone: maskForLogging(driverPhone, 2, 4),
         transporterPhone: maskForLogging(transporter.phone, 2, 4),
-        transporterPhoneFull: transporter.phone,
         expiresAt: expiresAt.toISOString()
       });
     } catch (smsError: any) {

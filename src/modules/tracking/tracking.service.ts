@@ -494,16 +494,11 @@ class TrackingService {
   private async addToHistory(tripId: string, entry: LocationHistoryEntry): Promise<void> {
     try {
       const key = REDIS_KEYS.TRIP_HISTORY(tripId);
-      const history = await redisService.getJSON<LocationHistoryEntry[]>(key) || [];
-
-      history.push(entry);
-
-      // Keep last 1000 points (prevent unbounded growth)
-      if (history.length > 1000) {
-        history.shift();
-      }
-
-      await redisService.setJSON(key, history, TTL.HISTORY);
+      // Use Redis list ops: O(1) append, atomic, no read-modify-write race
+      await redisService.rPush(key, JSON.stringify(entry));
+      // Cap at last 1000 points (lTrim keeps indices -1000 to -1)
+      await redisService.lTrim(key, -1000, -1);
+      await redisService.expire(key, TTL.HISTORY);
     } catch (error) {
       // Non-critical - log but don't throw
       logger.warn(`Failed to add to history: ${error}`);
@@ -1115,6 +1110,14 @@ class TrackingService {
     }, 30_000); // Every 30 seconds
 
     logger.info('🔍 Driver offline checker started (30s interval, 2min threshold)');
+  }
+
+  stopDriverOfflineChecker(): void {
+    if (this.offlineCheckerInterval) {
+      clearInterval(this.offlineCheckerInterval);
+      this.offlineCheckerInterval = null;
+      logger.info('Driver offline checker stopped');
+    }
   }
 
   /**
