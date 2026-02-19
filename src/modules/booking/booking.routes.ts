@@ -75,8 +75,7 @@ router.get(
       let ratingStatusMap: Record<string, boolean> = {};
       if (completedIds.length > 0) {
         try {
-          // Batch query: count rated assignments per booking (single DB call)
-          // Run both groupBy queries in parallel — they are independent
+          // Batch queries: count rated and total assignments per booking (parallel)
           const [ratedAssignments, totalAssignments] = await Promise.all([
             prismaClient.assignment.groupBy({
               by: ['bookingId'],
