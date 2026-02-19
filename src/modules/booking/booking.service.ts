@@ -1148,6 +1148,11 @@ class BookingService {
    * Already-cancelled bookings return success (idempotent).
    */
   async cancelBooking(bookingId: string, customerId: string): Promise<BookingRecord> {
+    // Delete timers BEFORE the status update so a racing expiry timer cannot
+    // fire in the window between the DB write and our own timer cleanup.
+    // Idempotent — safe to call even if timers don't exist yet.
+    await this.clearBookingTimers(bookingId).catch(() => {});
+
     // ATOMIC cancel: only succeeds if status is still cancellable
     const updated = await prismaClient.booking.updateMany({
       where: {
@@ -1184,8 +1189,7 @@ class BookingService {
 
     // === CANCEL WON: Full cleanup ===
 
-    // 1. Clear all timers INCLUDING radius expansion keys
-    await this.clearBookingTimers(bookingId);
+    // 1. Timers already cleared above (before DB update) — skip duplicate call
 
     // 2. Clear customer active broadcast key + idempotency keys
     await this.clearCustomerActiveBroadcast(customerId);
@@ -1412,6 +1416,15 @@ class BookingService {
    */
   async deliverMissedBroadcasts(transporterId: string): Promise<void> {
     try {
+      // Rate limit: max once per 30 seconds per transporter to prevent DOS via rapid toggle
+      const rateLimitKey = `ratelimit:missed-broadcasts:${transporterId}`;
+      const existing = await redisService.get(rateLimitKey).catch(() => null);
+      if (existing) {
+        logger.info(`[RE-BROADCAST] Rate limited for transporter ${transporterId} — skipping`);
+        return;
+      }
+      await redisService.set(rateLimitKey, '1', 30).catch(() => {});
+
       const bookings = await db.getActiveBookingsForTransporter(transporterId);
       const now = new Date();
 

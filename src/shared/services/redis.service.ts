@@ -110,6 +110,7 @@ interface IRedisClient {
   sAdd(key: string, ...members: string[]): Promise<number>;
   sRem(key: string, ...members: string[]): Promise<number>;
   sMembers(key: string): Promise<string[]>;
+  sScan(key: string, cursor: string, count?: number): Promise<[string, string[]]>;
   sIsMember(key: string, member: string): Promise<boolean>;
   sCard(key: string): Promise<number>;
 
@@ -420,6 +421,12 @@ class InMemoryRedisClient implements IRedisClient {
     const entry = this.store.get(key);
     if (!entry || entry.type !== 'set') return [];
     return Array.from(entry.value);
+  }
+
+  async sScan(key: string, cursor: string, count: number = 100): Promise<[string, string[]]> {
+    // In-memory: return all members in one shot (no real cursor needed)
+    const members = await this.sMembers(key);
+    return ['0', members];
   }
 
   async sIsMember(key: string, member: string): Promise<boolean> {
@@ -903,6 +910,11 @@ class RealRedisClient implements IRedisClient {
 
   async sMembers(key: string): Promise<string[]> {
     return this.client.smembers(key);
+  }
+
+  async sScan(key: string, cursor: string, count: number = 100): Promise<[string, string[]]> {
+    const result = await this.client.sscan(key, cursor, 'COUNT', count);
+    return [result[0], result[1]];
   }
 
   async sIsMember(key: string, member: string): Promise<boolean> {
@@ -1557,6 +1569,10 @@ class RedisService {
 
   async sMembers(key: string): Promise<string[]> {
     return this.client.sMembers(key);
+  }
+
+  async sScan(key: string, cursor: string, count: number = 100): Promise<[string, string[]]> {
+    return this.client.sScan(key, cursor, count);
   }
 
   async sIsMember(key: string, member: string): Promise<boolean> {

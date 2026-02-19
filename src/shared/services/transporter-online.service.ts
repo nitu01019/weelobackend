@@ -274,7 +274,14 @@ class TransporterOnlineService {
    * Single Redis SMEMBERS call.
    */
   private async getOnlineSet(): Promise<Set<string>> {
-    const members = await redisService.sMembers(ONLINE_TRANSPORTERS_SET);
+    // Use SSCAN instead of SMEMBERS to avoid blocking Redis on large sets (10K+ transporters)
+    const members: string[] = [];
+    let cursor = '0';
+    do {
+      const [nextCursor, batch] = await redisService.sScan(ONLINE_TRANSPORTERS_SET, cursor, 100);
+      members.push(...batch);
+      cursor = nextCursor;
+    } while (cursor !== '0');
     return new Set(members);
   }
 
