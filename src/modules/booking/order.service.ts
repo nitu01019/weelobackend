@@ -23,6 +23,7 @@
 
 import { v4 as uuid } from 'uuid';
 import { db, OrderRecord, TruckRequestRecord } from '../../shared/database/db';
+import { prismaClient } from '../../shared/database/prisma.service';
 import { AppError } from '../../shared/types/error.types';
 import { logger } from '../../shared/services/logger.service';
 import { emitToUser, emitToBooking, SocketEvent } from '../../shared/services/socket.service';
@@ -683,80 +684,237 @@ class OrderService {
     vehicleId: string,
     driverId?: string
   ): Promise<TruckRequestRecord> {
-    
+
     const startTime = Date.now();
-    
-    // STEP 1: Validate request exists and is available
-    const request = await db.getTruckRequestById(requestId);
-    if (!request) {
-      throw new AppError(404, 'REQUEST_NOT_FOUND', 'Truck request not found');
+    const MAX_RETRIES = 3;
+
+    // -------------------------------------------------------------------
+    // ATOMIC TRANSACTION with optimistic locking + P2034 retry loop
+    // Pattern: Prisma Serializable isolation + updateMany WHERE status guard
+    // Reference: broadcast.service.ts line 411
+    // -------------------------------------------------------------------
+    let txResult: {
+      updatedRequest: TruckRequestRecord;
+      request: any;
+      vehicle: any;
+      transporter: any;
+      driver: any;
+      order: any;
+      tripId: string;
+      newFilled: number;
+      trucksRemaining: number;
+      newStatus: string;
+      allRequests: any[];
+      remainingRequests: any[];
+      notifiedTransporters: Set<string>;
+    } | null = null;
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        txResult = await prismaClient.$transaction(async (tx) => {
+
+          // STEP 1: Validate request exists and is still available (inside tx)
+          const request = await tx.truckRequest.findUnique({ where: { id: requestId } });
+          if (!request) {
+            throw new AppError(404, 'REQUEST_NOT_FOUND', 'Truck request not found');
+          }
+
+          if (request.status !== 'searching') {
+            throw new AppError(400, 'REQUEST_ALREADY_TAKEN',
+              'This truck request was just taken by another transporter. Check for remaining trucks.');
+          }
+
+          // Verify transporter has this vehicle type (inside tx for consistency)
+          const vehicle = await tx.vehicle.findUnique({ where: { id: vehicleId } });
+          if (!vehicle) {
+            throw new AppError(404, 'VEHICLE_NOT_FOUND', 'Vehicle not found');
+          }
+          if (vehicle.transporterId !== transporterId) {
+            throw new AppError(403, 'FORBIDDEN', 'This vehicle does not belong to you');
+          }
+          if (vehicle.vehicleType !== request.vehicleType || vehicle.vehicleSubtype !== request.vehicleSubtype) {
+            throw new AppError(400, 'VEHICLE_TYPE_MISMATCH',
+              `Your vehicle (${vehicle.vehicleType} ${vehicle.vehicleSubtype}) doesn't match the request (${request.vehicleType} ${request.vehicleSubtype})`);
+          }
+
+          // Get transporter and driver info (inside tx)
+          const transporter = await tx.user.findUnique({ where: { id: transporterId } });
+          const driver = driverId
+            ? await tx.user.findUnique({ where: { id: driverId } })
+            : null;
+
+          // STEP 2: Optimistic lock — updateMany with status guard
+          // If another concurrent request already flipped status away from 'searching',
+          // this WHERE clause matches 0 rows and we detect the conflict.
+          const tripId = uuid();
+          const now = new Date().toISOString();
+
+          const requestUpdate = await tx.truckRequest.updateMany({
+            where: {
+              id: requestId,
+              status: 'searching'
+            },
+            data: {
+              status: 'assigned',
+              assignedTransporterId: transporterId,
+              assignedTransporterName: transporter?.businessName || transporter?.name || 'Unknown',
+              assignedVehicleId: vehicleId,
+              assignedVehicleNumber: vehicle.vehicleNumber,
+              assignedDriverId: driverId || null,
+              assignedDriverName: driver?.name || null,
+              assignedDriverPhone: driver?.phone || null,
+              tripId,
+              assignedAt: now
+            }
+          });
+
+          if (requestUpdate.count === 0) {
+            throw new AppError(409, 'REQUEST_ALREADY_TAKEN',
+              'This request is no longer available');
+          }
+
+          // Fetch the updated request record after the atomic update
+          const updatedRow = await tx.truckRequest.findUnique({ where: { id: requestId } });
+          if (!updatedRow) {
+            throw new AppError(500, 'INTERNAL_ERROR', 'Failed to read updated truck request');
+          }
+
+          // Map to TruckRequestRecord shape
+          const updatedRequest: TruckRequestRecord = {
+            ...updatedRow,
+            heldBy: updatedRow.heldById || undefined,
+            assignedTo: updatedRow.assignedTransporterId || undefined,
+            status: updatedRow.status as TruckRequestRecord['status'],
+            notifiedTransporters: updatedRow.notifiedTransporters || [],
+            createdAt: updatedRow.createdAt.toISOString(),
+            updatedAt: updatedRow.updatedAt.toISOString(),
+          };
+
+          // STEP 3: Get parent order and update atomically
+          const order = await tx.order.findUnique({ where: { id: request.orderId } });
+          if (!order) {
+            logger.error(`Order ${request.orderId} not found for request ${requestId}`);
+            return {
+              updatedRequest,
+              request,
+              vehicle,
+              transporter,
+              driver,
+              order: null,
+              tripId,
+              newFilled: 0,
+              trucksRemaining: 0,
+              newStatus: 'unknown',
+              allRequests: [],
+              remainingRequests: [],
+              notifiedTransporters: new Set<string>()
+            };
+          }
+
+          const newFilled = order.trucksFilled + 1;
+          const trucksRemaining = order.totalTrucks - newFilled;
+          const newStatus = newFilled >= order.totalTrucks ? 'fully_filled' : 'partially_filled';
+
+          // Optimistic lock on order: only update if trucksFilled hasn't changed
+          const orderUpdate = await tx.order.updateMany({
+            where: {
+              id: request.orderId,
+              trucksFilled: order.trucksFilled
+            },
+            data: {
+              trucksFilled: newFilled,
+              status: newStatus as any
+            }
+          });
+
+          if (orderUpdate.count === 0) {
+            // Another concurrent accept changed trucksFilled — retry will re-read
+            throw new AppError(409, 'ORDER_STATE_CHANGED',
+              'Order state changed concurrently. Retrying.');
+          }
+
+          // STEP 4: Get remaining searching requests (inside tx for consistency)
+          const allRequestRows = await tx.truckRequest.findMany({
+            where: { orderId: request.orderId }
+          });
+          const allRequests = allRequestRows.map((r: any) => ({
+            ...r,
+            heldBy: r.heldById || undefined,
+            assignedTo: r.assignedTransporterId || undefined,
+            status: r.status as string,
+            notifiedTransporters: r.notifiedTransporters || [],
+            createdAt: r.createdAt.toISOString(),
+            updatedAt: r.updatedAt.toISOString(),
+          }));
+
+          const remainingRequests = allRequests.filter((r: any) =>
+            r.status === 'searching' &&
+            r.vehicleType === request.vehicleType &&
+            r.vehicleSubtype === request.vehicleSubtype
+          );
+
+          // Collect notified transporters for post-tx notifications
+          const notifiedTransporters = new Set<string>();
+          allRequests.forEach((r: any) =>
+            (r.notifiedTransporters || []).forEach((t: string) => notifiedTransporters.add(t))
+          );
+
+          return {
+            updatedRequest,
+            request,
+            vehicle,
+            transporter,
+            driver,
+            order,
+            tripId,
+            newFilled,
+            trucksRemaining,
+            newStatus,
+            allRequests,
+            remainingRequests,
+            notifiedTransporters
+          };
+
+        }, { isolationLevel: 'Serializable' as any });
+
+        // Transaction succeeded — break out of retry loop
+        break;
+
+      } catch (txError: any) {
+        // Retry on serialization conflict (P2034 = Prisma, 40001 = Postgres)
+        const isRetryable = txError?.code === 'P2034' || txError?.code === '40001';
+        if (isRetryable && attempt < MAX_RETRIES) {
+          logger.warn(`[acceptTruckRequest] Serialization conflict, retry ${attempt}/${MAX_RETRIES}`, {
+            requestId, transporterId, vehicleId, attempt, code: txError.code
+          });
+          continue;
+        }
+        // Non-retryable or exhausted retries — rethrow
+        throw txError;
+      }
     }
 
-    if (request.status !== 'searching') {
-      // Request already taken - send immediate feedback
-      throw new AppError(400, 'REQUEST_ALREADY_TAKEN', 
-        'This truck request was just taken by another transporter. Check for remaining trucks.');
+    if (!txResult) {
+      throw new AppError(409, 'REQUEST_ALREADY_TAKEN',
+        'Unable to complete assignment after retries');
     }
 
-    // Verify transporter has this vehicle type
-    const vehicle = await db.getVehicleById(vehicleId);
-    if (!vehicle) {
-      throw new AppError(404, 'VEHICLE_NOT_FOUND', 'Vehicle not found');
-    }
-    if (vehicle.transporterId !== transporterId) {
-      throw new AppError(403, 'FORBIDDEN', 'This vehicle does not belong to you');
-    }
-    if (vehicle.vehicleType !== request.vehicleType || vehicle.vehicleSubtype !== request.vehicleSubtype) {
-      throw new AppError(400, 'VEHICLE_TYPE_MISMATCH', 
-        `Your vehicle (${vehicle.vehicleType} ${vehicle.vehicleSubtype}) doesn't match the request (${request.vehicleType} ${request.vehicleSubtype})`);
-    }
+    // -------------------------------------------------------------------
+    // ALL NOTIFICATIONS BELOW — outside the transaction
+    // -------------------------------------------------------------------
+    const {
+      updatedRequest, request, vehicle, transporter, driver, order,
+      tripId, newFilled, trucksRemaining, newStatus,
+      allRequests, remainingRequests, notifiedTransporters
+    } = txResult;
 
-    // Get transporter and driver info
-    const transporter = await db.getUserById(transporterId);
-    const driver = driverId ? await db.getUserById(driverId) : null;
-    
-    // STEP 2: Update the truck request IMMEDIATELY (atomic operation)
-    const tripId = uuid();
-    const updatedRequest = await db.updateTruckRequest(requestId, {
-      status: 'assigned',
-      assignedTransporterId: transporterId,
-      assignedTransporterName: transporter?.businessName || transporter?.name || 'Unknown',
-      assignedVehicleId: vehicleId,
-      assignedVehicleNumber: vehicle.vehicleNumber,
-      assignedDriverId: driverId,
-      assignedDriverName: driver?.name,
-      assignedDriverPhone: driver?.phone,
-      tripId,
-      assignedAt: new Date().toISOString()
-    });
-
-    // Get the parent order
-    const order = await db.getOrderById(request.orderId);
+    // If order was missing, return early (edge case preserved from original)
     if (!order) {
-      logger.error(`Order ${request.orderId} not found for request ${requestId}`);
-      return updatedRequest!;
+      return updatedRequest;
     }
-
-    // STEP 3: Update order stats
-    const newFilled = order.trucksFilled + 1;
-    const trucksRemaining = order.totalTrucks - newFilled;
-    const newStatus = newFilled >= order.totalTrucks ? 'fully_filled' : 'partially_filled';
-    
-    await db.updateOrder(request.orderId, {
-      trucksFilled: newFilled,
-      status: newStatus
-    });
-
-    // Get remaining searching requests for this vehicle type
-    const allRequests = await db.getTruckRequestsByOrder(request.orderId);
-    const remainingRequests = allRequests.filter(r => 
-      r.status === 'searching' && 
-      r.vehicleType === request.vehicleType && 
-      r.vehicleSubtype === request.vehicleSubtype
-    );
 
     logger.info(`╔══════════════════════════════════════════════════════════════╗`);
-    logger.info(`║  ✅ TRUCK ACCEPTED                                           ║`);
+    logger.info(`║  TRUCK ACCEPTED (atomic)                                     ║`);
     logger.info(`╠══════════════════════════════════════════════════════════════╣`);
     logger.info(`║  Request: ${requestId}`);
     logger.info(`║  Transporter: ${transporter?.name || transporterId}`);
@@ -766,25 +924,22 @@ class OrderService {
     logger.info(`║  Processing time: ${Date.now() - startTime}ms`);
     logger.info(`╚══════════════════════════════════════════════════════════════╝`);
 
-    // STEP 4: Send INSTANT confirmation to accepting transporter
+    // STEP 5: Send INSTANT confirmation to accepting transporter
     emitToUser(transporterId, SocketEvent.ACCEPT_CONFIRMATION, {
       success: true,
       requestId,
       orderId: order.id,
       vehicleNumber: vehicle.vehicleNumber,
       tripId,
-      message: `✅ You got it! Truck ${request.requestNumber} assigned to you.`,
-      
+      message: `You got it! Truck ${request.requestNumber} assigned to you.`,
+
       // Show if more trucks available of same type
       moreTrucksAvailable: remainingRequests.length > 0,
       remainingOfSameType: remainingRequests.length,
-      remainingRequestIds: remainingRequests.map(r => r.id)
+      remainingRequestIds: remainingRequests.map((r: any) => r.id)
     });
 
-    // STEP 5: Update ALL other transporters with remaining count
-    const notifiedTransporters = new Set<string>();
-    allRequests.forEach(r => r.notifiedTransporters.forEach(t => notifiedTransporters.add(t)));
-    
+    // STEP 6: Update ALL other transporters with remaining count
     for (const otherTransporterId of notifiedTransporters) {
       if (otherTransporterId !== transporterId) {
         // Tell them this specific request is gone
@@ -800,26 +955,26 @@ class OrderService {
           orderId: order.id,
           vehicleType: request.vehicleType,
           vehicleSubtype: request.vehicleSubtype,
-          
+
           // Overall order progress
           totalTrucks: order.totalTrucks,
           trucksFilled: newFilled,
           trucksRemaining,
-          
+
           // Remaining of same type (what they can still accept)
           remainingOfSameType: remainingRequests.length,
-          remainingRequestIds: remainingRequests.map(r => r.id),
-          
+          remainingRequestIds: remainingRequests.map((r: any) => r.id),
+
           // Status
           orderStatus: newStatus,
-          message: remainingRequests.length > 0 
+          message: remainingRequests.length > 0
             ? `${remainingRequests.length} ${request.vehicleType} ${request.vehicleSubtype} trucks still available!`
             : `All ${request.vehicleType} ${request.vehicleSubtype} trucks have been taken.`
         });
       }
     }
 
-    // STEP 6: Notify customer with REAL-TIME progress
+    // STEP 7: Notify customer with REAL-TIME progress
     emitToUser(order.customerId, SocketEvent.TRUCK_ASSIGNED, {
       orderId: order.id,
       requestId,
@@ -832,29 +987,29 @@ class OrderService {
       driverName: driver?.name,
       driverPhone: driver?.phone,
       tripId,
-      
+
       // Progress info
       trucksFilled: newFilled,
       totalTrucks: order.totalTrucks,
       trucksRemaining,
       progressPercent: Math.round((newFilled / order.totalTrucks) * 100),
-      
-      message: `🚛 Truck ${newFilled}/${order.totalTrucks} assigned!`
+
+      message: `Truck ${newFilled}/${order.totalTrucks} assigned!`
     });
 
-    // STEP 7: Handle completion or partial fill
+    // STEP 8: Handle completion or partial fill
     if (newStatus === 'fully_filled') {
       // All trucks filled - Cancel timeout and celebrate!
       await this.cancelOrderTimeout(order.id);
-      
+
       emitToUser(order.customerId, SocketEvent.BOOKING_FULLY_FILLED, {
         orderId: order.id,
         totalTrucks: order.totalTrucks,
         totalAmount: order.totalAmount,
-        message: '🎉 All trucks have been assigned! Your order is complete.',
+        message: 'All trucks have been assigned! Your order is complete.',
         assignedTrucks: allRequests
-          .filter(r => r.status === 'assigned')
-          .map(r => ({
+          .filter((r: any) => r.status === 'assigned')
+          .map((r: any) => ({
             requestNumber: r.requestNumber,
             vehicleType: r.vehicleType,
             vehicleSubtype: r.vehicleSubtype,
@@ -875,11 +1030,11 @@ class OrderService {
           });
         }
       }
-      
-      logger.info(`🎉 ORDER ${order.id} FULLY FILLED!`);
+
+      logger.info(`ORDER ${order.id} FULLY FILLED!`);
     }
 
-    return updatedRequest!;
+    return updatedRequest;
   }
 
   // ==========================================================================
