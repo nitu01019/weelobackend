@@ -1439,6 +1439,17 @@ class OrderService {
                 pickupAddress: order.pickup?.address || '',
                 dropAddress: order.drop?.address || ''
               });
+              sendPushNotification(assignment.driverId, {
+                title: 'Trip Expired',
+                body: 'This trip request has expired.',
+                data: {
+                  type: 'trip_cancelled',
+                  orderId,
+                  tripId: assignment.tripId || '',
+                  reason: 'timeout',
+                  cancelledAt: expiredAt
+                }
+              }).catch(err => logger.warn(`FCM to driver failed: ${err.message}`));
             }
           }
 
@@ -2031,19 +2042,22 @@ class OrderService {
     });
 
     if (newStatus === 'fully_filled') {
+      const latestAssignment = {
+        assignmentId,
+        tripId,
+        vehicleNumber,
+        driverName,
+        driverPhone
+      };
       emitToUser(customerId, 'booking_fully_filled', {
         orderId,
         trucksNeeded: orderTotalTrucks,
         trucksFilled: newTrucksFilled,
         filledAt: now,
+        latestAssignment,
+        // Keep array for backward compatibility with existing consumers.
         assignments: [
-          {
-            assignmentId,
-            tripId,
-            vehicleNumber,
-            driverName,
-            driverPhone
-          }
+          latestAssignment
         ]
       });
     }
