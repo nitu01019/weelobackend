@@ -174,7 +174,8 @@ export interface OrderAvailability {
  * Hold configuration - easy to adjust
  */
 const CONFIG = {
-  HOLD_DURATION_SECONDS: 15,       // How long trucks are held
+  // Keep enough time for transporter to map vehicles + drivers before confirm.
+  HOLD_DURATION_SECONDS: 180,      // 3 minutes hold window
   CLEANUP_INTERVAL_MS: 5000,       // How often to clean expired holds
   MAX_HOLD_QUANTITY: 50,           // Max trucks one transporter can hold at once
   MIN_HOLD_QUANTITY: 1,            // Minimum trucks to hold
