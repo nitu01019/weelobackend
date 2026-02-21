@@ -1370,59 +1370,66 @@ class OrderService {
     // Without this, a driver stays on a dead TripAcceptDeclineScreen forever if
     // the 120s search timer fires while they are deciding.
     try {
+      const cancellableAssignmentStatuses = [
+        AssignmentStatus.pending,
+        AssignmentStatus.driver_accepted,
+        AssignmentStatus.en_route_pickup,
+        AssignmentStatus.at_pickup,
+        AssignmentStatus.in_transit
+      ];
+
       const activeAssignments = await prismaClient.assignment.findMany({
         where: {
           orderId,
-          status: {
-            in: [
-              AssignmentStatus.pending,
-              AssignmentStatus.driver_accepted,
-              AssignmentStatus.en_route_pickup,
-              AssignmentStatus.at_pickup,
-              AssignmentStatus.in_transit
-            ]
-          }
+          status: { in: cancellableAssignmentStatuses }
         }
       });
+
       if (activeAssignments.length > 0) {
-        // Mark cancelled atomically
-        await prismaClient.assignment.updateMany({
+        const candidateAssignmentIds = activeAssignments.map(a => a.id);
+
+        // Mark cancelled atomically only for the records we just observed.
+        const updateResult = await prismaClient.assignment.updateMany({
           where: {
-            orderId,
-            status: {
-              in: [
-                AssignmentStatus.pending,
-                AssignmentStatus.driver_accepted,
-                AssignmentStatus.en_route_pickup,
-                AssignmentStatus.at_pickup,
-                AssignmentStatus.in_transit
-              ]
-            }
+            id: { in: candidateAssignmentIds },
+            status: { in: cancellableAssignmentStatuses }
           },
           data: { status: AssignmentStatus.cancelled }
         });
-        for (const assignment of activeAssignments) {
-          if (assignment.vehicleId) {
-            await prismaClient.vehicle.update({
-              where: { id: assignment.vehicleId },
-              data: { status: VehicleStatus.available, currentTripId: null, assignedDriverId: null }
-            }).catch(() => {});
+
+        if (updateResult.count > 0) {
+          // Re-fetch the subset that is actually cancelled to avoid stale notifications.
+          const cancelledAssignments = await prismaClient.assignment.findMany({
+            where: {
+              id: { in: candidateAssignmentIds },
+              status: AssignmentStatus.cancelled
+            }
+          });
+
+          for (const assignment of cancelledAssignments) {
+            if (assignment.vehicleId) {
+              await prismaClient.vehicle.update({
+                where: { id: assignment.vehicleId },
+                data: { status: VehicleStatus.available, currentTripId: null, assignedDriverId: null }
+              }).catch(() => {});
+            }
+            if (assignment.driverId) {
+              this.emitDriverCancellationEvents(assignment.driverId, {
+                orderId,
+                tripId: assignment.tripId,
+                reason: 'timeout',
+                message: 'This trip request has expired',
+                cancelledAt: expiredAt,
+                customerName: order.customerName,
+                customerPhone: order.customerPhone,
+                pickupAddress: order.pickup?.address || '',
+                dropAddress: order.drop?.address || ''
+              });
+            }
           }
-          if (assignment.driverId) {
-            this.emitDriverCancellationEvents(assignment.driverId, {
-              orderId,
-              tripId: assignment.tripId,
-              reason: 'timeout',
-              message: 'This trip request has expired',
-              cancelledAt: expiredAt,
-              customerName: order.customerName,
-              customerPhone: order.customerPhone,
-              pickupAddress: order.pickup?.address || '',
-              dropAddress: order.drop?.address || ''
-            });
-          }
+
+          logger.info(`[EXPIRY] Notified ${cancelledAssignments.length} drivers of order expiry`);
         }
-        logger.info(`[EXPIRY] Notified ${activeAssignments.length} drivers of order expiry`);
       }
     } catch (err: any) {
       // Non-blocking — expiry still succeeds even if driver notify fails

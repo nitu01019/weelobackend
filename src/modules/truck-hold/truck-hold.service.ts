@@ -24,10 +24,10 @@
  * 
  * THE SOLUTION (Redis Distributed Lock):
  * ──────────────────────────────────────
- * SET truck:1234 transporter_id NX EX 15
+ * SET truck:1234 transporter_id NX EX 180
  * 
  *   NX  = SET only if key does NOT exist (atomic)
- *   EX  = Auto-expire after 15 seconds (prevents deadlocks)
+ *   EX  = Auto-expire after 180 seconds (3 minutes, prevents deadlocks)
  * 
  * First transporter wins. Others get instant rejection. Zero DB load for losers.
  * 
@@ -44,7 +44,7 @@
  *    a. Acquire Redis locks for selected trucks (atomic, instant)
  *    b. If lock fails → Return immediately (someone else got them)
  *    c. If lock acquired → Update database (safe, unique)
- *    d. Trucks held for 15 seconds
+ *    d. Trucks held for 180 seconds (3 minutes)
  * 
  * 2. Transporter confirms → confirmHold()
  *    a. Verify hold exists and is valid
@@ -93,7 +93,7 @@ import { queueService } from '../../shared/services/queue.service';
  * Truck status for the hold system
  * Note: Maps to TruckRequestRecord status in db.ts
  * - 'searching' = available for transporters to hold
- * - 'held' = temporarily held (15 sec timer)
+ * - 'held' = temporarily held (180 sec / 3 minute timer)
  * - 'assigned' = confirmed, waiting for driver assignment
  */
 export type TruckStatus = 'searching' | 'held' | 'assigned' | 'in_transit' | 'completed';
