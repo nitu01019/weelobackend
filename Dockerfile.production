@@ -35,10 +35,8 @@ RUN npm run build
 # =============================================================================
 FROM --platform=linux/amd64 node:20-alpine
 
-# Accept build-time arguments for environment variables (SCALABILITY)
-ARG GOOGLE_MAPS_API_KEY
-ENV GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY}
-
+# NOTE: GOOGLE_MAPS_API_KEY is injected at runtime via ECS Task Definition
+# environment variables — do NOT bake secrets into the image layer.
 # Install runtime dependencies
 RUN apk add --no-cache openssl curl
 
