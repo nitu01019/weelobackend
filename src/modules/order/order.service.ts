@@ -1257,12 +1257,15 @@ class OrderService {
     const newStatus = order.trucksFilled > 0 ? 'partially_filled' : 'expired';
     await db.updateOrder(orderId, { status: newStatus, stateChangedAt: new Date() });
 
-    // Notify customer
+    const expiredAt = new Date().toISOString();
+
+    // Notify customer — payload matches PRD WebSocket event spec
     emitToUser(order.customerId, 'order_expired', {
       orderId,
+      status: newStatus,
+      expiredAt,
       totalTrucks: order.totalTrucks,
-      trucksFilled: order.trucksFilled,
-      status: newStatus
+      trucksFilled: order.trucksFilled
     });
 
     // =========================================================================
@@ -1294,10 +1297,20 @@ class OrderService {
         message: 'This booking request has expired'
       };
 
+      // broadcast_dismissed feeds BroadcastListScreen overlay (same infrastructure as cancel)
+      const expiredDismissData = {
+        broadcastId: orderId,
+        orderId,
+        reason: 'timeout',
+        message: 'This booking request has expired',
+        cancelledAt: expiredAt
+      };
+
       // WebSocket: Instant removal from overlay (for foreground transporters)
       if (transporterIds.length < 50) {
         for (const transporterId of transporterIds) {
           emitToUser(transporterId, 'broadcast_expired', expiryPayload);
+          emitToUser(transporterId, 'broadcast_dismissed', expiredDismissData);
         }
         logger.info(`   📱 Direct expiry broadcast to ${transporterIds.length} transporters`);
       } else {
@@ -1305,6 +1318,11 @@ class OrderService {
           transporterIds,
           'broadcast_expired',
           expiryPayload
+        );
+        await queueService.queueBroadcastBatch(
+          transporterIds,
+          'broadcast_dismissed',
+          expiredDismissData
         );
         logger.info(`   📱 Queued expiry broadcast to ${transporterIds.length} transporters`);
       }
@@ -1414,9 +1432,19 @@ class OrderService {
     const transporterIds = Array.from(notifiedTransporters);
 
     if (transporterIds.length > 0) {
+      // broadcast_dismissed feeds BroadcastListScreen overlay infrastructure directly
+      const dismissedData = {
+        broadcastId: orderId,
+        orderId,
+        reason: 'customer_cancelled',
+        message: 'Sorry, the customer cancelled this order',
+        cancelledAt: new Date().toISOString()
+      };
+
       if (transporterIds.length < 50) {
         for (const transporterId of transporterIds) {
           emitToUser(transporterId, 'order_cancelled', cancellationData);
+          emitToUser(transporterId, 'broadcast_dismissed', dismissedData);
         }
         logger.info(`   Direct cancellation broadcast to ${transporterIds.length} transporters`);
       } else {
@@ -1424,6 +1452,11 @@ class OrderService {
           transporterIds,
           'order_cancelled',
           cancellationData
+        );
+        await queueService.queueBroadcastBatch(
+          transporterIds,
+          'broadcast_dismissed',
+          dismissedData
         );
         logger.info(`   Queued cancellation broadcast to ${transporterIds.length} transporters`);
       }
@@ -1448,6 +1481,7 @@ class OrderService {
       orderId,
       status: 'cancelled',
       reason: reason || 'Cancelled by customer',
+      cancelledAt: new Date().toISOString(),
       stateChangedAt: new Date().toISOString()
     });
 
