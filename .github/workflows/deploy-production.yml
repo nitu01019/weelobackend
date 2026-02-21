@@ -1,0 +1,182 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REGISTRY: 318774499084.dkr.ecr.ap-south-1.amazonaws.com
+  ECR_REPOSITORY: weelo-backend
+  ECS_CLUSTER: weelocluster
+  ECS_SERVICE: weelobackendtask-service-joxh3c0r
+  ALB_URL: http://weelo-alb-380596483.ap-south-1.elb.amazonaws.com
+
+jobs:
+  deploy:
+    name: Build, Push & Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript compile check
+        run: npx tsc --noEmit
+
+      - name: Run tests (jest)
+        run: npx jest --forceExit
+        env:
+          NODE_ENV: test
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        id: image-tag
+        run: |
+          VERSION_TAG="${{ github.sha }}"
+          echo "tag=${VERSION_TAG}" >> $GITHUB_OUTPUT
+          echo "image=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${VERSION_TAG}" >> $GITHUB_OUTPUT
+          echo "latest=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest" >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.production
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.image-tag.outputs.image }}
+            ${{ steps.image-tag.outputs.latest }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Deploy to ECS
+        run: |
+          echo "🚀 Deploying ${{ steps.image-tag.outputs.tag }} to ECS..."
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }} > /dev/null
+          echo "✅ ECS deployment triggered"
+
+      - name: Wait for ECS service to stabilize
+        run: |
+          echo "⏳ Waiting for ECS service to stabilize (rolling deploy)..."
+          MAX_RETRIES=30
+          SLEEP_SECONDS=20
+          ATTEMPT=0
+
+          while [ $ATTEMPT -lt $MAX_RETRIES ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            echo "  Attempt $ATTEMPT/$MAX_RETRIES..."
+
+            # Get service state
+            SERVICE_JSON=$(aws ecs describe-services \
+              --cluster ${{ env.ECS_CLUSTER }} \
+              --services ${{ env.ECS_SERVICE }} \
+              --region ${{ env.AWS_REGION }} \
+              --query 'services[0]' \
+              --output json)
+
+            RUNNING=$(echo "$SERVICE_JSON" | python3 -c "import json,sys; s=json.load(sys.stdin); print(s['runningCount'])")
+            DESIRED=$(echo "$SERVICE_JSON" | python3 -c "import json,sys; s=json.load(sys.stdin); print(s['desiredCount'])")
+            DEPLOYMENTS=$(echo "$SERVICE_JSON" | python3 -c "import json,sys; s=json.load(sys.stdin); print(len([d for d in s['deployments'] if d['status']=='PRIMARY' and d['rolloutState']=='COMPLETED']))")
+
+            echo "  Running: $RUNNING/$DESIRED  |  PRIMARY+COMPLETED deployments: $DEPLOYMENTS"
+
+            if [ "$RUNNING" = "$DESIRED" ] && [ "$DEPLOYMENTS" = "1" ]; then
+              echo "✅ ECS service is stable! ($RUNNING/$DESIRED tasks running)"
+              break
+            fi
+
+            # Check for rollback (circuit breaker)
+            ROLLBACK=$(echo "$SERVICE_JSON" | python3 -c "import json,sys; s=json.load(sys.stdin); print(any(d.get('rolloutState')=='FAILED' for d in s['deployments']))")
+            if [ "$ROLLBACK" = "True" ]; then
+              echo "❌ ECS circuit breaker triggered — deployment FAILED and rolled back"
+              exit 1
+            fi
+
+            if [ $ATTEMPT -lt $MAX_RETRIES ]; then
+              sleep $SLEEP_SECONDS
+            fi
+          done
+
+          if [ $ATTEMPT -ge $MAX_RETRIES ]; then
+            echo "❌ Timed out waiting for ECS to stabilize after $((MAX_RETRIES * SLEEP_SECONDS))s"
+            exit 1
+          fi
+
+      - name: Health check
+        run: |
+          echo "🏥 Running health check..."
+          MAX_RETRIES=5
+          RETRY_DELAY=10
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "  Attempt $i/$MAX_RETRIES..."
+            HTTP_CODE=$(curl -s -o /tmp/health_response.json -w "%{http_code}" \
+              --max-time 15 \
+              ${{ env.ALB_URL }}/health)
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✅ Health check passed (HTTP $HTTP_CODE)"
+              cat /tmp/health_response.json | python3 -m json.tool 2>/dev/null || cat /tmp/health_response.json
+              break
+            fi
+            echo "  Health check returned HTTP $HTTP_CODE, retrying in ${RETRY_DELAY}s..."
+            if [ $i -lt $MAX_RETRIES ]; then
+              sleep $RETRY_DELAY
+            fi
+          done
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ Health check failed after $MAX_RETRIES attempts (last HTTP $HTTP_CODE)"
+            exit 1
+          fi
+
+      - name: Deployment summary
+        if: success()
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "✅ DEPLOYMENT SUCCESSFUL"
+          echo "=========================================="
+          echo "  Commit: ${{ github.sha }}"
+          echo "  Image:  ${{ steps.image-tag.outputs.image }}"
+          echo "  Health: ${{ env.ALB_URL }}/health"
+          echo "=========================================="
+
+      - name: Deployment failed
+        if: failure()
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "❌ DEPLOYMENT FAILED"
+          echo "=========================================="
+          echo "  Commit: ${{ github.sha }}"
+          echo "  Check ECS events:"
+          echo "  aws ecs describe-services --cluster ${{ env.ECS_CLUSTER }} --services ${{ env.ECS_SERVICE }} --region ${{ env.AWS_REGION }}"
+          echo "  Check logs:"
+          echo "  aws logs tail weelobackendtask --follow --region ${{ env.AWS_REGION }}"
+          echo "=========================================="
+          echo "  ECS circuit breaker will auto-rollback to last stable task definition."

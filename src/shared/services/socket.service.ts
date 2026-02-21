@@ -476,10 +476,11 @@ async function setupRedisAdapter(socketServer: Server): Promise<void> {
 
   // Heuristic fallback: rediss:// (TLS) is the ElastiCache Serverless URL scheme,
   // which does not support PSUBSCRIBE. Disable adapter to prevent worker crash.
-  // If your TLS Redis DOES support pub/sub, set REDIS_PUBSUB_DISABLED=false explicitly.
-  if (redisUrl.startsWith('rediss://')) {
+  // Override: set REDIS_PUBSUB_DISABLED=false explicitly if your TLS Redis supports pub/sub
+  // (e.g. Redis Enterprise, Azure Cache for Redis — they support pub/sub over TLS).
+  if (redisUrl.startsWith('rediss://') && process.env.REDIS_PUBSUB_DISABLED !== 'false') {
     logger.info('[Socket] TLS Redis detected (rediss://) — skipping Redis adapter (heuristic: ElastiCache Serverless does not support pub/sub)');
-    logger.info('[Socket] To enable cross-instance delivery, set REDIS_PUBSUB_DISABLED=false and use a pub/sub-capable Redis endpoint');
+    logger.info('[Socket] To enable cross-instance delivery on a pub/sub-capable TLS Redis, set REDIS_PUBSUB_DISABLED=false');
     logger.info('[Socket] Running in single-instance mode per ECS task');
     return;
   }
