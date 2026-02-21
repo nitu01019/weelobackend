@@ -498,7 +498,16 @@ async function setupRedisAdapter(socketServer: Server): Promise<void> {
       logger.warn(`[Socket] Redis sub client error: ${err.message}`);
     });
 
-    await Promise.all([pubClient.connect(), subClient.connect()]);
+    await Promise.all([
+      pubClient.connect().catch((err: Error) => {
+        logger.warn(`[Socket] Redis pub client connect failed: ${err.message}`);
+        throw err;
+      }),
+      subClient.connect().catch((err: Error) => {
+        logger.warn(`[Socket] Redis sub client connect failed: ${err.message}`);
+        throw err;
+      })
+    ]);
 
     socketServer.adapter(createAdapter(pubClient, subClient));
     redisPubSubInitialized = true;
