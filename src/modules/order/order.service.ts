@@ -1388,24 +1388,47 @@ class OrderService {
       if (activeAssignments.length > 0) {
         const candidateAssignmentIds = activeAssignments.map(a => a.id);
 
-        // Mark cancelled atomically only for the records we just observed.
-        const updateResult = await prismaClient.assignment.updateMany({
+        // Atomic phase: pending assignments only (preconditioned to avoid races).
+        await prismaClient.assignment.updateMany({
           where: {
             id: { in: candidateAssignmentIds },
-            status: { in: cancellableAssignmentStatuses }
+            status: AssignmentStatus.pending
           },
           data: { status: AssignmentStatus.cancelled }
         });
 
-        if (updateResult.count > 0) {
-          // Re-fetch the subset that is actually cancelled to avoid stale notifications.
-          const cancelledAssignments = await prismaClient.assignment.findMany({
+        // Re-check and cancel any remaining in-flight assignments with status preconditions.
+        const nonPendingStatuses = cancellableAssignmentStatuses.filter(
+          (status) => status !== AssignmentStatus.pending
+        );
+        if (nonPendingStatuses.length > 0) {
+          const remainingAssignments = await prismaClient.assignment.findMany({
             where: {
               id: { in: candidateAssignmentIds },
-              status: AssignmentStatus.cancelled
+              status: { in: nonPendingStatuses }
             }
           });
 
+          for (const assignment of remainingAssignments) {
+            await prismaClient.assignment.updateMany({
+              where: {
+                id: assignment.id,
+                status: assignment.status
+              },
+              data: { status: AssignmentStatus.cancelled }
+            });
+          }
+        }
+
+        // Re-fetch the subset that is actually cancelled to avoid stale notifications.
+        const cancelledAssignments = await prismaClient.assignment.findMany({
+          where: {
+            id: { in: candidateAssignmentIds },
+            status: AssignmentStatus.cancelled
+          }
+        });
+
+        if (cancelledAssignments.length > 0) {
           for (const assignment of cancelledAssignments) {
             if (assignment.vehicleId) {
               await prismaClient.vehicle.update({
