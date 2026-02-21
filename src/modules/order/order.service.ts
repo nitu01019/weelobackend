@@ -1449,7 +1449,10 @@ class OrderService {
                   reason: 'timeout',
                   cancelledAt: expiredAt
                 }
-              }).catch(err => logger.warn(`FCM to driver failed: ${err.message}`));
+              }).catch((err: unknown) => {
+                const errorMessage = err instanceof Error ? err.message : String(err);
+                logger.warn(`FCM to driver failed: ${errorMessage}`);
+              });
             }
           }
 
@@ -1992,7 +1995,10 @@ class OrderService {
         assignmentId,
         orderId
       }
-    }).catch(err => logger.warn(`FCM to driver failed: ${err.message}`));
+    }).catch((err: unknown) => {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      logger.warn(`FCM to driver failed: ${errorMessage}`);
+    });
 
     // ============== NOTIFY CUSTOMER ==============
     const customerNotification = {
@@ -2072,7 +2078,10 @@ class OrderService {
         trucksConfirmed: newTrucksFilled,
         totalTrucks: orderTotalTrucks
       }
-    }).catch(err => logger.warn(`FCM to customer failed: ${err.message}`));
+    }).catch((err: unknown) => {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      logger.warn(`FCM to customer failed: ${errorMessage}`);
+    });
 
     // If fully filled, cancel expiry timer and clear active key
     if (newStatus === 'fully_filled') {
