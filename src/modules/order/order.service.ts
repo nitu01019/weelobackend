@@ -811,8 +811,9 @@ class OrderService {
         // Store pointer for cleanup on cancel/expiry
         await redisService.set(`idempotency:order:${request.customerId}:latest`, request.idempotencyKey, ttl);
         logger.info(`Idempotency cached: ${cacheKey.substring(0, 50)}... (TTL: ${ttl}s)`);
-      } catch (error: any) {
-        logger.warn(`⚠️ Failed to cache idempotency response: ${error.message}`);
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        logger.warn(`⚠️ Failed to cache idempotency response: ${message}`);
         // Non-critical error, continue
       }
     }
@@ -828,8 +829,9 @@ class OrderService {
     // Return response
     return orderResponse;
     } finally {
-      await redisService.releaseLock(lockKey, request.customerId).catch((err: any) => {
-        logger.warn('Failed to release customer broadcast lock', { customerId: request.customerId, error: err.message });
+      await redisService.releaseLock(lockKey, request.customerId).catch((err: unknown) => {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        logger.warn('Failed to release customer broadcast lock', { customerId: request.customerId, error: errorMessage });
       });
     }
   }
@@ -1194,8 +1196,9 @@ class OrderService {
    */
   private async clearCustomerActiveBroadcast(customerId: string): Promise<void> {
     const activeKey = `customer:active-broadcast:${customerId}`;
-    await redisService.del(activeKey).catch((err: any) => {
-      logger.warn('Failed to clear customer active broadcast key', { customerId, error: err.message });
+    await redisService.del(activeKey).catch((err: unknown) => {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      logger.warn('Failed to clear customer active broadcast key', { customerId, error: errorMessage });
     });
     // Clean up server-generated idempotency key
     const latestIdemKey = await redisService.get(`idem:broadcast:latest:${customerId}`).catch(() => null);
@@ -1360,8 +1363,9 @@ class OrderService {
             orderId
           }
         }
-      ).catch((err: any) => {
-        logger.warn(`FCM: Failed to queue expiry push for order ${orderId}`, err);
+      ).catch((err: unknown) => {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        logger.warn(`FCM: Failed to queue expiry push for order ${orderId}: ${errorMessage}`);
       });
     }
 
