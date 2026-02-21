@@ -61,9 +61,8 @@ COPY --from=builder --chown=weelo:nodejs /app/node_modules/@prisma ./node_module
 COPY --chown=weelo:nodejs prisma ./prisma
 COPY --chown=weelo:nodejs scripts ./scripts
 
-# Copy production environment file as fallback (Defense in Depth)
-# Runtime env vars from ECS Task Definition take precedence
-COPY --chown=weelo:nodejs .env.production .env
+# NOTE: All environment variables are injected at runtime via ECS Task Definition.
+# No .env file is needed in the image — secrets stay out of the image layer.
 
 # Create directories
 RUN mkdir -p logs uploads/driver-photos && \
