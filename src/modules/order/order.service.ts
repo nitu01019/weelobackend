@@ -1402,22 +1402,13 @@ class OrderService {
           (status) => status !== AssignmentStatus.pending
         );
         if (nonPendingStatuses.length > 0) {
-          const remainingAssignments = await prismaClient.assignment.findMany({
+          await prismaClient.assignment.updateMany({
             where: {
               id: { in: candidateAssignmentIds },
               status: { in: nonPendingStatuses }
-            }
+            },
+            data: { status: AssignmentStatus.cancelled }
           });
-
-          for (const assignment of remainingAssignments) {
-            await prismaClient.assignment.updateMany({
-              where: {
-                id: assignment.id,
-                status: assignment.status
-              },
-              data: { status: AssignmentStatus.cancelled }
-            });
-          }
         }
 
         // Re-fetch the subset that is actually cancelled to avoid stale notifications.
@@ -1454,9 +1445,10 @@ class OrderService {
           logger.info(`[EXPIRY] Notified ${cancelledAssignments.length} drivers of order expiry`);
         }
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
       // Non-blocking — expiry still succeeds even if driver notify fails
-      logger.warn(`[EXPIRY] Failed to notify drivers (non-critical)`, { error: err.message });
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      logger.warn(`[EXPIRY] Failed to notify drivers (non-critical)`, { error: errorMessage });
     }
 
     // GAP 7 FIX: FCM push to customer for background/killed app.
@@ -1472,8 +1464,9 @@ class OrderService {
           status: newStatus
         }
       }
-    ).catch((err: any) => {
-      logger.warn(`FCM: Failed to send expiry push to customer ${order.customerId}`, err);
+    ).catch((err: unknown) => {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      logger.warn(`FCM: Failed to send expiry push to customer ${order.customerId}`, { error: errorMessage });
     });
 
     // Cleanup timer from Redis
@@ -1591,8 +1584,9 @@ class OrderService {
             orderId
           }
         }
-      ).catch((err: any) => {
-        logger.warn(`FCM: Failed to queue cancellation push for order ${orderId}`, err);
+      ).catch((err: unknown) => {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        logger.warn(`FCM: Failed to queue cancellation push for order ${orderId}`, { error: errorMessage });
       });
     }
 
@@ -1619,8 +1613,9 @@ class OrderService {
           status: 'cancelled'
         }
       }
-    ).catch((err: any) => {
-      logger.warn(`FCM: Failed to send cancellation push to customer ${customerId}`, err);
+    ).catch((err: unknown) => {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      logger.warn(`FCM: Failed to send cancellation push to customer ${customerId}`, { error: errorMessage });
     });
 
     // 6. Revert active assignments — release vehicles and notify drivers
@@ -1656,8 +1651,9 @@ class OrderService {
         }
         logger.info(`[CANCEL] Reverted ${activeAssignments.length} assignments, released vehicles`);
       }
-    } catch (err: any) {
-      logger.warn(`[CANCEL] Failed to revert assignments (non-critical)`, { error: err.message });
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      logger.warn(`[CANCEL] Failed to revert assignments (non-critical)`, { error: errorMessage });
     }
 
     logger.info(`Order ${orderId} cancelled, notified ${transporterIds.length} transporters`);
