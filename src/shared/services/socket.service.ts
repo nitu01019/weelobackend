@@ -467,13 +467,36 @@ async function setupRedisAdapter(socketServer: Server): Promise<void> {
     return;
   }
 
+  // Explicit opt-out: set REDIS_PUBSUB_DISABLED=true for environments that
+  // don't support Redis pub/sub commands (e.g. AWS ElastiCache Serverless).
+  if (process.env.REDIS_PUBSUB_DISABLED === 'true') {
+    logger.info('[Socket] REDIS_PUBSUB_DISABLED=true — skipping Redis adapter, running in single-instance mode per ECS task');
+    return;
+  }
+
+  // Heuristic fallback: rediss:// (TLS) is the ElastiCache Serverless URL scheme,
+  // which does not support PSUBSCRIBE. Disable adapter to prevent worker crash.
+  // If your TLS Redis DOES support pub/sub, set REDIS_PUBSUB_DISABLED=false explicitly.
+  if (redisUrl.startsWith('rediss://')) {
+    logger.info('[Socket] TLS Redis detected (rediss://) — skipping Redis adapter (heuristic: ElastiCache Serverless does not support pub/sub)');
+    logger.info('[Socket] To enable cross-instance delivery, set REDIS_PUBSUB_DISABLED=false and use a pub/sub-capable Redis endpoint');
+    logger.info('[Socket] Running in single-instance mode per ECS task');
+    return;
+  }
+
   try {
     const Redis = require('ioredis');
-    const useTls = redisUrl.startsWith('rediss://');
-    const tlsOpts = useTls ? { tls: { rejectUnauthorized: false } } : {};
 
-    const pubClient = new Redis(redisUrl, { ...tlsOpts, lazyConnect: true });
-    const subClient = new Redis(redisUrl, { ...tlsOpts, lazyConnect: true });
+    const pubClient = new Redis(redisUrl, { lazyConnect: true });
+    const subClient = new Redis(redisUrl, { lazyConnect: true });
+
+    // Attach error handlers before connect to avoid unhandled rejections
+    pubClient.on('error', (err: Error) => {
+      logger.warn(`[Socket] Redis pub client error: ${err.message}`);
+    });
+    subClient.on('error', (err: Error) => {
+      logger.warn(`[Socket] Redis sub client error: ${err.message}`);
+    });
 
     await Promise.all([pubClient.connect(), subClient.connect()]);
 

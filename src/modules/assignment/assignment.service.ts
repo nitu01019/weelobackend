@@ -396,14 +396,16 @@ class AssignmentService {
         'You already have an active trip. Complete or cancel it before accepting a new one.');
     }
 
+    // Cancel timeout timer BEFORE DB update — prevents race with timeout handler
+    await redisService.cancelTimer(TIMER_KEYS.ASSIGNMENT_EXPIRY(assignmentId)).catch(err => {
+      logger.warn(`Failed to cancel assignment timer on accept (non-fatal)`, { assignmentId, error: err.message });
+    });
+    logger.info(`⏱️ Assignment timeout cancelled (accepted): ${assignmentId}`);
+
     const updated = await db.updateAssignment(assignmentId, {
       status: 'driver_accepted',
       driverAcceptedAt: new Date().toISOString()
     });
-
-    // Cancel timeout timer — driver responded in time
-    await redisService.cancelTimer(TIMER_KEYS.ASSIGNMENT_EXPIRY(assignmentId));
-    logger.info(`⏱️ Assignment timeout cancelled (accepted): ${assignmentId}`);
 
     // Notify booking room
     emitToBooking(assignment.bookingId, SocketEvent.ASSIGNMENT_STATUS_CHANGED, {
@@ -543,10 +545,12 @@ class AssignmentService {
       throw new AppError(403, 'FORBIDDEN', 'Access denied');
     }
 
-    await db.updateAssignment(assignmentId, { status: 'cancelled' });
+    // Cancel timeout timer BEFORE DB update — prevents race with timeout handler
+    await redisService.cancelTimer(TIMER_KEYS.ASSIGNMENT_EXPIRY(assignmentId)).catch(err => {
+      logger.warn(`Failed to cancel assignment timer on cancel (non-fatal)`, { assignmentId, error: err.message });
+    });
 
-    // Cancel timeout timer
-    await redisService.cancelTimer(TIMER_KEYS.ASSIGNMENT_EXPIRY(assignmentId));
+    await db.updateAssignment(assignmentId, { status: 'cancelled' });
 
     // Decrement trucks filled
     await bookingService.decrementTrucksFilled(assignment.bookingId);
@@ -605,11 +609,13 @@ class AssignmentService {
       throw new AppError(400, 'INVALID_STATUS', 'Assignment cannot be declined');
     }
 
-    // 1. Update status to driver_declined
-    await db.updateAssignment(assignmentId, { status: 'driver_declined' });
+    // 1. Cancel timeout timer BEFORE DB update — prevents race with timeout handler
+    await redisService.cancelTimer(TIMER_KEYS.ASSIGNMENT_EXPIRY(assignmentId)).catch(err => {
+      logger.warn(`Failed to cancel assignment timer on decline (non-fatal)`, { assignmentId, error: err.message });
+    });
 
-    // 2. Cancel timeout timer — driver responded (with decline)
-    await redisService.cancelTimer(TIMER_KEYS.ASSIGNMENT_EXPIRY(assignmentId));
+    // 2. Update status to driver_declined
+    await db.updateAssignment(assignmentId, { status: 'driver_declined' });
 
     // 3. Release vehicle back to available
     if (assignment.vehicleId) {

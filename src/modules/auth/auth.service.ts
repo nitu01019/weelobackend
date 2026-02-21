@@ -325,12 +325,13 @@ class AuthService {
       throw new AppError(400, 'OTP_EXPIRED', 'OTP has expired. Please request a new one.');
     }
     
-    // Check attempts
+    // Check attempts — DB is source of truth; Redis is a faster counter that must never go below DB value
     const maxAttempts = config.otp.maxAttempts;
     let currentAttempts = stored.attempts || 0;
-    try {
-      currentAttempts = await redisService.getOtpAttempts(key);
-    } catch { /* Use DB-stored attempts */ }
+    const redisAttempts = await redisService.getOtpAttempts(key).catch(() => 0);
+    if (redisAttempts > 0) {
+      currentAttempts = Math.max(currentAttempts, redisAttempts);
+    }
     
     if (currentAttempts >= maxAttempts) {
       await Promise.allSettled([
