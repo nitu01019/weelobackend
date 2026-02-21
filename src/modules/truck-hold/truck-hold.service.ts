@@ -24,10 +24,10 @@
  * 
  * THE SOLUTION (Redis Distributed Lock):
  * ──────────────────────────────────────
- * SET truck:1234 transporter_id NX EX 15
+ * SET truck:1234 transporter_id NX EX 180
  * 
  *   NX  = SET only if key does NOT exist (atomic)
- *   EX  = Auto-expire after 15 seconds (prevents deadlocks)
+ *   EX  = Auto-expire after 180 seconds (3 minutes, prevents deadlocks)
  * 
  * First transporter wins. Others get instant rejection. Zero DB load for losers.
  * 
@@ -44,7 +44,7 @@
  *    a. Acquire Redis locks for selected trucks (atomic, instant)
  *    b. If lock fails → Return immediately (someone else got them)
  *    c. If lock acquired → Update database (safe, unique)
- *    d. Trucks held for 15 seconds
+ *    d. Trucks held for 180 seconds (3 minutes)
  * 
  * 2. Transporter confirms → confirmHold()
  *    a. Verify hold exists and is valid
@@ -93,7 +93,7 @@ import { queueService } from '../../shared/services/queue.service';
  * Truck status for the hold system
  * Note: Maps to TruckRequestRecord status in db.ts
  * - 'searching' = available for transporters to hold
- * - 'held' = temporarily held (15 sec timer)
+ * - 'held' = temporarily held (180 sec / 3 minute timer)
  * - 'assigned' = confirmed, waiting for driver assignment
  */
 export type TruckStatus = 'searching' | 'held' | 'assigned' | 'in_transit' | 'completed';
@@ -174,7 +174,8 @@ export interface OrderAvailability {
  * Hold configuration - easy to adjust
  */
 const CONFIG = {
-  HOLD_DURATION_SECONDS: 15,       // How long trucks are held
+  // Keep enough time for transporter to map vehicles + drivers before confirm.
+  HOLD_DURATION_SECONDS: 180,      // 3 minutes hold window
   CLEANUP_INTERVAL_MS: 5000,       // How often to clean expired holds
   MAX_HOLD_QUANTITY: 50,           // Max trucks one transporter can hold at once
   MIN_HOLD_QUANTITY: 1,            // Minimum trucks to hold
@@ -194,7 +195,7 @@ const CONFIG = {
  * - Works across multiple server instances
  * 
  * KEY PATTERNS:
- * - hold:{holdId}                    → Hold data (JSON, TTL: 15s)
+ * - hold:{holdId}                    → Hold data (JSON, TTL: 180s / 3 min)
  * - hold:order:{orderId}             → Set of holdIds for this order
  * - hold:transporter:{transporterId} → Set of holdIds for this transporter
  * - lock:truck:{truckRequestId}      → Lock for specific truck (SETNX)

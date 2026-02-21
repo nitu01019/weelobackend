@@ -28,7 +28,7 @@ import { Prisma } from '@prisma/client';
 import { db, OrderRecord, TruckRequestRecord } from '../../shared/database/db';
 import { prismaClient, OrderStatus, AssignmentStatus, VehicleStatus, BookingStatus, TruckRequestStatus } from '../../shared/database/prisma.service';
 import { logger } from '../../shared/services/logger.service';
-import { emitToUser } from '../../shared/services/socket.service';
+import { emitToUser, emitToUsers } from '../../shared/services/socket.service';
 import { sendPushNotification } from '../../shared/services/fcm.service';
 import { cacheService } from '../../shared/services/cache.service';
 import { queueService } from '../../shared/services/queue.service';
@@ -811,8 +811,9 @@ class OrderService {
         // Store pointer for cleanup on cancel/expiry
         await redisService.set(`idempotency:order:${request.customerId}:latest`, request.idempotencyKey, ttl);
         logger.info(`Idempotency cached: ${cacheKey.substring(0, 50)}... (TTL: ${ttl}s)`);
-      } catch (error: any) {
-        logger.warn(`⚠️ Failed to cache idempotency response: ${error.message}`);
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        logger.warn(`⚠️ Failed to cache idempotency response: ${message}`);
         // Non-critical error, continue
       }
     }
@@ -828,8 +829,9 @@ class OrderService {
     // Return response
     return orderResponse;
     } finally {
-      await redisService.releaseLock(lockKey, request.customerId).catch((err: any) => {
-        logger.warn('Failed to release customer broadcast lock', { customerId: request.customerId, error: err.message });
+      await redisService.releaseLock(lockKey, request.customerId).catch((err: unknown) => {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        logger.warn('Failed to release customer broadcast lock', { customerId: request.customerId, error: errorMessage });
       });
     }
   }
@@ -1194,8 +1196,9 @@ class OrderService {
    */
   private async clearCustomerActiveBroadcast(customerId: string): Promise<void> {
     const activeKey = `customer:active-broadcast:${customerId}`;
-    await redisService.del(activeKey).catch((err: any) => {
-      logger.warn('Failed to clear customer active broadcast key', { customerId, error: err.message });
+    await redisService.del(activeKey).catch((err: unknown) => {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      logger.warn('Failed to clear customer active broadcast key', { customerId, error: errorMessage });
     });
     // Clean up server-generated idempotency key
     const latestIdemKey = await redisService.get(`idem:broadcast:latest:${customerId}`).catch(() => null);
@@ -1224,6 +1227,43 @@ class OrderService {
 
     await redisService.setTimer(this.TIMER_KEYS.ORDER_EXPIRY(orderId), timerData, expiresAt);
     logger.info(`⏱️ Order expiry timer set for ${orderId} (${timeoutMs / 1000}s) [Redis-based]`);
+  }
+
+  /**
+   * Emit cancellation events to drivers with dual-event compatibility.
+   *
+   * Captain app currently consumes both `trip_cancelled` (new) and
+   * `order_cancelled` (legacy) paths. Keep payload shape aligned so
+   * either listener can drive the same UI behavior.
+   */
+  private emitDriverCancellationEvents(
+    driverId: string,
+    payload: {
+      orderId: string;
+      tripId?: string | null;
+      reason: string;
+      message: string;
+      cancelledAt?: string;
+      customerName?: string;
+      customerPhone?: string;
+      pickupAddress?: string;
+      dropAddress?: string;
+    }
+  ): void {
+    const eventPayload = {
+      orderId: payload.orderId,
+      tripId: payload.tripId ?? '',
+      reason: payload.reason,
+      message: payload.message,
+      cancelledAt: payload.cancelledAt || new Date().toISOString(),
+      customerName: payload.customerName ?? '',
+      customerPhone: payload.customerPhone ?? '',
+      pickupAddress: payload.pickupAddress ?? '',
+      dropAddress: payload.dropAddress ?? ''
+    };
+
+    emitToUser(driverId, 'trip_cancelled', eventPayload);
+    emitToUser(driverId, 'order_cancelled', eventPayload);
   }
 
   /**
@@ -1306,26 +1346,11 @@ class OrderService {
         cancelledAt: expiredAt
       };
 
-      // WebSocket: Instant removal from overlay (for foreground transporters)
-      if (transporterIds.length < 50) {
-        for (const transporterId of transporterIds) {
-          emitToUser(transporterId, 'broadcast_expired', expiryPayload);
-          emitToUser(transporterId, 'broadcast_dismissed', expiredDismissData);
-        }
-        logger.info(`   📱 Direct expiry broadcast to ${transporterIds.length} transporters`);
-      } else {
-        await queueService.queueBroadcastBatch(
-          transporterIds,
-          'broadcast_expired',
-          expiryPayload
-        );
-        await queueService.queueBroadcastBatch(
-          transporterIds,
-          'broadcast_dismissed',
-          expiredDismissData
-        );
-        logger.info(`   📱 Queued expiry broadcast to ${transporterIds.length} transporters`);
-      }
+      // WebSocket: always emit immediately for real-time UI parity.
+      // Queue-based fanout can add polling latency and delay dismiss overlays.
+      emitToUsers(transporterIds, 'broadcast_expired', expiryPayload);
+      emitToUsers(transporterIds, 'broadcast_dismissed', expiredDismissData);
+      logger.info(`   📱 Instant expiry broadcast to ${transporterIds.length} transporters`);
 
       // FCM: Push notification for background/closed app transporters
       await queueService.queuePushNotificationBatch(
@@ -1338,10 +1363,129 @@ class OrderService {
             orderId
           }
         }
-      ).catch((err: any) => {
-        logger.warn(`FCM: Failed to queue expiry push for order ${orderId}`, err);
+      ).catch((err: unknown) => {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        logger.warn(`FCM: Failed to queue expiry push for order ${orderId}: ${errorMessage}`);
       });
     }
+
+    // GAP 4 FIX: Notify drivers whose trips are in-flight when order expires.
+    // TripAcceptDeclineScreen only listens to 'order_cancelled', not 'order_expired'.
+    // Without this, a driver stays on a dead TripAcceptDeclineScreen forever if
+    // the 120s search timer fires while they are deciding.
+    try {
+      const cancellableAssignmentStatuses = [
+        AssignmentStatus.pending,
+        AssignmentStatus.driver_accepted,
+        AssignmentStatus.en_route_pickup,
+        AssignmentStatus.at_pickup,
+        AssignmentStatus.in_transit
+      ];
+
+      const activeAssignments = await prismaClient.assignment.findMany({
+        where: {
+          orderId,
+          status: { in: cancellableAssignmentStatuses }
+        }
+      });
+
+      if (activeAssignments.length > 0) {
+        const candidateAssignmentIds = activeAssignments.map(a => a.id);
+
+        // Atomic phase: pending assignments only (preconditioned to avoid races).
+        await prismaClient.assignment.updateMany({
+          where: {
+            id: { in: candidateAssignmentIds },
+            status: AssignmentStatus.pending
+          },
+          data: { status: AssignmentStatus.cancelled }
+        });
+
+        // Re-check and cancel any remaining in-flight assignments with status preconditions.
+        const nonPendingStatuses = cancellableAssignmentStatuses.filter(
+          (status) => status !== AssignmentStatus.pending
+        );
+        if (nonPendingStatuses.length > 0) {
+          await prismaClient.assignment.updateMany({
+            where: {
+              id: { in: candidateAssignmentIds },
+              status: { in: nonPendingStatuses }
+            },
+            data: { status: AssignmentStatus.cancelled }
+          });
+        }
+
+        // Re-fetch the subset that is actually cancelled to avoid stale notifications.
+        const cancelledAssignments = await prismaClient.assignment.findMany({
+          where: {
+            id: { in: candidateAssignmentIds },
+            status: AssignmentStatus.cancelled
+          }
+        });
+
+        if (cancelledAssignments.length > 0) {
+          for (const assignment of cancelledAssignments) {
+            if (assignment.vehicleId) {
+              await prismaClient.vehicle.update({
+                where: { id: assignment.vehicleId },
+                data: { status: VehicleStatus.available, currentTripId: null, assignedDriverId: null }
+              }).catch(() => {});
+            }
+            if (assignment.driverId) {
+              this.emitDriverCancellationEvents(assignment.driverId, {
+                orderId,
+                tripId: assignment.tripId,
+                reason: 'timeout',
+                message: 'This trip request has expired',
+                cancelledAt: expiredAt,
+                customerName: order.customerName,
+                customerPhone: order.customerPhone,
+                pickupAddress: order.pickup?.address || '',
+                dropAddress: order.drop?.address || ''
+              });
+              sendPushNotification(assignment.driverId, {
+                title: 'Trip Expired',
+                body: 'This trip request has expired.',
+                data: {
+                  type: 'trip_cancelled',
+                  orderId,
+                  tripId: assignment.tripId || '',
+                  reason: 'timeout',
+                  cancelledAt: expiredAt
+                }
+              }).catch((err: unknown) => {
+                const errorMessage = err instanceof Error ? err.message : String(err);
+                logger.warn(`FCM to driver failed: ${errorMessage}`);
+              });
+            }
+          }
+
+          logger.info(`[EXPIRY] Notified ${cancelledAssignments.length} drivers of order expiry`);
+        }
+      }
+    } catch (err: unknown) {
+      // Non-blocking — expiry still succeeds even if driver notify fails
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      logger.warn(`[EXPIRY] Failed to notify drivers (non-critical)`, { error: errorMessage });
+    }
+
+    // GAP 7 FIX: FCM push to customer for background/killed app.
+    // handleOrderExpiry only did WS + transporter FCM, not customer FCM.
+    await queueService.queuePushNotificationBatch(
+      [order.customerId],
+      {
+        title: 'No trucks found',
+        body: 'Your search timed out. Tap to search again.',
+        data: {
+          type: 'order_expired',
+          orderId,
+          status: newStatus
+        }
+      }
+    ).catch((err: unknown) => {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      logger.warn(`FCM: Failed to send expiry push to customer ${order.customerId}`, { error: errorMessage });
+    });
 
     // Cleanup timer from Redis
     await redisService.cancelTimer(this.TIMER_KEYS.ORDER_EXPIRY(orderId));
@@ -1422,11 +1566,12 @@ class OrderService {
       }
     }
 
+    const cancelledAt = new Date().toISOString();
     const cancellationData = {
       type: 'order_cancelled',
       orderId,
       reason: reason || 'Cancelled by customer',
-      cancelledAt: new Date().toISOString()
+      cancelledAt
     };
 
     const transporterIds = Array.from(notifiedTransporters);
@@ -1438,28 +1583,14 @@ class OrderService {
         orderId,
         reason: 'customer_cancelled',
         message: 'Sorry, the customer cancelled this order',
-        cancelledAt: new Date().toISOString()
+        cancelledAt
       };
 
-      if (transporterIds.length < 50) {
-        for (const transporterId of transporterIds) {
-          emitToUser(transporterId, 'order_cancelled', cancellationData);
-          emitToUser(transporterId, 'broadcast_dismissed', dismissedData);
-        }
-        logger.info(`   Direct cancellation broadcast to ${transporterIds.length} transporters`);
-      } else {
-        await queueService.queueBroadcastBatch(
-          transporterIds,
-          'order_cancelled',
-          cancellationData
-        );
-        await queueService.queueBroadcastBatch(
-          transporterIds,
-          'broadcast_dismissed',
-          dismissedData
-        );
-        logger.info(`   Queued cancellation broadcast to ${transporterIds.length} transporters`);
-      }
+      // WebSocket: always emit immediately for real-time UI parity.
+      // Queue-based fanout can add polling latency and delay dismiss overlays.
+      emitToUsers(transporterIds, 'order_cancelled', cancellationData);
+      emitToUsers(transporterIds, 'broadcast_dismissed', dismissedData);
+      logger.info(`   Instant cancellation broadcast to ${transporterIds.length} transporters`);
 
       await queueService.queuePushNotificationBatch(
         transporterIds,
@@ -1471,18 +1602,38 @@ class OrderService {
             orderId
           }
         }
-      ).catch((err: any) => {
-        logger.warn(`FCM: Failed to queue cancellation push for order ${orderId}`, err);
+      ).catch((err: unknown) => {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        logger.warn(`FCM: Failed to queue cancellation push for order ${orderId}`, { error: errorMessage });
       });
     }
 
-    // 5. Notify customer
+    // 5. Notify customer — WebSocket (foreground) + FCM (background/killed app)
     emitToUser(customerId, 'order_cancelled', {
       orderId,
       status: 'cancelled',
       reason: reason || 'Cancelled by customer',
-      cancelledAt: new Date().toISOString(),
-      stateChangedAt: new Date().toISOString()
+      cancelledAt,
+      stateChangedAt: cancelledAt
+    });
+
+    // GAP 7 FIX: FCM fallback for customer when app is backgrounded/killed.
+    // Without this, a customer who backgrounds the app during search never
+    // sees the "Search cancelled" state when they reopen it.
+    await queueService.queuePushNotificationBatch(
+      [customerId],
+      {
+        title: 'Search cancelled',
+        body: 'Your truck search was cancelled.',
+        data: {
+          type: 'order_cancelled',
+          orderId,
+          status: 'cancelled'
+        }
+      }
+    ).catch((err: unknown) => {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      logger.warn(`FCM: Failed to send cancellation push to customer ${customerId}`, { error: errorMessage });
     });
 
     // 6. Revert active assignments — release vehicles and notify drivers
@@ -1503,15 +1654,24 @@ class OrderService {
             }).catch(() => {});
           }
           if (assignment.driverId) {
-            emitToUser(assignment.driverId, 'trip_cancelled', {
-              orderId, tripId: assignment.tripId, message: 'Trip cancelled by customer'
+            this.emitDriverCancellationEvents(assignment.driverId, {
+              orderId,
+              tripId: assignment.tripId,
+              reason: reason || 'Cancelled by customer',
+              message: 'Trip cancelled by customer',
+              cancelledAt,
+              customerName: order.customerName,
+              customerPhone: order.customerPhone,
+              pickupAddress: order.pickup?.address || '',
+              dropAddress: order.drop?.address || ''
             });
           }
         }
         logger.info(`[CANCEL] Reverted ${activeAssignments.length} assignments, released vehicles`);
       }
-    } catch (err: any) {
-      logger.warn(`[CANCEL] Failed to revert assignments (non-critical)`, { error: err.message });
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      logger.warn(`[CANCEL] Failed to revert assignments (non-critical)`, { error: errorMessage });
     }
 
     logger.info(`Order ${orderId} cancelled, notified ${transporterIds.length} transporters`);
@@ -1839,7 +1999,10 @@ class OrderService {
         assignmentId,
         orderId
       }
-    }).catch(err => logger.warn(`FCM to driver failed: ${err.message}`));
+    }).catch((err: unknown) => {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      logger.warn(`FCM to driver failed: ${errorMessage}`);
+    });
 
     // ============== NOTIFY CUSTOMER ==============
     const customerNotification = {
@@ -1871,6 +2034,44 @@ class OrderService {
     emitToUser(customerId, 'truck_confirmed', customerNotification);
     logger.info(`Notified customer - ${newTrucksFilled}/${orderTotalTrucks} trucks confirmed`);
 
+    // Phase 3 parity: keep searching dialog in sync with backend fill progress.
+    emitToUser(customerId, 'trucks_remaining_update', {
+      orderId,
+      trucksNeeded: orderTotalTrucks,
+      trucksFilled: newTrucksFilled,
+      trucksRemaining: Math.max(orderTotalTrucks - newTrucksFilled, 0),
+      isFullyFilled: newTrucksFilled >= orderTotalTrucks,
+      timestamp: now
+    });
+
+    // Lifecycle update whenever order status changes due to accept flow.
+    emitToUser(customerId, 'broadcast_state_changed', {
+      orderId,
+      status: newStatus,
+      stateChangedAt: now
+    });
+
+    if (newStatus === 'fully_filled') {
+      const latestAssignment = {
+        assignmentId,
+        tripId,
+        vehicleNumber,
+        driverName,
+        driverPhone
+      };
+      emitToUser(customerId, 'booking_fully_filled', {
+        orderId,
+        trucksNeeded: orderTotalTrucks,
+        trucksFilled: newTrucksFilled,
+        filledAt: now,
+        latestAssignment,
+        // Keep array for backward compatibility with existing consumers.
+        assignments: [
+          latestAssignment
+        ]
+      });
+    }
+
     // Push notification to customer
     sendPushNotification(customerId, {
       title: `Truck ${newTrucksFilled}/${orderTotalTrucks} Confirmed!`,
@@ -1881,7 +2082,10 @@ class OrderService {
         trucksConfirmed: newTrucksFilled,
         totalTrucks: orderTotalTrucks
       }
-    }).catch(err => logger.warn(`FCM to customer failed: ${err.message}`));
+    }).catch((err: unknown) => {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      logger.warn(`FCM to customer failed: ${errorMessage}`);
+    });
 
     // If fully filled, cancel expiry timer and clear active key
     if (newStatus === 'fully_filled') {
