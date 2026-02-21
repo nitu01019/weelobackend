@@ -43,6 +43,9 @@ export function requestLogger(req: Request, res: Response, next: NextFunction): 
   // Log when response finishes
   res.on('finish', () => {
     const duration = Date.now() - startTime;
+    const requestId = req.headers['x-request-id'] as string | undefined;
+    const traceId = req.headers['x-trace-id'] as string | undefined;
+    const loadTestRunId = req.headers['x-load-test-run-id'] as string | undefined;
     const logData = {
       method: req.method,
       path: req.path,
@@ -50,6 +53,9 @@ export function requestLogger(req: Request, res: Response, next: NextFunction): 
       duration: `${duration}ms`,
       ip: req.ip,
       userAgent: req.get('user-agent')?.substring(0, 100), // Truncate long user agents
+      ...(requestId && { requestId }),
+      ...(traceId && { traceId }),
+      ...(loadTestRunId && { loadTestRunId }),
       ...(Object.keys(req.query).length > 0 && { 
         query: maskQueryParams(req.query as Record<string, any>) 
       })

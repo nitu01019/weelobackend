@@ -231,7 +231,13 @@ app.use(securityResponseHeaders);
 app.use(cors({
   origin: config.isDevelopment ? '*' : config.cors.origin,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-ID'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'X-Request-ID',
+    'X-Trace-ID',
+    'X-Load-Test-Run-Id'
+  ],
   credentials: true,
   maxAge: 86400 // 24 hours preflight cache
 }));

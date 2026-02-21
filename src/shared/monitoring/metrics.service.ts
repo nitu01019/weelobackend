@@ -50,8 +50,16 @@ interface HistogramMetric {
   help: string;
   buckets: number[];
   values: Map<string, number[]>; // label -> array of values
+  bucketCounts: Map<string, number[]>; // label -> cumulative counts per bucket +Inf
   sum: Map<string, number>;
   count: Map<string, number>;
+}
+
+interface HttpRequestSample {
+  timestampMs: number;
+  durationMs: number;
+  statusCode: number;
+  loadTestRunId?: string;
 }
 
 // =============================================================================
@@ -62,9 +70,12 @@ class MetricsService {
   private counters: Map<string, CounterMetric> = new Map();
   private gauges: Map<string, GaugeMetric> = new Map();
   private histograms: Map<string, HistogramMetric> = new Map();
+  private httpRequestSamples: HttpRequestSample[] = [];
   
   // Pre-defined histogram buckets (in milliseconds for latency)
   private readonly latencyBuckets = [5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
+  private readonly maxHttpRequestSamples = 40000;
+  private readonly maxHttpSampleWindowMs = 15 * 60 * 1000;
   
   constructor() {
     this.initializeDefaultMetrics();
@@ -88,6 +99,7 @@ class MetricsService {
       help: 'HTTP request duration in milliseconds',
       buckets: this.latencyBuckets,
       values: new Map(),
+      bucketCounts: new Map(),
       sum: new Map(),
       count: new Map()
     });
@@ -105,6 +117,7 @@ class MetricsService {
       help: 'Database query duration in milliseconds',
       buckets: this.latencyBuckets,
       values: new Map(),
+      bucketCounts: new Map(),
       sum: new Map(),
       count: new Map()
     });
@@ -120,6 +133,23 @@ class MetricsService {
       name: 'cache_misses_total',
       help: 'Total number of cache misses',
       labels: {}
+    });
+
+    // Load test metrics (correlated by run id)
+    this.counters.set('load_test_requests_total', {
+      name: 'load_test_requests_total',
+      help: 'Total number of requests tagged with X-Load-Test-Run-Id',
+      labels: {}
+    });
+
+    this.histograms.set('load_test_request_duration_ms', {
+      name: 'load_test_request_duration_ms',
+      help: 'Load test tagged request duration in milliseconds',
+      buckets: this.latencyBuckets,
+      values: new Map(),
+      bucketCounts: new Map(),
+      sum: new Map(),
+      count: new Map()
     });
     
     // WebSocket connections
@@ -162,7 +192,7 @@ class MetricsService {
    */
   private startSystemMetricsCollection(): void {
     // Collect every 15 seconds
-    setInterval(() => {
+    const timer = setInterval(() => {
       const memUsage = process.memoryUsage();
       this.setGauge('nodejs_memory_heap_used_bytes', memUsage.heapUsed);
       this.setGauge('nodejs_memory_heap_total_bytes', memUsage.heapTotal);
@@ -174,6 +204,8 @@ class MetricsService {
         this.setGauge('nodejs_eventloop_lag_ms', lag);
       });
     }, 15000);
+    // Prevent this timer from blocking Jest process exit.
+    timer.unref();
   }
   
   // ===========================================================================
@@ -247,6 +279,7 @@ class MetricsService {
     // Initialize if needed
     if (!histogram.values.has(labelKey)) {
       histogram.values.set(labelKey, []);
+      histogram.bucketCounts.set(labelKey, new Array(histogram.buckets.length + 1).fill(0));
       histogram.sum.set(labelKey, 0);
       histogram.count.set(labelKey, 0);
     }
@@ -257,6 +290,15 @@ class MetricsService {
     if (values.length > 1000) {
       values.shift();
     }
+
+    const cumulativeBuckets = histogram.bucketCounts.get(labelKey)!;
+    for (let i = 0; i < histogram.buckets.length; i++) {
+      if (value <= histogram.buckets[i]) {
+        cumulativeBuckets[i] += 1;
+      }
+    }
+    // +Inf bucket is always incremented.
+    cumulativeBuckets[histogram.buckets.length] += 1;
     
     histogram.sum.set(labelKey, histogram.sum.get(labelKey)! + value);
     histogram.count.set(labelKey, histogram.count.get(labelKey)! + 1);
@@ -309,24 +351,29 @@ class MetricsService {
       lines.push(`# HELP ${histogram.name} ${histogram.help}`);
       lines.push(`# TYPE ${histogram.name} histogram`);
       
-      for (const [labelKey, values] of histogram.values) {
-        const sortedValues = [...values].sort((a, b) => a - b);
+      for (const [labelKey] of histogram.values) {
+        const cumulativeBuckets = histogram.bucketCounts.get(labelKey) || [];
         const count = histogram.count.get(labelKey) || 0;
         const sum = histogram.sum.get(labelKey) || 0;
         
-        // Calculate bucket counts
-        let cumulative = 0;
-        for (const bucket of histogram.buckets) {
-          cumulative = sortedValues.filter(v => v <= bucket).length;
+        for (let i = 0; i < histogram.buckets.length; i++) {
+          const bucket = histogram.buckets[i];
+          const cumulative = cumulativeBuckets[i] || 0;
           const labelPart = labelKey ? `${labelKey},` : '';
           lines.push(`${histogram.name}_bucket{${labelPart}le="${bucket}"} ${cumulative}`);
         }
         
         // +Inf bucket
         const labelPart = labelKey ? `${labelKey},` : '';
-        lines.push(`${histogram.name}_bucket{${labelPart}le="+Inf"} ${count}`);
-        lines.push(`${histogram.name}_sum{${labelKey || ''}} ${sum}`);
-        lines.push(`${histogram.name}_count{${labelKey || ''}} ${count}`);
+        const infCount = cumulativeBuckets[histogram.buckets.length] || count;
+        lines.push(`${histogram.name}_bucket{${labelPart}le="+Inf"} ${infCount}`);
+        if (labelKey) {
+          lines.push(`${histogram.name}_sum{${labelKey}} ${sum}`);
+          lines.push(`${histogram.name}_count{${labelKey}} ${count}`);
+        } else {
+          lines.push(`${histogram.name}_sum ${sum}`);
+          lines.push(`${histogram.name}_count ${count}`);
+        }
       }
     }
     
@@ -355,11 +402,82 @@ class MetricsService {
       )
     };
   }
+
+  /**
+   * Record one HTTP request sample for short SLO windows.
+   * Keeps an in-memory sliding window (last 15 minutes max).
+   */
+  recordHttpRequestSample(sample: HttpRequestSample): void {
+    this.httpRequestSamples.push(sample);
+    if (this.httpRequestSamples.length > this.maxHttpRequestSamples) {
+      this.httpRequestSamples.shift();
+    }
+    this.pruneHttpRequestSamples(sample.timestampMs);
+  }
+
+  /**
+   * Summarize HTTP latency + error rate for a recent window.
+   * Uses in-process samples captured by metricsMiddleware.
+   */
+  getHttpSloSummary(windowMinutes: number = 5, loadTestRunId?: string): {
+    windowMinutes: number;
+    sampleCount: number;
+    p95Ms: number;
+    p99Ms: number;
+    avgMs: number;
+    errorRate5xxPct: number;
+    windowStart: string;
+    windowEnd: string;
+    loadTestRunId?: string;
+  } {
+    const now = Date.now();
+    const effectiveWindowMinutes = Math.min(Math.max(windowMinutes, 1), 15);
+    const windowStartMs = now - effectiveWindowMinutes * 60_000;
+
+    this.pruneHttpRequestSamples(now);
+
+    const relevant = this.httpRequestSamples.filter((sample) => {
+      if (sample.timestampMs < windowStartMs) return false;
+      if (!loadTestRunId) return true;
+      return sample.loadTestRunId === loadTestRunId;
+    });
+
+    const durations = relevant.map((s) => s.durationMs).sort((a, b) => a - b);
+    const sampleCount = relevant.length;
+    const errorCount5xx = relevant.filter((s) => s.statusCode >= 500).length;
+    const totalDuration = relevant.reduce((sum, s) => sum + s.durationMs, 0);
+
+    return {
+      windowMinutes: effectiveWindowMinutes,
+      sampleCount,
+      p95Ms: this.percentile(durations, 0.95),
+      p99Ms: this.percentile(durations, 0.99),
+      avgMs: sampleCount > 0 ? totalDuration / sampleCount : 0,
+      errorRate5xxPct: sampleCount > 0 ? (errorCount5xx / sampleCount) * 100 : 0,
+      windowStart: new Date(windowStartMs).toISOString(),
+      windowEnd: new Date(now).toISOString(),
+      ...(loadTestRunId && { loadTestRunId })
+    };
+  }
   
   // ===========================================================================
   // HELPERS
   // ===========================================================================
   
+  private pruneHttpRequestSamples(nowMs: number): void {
+    const minTimestamp = nowMs - this.maxHttpSampleWindowMs;
+    while (this.httpRequestSamples.length > 0 && this.httpRequestSamples[0].timestampMs < minTimestamp) {
+      this.httpRequestSamples.shift();
+    }
+  }
+
+  private percentile(sortedValues: number[], q: number): number {
+    if (sortedValues.length === 0) return 0;
+    const index = Math.ceil(sortedValues.length * q) - 1;
+    const boundedIndex = Math.max(0, Math.min(index, sortedValues.length - 1));
+    return sortedValues[boundedIndex];
+  }
+
   private labelsToKey(labels: Record<string, string>): string {
     return Object.entries(labels)
       .sort(([a], [b]) => a.localeCompare(b))
@@ -380,6 +498,8 @@ export const metrics = new MetricsService();
  */
 export function metricsMiddleware(req: Request, res: Response, next: NextFunction): void {
   const startTime = process.hrtime.bigint();
+  const routePath = getRoutePath(req);
+  const loadTestRunId = normalizeRunId(req.headers['x-load-test-run-id']);
   
   // Increment active requests
   metrics.incrementGauge('http_active_requests');
@@ -389,13 +509,31 @@ export function metricsMiddleware(req: Request, res: Response, next: NextFunctio
     const duration = Number(process.hrtime.bigint() - startTime) / 1e6;
     const labels = {
       method: req.method,
-      path: getRoutePath(req),
+      path: routePath,
       status: String(res.statusCode)
     };
     
     // Record metrics
     metrics.incrementCounter('http_requests_total', labels);
     metrics.observeHistogram('http_request_duration_ms', duration, labels);
+    metrics.recordHttpRequestSample({
+      timestampMs: Date.now(),
+      durationMs: duration,
+      statusCode: res.statusCode,
+      loadTestRunId: loadTestRunId || undefined
+    });
+
+    if (loadTestRunId) {
+      const loadLabels = {
+        run_id: loadTestRunId,
+        method: req.method,
+        path: routePath,
+        status: String(res.statusCode)
+      };
+      metrics.incrementCounter('load_test_requests_total', loadLabels);
+      metrics.observeHistogram('load_test_request_duration_ms', duration, loadLabels);
+    }
+
     metrics.decrementGauge('http_active_requests');
   });
   
@@ -415,6 +553,14 @@ function getRoutePath(req: Request): string {
   return req.path
     .replace(/\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '/:id')
     .replace(/\/\d+/g, '/:id');
+}
+
+function normalizeRunId(headerValue: unknown): string {
+  if (typeof headerValue !== 'string') return '';
+  return headerValue
+    .trim()
+    .slice(0, 64)
+    .replace(/[^a-zA-Z0-9._:-]/g, '_');
 }
 
 /**

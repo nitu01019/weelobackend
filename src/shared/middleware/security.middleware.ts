@@ -32,9 +32,22 @@ export function requestIdMiddleware(
   res: Response,
   next: NextFunction
 ): void {
-  const requestId = req.headers['x-request-id'] as string || uuidv4();
+  const requestId = (req.headers['x-request-id'] as string)?.trim() || uuidv4();
+  const traceId = (req.headers['x-trace-id'] as string)?.trim() || requestId;
+  const loadTestRunId = (req.headers['x-load-test-run-id'] as string)?.trim();
+
   req.headers['x-request-id'] = requestId;
+  req.headers['x-trace-id'] = traceId;
+  if (loadTestRunId) {
+    req.headers['x-load-test-run-id'] = loadTestRunId;
+  }
+
   res.setHeader('X-Request-ID', requestId);
+  res.setHeader('X-Trace-ID', traceId);
+  if (loadTestRunId) {
+    res.setHeader('X-Load-Test-Run-Id', loadTestRunId);
+  }
+
   next();
 }
 

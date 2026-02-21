@@ -20,6 +20,7 @@ import { authMiddleware, roleGuard } from '../../shared/middleware/auth.middlewa
 import { logger } from '../../shared/services/logger.service';
 import { emitToUser } from '../../shared/services/socket.service';
 import { redisService } from '../../shared/services/redis.service';
+import { bookingQueue, trackingQueue, Priority } from '../../shared/resilience/request-queue';
 import { z } from 'zod';
 
 const router = Router();
@@ -116,6 +117,7 @@ router.post(
   '/',
   authMiddleware,
   roleGuard(['customer']),
+  bookingQueue.middleware({ priority: Priority.HIGH, timeout: 15000 }),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const user = (req as any).user;
@@ -475,6 +477,7 @@ router.post(
   '/accept',
   authMiddleware,
   roleGuard(['transporter']),
+  bookingQueue.middleware({ priority: Priority.CRITICAL, timeout: 12000 }),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       // Validate request body
@@ -543,6 +546,7 @@ router.post(
   '/:id/cancel',
   authMiddleware,
   roleGuard(['customer']),
+  bookingQueue.middleware({ priority: Priority.HIGH, timeout: 12000 }),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { id: orderId } = req.params;
@@ -612,6 +616,7 @@ router.post(
   '/:orderId/reached-stop',
   authMiddleware,
   roleGuard(['driver']),
+  trackingQueue.middleware({ priority: Priority.NORMAL, timeout: 10000 }),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { orderId } = req.params;

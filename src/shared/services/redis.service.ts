@@ -161,6 +161,7 @@ class InMemoryRedisClient implements IRedisClient {
   constructor() {
     // Cleanup expired keys every 10 seconds
     this.cleanupInterval = setInterval(() => this.cleanup(), 10000);
+    this.cleanupInterval.unref();
     logger.info('📦 [Redis] In-memory fallback initialized (development mode)');
   }
 

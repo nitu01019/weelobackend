@@ -118,6 +118,33 @@ router.get('/health/ready', async (_req: Request, res: Response) => {
 });
 
 /**
+ * SLO snapshot for recent HTTP window.
+ * Query params:
+ * - windowMinutes (1..15, default 5)
+ * - loadTestRunId (optional)
+ */
+router.get('/health/slo', (req: Request, res: Response) => {
+  const windowMinutesRaw = Number(req.query.windowMinutes);
+  const windowMinutes = Number.isFinite(windowMinutesRaw) ? windowMinutesRaw : 5;
+  const loadTestRunId = typeof req.query.loadTestRunId === 'string'
+    ? req.query.loadTestRunId
+    : undefined;
+
+  const summary = metrics.getHttpSloSummary(windowMinutes, loadTestRunId);
+  const hasSufficientData = summary.sampleCount > 0;
+  const isHealthy = hasSufficientData && summary.errorRate5xxPct <= 0.5 && summary.p99Ms <= 1200;
+
+  res.status(200).json({
+    status: hasSufficientData ? (isHealthy ? 'healthy' : 'degraded') : 'insufficient_data',
+    targets: {
+      maxErrorRate5xxPct: 0.5,
+      maxP99Ms: 1200
+    },
+    summary
+  });
+});
+
+/**
  * Detailed health - full system status
  * Internal use only, provides comprehensive diagnostics
  */

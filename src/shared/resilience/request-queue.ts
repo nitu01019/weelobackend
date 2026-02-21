@@ -104,6 +104,7 @@ export class RequestQueue {
   private activeCount: number = 0;
   private options: Required<RequestQueueOptions>;
   private requestCounter: number = 0;
+  private cleanupTimer: NodeJS.Timeout;
   
   constructor(options: RequestQueueOptions = {}) {
     this.options = { ...DEFAULT_OPTIONS, ...options };
@@ -114,7 +115,9 @@ export class RequestQueue {
     });
     
     // Periodically clean up timed-out requests
-    setInterval(() => this.cleanupTimedOut(), 5000);
+    this.cleanupTimer = setInterval(() => this.cleanupTimedOut(), 5000);
+    // Prevent this timer from keeping test processes alive.
+    this.cleanupTimer.unref();
   }
   
   /**
@@ -174,7 +177,13 @@ export class RequestQueue {
    * Release a slot
    */
   release(): void {
-    this.activeCount--;
+    if (this.activeCount > 0) {
+      this.activeCount--;
+    } else {
+      // Defensive guard: duplicate release hooks should never underflow active slots.
+      this.activeCount = 0;
+      logger.warn(`Queue '${this.options.name}' release called with activeCount=0`);
+    }
     metrics.decrementGauge('queue_active_requests');
     
     // Process next in queue
@@ -237,10 +246,17 @@ export class RequestQueue {
     return async (req: Request, res: Response, next: NextFunction) => {
       try {
         await this.acquire(options.priority, options.timeout);
-        
-        // Release slot when response finishes
-        res.on('finish', () => this.release());
-        res.on('close', () => this.release());
+
+        let released = false;
+        const releaseOnce = () => {
+          if (released) return;
+          released = true;
+          this.release();
+        };
+
+        // Release slot exactly once when response finishes/closes.
+        res.once('finish', releaseOnce);
+        res.once('close', releaseOnce);
         
         next();
       } catch (error) {

@@ -700,11 +700,11 @@ class OrderService {
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
 
     // Emit lifecycle state: created
-    emitToUser(request.customerId, 'broadcast_state_changed', {
+    emitToUser(request.customerId, 'broadcast_state_changed', this.withEventMeta({
       orderId,
       status: 'created',
       stateChangedAt: new Date().toISOString()
-    });
+    }));
 
     // 2. Create TruckRequests for each vehicle type
     const truckRequests: TruckRequestRecord[] = [];
@@ -764,22 +764,22 @@ class OrderService {
 
     // Transition: created -> broadcasting (transporters have been notified)
     await db.updateOrder(orderId, { status: 'broadcasting', stateChangedAt: new Date() });
-    emitToUser(request.customerId, 'broadcast_state_changed', {
+    emitToUser(request.customerId, 'broadcast_state_changed', this.withEventMeta({
       orderId,
       status: 'broadcasting',
       stateChangedAt: new Date().toISOString()
-    });
+    }));
 
     // 4. Set expiry timer
     this.setOrderExpiryTimer(orderId, this.BROADCAST_TIMEOUT_MS);
 
     // Transition: broadcasting -> active (timer started, awaiting responses)
     await db.updateOrder(orderId, { status: 'active', stateChangedAt: new Date() });
-    emitToUser(request.customerId, 'broadcast_state_changed', {
+    emitToUser(request.customerId, 'broadcast_state_changed', this.withEventMeta({
       orderId,
       status: 'active',
       stateChangedAt: new Date().toISOString()
-    });
+    }));
 
     // SCALABILITY: Calculate expiresIn for UI countdown timer
     // EASY UNDERSTANDING: UI always matches backend TTL
@@ -1214,6 +1214,17 @@ class OrderService {
     }
   }
 
+  /**
+   * Add standard event metadata for correlation across logs, sockets and load tests.
+   */
+  private withEventMeta<T extends Record<string, unknown>>(payload: T, eventId?: string): T & { eventId: string; emittedAt: string } {
+    return {
+      ...payload,
+      eventId: eventId || uuidv4(),
+      emittedAt: new Date().toISOString()
+    };
+  }
+
   private async setOrderExpiryTimer(orderId: string, timeoutMs: number): Promise<void> {
     // Cancel any existing timer
     await redisService.cancelTimer(this.TIMER_KEYS.ORDER_EXPIRY(orderId));
@@ -1250,6 +1261,8 @@ class OrderService {
       dropAddress?: string;
     }
   ): void {
+    const correlationEventId = uuidv4();
+    const emittedAt = new Date().toISOString();
     const eventPayload = {
       orderId: payload.orderId,
       tripId: payload.tripId ?? '',
@@ -1259,7 +1272,9 @@ class OrderService {
       customerName: payload.customerName ?? '',
       customerPhone: payload.customerPhone ?? '',
       pickupAddress: payload.pickupAddress ?? '',
-      dropAddress: payload.dropAddress ?? ''
+      dropAddress: payload.dropAddress ?? '',
+      eventId: correlationEventId,
+      emittedAt
     };
 
     emitToUser(driverId, 'trip_cancelled', eventPayload);
@@ -1300,13 +1315,13 @@ class OrderService {
     const expiredAt = new Date().toISOString();
 
     // Notify customer — payload matches PRD WebSocket event spec
-    emitToUser(order.customerId, 'order_expired', {
+    emitToUser(order.customerId, 'order_expired', this.withEventMeta({
       orderId,
       status: newStatus,
       expiredAt,
       totalTrucks: order.totalTrucks,
       trucksFilled: order.trucksFilled
-    });
+    }));
 
     // =========================================================================
     // CRITICAL FIX: Notify ALL transporters to remove expired broadcast
@@ -1329,12 +1344,15 @@ class OrderService {
     const transporterIds = Array.from(notifiedTransporters);
 
     if (transporterIds.length > 0) {
+      const expiryEventId = uuidv4();
       const expiryPayload = {
         broadcastId: orderId,
         orderId,
         reason: 'timeout',
         timestamp: new Date().toISOString(),
-        message: 'This booking request has expired'
+        message: 'This booking request has expired',
+        eventId: expiryEventId,
+        emittedAt: new Date().toISOString()
       };
 
       // broadcast_dismissed feeds BroadcastListScreen overlay (same infrastructure as cancel)
@@ -1343,7 +1361,9 @@ class OrderService {
         orderId,
         reason: 'timeout',
         message: 'This booking request has expired',
-        cancelledAt: expiredAt
+        cancelledAt: expiredAt,
+        eventId: expiryEventId,
+        emittedAt: new Date().toISOString()
       };
 
       // WebSocket: always emit immediately for real-time UI parity.
@@ -1567,11 +1587,14 @@ class OrderService {
     }
 
     const cancelledAt = new Date().toISOString();
+    const cancellationEventId = uuidv4();
     const cancellationData = {
       type: 'order_cancelled',
       orderId,
       reason: reason || 'Cancelled by customer',
-      cancelledAt
+      cancelledAt,
+      eventId: cancellationEventId,
+      emittedAt: new Date().toISOString()
     };
 
     const transporterIds = Array.from(notifiedTransporters);
@@ -1583,7 +1606,9 @@ class OrderService {
         orderId,
         reason: 'customer_cancelled',
         message: 'Sorry, the customer cancelled this order',
-        cancelledAt
+        cancelledAt,
+        eventId: cancellationEventId,
+        emittedAt: new Date().toISOString()
       };
 
       // WebSocket: always emit immediately for real-time UI parity.
@@ -1614,7 +1639,9 @@ class OrderService {
       status: 'cancelled',
       reason: reason || 'Cancelled by customer',
       cancelledAt,
-      stateChangedAt: cancelledAt
+      stateChangedAt: cancelledAt,
+      eventId: cancellationEventId,
+      emittedAt: new Date().toISOString()
     });
 
     // GAP 7 FIX: FCM fallback for customer when app is backgrounded/killed.
@@ -2005,6 +2032,7 @@ class OrderService {
     });
 
     // ============== NOTIFY CUSTOMER ==============
+    const customerEventId = uuidv4();
     const customerNotification = {
       type: 'truck_confirmed',
       orderId,
@@ -2028,7 +2056,9 @@ class OrderService {
         name: transporterName,
         phone: transporterPhone
       },
-      message: `Truck ${newTrucksFilled}/${orderTotalTrucks} confirmed!`
+      message: `Truck ${newTrucksFilled}/${orderTotalTrucks} confirmed!`,
+      eventId: customerEventId,
+      emittedAt: now
     };
 
     emitToUser(customerId, 'truck_confirmed', customerNotification);
@@ -2041,14 +2071,18 @@ class OrderService {
       trucksFilled: newTrucksFilled,
       trucksRemaining: Math.max(orderTotalTrucks - newTrucksFilled, 0),
       isFullyFilled: newTrucksFilled >= orderTotalTrucks,
-      timestamp: now
+      timestamp: now,
+      eventId: customerEventId,
+      emittedAt: now
     });
 
     // Lifecycle update whenever order status changes due to accept flow.
     emitToUser(customerId, 'broadcast_state_changed', {
       orderId,
       status: newStatus,
-      stateChangedAt: now
+      stateChangedAt: now,
+      eventId: customerEventId,
+      emittedAt: now
     });
 
     if (newStatus === 'fully_filled') {
@@ -2064,6 +2098,8 @@ class OrderService {
         trucksNeeded: orderTotalTrucks,
         trucksFilled: newTrucksFilled,
         filledAt: now,
+        eventId: customerEventId,
+        emittedAt: now,
         latestAssignment,
         // Keep array for backward compatibility with existing consumers.
         assignments: [

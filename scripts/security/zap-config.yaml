@@ -1,0 +1,32 @@
+context:
+  name: "weelo-staging"
+  urls:
+    - "${STAGING_BASE_URL}"
+  includePaths:
+    - "${STAGING_BASE_URL}/api/v1/.*"
+  authentication:
+    method: "json"
+    parameters:
+      loginUrl: "${STAGING_BASE_URL}/api/v1/auth/login"
+      loginRequestData: '{"phone":"${ZAP_LOGIN_PHONE}","otp":"${ZAP_LOGIN_OTP}"}'
+  sessionManagement:
+    method: "headers"
+    parameters:
+      Authorization: "Bearer ${ZAP_BEARER_TOKEN}"
+
+jobs:
+  - type: spider
+    parameters:
+      context: "weelo-staging"
+      maxDuration: 10
+
+  - type: activeScan
+    parameters:
+      context: "weelo-staging"
+      maxDuration: 20
+
+  - type: report
+    parameters:
+      template: traditional-html
+      reportFile: /zap/wrk/zap-report.html
+      reportDir: /zap/wrk
