@@ -195,7 +195,7 @@ const CONFIG = {
  * - Works across multiple server instances
  * 
  * KEY PATTERNS:
- * - hold:{holdId}                    → Hold data (JSON, TTL: 15s)
+ * - hold:{holdId}                    → Hold data (JSON, TTL: 180s / 3 min)
  * - hold:order:{orderId}             → Set of holdIds for this order
  * - hold:transporter:{transporterId} → Set of holdIds for this transporter
  * - lock:truck:{truckRequestId}      → Lock for specific truck (SETNX)
