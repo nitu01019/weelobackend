@@ -25,6 +25,7 @@
 import { Server as HttpServer } from 'http';
 import { Server, Socket } from 'socket.io';
 import { createAdapter } from '@socket.io/redis-adapter';
+import Redis from 'ioredis';
 import jwt from 'jsonwebtoken';
 import { config } from '../../config/environment';
 import { logger } from './logger.service';
@@ -486,8 +487,6 @@ async function setupRedisAdapter(socketServer: Server): Promise<void> {
   }
 
   try {
-    const Redis = require('ioredis');
-
     const pubClient = new Redis(redisUrl, { lazyConnect: true });
     const subClient = new Redis(redisUrl, { lazyConnect: true });
 
