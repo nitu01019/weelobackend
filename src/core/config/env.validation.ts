@@ -143,6 +143,12 @@ const ENV_VARS: EnvVar[] = [
     description: 'SMS service provider (mock, console, twilio, msg91, aws-sns)'
   },
   {
+    name: 'SMS_RETRIEVER_HASH',
+    required: false,
+    validator: (v) => v.length === 0 || v.length === 11,
+    description: 'Android SMS Retriever app hash (11 chars, optional but recommended for OTP autofill)'
+  },
+  {
     name: 'TWILIO_ACCOUNT_SID',
     required: false,
     description: 'Twilio Account SID (required if SMS_PROVIDER=twilio)'

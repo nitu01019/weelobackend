@@ -140,6 +140,7 @@ export const config = {
   // For AWS deployment: use 'aws-sns' - it uses IAM role automatically on ECS
   sms: {
     provider: getOptional('SMS_PROVIDER', 'console'),
+    retrieverHash: getOptional('SMS_RETRIEVER_HASH', ''),
     twilio: {
       accountSid: getOptional('TWILIO_ACCOUNT_SID', ''),
       authToken: getOptional('TWILIO_AUTH_TOKEN', ''),
@@ -225,6 +226,11 @@ function validateConfig(): void {
     // SMS provider should be configured
     if (config.sms.provider === 'console') {
       warnings.push('SMS_PROVIDER is "console" - configure Twilio or MSG91 for real SMS');
+    }
+
+    // SMS Retriever hash is required for Android zero-permission OTP autofill (AWS SNS/Twilio)
+    if ((config.sms.provider === 'aws-sns' || config.sms.provider === 'twilio') && !config.sms.retrieverHash) {
+      warnings.push('SMS_RETRIEVER_HASH is not set — Android SMS Retriever OTP autofill may fail. Set the 11-char app hash for the deployed app signing key.');
     }
   }
   
