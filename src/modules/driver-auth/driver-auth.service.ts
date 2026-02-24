@@ -20,7 +20,7 @@
  * 
  * SECURITY:
  * - Cryptographically secure OTP generation (crypto.randomInt)
- * - OTPs are hashed with bcrypt before storage (plain OTP is NEVER stored)
+ * - OTPs are hashed before storage (SHA-256 for new OTPs; legacy bcrypt verify compatibility retained temporarily)
  * - OTPs expire after configured time (default: 5 minutes)
  * - Maximum 3 attempts before OTP is invalidated
  * - Rate limiting enforced at route level
@@ -41,14 +41,13 @@
  */
 
 import jwt from 'jsonwebtoken';
-import bcrypt from 'bcryptjs';
 import { config } from '../../config/environment';
 import { logger } from '../../shared/services/logger.service';
 import { AppError } from '../../shared/types/error.types';
 import { db, UserRecord } from '../../shared/database/db';
 import { generateSecureOTP, maskForLogging } from '../../shared/utils/crypto.utils';
-import { redisService } from '../../shared/services/redis.service';
 import { smsService } from '../auth/sms.service';
+import { otpChallengeService } from '../auth/otp-challenge.service';
 
 // =============================================================================
 // REDIS KEY PATTERNS (consistent with auth.service.ts)
@@ -63,27 +62,8 @@ const REDIS_KEYS = {
   
   /** Driver's refresh tokens set: driver:tokens:{driverId} */
   DRIVER_TOKENS: (driverId: string) => `driver:tokens:${driverId}`,
+  OTP_VERIFY_LOCK: (driverPhone: string) => `driver-otp:verify:lock:${driverPhone}`,
 };
-
-// =============================================================================
-// OTP STORAGE INTERFACE (Redis-powered, same pattern as auth.service.ts)
-// =============================================================================
-
-/**
- * OTP entry stored in Redis
- * Key: driver-otp:{driverPhone}
- * TTL: OTP expiry time (auto-cleanup)
- */
-interface DriverOtpEntry {
-  hashedOtp: string;
-  driverId: string;
-  driverName: string;
-  transporterId: string;
-  transporterPhone: string;
-  transporterName: string;
-  expiresAt: string; // ISO string for JSON serialization
-  attempts: number;
-}
 
 /**
  * DriverAuthService - Handles driver-specific authentication
@@ -165,54 +145,22 @@ class DriverAuthService {
 
     // 3. Generate cryptographically secure OTP
     const otp = generateSecureOTP(config.otp.length);
-    
-    // Hash OTP before storing (NEVER store plain OTP)
-    const hashedOtp = await bcrypt.hash(otp, 10);
-    
-    // Calculate expiry
-    const expiresAt = new Date(Date.now() + config.otp.expiryMinutes * 60 * 1000);
 
-    // 4. Store ONLY hashed OTP in Redis with TTL (auto-expires)
+    // 4. Store OTP challenge (Redis + PostgreSQL backup, shared OTP core)
     const key = REDIS_KEYS.DRIVER_OTP(driverPhone);
-    const otpEntry: DriverOtpEntry = {
-      hashedOtp,
-      driverId: driver.id,
-      driverName: driver.name || 'Driver',
-      transporterId: driver.transporterId,
-      transporterPhone: transporter.phone,
-      transporterName: transporter.name || transporter.businessName || 'Transporter',
-      expiresAt: expiresAt.toISOString(),
-      attempts: 0
-    };
-    
-    // Store with TTL (auto-cleanup by Redis)
-    // SCALABILITY: Try Redis first, fallback to PostgreSQL (cross-task safe)
-    const ttlSeconds = config.otp.expiryMinutes * 60;
-    let storedInRedis = false;
-    try {
-      await redisService.setJSON(key, otpEntry, ttlSeconds);
-      storedInRedis = true;
-      logger.info('[DRIVER AUTH] OTP stored in Redis', { driverPhone: maskForLogging(driverPhone, 2, 4) });
-    } catch (redisError: any) {
-      logger.warn('[DRIVER AUTH] Redis unavailable for OTP storage, using PostgreSQL fallback', {
-        error: redisError.message,
+    const issueResult = await otpChallengeService.issueChallenge({
+      otp,
+      redisKey: key,
+      dbKey: { phone: driverPhone, role: 'driver' },
+      logContext: { driverPhone: maskForLogging(driverPhone, 2, 4) }
+    });
+
+    const expiresAt = issueResult.expiresAt;
+    if (!issueResult.storedInRedis && !issueResult.storedInDb) {
+      logger.error('[DRIVER AUTH] ❌ CRITICAL: OTP not stored in Redis OR PostgreSQL', {
         driverPhone: maskForLogging(driverPhone, 2, 4)
       });
-    }
-    
-    // ALWAYS store in PostgreSQL as cross-task backup
-    try {
-      await db.prisma?.$executeRawUnsafe(
-        `INSERT INTO "OtpStore" (phone, role, otp, expires_at, attempts) 
-         VALUES ($1, $2, $3, $4, 0) 
-         ON CONFLICT (phone, role) DO UPDATE SET otp = $3, expires_at = $4, attempts = 0`,
-        driverPhone, 'driver', hashedOtp, expiresAt.toISOString()
-      );
-      logger.info('[DRIVER AUTH] OTP stored in PostgreSQL (cross-task backup)', { driverPhone: maskForLogging(driverPhone, 2, 4) });
-    } catch (dbError: any) {
-      if (!storedInRedis) {
-        logger.error('[DRIVER AUTH] ❌ CRITICAL: OTP not stored in Redis OR PostgreSQL', { error: dbError.message });
-      }
+      throw new AppError(503, 'SERVICE_UNAVAILABLE', 'OTP service temporarily unavailable. Please try again in a moment.');
     }
 
     // 5. Send OTP to TRANSPORTER's phone via SMS
@@ -229,7 +177,15 @@ class DriverAuthService {
         error: smsError.message, 
         transporterPhone: maskForLogging(transporter.phone, 2, 4) 
       });
-      // Continue anyway - OTP is stored and can be verified
+      if (config.isProduction) {
+        await otpChallengeService.deleteChallenge({
+          redisKey: key,
+          dbKey: { phone: driverPhone, role: 'driver' },
+          logContext: { driverPhone: maskForLogging(driverPhone, 2, 4), reason: 'sms_send_failed' }
+        });
+        throw new AppError(503, 'SMS_SEND_FAILED', 'Could not deliver OTP. Please try again in a moment.');
+      }
+      // Non-production only: allow pending/dev fallback behavior.
     }
 
     // Log without exposing OTP (safe for production logs)
@@ -256,7 +212,7 @@ class DriverAuthService {
    * Verify OTP and authenticate driver
    * 
    * SECURITY:
-   * - OTP is compared using bcrypt (timing-safe)
+   * - OTP is compared using shared OTP verifier (SHA-256 + legacy bcrypt compatibility)
    * - OTP is deleted after successful verification (single use)
    * - Maximum attempts enforced before OTP is invalidated
    * - Failed attempts are logged for security monitoring
@@ -283,164 +239,45 @@ class DriverAuthService {
     role: string;
   }> {
     const key = REDIS_KEYS.DRIVER_OTP(driverPhone);
-    
-    // SCALABILITY: Try Redis first, fallback to PostgreSQL (cross-task safe)
-    let stored: DriverOtpEntry | null = null;
-    try {
-      stored = await redisService.getJSON<DriverOtpEntry>(key);
-      if (stored) {
-        logger.info('[DRIVER AUTH] OTP fetched from Redis', { phone: maskForLogging(driverPhone, 2, 4) });
-      }
-    } catch (redisError: any) {
-      logger.warn('[DRIVER AUTH] Redis unavailable during OTP verification, trying PostgreSQL', {
-        error: redisError.message,
-        phone: maskForLogging(driverPhone, 2, 4)
-      });
-    }
-    
-    // FALLBACK: Check PostgreSQL if Redis didn't have the OTP
-    if (!stored) {
-      try {
-        const dbResult: any[] | null = await db.prisma?.$queryRawUnsafe(
-          `SELECT otp, expires_at, attempts FROM "OtpStore" 
-           WHERE phone = $1 AND role = $2 LIMIT 1`,
-          driverPhone, 'driver'
-        );
-        if (dbResult && dbResult.length > 0) {
-          const row = dbResult[0];
-          stored = {
-            hashedOtp: row.otp,
-            driverId: '',
-            driverName: '',
-            transporterId: '',
-            transporterPhone: '',
-            transporterName: '',
-            expiresAt: row.expires_at instanceof Date ? row.expires_at.toISOString() : String(row.expires_at),
-            attempts: row.attempts || 0
-          };
-          // Lookup driver to fill in missing fields
-          try {
-            const driver = await db.getUserByPhone(driverPhone, 'driver');
-            if (driver) {
-              stored.driverId = driver.id;
-              stored.driverName = driver.name || 'Driver';
-              stored.transporterId = driver.transporterId || '';
-            }
-          } catch { /* best effort */ }
-          logger.info('[DRIVER AUTH] OTP fetched from PostgreSQL fallback', { phone: maskForLogging(driverPhone, 2, 4) });
+    const verifyResult = await otpChallengeService.verifyChallenge({
+      otp,
+      redisKey: key,
+      dbKey: { phone: driverPhone, role: 'driver' },
+      verifyLockKey: REDIS_KEYS.OTP_VERIFY_LOCK(driverPhone),
+      hashStrategy: 'sha256_or_bcrypt_compat',
+      logContext: { driverPhone: maskForLogging(driverPhone, 2, 4) }
+    });
+
+    if (!verifyResult.ok) {
+      const failed = verifyResult as Exclude<typeof verifyResult, { ok: true }>;
+      switch (failed.code) {
+        case 'OTP_VERIFY_IN_PROGRESS':
+          throw new AppError(409, 'OTP_VERIFY_IN_PROGRESS', 'OTP verification already in progress. Please try again.');
+        case 'OTP_NOT_FOUND':
+          throw new AppError(400, 'OTP_NOT_FOUND', 'No OTP request found. Please request a new OTP.');
+        case 'OTP_EXPIRED':
+          throw new AppError(400, 'OTP_EXPIRED', 'OTP has expired. Please request a new one.');
+        case 'MAX_ATTEMPTS':
+          throw new AppError(400, 'OTP_MAX_ATTEMPTS', 'Too many failed attempts. Please request a new OTP.');
+        case 'OTP_INVALID': {
+          const remaining = failed.attemptsRemaining;
+          if (typeof remaining === 'number') {
+            throw new AppError(
+              400,
+              'OTP_INVALID',
+              `Invalid OTP. ${remaining} attempt${remaining !== 1 ? 's' : ''} remaining.`
+            );
+          }
+          throw new AppError(400, 'OTP_INVALID', 'Invalid OTP. Please try again.');
         }
-      } catch (dbError: any) {
-        logger.error('[DRIVER AUTH] PostgreSQL OTP fallback also failed', { error: dbError.message });
       }
     }
-
-    // 1. Check if OTP exists
-    if (!stored) {
-      logger.warn('[DRIVER AUTH] OTP verification failed - no OTP found', { 
-        phone: maskForLogging(driverPhone, 2, 4) 
-      });
-      throw new AppError(
-        400,
-        'OTP_NOT_FOUND',
-        'No OTP request found. Please request a new OTP.'
-      );
-    }
-
-    // 2. Check if OTP is expired
-    if (new Date() > new Date(stored.expiresAt)) {
-      await Promise.allSettled([
-        redisService.del(key),
-        db.prisma?.$executeRawUnsafe(`DELETE FROM "OtpStore" WHERE phone = $1 AND role = $2`, driverPhone, 'driver')
-      ]);
-      logger.warn('[DRIVER AUTH] OTP verification failed - expired', { 
-        phone: maskForLogging(driverPhone, 2, 4) 
-      });
-      throw new AppError(
-        400,
-        'OTP_EXPIRED',
-        'OTP has expired. Please request a new one.'
-      );
-    }
-
-    // 3. Check attempts
-    const maxAttempts = config.otp.maxAttempts;
-    let currentAttempts = stored.attempts || 0;
-    try {
-      currentAttempts = await redisService.getOtpAttempts(key);
-    } catch { /* Use DB-stored attempts */ }
-    
-    if (currentAttempts >= maxAttempts) {
-      await Promise.allSettled([
-        redisService.deleteOtpWithAttempts(key),
-        db.prisma?.$executeRawUnsafe(`DELETE FROM "OtpStore" WHERE phone = $1 AND role = $2`, driverPhone, 'driver')
-      ]);
-      logger.warn('[DRIVER AUTH] OTP verification failed - max attempts exceeded', { 
-        phone: maskForLogging(driverPhone, 2, 4),
-        attempts: currentAttempts
-      });
-      throw new AppError(
-        400,
-        'OTP_MAX_ATTEMPTS',
-        'Too many failed attempts. Please request a new OTP.'
-      );
-    }
-
-    // 4. Verify OTP using bcrypt (timing-safe comparison)
-    const isValid = await bcrypt.compare(otp, stored.hashedOtp);
-
-    if (!isValid) {
-      let attemptsRemaining = maxAttempts - currentAttempts - 1;
-      let maxReached = false;
-      
-      try {
-        const attemptResult = await redisService.incrementOtpAttempts(key, maxAttempts);
-        attemptsRemaining = attemptResult.remaining;
-        maxReached = !attemptResult.allowed;
-      } catch {
-        maxReached = attemptsRemaining <= 0;
-      }
-      
-      // Always increment DB attempts (cross-task consistency)
-      try {
-        await db.prisma?.$executeRawUnsafe(
-          `UPDATE "OtpStore" SET attempts = attempts + 1 WHERE phone = $1 AND role = $2`,
-          driverPhone, 'driver'
-        );
-      } catch { /* best effort */ }
-      
-      logger.warn('[DRIVER AUTH] OTP verification failed - invalid OTP', { 
-        phone: maskForLogging(driverPhone, 2, 4),
-        attemptsRemaining
-      });
-      
-      if (maxReached) {
-        await Promise.allSettled([
-          redisService.deleteOtpWithAttempts(key),
-          db.prisma?.$executeRawUnsafe(`DELETE FROM "OtpStore" WHERE phone = $1 AND role = $2`, driverPhone, 'driver')
-        ]);
-        throw new AppError(
-          400,
-          'OTP_MAX_ATTEMPTS',
-          'Too many failed attempts. Please request a new OTP.'
-        );
-      }
-      
-      throw new AppError(
-        400,
-        'OTP_INVALID',
-        `Invalid OTP. ${attemptsRemaining} attempt${attemptsRemaining !== 1 ? 's' : ''} remaining.`
-      );
-    }
-
-    // 5. OTP verified - delete from BOTH Redis and PostgreSQL (single use)
-    await Promise.allSettled([
-      redisService.deleteOtpWithAttempts(key),
-      db.prisma?.$executeRawUnsafe(`DELETE FROM "OtpStore" WHERE phone = $1 AND role = $2`, driverPhone, 'driver')
-    ]);
 
     // 6. Get fresh driver and transporter data from database
     const driver = await this.findDriverByPhone(driverPhone);
-    const transporter = await this.findTransporterById(stored.transporterId);
+    const transporter = driver?.transporterId
+      ? await this.findTransporterById(driver.transporterId)
+      : undefined;
 
     if (!driver || !transporter) {
       logger.error('[DRIVER AUTH] Data integrity error after OTP verification', {

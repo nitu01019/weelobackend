@@ -25,6 +25,16 @@ interface SmsProvider {
  * Twilio SMS Provider
  */
 class TwilioProvider implements SmsProvider {
+  private client: any | null = null;
+
+  private getClient() {
+    if (this.client) return this.client;
+    const { accountSid, authToken } = config.sms.twilio;
+    const twilio = require('twilio');
+    this.client = twilio(accountSid, authToken);
+    return this.client;
+  }
+
   async sendOtp(phone: string, otp: string): Promise<void> {
     const { accountSid, authToken, phoneNumber } = config.sms.twilio;
     
@@ -36,9 +46,7 @@ class TwilioProvider implements SmsProvider {
     const formattedPhone = phone.startsWith('+') ? phone : `+91${phone}`;
     
     try {
-      // Dynamic import to avoid loading Twilio if not used
-      const twilio = require('twilio');
-      const client = twilio(accountSid, authToken);
+      const client = this.getClient();
       
       // SMS Retriever API format: <#> prefix + app hash suffix
       const appHash = config.sms.retrieverHash || process.env.SMS_RETRIEVER_HASH || '';
@@ -100,6 +108,25 @@ class MSG91Provider implements SmsProvider {
  * Uses AWS Simple Notification Service for sending SMS
  */
 class AWSSNSProvider implements SmsProvider {
+  private client: any | null = null;
+
+  private getClient() {
+    if (this.client) return this.client;
+    const { region, accessKeyId, secretAccessKey } = config.sms.awsSns;
+    const { SNSClient } = require('@aws-sdk/client-sns');
+    const clientConfig: any = { region };
+
+    if (accessKeyId && secretAccessKey) {
+      clientConfig.credentials = {
+        accessKeyId,
+        secretAccessKey
+      };
+    }
+
+    this.client = new SNSClient(clientConfig);
+    return this.client;
+  }
+
   async sendOtp(phone: string, otp: string): Promise<void> {
     const { region, accessKeyId, secretAccessKey } = config.sms.awsSns;
     
@@ -112,21 +139,8 @@ class AWSSNSProvider implements SmsProvider {
     
     try {
       // Dynamic import to avoid loading AWS SDK if not used
-      const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns');
-      
-      // Create SNS client - uses IAM role if on AWS, or env credentials
-      const clientConfig: any = { region };
-      
-      // Only add credentials if explicitly provided (for local development)
-      // On AWS ECS/EC2, IAM role is used automatically
-      if (accessKeyId && secretAccessKey) {
-        clientConfig.credentials = {
-          accessKeyId,
-          secretAccessKey
-        };
-      }
-      
-      const client = new SNSClient(clientConfig);
+      const { PublishCommand } = require('@aws-sdk/client-sns');
+      const client = this.getClient();
       
       // SMS Retriever API format: Must start with <#> and end with app hash
       // The app hash is computed from the signing certificate + package name
@@ -167,6 +181,9 @@ class AWSSNSProvider implements SmsProvider {
  */
 class ConsoleProvider implements SmsProvider {
   async sendOtp(phone: string, otp: string): Promise<void> {
+    if (config.isProduction) {
+      throw new AppError(500, 'SMS_PROVIDER_DISABLED', 'Console SMS provider is disabled in production');
+    }
     console.log('\n===========================================');
     console.log('📱 SMS (CONSOLE MODE - DEV ONLY)');
     console.log('===========================================');
@@ -258,6 +275,10 @@ class SmsService {
    * CODING STANDARDS: Detailed error logging for debugging
    */
   async sendOtp(phone: string, otp: string): Promise<void> {
+    if (config.isProduction && this.provider === this.fallbackProvider) {
+      throw new AppError(500, 'SMS_PROVIDER_DISABLED', 'No production SMS provider is configured');
+    }
+
     try {
       await this.provider.sendOtp(phone, otp);
       this.metrics.sent++;
@@ -274,9 +295,8 @@ class SmsService {
         totalFailures: this.metrics.failed,
       });
       
-      // AUTOMATIC FALLBACK: Log OTP to console/CloudWatch so it's retrievable
-      // This ensures the user can still get their OTP even if SMS provider is down
-      if (this.provider !== this.fallbackProvider) {
+      // Non-production only: fallback to console logging for local/dev debugging.
+      if (!config.isProduction && this.provider !== this.fallbackProvider) {
         logger.warn(`⚠️  Falling back to console logging for OTP delivery`);
         try {
           await this.fallbackProvider.sendOtp(phone, otp);
@@ -286,7 +306,7 @@ class SmsService {
         }
       }
       
-      // Re-throw so caller knows SMS failed (they can decide to continue or not)
+      // Re-throw so caller decides whether to fail closed (production) or degrade (non-prod).
       throw error;
     }
   }

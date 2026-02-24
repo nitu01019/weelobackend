@@ -39,6 +39,7 @@ import { db } from '../../shared/database/db';
 import { generateSecureOTP, maskForLogging } from '../../shared/utils/crypto.utils';
 import { redisService } from '../../shared/services/redis.service';
 import { smsService } from './sms.service';
+import { otpChallengeService } from './otp-challenge.service';
 
 // =============================================================================
 // REDIS KEY PATTERNS
@@ -47,6 +48,7 @@ import { smsService } from './sms.service';
 const REDIS_KEYS = {
   /** OTP storage: otp:{phone}:{role} */
   OTP: (phone: string, role: string) => `otp:${phone}:${role}`,
+  OTP_VERIFY_LOCK: (phone: string, role: string) => `otp:verify:lock:${phone}:${role}`,
   
   /** Refresh token storage: refresh:{tokenId} */
   REFRESH_TOKEN: (tokenId: string) => `refresh:${tokenId}`,
@@ -55,21 +57,6 @@ const REDIS_KEYS = {
   USER_TOKENS: (userId: string) => `user:tokens:${userId}`,
 };
 
-// =============================================================================
-// OTP STORAGE (Redis-powered)
-// =============================================================================
-// Redis key: otp:{phone}:{role}
-// Value: JSON { otp, expiresAt, attempts }
-// TTL: OTP expiry time (auto-cleanup)
-// Security: Plain storage OK (TTL + max 3 attempts + 6-digit = secure)
-
-interface OtpEntry {
-  otp: string;       // Plain OTP (secure: auto-delete + attempt limit)
-  expiresAt: string; // ISO string for JSON serialization
-  attempts: number;
-}
-
-// =============================================================================
 // REFRESH TOKEN STORAGE (Redis-powered)
 // =============================================================================
 // Redis key: refresh:{tokenId}
@@ -136,60 +123,22 @@ class AuthService {
     // - 6-digit = 1M combinations (impossible to guess in 3 tries)
     // - Rate limiting prevents spam
     
-    // Calculate expiry
-    const expiresAt = new Date(Date.now() + config.otp.expiryMinutes * 60 * 1000);
-    
-    // Store ONLY hashed OTP in Redis with TTL
     const key = REDIS_KEYS.OTP(phone, role);
-    // Hash OTP with SHA-256 before storing (fast, prevents plaintext exposure in Redis/DB)
-    const otpHash = crypto.createHash('sha256').update(otp).digest('hex');
-    const otpEntry: OtpEntry = {
-      otp: otpHash,
-      expiresAt: expiresAt.toISOString(),
-      attempts: 0
-    };
-    
-    // Store with TTL (auto-expires)
-    const ttlSeconds = config.otp.expiryMinutes * 60;
-    
-    // SCALABILITY: Try Redis first, fallback to PostgreSQL (NEVER in-memory)
-    // With 2+ ECS tasks, in-memory is per-process and causes "Invalid OTP" errors.
-    // PostgreSQL is shared across all tasks — OTP stored by Task A can be verified by Task B.
-    let storedInRedis = false;
-    try {
-      const redisStart = Date.now();
-      await redisService.setJSON(key, otpEntry, ttlSeconds);
-      storedInRedis = true;
-      logger.info('OTP stored in Redis', { phone: maskForLogging(phone, 2, 4), durationMs: Date.now() - redisStart });
-    } catch (redisError: any) {
-      logger.warn('⚠️  Redis unavailable for OTP storage, using PostgreSQL fallback', { 
-        error: redisError.message,
-        phone: maskForLogging(phone, 2, 4)
+    const issueResult = await otpChallengeService.issueChallenge({
+      otp,
+      redisKey: key,
+      dbKey: { phone, role },
+      logContext: { phone: maskForLogging(phone, 2, 4), role }
+    });
+
+    const expiresAt = issueResult.expiresAt;
+
+    if (!issueResult.storedInRedis && !issueResult.storedInDb) {
+      logger.error('❌ CRITICAL: OTP could not be stored in Redis OR PostgreSQL', {
+        phone: maskForLogging(phone, 2, 4),
+        role
       });
-    }
-    
-    // ALWAYS store in PostgreSQL as backup (ensures cross-task availability)
-    // If Redis worked, this is a backup. If Redis failed, this is the primary.
-    try {
-      await db.prisma?.$executeRawUnsafe(
-        `INSERT INTO "OtpStore" (phone, role, otp, expires_at, attempts) 
-         VALUES ($1, $2, $3, $4, 0) 
-         ON CONFLICT (phone, role) DO UPDATE SET otp = $3, expires_at = $4, attempts = 0`,
-        phone, role, otpHash, expiresAt.toISOString()
-      );
-      logger.info('OTP stored in PostgreSQL (cross-task backup)', { phone: maskForLogging(phone, 2, 4) });
-    } catch (dbError: any) {
-      if (!storedInRedis) {
-        logger.error('❌ CRITICAL: OTP could not be stored in Redis OR PostgreSQL', {
-          redisError: 'unavailable',
-          dbError: dbError.message,
-          phone: maskForLogging(phone, 2, 4)
-        });
-        // Abort — sending OTP that can't be verified is worse than failing fast
-        throw new AppError(503, 'SERVICE_UNAVAILABLE', 'OTP service temporarily unavailable. Please try again in a moment.');
-      } else {
-        logger.warn('OTP DB backup failed (Redis is primary)', { error: dbError.message });
-      }
+      throw new AppError(503, 'SERVICE_UNAVAILABLE', 'OTP service temporarily unavailable. Please try again in a moment.');
     }
     
     // ==========================================================================
@@ -215,8 +164,15 @@ class AuthService {
         role,
         otpStored: true,
       });
-      // OTP is stored in Redis — don't fail the request
-      // SMS service already falls back to console logging (CloudWatch)
+      if (config.isProduction) {
+        await otpChallengeService.deleteChallenge({
+          redisKey: key,
+          dbKey: { phone, role },
+          logContext: { phone: maskForLogging(phone, 2, 4), role, reason: 'sms_send_failed' }
+        });
+        throw new AppError(503, 'SMS_SEND_FAILED', 'Could not deliver OTP. Please try again in a moment.');
+      }
+      // Non-production only: allow pending/dev fallback behavior.
     }
     
     // Log without exposing OTP (safe for production logs)
@@ -242,7 +198,7 @@ class AuthService {
    * Creates new user in database if first time login
    * 
    * SECURITY:
-   * - OTP is compared using bcrypt (timing-safe)
+   * - OTP is compared using the shared OTP challenge verifier (SHA-256)
    * - OTP is deleted after successful verification
    * - Maximum 3 attempts before OTP is invalidated
    * - Failed attempts are logged for security monitoring
@@ -261,142 +217,35 @@ class AuthService {
     preferredLanguage: string | null;
   }> {
     const key = REDIS_KEYS.OTP(phone, role);
-    
-    // SCALABILITY: Try Redis first, fallback to PostgreSQL (NEVER in-memory)
-    // With 2+ ECS tasks, both send and verify must use shared storage.
-    let stored: OtpEntry | null = null;
-    const fetchStart = Date.now();
-    try {
-      stored = await redisService.getJSON<OtpEntry>(key);
-      if (stored) {
-        logger.info('OTP fetched from Redis', { phone: maskForLogging(phone, 2, 4), durationMs: Date.now() - fetchStart });
-      }
-    } catch (redisError: any) {
-      logger.warn('Redis unavailable during OTP verification, trying PostgreSQL', { 
-        phone: maskForLogging(phone, 2, 4),
-        error: redisError.message
-      });
-    }
-    
-    // FALLBACK: If Redis didn't have the OTP, check PostgreSQL
-    if (!stored) {
-      try {
-        const dbResult: any[] | null = await db.prisma?.$queryRawUnsafe(
-          `SELECT otp, expires_at, attempts FROM "OtpStore" 
-           WHERE phone = $1 AND role = $2 LIMIT 1`,
-          phone, role
-        );
-        if (dbResult && dbResult.length > 0) {
-          const row = dbResult[0];
-          stored = {
-            otp: row.otp,
-            expiresAt: row.expires_at instanceof Date ? row.expires_at.toISOString() : String(row.expires_at),
-            attempts: row.attempts || 0
-          };
-          logger.info('OTP fetched from PostgreSQL fallback', { phone: maskForLogging(phone, 2, 4), durationMs: Date.now() - fetchStart });
-        }
-      } catch (dbError: any) {
-        logger.error('PostgreSQL OTP fallback also failed', { 
-          error: dbError.message,
-          phone: maskForLogging(phone, 2, 4) 
-        });
+    const verifyResult = await otpChallengeService.verifyChallenge({
+      otp,
+      redisKey: key,
+      dbKey: { phone, role },
+      verifyLockKey: REDIS_KEYS.OTP_VERIFY_LOCK(phone, role),
+      hashStrategy: 'sha256',
+      logContext: { phone: maskForLogging(phone, 2, 4), role }
+    });
+
+    if (!verifyResult.ok) {
+      const failed = verifyResult as Exclude<typeof verifyResult, { ok: true }>;
+      switch (failed.code) {
+        case 'OTP_VERIFY_IN_PROGRESS':
+          throw new AppError(409, 'OTP_VERIFY_IN_PROGRESS', 'OTP verification already in progress. Please try again.');
+        case 'OTP_EXPIRED':
+          throw new AppError(400, 'OTP_EXPIRED', 'OTP has expired. Please request a new one.');
+        case 'MAX_ATTEMPTS':
+          throw new AppError(400, 'MAX_ATTEMPTS', 'Too many failed attempts. Please request a new OTP.');
+        case 'OTP_INVALID':
+          if (typeof failed.attemptsRemaining === 'number') {
+            const remaining = failed.attemptsRemaining;
+            throw new AppError(400, 'INVALID_OTP', `Invalid OTP. ${remaining} attempt${remaining !== 1 ? 's' : ''} remaining.`);
+          }
+          throw new AppError(400, 'INVALID_OTP', 'Invalid or expired OTP. Please request a new one.');
+        case 'OTP_NOT_FOUND':
+        default:
+          throw new AppError(400, 'INVALID_OTP', 'Invalid or expired OTP. Please request a new one.');
       }
     }
-    
-    // Check if OTP exists
-    if (!stored) {
-      logger.warn('OTP verification failed - no OTP found', { 
-        phone: maskForLogging(phone, 2, 4), 
-        role 
-      });
-      throw new AppError(400, 'INVALID_OTP', 'Invalid or expired OTP. Please request a new one.');
-    }
-    
-    // Check if OTP is expired
-    if (new Date() > new Date(stored.expiresAt)) {
-      await Promise.allSettled([
-        redisService.del(key),
-        db.prisma?.$executeRawUnsafe(`DELETE FROM "OtpStore" WHERE phone = $1 AND role = $2`, phone, role)
-      ]);
-      logger.warn('OTP verification failed - expired', { 
-        phone: maskForLogging(phone, 2, 4), 
-        role 
-      });
-      throw new AppError(400, 'OTP_EXPIRED', 'OTP has expired. Please request a new one.');
-    }
-    
-    // Check attempts — DB is source of truth; Redis is a faster counter that must never go below DB value
-    const maxAttempts = config.otp.maxAttempts;
-    let currentAttempts = stored.attempts || 0;
-    const redisAttempts = await redisService.getOtpAttempts(key).catch(() => 0);
-    if (redisAttempts > 0) {
-      currentAttempts = Math.max(currentAttempts, redisAttempts);
-    }
-    
-    if (currentAttempts >= maxAttempts) {
-      await Promise.allSettled([
-        redisService.deleteOtpWithAttempts(key),
-        db.prisma?.$executeRawUnsafe(`DELETE FROM "OtpStore" WHERE phone = $1 AND role = $2`, phone, role)
-      ]);
-      logger.warn('OTP verification failed - max attempts exceeded', { 
-        phone: maskForLogging(phone, 2, 4), 
-        role,
-        attempts: currentAttempts
-      });
-      throw new AppError(400, 'MAX_ATTEMPTS', 'Too many failed attempts. Please request a new OTP.');
-    }
-    
-    // Verify OTP — hash input and compare with stored hash (timing-safe)
-    const inputHash = crypto.createHash('sha256').update(otp).digest('hex');
-    const isValid = crypto.timingSafeEqual(Buffer.from(inputHash), Buffer.from(stored.otp));
-    
-    if (!isValid) {
-      let attemptsRemaining = maxAttempts - currentAttempts - 1;
-      let maxReached = false;
-      
-      try {
-        const attemptResult = await redisService.incrementOtpAttempts(key, maxAttempts);
-        attemptsRemaining = attemptResult.remaining;
-        maxReached = !attemptResult.allowed;
-      } catch {
-        maxReached = attemptsRemaining <= 0;
-      }
-      
-      // Always increment DB attempts (cross-task consistency)
-      try {
-        await db.prisma?.$executeRawUnsafe(
-          `UPDATE "OtpStore" SET attempts = attempts + 1 WHERE phone = $1 AND role = $2`,
-          phone, role
-        );
-      } catch { /* best effort */ }
-      
-      logger.warn('OTP verification failed - invalid OTP', { 
-        phone: maskForLogging(phone, 2, 4), 
-        role,
-        attemptsRemaining
-      });
-      
-      if (maxReached) {
-        await Promise.allSettled([
-          redisService.deleteOtpWithAttempts(key),
-          db.prisma?.$executeRawUnsafe(`DELETE FROM "OtpStore" WHERE phone = $1 AND role = $2`, phone, role)
-        ]);
-        throw new AppError(400, 'MAX_ATTEMPTS', 'Too many failed attempts. Please request a new OTP.');
-      }
-      
-      throw new AppError(400, 'INVALID_OTP', `Invalid OTP. ${attemptsRemaining} attempt${attemptsRemaining !== 1 ? 's' : ''} remaining.`);
-    }
-    
-    // OTP verified - delete from BOTH Redis and PostgreSQL (single use)
-    const deleteStart = Date.now();
-    await Promise.allSettled([
-      redisService.deleteOtpWithAttempts(key),
-      db.prisma?.$executeRawUnsafe(
-        `DELETE FROM "OtpStore" WHERE phone = $1 AND role = $2`,
-        phone, role
-      )
-    ]);
-    logger.info('OTP cleanup completed (Redis + DB)', { phone: maskForLogging(phone, 2, 4), durationMs: Date.now() - deleteStart });
     
     // Find or create user in DATABASE
     let dbUser: any = null;

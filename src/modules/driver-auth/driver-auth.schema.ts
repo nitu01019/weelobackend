@@ -15,35 +15,24 @@
  */
 
 import { z } from 'zod';
+import { otpSchema, phoneSchema } from '../../shared/utils/validation.utils';
 
 /**
  * Schema for sending OTP to transporter for driver login
  * Driver provides their phone, OTP goes to their transporter
  */
 export const sendDriverOtpSchema = z.object({
-  body: z.object({
-    driverPhone: z.string()
-      .min(10, 'Phone number must be at least 10 digits')
-      .max(15, 'Phone number too long')
-      .regex(/^[0-9]+$/, 'Phone number must contain only digits'),
-  }),
-});
+  driverPhone: phoneSchema
+}).strict();
 
 /**
  * Schema for verifying OTP and logging in driver
  */
 export const verifyDriverOtpSchema = z.object({
-  body: z.object({
-    driverPhone: z.string()
-      .min(10, 'Phone number must be at least 10 digits')
-      .max(15, 'Phone number too long')
-      .regex(/^[0-9]+$/, 'Phone number must contain only digits'),
-    otp: z.string()
-      .length(6, 'OTP must be 6 digits')
-      .regex(/^[0-9]+$/, 'OTP must contain only digits'),
-  }),
-});
+  driverPhone: phoneSchema,
+  otp: otpSchema,
+}).strict();
 
 // Type exports for use in controller/service
-export type SendDriverOtpInput = z.infer<typeof sendDriverOtpSchema>['body'];
-export type VerifyDriverOtpInput = z.infer<typeof verifyDriverOtpSchema>['body'];
+export type SendDriverOtpInput = z.infer<typeof sendDriverOtpSchema>;
+export type VerifyDriverOtpInput = z.infer<typeof verifyDriverOtpSchema>;
