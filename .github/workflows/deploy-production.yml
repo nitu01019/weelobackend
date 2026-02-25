@@ -122,8 +122,7 @@ jobs:
 
             # Check for rollback/circuit-breaker on the CURRENT primary deployment only.
             # Older FAILED active deployments can remain in history and should not fail this run.
-            PRIMARY_FAILED=$(echo "$SERVICE_JSON" | python3 -c "import json,sys; s=json.load(sys.stdin); d=next((x for x in s.get('deployments',[]) if x.get('status')=='PRIMARY'),{}); print(d.get('rolloutState')=='FAILED')")
-            if [ "$PRIMARY_FAILED" = "True" ]; then
+            if [ "$PRIMARY_STATE" = "FAILED" ]; then
               echo "❌ ECS circuit breaker triggered — deployment FAILED and rolled back"
               echo "📋 Recent ECS service events:"
               aws ecs describe-services \
