@@ -1335,23 +1335,38 @@ class PrismaDatabaseService {
   // ==========================================================================
 
   async getStats() {
-    const [users, vehicles, bookings, assignments] = await Promise.all([
-      this.prisma.user.findMany(),
-      this.prisma.vehicle.findMany(),
-      this.prisma.booking.findMany(),
-      this.prisma.assignment.findMany(),
+    const [
+      users,
+      customers,
+      transporters,
+      drivers,
+      vehicles,
+      activeVehicles,
+      bookings,
+      activeBookings,
+      assignments
+    ] = await Promise.all([
+      this.prisma.user.count(),
+      this.prisma.user.count({ where: { role: 'customer' } }),
+      this.prisma.user.count({ where: { role: 'transporter' } }),
+      this.prisma.user.count({ where: { role: 'driver' } }),
+      this.prisma.vehicle.count(),
+      this.prisma.vehicle.count({ where: { isActive: true } }),
+      this.prisma.booking.count(),
+      this.prisma.booking.count({ where: { status: 'active' } }),
+      this.prisma.assignment.count(),
     ]);
 
     return {
-      users: users.length,
-      customers: users.filter(u => u.role === 'customer').length,
-      transporters: users.filter(u => u.role === 'transporter').length,
-      drivers: users.filter(u => u.role === 'driver').length,
-      vehicles: vehicles.length,
-      activeVehicles: vehicles.filter(v => v.isActive).length,
-      bookings: bookings.length,
-      activeBookings: bookings.filter(b => b.status === 'active').length,
-      assignments: assignments.length,
+      users,
+      customers,
+      transporters,
+      drivers,
+      vehicles,
+      activeVehicles,
+      bookings,
+      activeBookings,
+      assignments,
       dbType: 'PostgreSQL (Prisma)',
     };
   }

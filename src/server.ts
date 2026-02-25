@@ -267,37 +267,48 @@ app.use(rateLimiter);
 // HEALTH CHECK
 // =============================================================================
 
-app.get('/health', async (_req, res) => {
-  const stats = await db.getStats();
-  const socketAdapter = getRedisAdapterStatus();
-  res.json({
-    status: 'healthy',
-    timestamp: new Date().toISOString(),
-    environment: config.nodeEnv,
-    version: '1.0.0',
-    connectedUsers: getConnectedUserCount(),
-    database: {
-      path: stats.dbPath,
-      users: stats.users,
-      vehicles: stats.vehicles,
-      bookings: stats.bookings,
-      assignments: stats.assignments
-    },
-    redis: {
-      connected: redisService.isConnected(),
-      mode: redisService.isRedisEnabled() ? 'redis' : 'memory'
-    },
-    socket: {
+app.get('/health/runtime', async (_req, res) => {
+  try {
+    const stats = await db.getStats();
+    const socketAdapter = getRedisAdapterStatus();
+    res.json({
+      status: 'healthy',
+      timestamp: new Date().toISOString(),
+      environment: config.nodeEnv,
+      version: '1.0.0',
       connectedUsers: getConnectedUserCount(),
-      adapter: socketAdapter
-    },
-    security: {
-      helmet: true,
-      rateLimiting: true,
-      inputSanitization: true,
-      xssProtection: true
-    }
-  });
+      database: {
+        users: stats.users,
+        vehicles: stats.vehicles,
+        bookings: stats.bookings,
+        assignments: stats.assignments
+      },
+      redis: {
+        connected: redisService.isConnected(),
+        mode: redisService.isRedisEnabled() ? 'redis' : 'memory'
+      },
+      socket: {
+        connectedUsers: getConnectedUserCount(),
+        adapter: socketAdapter
+      },
+      security: {
+        helmet: true,
+        rateLimiting: true,
+        inputSanitization: true,
+        xssProtection: true
+      }
+    });
+  } catch (error) {
+    logger.warn('Runtime health stats unavailable', { error: error instanceof Error ? error.message : String(error) });
+    res.status(200).json({
+      status: 'healthy',
+      timestamp: new Date().toISOString(),
+      environment: config.nodeEnv,
+      version: '1.0.0',
+      connectedUsers: getConnectedUserCount(),
+      database: { unavailable: true }
+    });
+  }
 });
 
 // =============================================================================
@@ -435,7 +446,25 @@ server.listen(PORT, '0.0.0.0', async () => {
   server.keepAliveTimeout = 65000;  // 65s > ALB idle timeout (60s)
   server.headersTimeout = 66000;    // 66s > keepAliveTimeout
 
-  const stats = await db.getStats();
+  let stats: Awaited<ReturnType<typeof db.getStats>> = {
+    users: 0,
+    customers: 0,
+    transporters: 0,
+    drivers: 0,
+    vehicles: 0,
+    activeVehicles: 0,
+    bookings: 0,
+    activeBookings: 0,
+    assignments: 0,
+    dbType: 'unknown'
+  };
+  try {
+    stats = await db.getStats();
+  } catch (error) {
+    logger.warn('Startup stats unavailable; continuing server boot', {
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
   const protocol = isHttps ? 'https' : 'http';
   const securityStatus = isHttps ? '🔒 SECURE (TLS 1.2+)' : '⚠️  HTTP (dev only)';
 
