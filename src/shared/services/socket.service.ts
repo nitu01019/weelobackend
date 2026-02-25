@@ -61,7 +61,7 @@ const SERVER_INSTANCE_ID = `server_${process.pid}_${Date.now().toString(36)}`;
 
 // Flag to track if Redis adapter is initialized
 let redisPubSubInitialized = false;
-let redisAdapterMode: 'enabled' | 'disabled' | 'disabled_by_config' | 'failed' = 'disabled';
+let redisAdapterMode: 'enabled' | 'disabled' | 'disabled_by_config' | 'disabled_by_capability' | 'failed' = 'disabled';
 let redisAdapterLastError: string | null = null;
 const SOCKET_EVENT_VERSION = 1;
 const SOCKET_MULTI_ROOM_EMIT_CHUNK_SIZE = Math.max(
@@ -489,6 +489,32 @@ async function setupRedisAdapter(socketServer: Server): Promise<void> {
   }
 
   try {
+    // Preflight capability probe: some managed Redis modes do not support pub/sub
+    // commands required by Socket.IO adapter (PSUBSCRIBE/PUBLISH).
+    const probeClient = new Redis(redisUrl, { lazyConnect: true });
+    probeClient.on('error', (err: Error) => {
+      logger.warn(`[Socket] Redis probe client error: ${err.message}`);
+    });
+    try {
+      await probeClient.connect();
+      await probeClient.psubscribe('__weelo_socket_probe__');
+      await probeClient.punsubscribe('__weelo_socket_probe__');
+    } catch (probeError: any) {
+      const message = probeError?.message || 'unknown';
+      redisPubSubInitialized = false;
+      redisAdapterMode = 'disabled_by_capability';
+      redisAdapterLastError = message;
+      logger.warn(`[Socket] Redis pub/sub unsupported in this environment (${message})`);
+      logger.warn('[Socket] Running without Redis adapter; cross-instance socket fanout disabled');
+      return;
+    } finally {
+      try {
+        await probeClient.quit();
+      } catch {
+        probeClient.disconnect();
+      }
+    }
+
     const pubClient = new Redis(redisUrl, { lazyConnect: true });
     const subClient = new Redis(redisUrl, { lazyConnect: true });
 
@@ -723,7 +749,7 @@ export function emitToAllTransporters(event: string, data: any): void {
 
 export function getRedisAdapterStatus(): {
   enabled: boolean;
-  mode: 'enabled' | 'disabled' | 'disabled_by_config' | 'failed';
+  mode: 'enabled' | 'disabled' | 'disabled_by_config' | 'disabled_by_capability' | 'failed';
   lastError: string | null;
 } {
   return {
