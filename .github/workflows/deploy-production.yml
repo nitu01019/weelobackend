@@ -78,17 +78,19 @@ jobs:
       - name: Deploy to ECS
         run: |
           echo "🚀 Deploying ${{ steps.image-tag.outputs.tag }} to ECS..."
+          HEALTH_GRACE_SECONDS=180
           aws ecs update-service \
             --cluster ${{ env.ECS_CLUSTER }} \
             --service ${{ env.ECS_SERVICE }} \
             --force-new-deployment \
+            --health-check-grace-period-seconds $HEALTH_GRACE_SECONDS \
             --region ${{ env.AWS_REGION }} > /dev/null
-          echo "✅ ECS deployment triggered"
+          echo "✅ ECS deployment triggered (healthCheckGrace=${HEALTH_GRACE_SECONDS}s)"
 
       - name: Wait for ECS service to stabilize
         run: |
           echo "⏳ Waiting for ECS service to stabilize (rolling deploy)..."
-          MAX_RETRIES=30
+          MAX_RETRIES=90
           SLEEP_SECONDS=20
           ATTEMPT=0
 
@@ -122,6 +124,20 @@ jobs:
             ROLLBACK=$(echo "$SERVICE_JSON" | python3 -c "import json,sys; s=json.load(sys.stdin); print(any(d.get('rolloutState')=='FAILED' for d in s['deployments']))")
             if [ "$ROLLBACK" = "True" ]; then
               echo "❌ ECS circuit breaker triggered — deployment FAILED and rolled back"
+              exit 1
+            fi
+
+            # Fail fast on explicit unhealthy task events to avoid waiting full timeout.
+            UNHEALTHY_EVENT=$(echo "$SERVICE_JSON" | python3 -c "import json,sys; s=json.load(sys.stdin); events=s.get('events',[]); print(any('is unhealthy in (target-group' in (e.get('message','')) for e in events[:12]))")
+            if [ "$UNHEALTHY_EVENT" = "True" ]; then
+              echo "❌ ECS reported unhealthy target-group task events during rollout"
+              echo "📋 Recent ECS service events:"
+              aws ecs describe-services \
+                --cluster ${{ env.ECS_CLUSTER }} \
+                --services ${{ env.ECS_SERVICE }} \
+                --region ${{ env.AWS_REGION }} \
+                --query 'services[0].events[0:12].[createdAt,message]' \
+                --output table || true
               exit 1
             fi
 
