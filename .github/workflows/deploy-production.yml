@@ -79,13 +79,15 @@ jobs:
         run: |
           echo "🚀 Deploying ${{ steps.image-tag.outputs.tag }} to ECS..."
           HEALTH_GRACE_SECONDS=180
+          DEPLOY_START_EPOCH=$(date +%s)
+          echo "DEPLOY_START_EPOCH=$DEPLOY_START_EPOCH" >> $GITHUB_ENV
           aws ecs update-service \
             --cluster ${{ env.ECS_CLUSTER }} \
             --service ${{ env.ECS_SERVICE }} \
             --force-new-deployment \
             --health-check-grace-period-seconds $HEALTH_GRACE_SECONDS \
             --region ${{ env.AWS_REGION }} > /dev/null
-          echo "✅ ECS deployment triggered (healthCheckGrace=${HEALTH_GRACE_SECONDS}s)"
+          echo "✅ ECS deployment triggered (healthCheckGrace=${HEALTH_GRACE_SECONDS}s, startEpoch=${DEPLOY_START_EPOCH})"
 
       - name: Wait for ECS service to stabilize
         run: |
@@ -109,6 +111,7 @@ jobs:
             RUNNING=$(echo "$SERVICE_JSON" | python3 -c "import json,sys; s=json.load(sys.stdin); print(s['runningCount'])")
             DESIRED=$(echo "$SERVICE_JSON" | python3 -c "import json,sys; s=json.load(sys.stdin); print(s['desiredCount'])")
             PENDING=$(echo "$SERVICE_JSON" | python3 -c "import json,sys; s=json.load(sys.stdin); print(s.get('pendingCount', 0))")
+            PRIMARY_ID=$(echo "$SERVICE_JSON" | python3 -c "import json,sys; s=json.load(sys.stdin); d=next((x for x in s.get('deployments',[]) if x.get('status')=='PRIMARY'),{}); print(d.get('id',''))")
             PRIMARY_STATE=$(echo "$SERVICE_JSON" | python3 -c "import json,sys; s=json.load(sys.stdin); d=next((x for x in s.get('deployments',[]) if x.get('status')=='PRIMARY'),{}); print(d.get('rolloutState','UNKNOWN'))")
             DEPLOYMENTS_STATE=$(echo "$SERVICE_JSON" | python3 -c "import json,sys; s=json.load(sys.stdin); print(' | '.join([f\"{d.get('status')}:{d.get('rolloutState','UNKNOWN')} running={d.get('runningCount')}/{d.get('desiredCount')}\" for d in s.get('deployments',[])]))")
 
@@ -134,10 +137,11 @@ jobs:
               exit 1
             fi
 
-            # Fail fast on explicit unhealthy task events to avoid waiting full timeout.
-            UNHEALTHY_EVENT=$(echo "$SERVICE_JSON" | python3 -c "import json,sys; s=json.load(sys.stdin); events=s.get('events',[]); print(any('is unhealthy in (target-group' in (e.get('message','')) for e in events[:12]))")
-            if [ "$UNHEALTHY_EVENT" = "True" ]; then
-              echo "❌ ECS reported unhealthy target-group task events during rollout"
+            # Fail fast only for deployment-failed events that match CURRENT primary deployment
+            # and happened after this workflow's deploy trigger time.
+            CURRENT_DEPLOY_FAILED_EVENT=$(echo "$SERVICE_JSON" | python3 -c "import json,sys,datetime; s=json.load(sys.stdin); pid='''$PRIMARY_ID'''.strip(); cutoff=int('''${DEPLOY_START_EPOCH:-0}'''); to_epoch=lambda ts:int(datetime.datetime.fromisoformat(ts.replace('Z','+00:00')).timestamp()) if ts else 0; print(any((pid and pid in e.get('message','') and 'deployment failed' in e.get('message','') and to_epoch(e.get('createdAt',''))>=cutoff) for e in s.get('events',[])[:25]))")
+            if [ "$CURRENT_DEPLOY_FAILED_EVENT" = "True" ]; then
+              echo "❌ ECS reported deployment failure for current primary deployment: $PRIMARY_ID"
               echo "📋 Recent ECS service events:"
               aws ecs describe-services \
                 --cluster ${{ env.ECS_CLUSTER }} \
@@ -214,5 +218,22 @@ jobs:
           echo "  aws ecs describe-services --cluster ${{ env.ECS_CLUSTER }} --services ${{ env.ECS_SERVICE }} --region ${{ env.AWS_REGION }}"
           echo "  Check logs:"
           echo "  aws logs tail weelobackendtask --follow --region ${{ env.AWS_REGION }}"
+          echo ""
+          echo "  Recent stopped tasks (diagnostic):"
+          TASK_ARNS=$(aws ecs list-tasks \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service-name ${{ env.ECS_SERVICE }} \
+            --desired-status STOPPED \
+            --region ${{ env.AWS_REGION }} \
+            --query 'taskArns[0:5]' \
+            --output text || true)
+          if [ -n "$TASK_ARNS" ]; then
+            aws ecs describe-tasks \
+              --cluster ${{ env.ECS_CLUSTER }} \
+              --tasks $TASK_ARNS \
+              --region ${{ env.AWS_REGION }} \
+              --query 'tasks[].{taskArn:taskArn,lastStatus:lastStatus,stopCode:stopCode,stoppedReason:stoppedReason,containers:containers[].{name:name,exitCode:exitCode,reason:reason,lastStatus:lastStatus}}' \
+              --output table || true
+          fi
           echo "=========================================="
           echo "  ECS circuit breaker will auto-rollback to last stable task definition."
