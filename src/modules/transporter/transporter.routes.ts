@@ -474,7 +474,7 @@ router.post(
         return;
       }
 
-      // Get transporter's vehicles to determine vehicleKey
+      // Get transporter's vehicles to determine availability index keys
       const vehicles = await db.getVehiclesByTransporter(user.userId);
 
       if (vehicles.length === 0) {
@@ -488,10 +488,11 @@ router.post(
         return;
       }
 
-      // Use specified vehicle or first available
+      // Use specified vehicle or first active/available for response primary context.
+      const activeVehicles = vehicles.filter(v => v.isActive);
       const vehicle = vehicleId
         ? vehicles.find(v => v.id === vehicleId)
-        : vehicles.find(v => v.isActive && v.status === 'available') || vehicles[0];
+        : activeVehicles.find(v => v.status === 'available') || activeVehicles[0] || vehicles[0];
 
       if (!vehicle) {
         res.status(400).json({
@@ -504,19 +505,53 @@ router.post(
         return;
       }
 
-      // Generate vehicle key if not present (legacy vehicle)
+      // Build deduped fleet key set to support mixed-vehicle transporters.
+      const fleetVehiclesForIndex = activeVehicles.length > 0 ? activeVehicles : [vehicle];
+      const vehicleEntries: Array<{ vehicleKey: string; vehicleId: string }> = [];
+      const seenVehicleKeys = new Set<string>();
+      for (const currentVehicle of fleetVehiclesForIndex) {
+        const key = currentVehicle.vehicleKey || generateVehicleKey(
+          currentVehicle.vehicleType,
+          currentVehicle.vehicleSubtype
+        );
+        if (seenVehicleKeys.has(key)) continue;
+        seenVehicleKeys.add(key);
+        vehicleEntries.push({
+          vehicleKey: key,
+          vehicleId: currentVehicle.id
+        });
+      }
+
+      // Generate vehicle key for primary response payload.
       const vehicleKey = vehicle.vehicleKey || generateVehicleKey(vehicle.vehicleType, vehicle.vehicleSubtype);
 
-      // Update availability service (geohash-indexed)
-      availabilityService.updateAvailability({
-        transporterId: user.userId,
-        driverId: user.role === 'driver' ? user.userId : undefined,
-        vehicleKey,
-        vehicleId: vehicle.id,
-        latitude,
-        longitude,
-        isOnTrip: isOnTrip || false
-      });
+      // Update availability service (geospatial index + TTL) before acknowledging heartbeat.
+      try {
+        await availabilityService.updateAvailabilityForVehicleKeysAsync({
+          transporterId: user.userId,
+          driverId: user.role === 'driver' ? user.userId : undefined,
+          vehicleEntries,
+          latitude,
+          longitude,
+          isOnTrip: isOnTrip || false
+        });
+      } catch (availabilityError: any) {
+        logger.error('[TRANSPORTER HEARTBEAT] Availability sync failed', {
+          userId: user.userId,
+          vehicleId: vehicle.id,
+          vehicleKey,
+          indexedVehicleKeys: vehicleEntries.length,
+          error: availabilityError?.message || 'unknown'
+        });
+        res.status(503).json({
+          success: false,
+          error: {
+            code: 'HEARTBEAT_SYNC_FAILED',
+            message: 'Unable to sync transporter availability. Please retry.'
+          }
+        });
+        return;
+      }
 
       // =====================================================================
       // REFRESH TRANSPORTER PRESENCE KEY (Toggle-based online tracking)
@@ -557,6 +592,7 @@ router.post(
           registered: true,
           vehicleKey,
           vehicleId: vehicle.id,
+          indexedVehicleKeys: vehicleEntries.length,
           isOnTrip: isOnTrip || false,
           nextHeartbeatMs: availabilityService.HEARTBEAT_INTERVAL_MS
         }

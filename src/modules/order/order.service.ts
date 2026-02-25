@@ -38,6 +38,8 @@ import { transporterOnlineService } from '../../shared/services/transporter-onli
 import { routingService } from '../routing';
 import { redisService } from '../../shared/services/redis.service';
 import { pricingService } from '../pricing/pricing.service';
+import { AppError } from '../../shared/types/error.types';
+import { PROGRESSIVE_RADIUS_STEPS, progressiveRadiusMatcher } from './progressive-radius-matcher';
 
 // =============================================================================
 // CACHE KEYS & TTL (Optimized for fast lookups)
@@ -53,6 +55,8 @@ const CACHE_TTL = {
   ORDER: 60,            // 1 minute - order details
   ACTIVE_REQUESTS: 30   // 30 seconds - active requests list
 };
+
+const FF_BROADCAST_STRICT_SENT_ACCOUNTING = process.env.FF_BROADCAST_STRICT_SENT_ACCOUNTING !== 'false';
 
 // =============================================================================
 // TYPES
@@ -192,6 +196,11 @@ interface BroadcastRouteBreakdown {
   estimatedArrival?: string;
 }
 
+export interface ActiveTruckRequestOrderGroup {
+  order: OrderRecord;
+  requests: TruckRequestRecord[];
+}
+
 /**
  * Broadcast data sent to transporters via WebSocket
  * 
@@ -206,7 +215,7 @@ interface BroadcastRouteBreakdown {
  * @see Captain app: SocketIOService.kt -> handleNewBroadcast()
  */
 interface BroadcastData {
-  type: 'new_truck_request';
+  type: 'new_broadcast' | 'new_truck_request';
   orderId: string;
   truckRequestId: string;
   requestNumber: number;
@@ -269,10 +278,39 @@ class OrderService {
 
   // Timeout for broadcasts (1 minute - quick response needed)
   private readonly BROADCAST_TIMEOUT_MS = parseInt(process.env.BROADCAST_TIMEOUT_SECONDS || '120', 10) * 1000;
+  private readonly TRANSPORTER_FANOUT_QUEUE_ENABLED = (process.env.ORDER_TRANSPORTER_FANOUT_QUEUE_ENABLED || 'true') === 'true';
+  private readonly TRANSPORTER_FANOUT_SYNC_THRESHOLD = Math.max(
+    1,
+    parseInt(process.env.ORDER_TRANSPORTER_FANOUT_SYNC_THRESHOLD || '64', 10) || 64
+  );
+  private readonly TRANSPORTER_FANOUT_CHUNK_SIZE = Math.max(
+    25,
+    parseInt(process.env.ORDER_TRANSPORTER_FANOUT_QUEUE_CHUNK_SIZE || '500', 10) || 500
+  );
+  private readonly ORDER_EXPIRY_TIMER_PREFIX = 'timer:order-expiry:';
+  private readonly ORDER_STEP_TIMER_PREFIX = 'timer:order-broadcast-step:';
+  private readonly ORDER_STEP_TIMER_LOCK_PREFIX = 'lock:order-broadcast-step:';
+
+  private orderExpiryTimerKey(orderId: string): string {
+    return `${this.ORDER_EXPIRY_TIMER_PREFIX}${orderId}`;
+  }
+
+  private orderBroadcastStepTimerKey(
+    orderId: string,
+    vehicleType: string,
+    vehicleSubtype: string,
+    stepIndex: number
+  ): string {
+    return `${this.ORDER_STEP_TIMER_PREFIX}${orderId}:${vehicleType}:${vehicleSubtype}:${stepIndex}`;
+  }
+
+  private notifiedTransportersKey(orderId: string, vehicleType: string, vehicleSubtype: string): string {
+    return `order:notified:transporters:${orderId}:${generateVehicleKey(vehicleType, vehicleSubtype)}`;
+  }
 
   // Redis key patterns for distributed timers
   private readonly TIMER_KEYS = {
-    ORDER_EXPIRY: (orderId: string) => `timer:order:${orderId}`,
+    ORDER_EXPIRY: (orderId: string) => this.orderExpiryTimerKey(orderId)
   };
 
   // ===========================================================================
@@ -852,338 +890,441 @@ class OrderService {
     expiresAt: string,
     resolvedPickup: { latitude: number; longitude: number; address: string; city?: string; state?: string }
   ): Promise<void> {
+    const requestsByType = this.buildRequestsByType(truckRequests);
 
-    // Group requests by vehicle type for efficient broadcasting
+    for (const [typeKey, requests] of requestsByType) {
+      const [vehicleType, vehicleSubtype = ''] = typeKey.split('_');
+      const alreadyNotified = await this.getNotifiedTransporters(orderId, vehicleType, vehicleSubtype);
+      const stepCandidates = await progressiveRadiusMatcher.findCandidates({
+        pickupLat: resolvedPickup.latitude,
+        pickupLng: resolvedPickup.longitude,
+        vehicleType,
+        vehicleSubtype,
+        stepIndex: 0,
+        alreadyNotified
+      });
+      const targetTransporters = stepCandidates.map((candidate) => candidate.transporterId);
+
+      if (targetTransporters.length > 0) {
+        const sendResult = await this.broadcastVehicleTypePayload(
+          orderId,
+          request,
+          truckRequests,
+          requestsByType,
+          requests,
+          vehicleType,
+          vehicleSubtype,
+          targetTransporters,
+          expiresAt
+        );
+        await this.markTransportersNotified(orderId, vehicleType, vehicleSubtype, sendResult.sentTransporters);
+      } else {
+        logger.warn(`⚠️ No transporters found for ${vehicleType} (${vehicleSubtype}) in step 10km`);
+      }
+
+      // Always schedule the next step for unresolved demand.
+      // When demand is fulfilled before the timer fires, step processing exits early.
+      await this.scheduleNextProgressiveStep(orderId, vehicleType, vehicleSubtype, 1);
+    }
+  }
+
+  private async processProgressiveBroadcastStep(timerData: {
+    orderId: string;
+    vehicleType: string;
+    vehicleSubtype: string;
+    stepIndex: number;
+  }): Promise<void> {
+    const step = PROGRESSIVE_RADIUS_STEPS[timerData.stepIndex];
+    if (!step) return;
+
+    const order = await db.getOrderById(timerData.orderId);
+    if (!order) return;
+    if (!['created', 'broadcasting', 'active', 'partially_filled'].includes(order.status)) {
+      return;
+    }
+
+    const truckRequests = await db.getTruckRequestsByOrder(timerData.orderId);
+    const activeRequestsForType = truckRequests.filter((request) => {
+      return request.status === 'searching' &&
+        request.vehicleType === timerData.vehicleType &&
+        request.vehicleSubtype === timerData.vehicleSubtype;
+    });
+    if (activeRequestsForType.length === 0) return;
+
+    const alreadyNotified = await this.getNotifiedTransporters(
+      timerData.orderId,
+      timerData.vehicleType,
+      timerData.vehicleSubtype
+    );
+    const stepCandidates = await progressiveRadiusMatcher.findCandidates({
+      pickupLat: order.pickup.latitude,
+      pickupLng: order.pickup.longitude,
+      vehicleType: timerData.vehicleType,
+      vehicleSubtype: timerData.vehicleSubtype,
+      stepIndex: timerData.stepIndex,
+      alreadyNotified
+    });
+    const targetTransporters = stepCandidates.map((candidate) => candidate.transporterId);
+
+    if (targetTransporters.length === 0) {
+      await this.scheduleNextProgressiveStep(
+        timerData.orderId,
+        timerData.vehicleType,
+        timerData.vehicleSubtype,
+        timerData.stepIndex + 1
+      );
+      return;
+    }
+
+    const requestFromOrder: CreateOrderRequest = {
+      customerId: order.customerId,
+      customerName: order.customerName,
+      customerPhone: order.customerPhone,
+      routePoints: order.routePoints,
+      pickup: order.pickup,
+      drop: order.drop,
+      distanceKm: order.distanceKm,
+      vehicleRequirements: [],
+      goodsType: order.goodsType,
+      cargoWeightKg: order.cargoWeightKg
+    };
+
+    const requestsByType = this.buildRequestsByType(truckRequests);
+    const sendResult = await this.broadcastVehicleTypePayload(
+      timerData.orderId,
+      requestFromOrder,
+      truckRequests,
+      requestsByType,
+      activeRequestsForType,
+      timerData.vehicleType,
+      timerData.vehicleSubtype,
+      targetTransporters,
+      order.expiresAt
+    );
+    await this.markTransportersNotified(
+      timerData.orderId,
+      timerData.vehicleType,
+      timerData.vehicleSubtype,
+      sendResult.sentTransporters
+    );
+
+    await this.scheduleNextProgressiveStep(
+      timerData.orderId,
+      timerData.vehicleType,
+      timerData.vehicleSubtype,
+      timerData.stepIndex + 1
+    );
+  }
+
+  private async scheduleNextProgressiveStep(
+    orderId: string,
+    vehicleType: string,
+    vehicleSubtype: string,
+    stepIndex: number
+  ): Promise<void> {
+    const step = PROGRESSIVE_RADIUS_STEPS[stepIndex];
+    if (!step) return;
+
+    const timerKey = this.orderBroadcastStepTimerKey(orderId, vehicleType, vehicleSubtype, stepIndex);
+    const alreadyScheduled = await redisService.hasTimer(timerKey).catch(() => false);
+    if (alreadyScheduled) return;
+
+    await redisService.setTimer(
+      timerKey,
+      {
+        orderId,
+        vehicleType,
+        vehicleSubtype,
+        stepIndex,
+        scheduledAtMs: Date.now(),
+        stepWindowMs: step.windowMs
+      },
+      new Date(Date.now() + step.windowMs)
+    );
+  }
+
+  private buildRequestsByType(requests: TruckRequestRecord[]): Map<string, TruckRequestRecord[]> {
     const requestsByType = new Map<string, TruckRequestRecord[]>();
-
-    for (const tr of truckRequests) {
-      const key = `${tr.vehicleType}_${tr.vehicleSubtype}`;
+    for (const request of requests) {
+      const key = `${request.vehicleType}_${request.vehicleSubtype}`;
       if (!requestsByType.has(key)) {
         requestsByType.set(key, []);
       }
-      requestsByType.get(key)!.push(tr);
+      requestsByType.get(key)!.push(request);
+    }
+    return requestsByType;
+  }
+
+  private async getNotifiedTransporters(orderId: string, vehicleType: string, vehicleSubtype: string): Promise<Set<string>> {
+    const key = this.notifiedTransportersKey(orderId, vehicleType, vehicleSubtype);
+    const members = await redisService.sMembers(key).catch(() => []);
+    return new Set(members);
+  }
+
+  private async markTransportersNotified(
+    orderId: string,
+    vehicleType: string,
+    vehicleSubtype: string,
+    transporterIds: string[]
+  ): Promise<void> {
+    if (transporterIds.length === 0) return;
+    const key = this.notifiedTransportersKey(orderId, vehicleType, vehicleSubtype);
+    await redisService.sAdd(key, ...transporterIds).catch(() => {});
+    const ttlSeconds = Math.ceil(this.BROADCAST_TIMEOUT_MS / 1000) + 120;
+    await redisService.expire(key, ttlSeconds).catch(() => {});
+  }
+
+  private async broadcastVehicleTypePayload(
+    orderId: string,
+    request: CreateOrderRequest,
+    truckRequests: TruckRequestRecord[],
+    requestsByType: Map<string, TruckRequestRecord[]>,
+    requests: TruckRequestRecord[],
+    vehicleType: string,
+    vehicleSubtype: string,
+    matchingTransporters: string[],
+    expiresAt: string
+  ): Promise<{ sentTransporters: string[]; skippedNoAvailable: number }> {
+    if (matchingTransporters.length === 0) {
+      return { sentTransporters: [], skippedNoAvailable: 0 };
     }
 
-    // Broadcast each vehicle type to matching transporters
-    for (const [typeKey, requests] of requestsByType) {
-      const [vehicleType, vehicleSubtype] = typeKey.split('_');
+    const firstRequest = requests[0];
+    const order = await db.getOrderById(orderId);
+    if (!order) {
+      logger.warn(`Order ${orderId} missing while broadcasting ${vehicleType}/${vehicleSubtype}`);
+      return { sentTransporters: [], skippedNoAvailable: 0 };
+    }
 
-      // =====================================================================
-      // PROXIMITY-BASED BATCH NOTIFY (Rapido-style optimization)
-      // =====================================================================
-      // 1. First try LIVE availability service (top 10 nearby by geohash)
-      // 2. If not enough, expand to database lookup
-      // 3. This reduces load and improves acceptance speed
-      // =====================================================================
+    const broadcastRoutePoints: BroadcastRoutePoint[] = order.routePoints?.map(point => ({
+      type: point.type,
+      latitude: point.latitude,
+      longitude: point.longitude,
+      address: point.address,
+      city: point.city,
+      stopIndex: point.stopIndex
+    })) || [];
+    const totalStops = broadcastRoutePoints.filter(point => point.type === 'STOP').length;
+    const pickupPoint = broadcastRoutePoints.find(point => point.type === 'PICKUP') || request.pickup;
+    const dropPoint = broadcastRoutePoints.find(point => point.type === 'DROP') || request.drop;
 
-      // Generate vehicle key for availability lookup
-      const vehicleKey = generateVehicleKey(vehicleType, vehicleSubtype);
-
-      // STEP 1: Try live availability service first (nearby transporters)
-      // =====================================================================
-      // CRITICAL FIX: Use resolvedPickup (always defined) instead of
-      // request.pickup (undefined when routePoints is used).
-      //
-      // CRITICAL FIX: Use ASYNC getAvailableTransportersAsync() instead of
-      // sync getAvailableTransporters() which ALWAYS returns [] because
-      // Redis operations are async. The sync version logs a warning and
-      // fires the async search in the background (results are lost).
-      // =====================================================================
-      let matchingTransporters: string[] = [];
-      const pickupLat = resolvedPickup.latitude;
-      const pickupLng = resolvedPickup.longitude;
-
-      // Get top 10 nearby from live availability (ASYNC — proper Redis GEORADIUS)
-      const nearbyTransporters = await availabilityService.getAvailableTransportersAsync(
-        vehicleKey,
-        pickupLat,
-        pickupLng,
-        10,  // Top 10 nearby first
-        50   // 50km radius
-      );
-
-      if (nearbyTransporters.length > 0) {
-        logger.info(`🎯 Found ${nearbyTransporters.length} NEARBY transporters from live availability`);
-        matchingTransporters = nearbyTransporters;
-      }
-
-      // STEP 2: If not enough nearby, fall back to database (all matching transporters)
-      if (matchingTransporters.length < 5) {
-        logger.info(`📡 Not enough nearby, expanding to database lookup...`);
-        const dbTransporters = await this.getTransportersByVehicleCached(vehicleType, vehicleSubtype);
-
-        // Merge: nearby first, then others (avoid duplicates)
-        const nearbySet = new Set(matchingTransporters);
-        const additionalTransporters = dbTransporters.filter(t => !nearbySet.has(t));
-        matchingTransporters = [...matchingTransporters, ...additionalTransporters];
-      }
-
-      if (matchingTransporters.length === 0) {
-        logger.warn(`⚠️ No transporters found for ${vehicleType} (${vehicleSubtype})`);
-        continue;
-      }
-
-      const nearbyCount = nearbyTransporters.length;
-      logger.info(`📢 Broadcasting ${requests.length}x ${vehicleType} (${vehicleSubtype}) to ${matchingTransporters.length} transporters (${nearbyCount} nearby first)`);
-
-      // Create broadcast data for this vehicle type
-      // Send the FIRST request of this type (others are same type, just different trucks)
-      const firstRequest = requests[0];
-
-      // Get order to access routePoints
-      const order = await db.getOrderById(orderId);
-
-      // Build routePoints for broadcast (with city info)
-      const broadcastRoutePoints: BroadcastRoutePoint[] = order?.routePoints?.map(point => ({
+    const routeBreakdownCalc = routingService.calculateRouteBreakdown(
+      order.routePoints?.map((point) => ({
         type: point.type,
         latitude: point.latitude,
         longitude: point.longitude,
         address: point.address,
         city: point.city,
         stopIndex: point.stopIndex
-      })) || [];
+      })) || [],
+      new Date()
+    );
 
-      // Count intermediate stops
-      const totalStops = broadcastRoutePoints.filter(p => p.type === 'STOP').length;
+    const routeBreakdown: BroadcastRouteBreakdown = {
+      legs: routeBreakdownCalc.legs.map((leg) => ({
+        fromIndex: leg.fromIndex,
+        toIndex: leg.toIndex,
+        fromType: leg.fromType,
+        toType: leg.toType,
+        fromAddress: leg.fromAddress,
+        toAddress: leg.toAddress,
+        fromCity: leg.fromCity,
+        toCity: leg.toCity,
+        distanceKm: leg.distanceKm,
+        durationMinutes: leg.durationMinutes,
+        durationFormatted: `${Math.floor(leg.durationMinutes / 60)} hrs ${leg.durationMinutes % 60} mins`,
+        etaMinutes: leg.etaToEndMinutes
+      })),
+      totalDistanceKm: routeBreakdownCalc.totalDistanceKm,
+      totalDurationMinutes: routeBreakdownCalc.totalDurationMinutes,
+      totalDurationFormatted: routeBreakdownCalc.totalDurationFormatted,
+      totalStops: routeBreakdownCalc.totalStops,
+      estimatedArrival: routeBreakdownCalc.estimatedArrival
+    };
 
-      // Get pickup and drop from routePoints or request
-      const pickupPoint = broadcastRoutePoints.find(p => p.type === 'PICKUP') || request.pickup;
-      const dropPoint = broadcastRoutePoints.find(p => p.type === 'DROP') || request.drop;
+    const broadcastData: BroadcastData = {
+      type: 'new_broadcast',
+      orderId,
+      truckRequestId: firstRequest.id,
+      requestNumber: firstRequest.requestNumber,
+      customerName: request.customerName,
+      routePoints: broadcastRoutePoints,
+      totalStops,
+      routeBreakdown,
+      pickup: {
+        latitude: pickupPoint?.latitude || 0,
+        longitude: pickupPoint?.longitude || 0,
+        address: pickupPoint?.address || '',
+        city: pickupPoint?.city
+      },
+      drop: {
+        latitude: dropPoint?.latitude || 0,
+        longitude: dropPoint?.longitude || 0,
+        address: dropPoint?.address || '',
+        city: dropPoint?.city
+      },
+      pickupAddress: pickupPoint?.address || '',
+      pickupCity: pickupPoint?.city || '',
+      dropAddress: dropPoint?.address || '',
+      dropCity: dropPoint?.city || '',
+      vehicleType,
+      vehicleSubtype,
+      pricePerTruck: firstRequest.pricePerTruck,
+      farePerTruck: firstRequest.pricePerTruck,
+      distanceKm: request.distanceKm,
+      distance: request.distanceKm,
+      goodsType: request.goodsType,
+      expiresAt,
+      createdAt: new Date().toISOString()
+    };
 
-      // =======================================================================
-      // CALCULATE ROUTE BREAKDOWN (ETA per leg)
-      // =======================================================================
-      const routeBreakdownCalc = routingService.calculateRouteBreakdown(
-        order?.routePoints?.map(p => ({
-          type: p.type,
-          latitude: p.latitude,
-          longitude: p.longitude,
-          address: p.address,
-          city: p.city,
-          stopIndex: p.stopIndex
-        })) || [],
-        new Date()  // Departure time = now
+    const requestedVehicles: any[] = [];
+    for (const [key, reqs] of requestsByType) {
+      const [requestVehicleType, requestVehicleSubtype] = key.split('_');
+      const first = reqs[0];
+      requestedVehicles.push({
+        vehicleType: requestVehicleType,
+        vehicleSubtype: requestVehicleSubtype || '',
+        count: reqs.length,
+        filledCount: reqs.filter((requestItem) => requestItem.status !== 'searching').length,
+        farePerTruck: first.pricePerTruck,
+        capacityTons: 0
+      });
+    }
+
+    const trucksStillNeeded = requests.length;
+    const extendedBroadcast = {
+      ...broadcastData,
+      broadcastId: orderId,
+      trucksNeededOfThisType: trucksStillNeeded,
+      trucksNeeded: trucksStillNeeded,
+      totalTrucksInOrder: truckRequests.length,
+      totalTrucksNeeded: truckRequests.length,
+      trucksFilled: truckRequests.filter((requestItem) => requestItem.status !== 'searching').length,
+      requestedVehicles
+    };
+
+    const availabilitySnapshot = await db.getTransportersAvailabilitySnapshot(vehicleType, vehicleSubtype) as Array<{
+      transporterId: string;
+      transporterName: string;
+      totalOwned: number;
+      available: number;
+      inTransit: number;
+    }>;
+    const availabilityMap = new Map(
+      availabilitySnapshot.map((item) => [item.transporterId, item])
+    );
+
+    const sentTransporters: string[] = [];
+    const enqueueAcceptedTransporters: string[] = [];
+    const enqueueFailedTransporters: string[] = [];
+    let skippedNoAvailable = 0;
+
+    const socketQueueJobs: Array<Promise<void>> = [];
+    for (const transporterId of matchingTransporters) {
+      const availability = availabilityMap.get(transporterId);
+      if (!availability || availability.available <= 0) {
+        skippedNoAvailable++;
+        continue;
+      }
+
+      const trucksYouCanProvide = Math.min(availability.available, trucksStillNeeded);
+      const personalizedBroadcast = {
+        ...extendedBroadcast,
+        trucksYouCanProvide,
+        maxTrucksYouCanProvide: trucksYouCanProvide,
+        yourAvailableTrucks: availability.available,
+        yourTotalTrucks: availability.totalOwned,
+        trucksStillNeeded,
+        trucksNeededOfThisType: trucksStillNeeded,
+        isPersonalized: true,
+        personalizedFor: transporterId
+      };
+
+      const enqueueStartedAt = Date.now();
+      socketQueueJobs.push(
+        queueService
+          .queueBroadcast(transporterId, 'new_broadcast', personalizedBroadcast)
+          .then(() => {
+            enqueueAcceptedTransporters.push(transporterId);
+            logger.info('broadcast.enqueue.accepted', {
+              orderId,
+              transporterId,
+              latencyMs: Date.now() - enqueueStartedAt
+            });
+          })
+          .catch((error) => {
+            enqueueFailedTransporters.push(transporterId);
+            const message = error instanceof Error ? error.message : String(error);
+            logger.warn(`Failed to queue broadcast for transporter ${transporterId}: ${message}`, {
+              orderId,
+              transporterId,
+              metric: 'broadcast.enqueue.failed',
+              latencyMs: Date.now() - enqueueStartedAt
+            });
+          })
       );
-
-      // Convert to broadcast format
-      const routeBreakdown: BroadcastRouteBreakdown = {
-        legs: routeBreakdownCalc.legs.map(leg => ({
-          fromIndex: leg.fromIndex,
-          toIndex: leg.toIndex,
-          fromType: leg.fromType,
-          toType: leg.toType,
-          fromAddress: leg.fromAddress,
-          toAddress: leg.toAddress,
-          fromCity: leg.fromCity,
-          toCity: leg.toCity,
-          distanceKm: leg.distanceKm,
-          durationMinutes: leg.durationMinutes,
-          durationFormatted: `${Math.floor(leg.durationMinutes / 60)} hrs ${leg.durationMinutes % 60} mins`,
-          etaMinutes: leg.etaToEndMinutes
-        })),
-        totalDistanceKm: routeBreakdownCalc.totalDistanceKm,
-        totalDurationMinutes: routeBreakdownCalc.totalDurationMinutes,
-        totalDurationFormatted: routeBreakdownCalc.totalDurationFormatted,
-        totalStops: routeBreakdownCalc.totalStops,
-        estimatedArrival: routeBreakdownCalc.estimatedArrival
-      };
-
-      logger.info(`📍 Route breakdown: ${routeBreakdown.totalDistanceKm} km, ${routeBreakdown.totalDurationFormatted}, ${routeBreakdown.legs.length} legs`);
-
-      // Build broadcast data compatible with Captain app's SocketIOService parser
-      // Captain app expects: pickupLocation/dropLocation OR pickup/drop (with fallbacks)
-      const broadcastData: BroadcastData = {
-        type: 'new_truck_request',
-        orderId,
-        truckRequestId: firstRequest.id,
-        requestNumber: firstRequest.requestNumber,
-        customerName: request.customerName,
-
-        // =====================================================================
-        // ROUTE POINTS (NEW - with intermediate stops)
-        // =====================================================================
-        routePoints: broadcastRoutePoints,
-        totalStops,
-
-        // =====================================================================
-        // ROUTE BREAKDOWN (NEW - ETA per leg)
-        // =====================================================================
-        routeBreakdown,
-
-        // Both formats for maximum compatibility
-        pickup: {
-          latitude: pickupPoint?.latitude || 0,
-          longitude: pickupPoint?.longitude || 0,
-          address: pickupPoint?.address || '',
-          city: pickupPoint?.city
-        },
-        drop: {
-          latitude: dropPoint?.latitude || 0,
-          longitude: dropPoint?.longitude || 0,
-          address: dropPoint?.address || '',
-          city: dropPoint?.city
-        },
-        // Captain app also looks for these flat fields
-        pickupAddress: pickupPoint?.address || '',
-        pickupCity: pickupPoint?.city || '',
-        dropAddress: dropPoint?.address || '',
-        dropCity: dropPoint?.city || '',
-        vehicleType,
-        vehicleSubtype,
-        pricePerTruck: firstRequest.pricePerTruck,
-        farePerTruck: firstRequest.pricePerTruck, // Alias for Captain app
-        distanceKm: request.distanceKm,
-        distance: request.distanceKm, // Alias for Captain app
-        goodsType: request.goodsType,
-        expiresAt,
-        createdAt: new Date().toISOString()
-      };
-
-      // Build requestedVehicles array with ALL vehicle types in the order
-      const requestedVehicles: any[] = [];
-      for (const [key, reqs] of requestsByType) {
-        const [vType, vSubtype] = key.split('_');
-        const firstReq = reqs[0];
-        requestedVehicles.push({
-          vehicleType: vType,
-          vehicleSubtype: vSubtype || '',
-          count: reqs.length,
-          filledCount: 0,
-          farePerTruck: firstReq.pricePerTruck,
-          capacityTons: 0
-        });
+      if (!FF_BROADCAST_STRICT_SENT_ACCOUNTING) {
+        sentTransporters.push(transporterId);
       }
+    }
 
-      // Also include how many trucks of this type are needed
-      // IMPORTANT: Include BOTH orderId AND broadcastId for Captain app compatibility
-      // Captain app checks broadcastId first, then falls back to orderId
-      const extendedBroadcast = {
-        ...broadcastData,
-        broadcastId: orderId,  // CRITICAL: Captain app expects this field!
-        trucksNeededOfThisType: requests.length,
-        trucksNeeded: requests.length,  // Alias for Captain app
-        totalTrucksInOrder: truckRequests.length,
-        totalTrucksNeeded: truckRequests.length,
-        trucksFilled: 0,  // For Captain app
-        requestedVehicles: requestedVehicles  // ALL vehicle types in the order!
-      };
+    if (socketQueueJobs.length > 0) {
+      await Promise.allSettled(socketQueueJobs);
+    }
 
-      logger.info(`📢 Including ${requestedVehicles.length} vehicle types in broadcast:`, requestedVehicles.map(rv => `${rv.vehicleType}/${rv.vehicleSubtype}:${rv.count}`));
+    if (FF_BROADCAST_STRICT_SENT_ACCOUNTING) {
+      sentTransporters.push(...enqueueAcceptedTransporters);
+    }
 
-      // =========================================================================
-      // PERSONALIZED BROADCAST - Each transporter sees their available capacity
-      // =========================================================================
-      // 
-      // CRITICAL: This is the core of partial fulfillment UX!
-      // 
-      // Rule: trucksYouCanProvide = MIN(transporter_available, trucks_still_needed)
-      // 
-      // Example (Order needs 5 "Open 17ft" trucks):
-      //   Transporter A (2 available) → sees "Request for 2 trucks"
-      //   Transporter B (1 available) → sees "Request for 1 truck"
-      //   Transporter C (10 available) → sees "Request for 5 trucks" (capped)
-      // 
-      // This ensures:
-      // 1. Transporters only see requests they can fulfill
-      // 2. No over-promising (can't accept more than they have)
-      // 3. Partial fulfillment is natural
-      // =========================================================================
-
-      const trucksStillNeeded = requests.length; // How many of this type are still searching
-
-      logger.info(`╔══════════════════════════════════════════════════════════════╗`);
-      logger.info(`║  📢 PERSONALIZED BROADCAST                                   ║`);
-      logger.info(`╠══════════════════════════════════════════════════════════════╣`);
-      logger.info(`║  Vehicle: ${vehicleType} ${vehicleSubtype}`);
-      logger.info(`║  Trucks Still Needed: ${trucksStillNeeded}`);
-      logger.info(`║  Matching Transporters: ${matchingTransporters.length}`);
-      logger.info(`╚══════════════════════════════════════════════════════════════╝`);
-
-      // Get availability snapshot for all matching transporters
-      // CRITICAL FIX: Must await — db is Prisma instance, this is async!
-      // Without await, availabilitySnapshot is a Promise (empty map → no broadcasts sent)
-      const availabilitySnapshot = await db.getTransportersAvailabilitySnapshot(vehicleType, vehicleSubtype) as Array<{
-        transporterId: string;
-        transporterName: string;
-        totalOwned: number;
-        available: number;
-        inTransit: number;
-      }>;
-
-      // Create a map for quick lookup
-      const availabilityMap = new Map(
-        availabilitySnapshot.map(t => [t.transporterId, t])
+    const notifiedUpdateJobs: Array<Promise<unknown>> = [];
+    for (const requestItem of requests) {
+      const mergedNotified = Array.from(
+        new Set([
+          ...(requestItem.notifiedTransporters || []),
+          ...sentTransporters
+        ])
       );
+      notifiedUpdateJobs.push(db.updateTruckRequest(requestItem.id, {
+        notifiedTransporters: mergedNotified
+      }));
+    }
+    if (notifiedUpdateJobs.length > 0) {
+      await Promise.allSettled(notifiedUpdateJobs);
+    }
 
-      // Send personalized broadcast to each transporter
-      let sentCount = 0;
-      let skippedNoAvailable = 0;
-
-      for (const transporterId of matchingTransporters) {
-        const availability = availabilityMap.get(transporterId);
-
-        // Skip if no available trucks (they shouldn't receive broadcast)
-        if (!availability || availability.available <= 0) {
-          skippedNoAvailable++;
-          continue;
-        }
-
-        // Calculate personalized capacity
-        const trucksYouCanProvide = Math.min(availability.available, trucksStillNeeded);
-
-        // Create personalized broadcast payload
-        const personalizedBroadcast = {
-          ...extendedBroadcast,
-          // =====================================================================
-          // PERSONALIZED FIELDS - Unique per transporter
-          // =====================================================================
-          trucksYouCanProvide,           // How many they can accept (1 to N)
-          maxTrucksYouCanProvide: trucksYouCanProvide, // Alias
-          yourAvailableTrucks: availability.available, // How many they have free
-          yourTotalTrucks: availability.totalOwned,    // How many they own of this type
-
-          // =====================================================================
-          // ORDER FIELDS - Same for everyone
-          // =====================================================================
-          trucksStillNeeded,             // Total still needed for this type
-          trucksNeededOfThisType: trucksStillNeeded, // Alias
-
-          // Personalization metadata
-          isPersonalized: true,
-          personalizedFor: transporterId
-        };
-
-        // Send via WebSocket
-        emitToUser(transporterId, 'new_broadcast', personalizedBroadcast);
-        sentCount++;
-
-        logger.info(`   📱 → ${availability.transporterName || transporterId.substring(0, 8)}: ` +
-          `${trucksYouCanProvide}/${trucksStillNeeded} trucks (has ${availability.available} available)`);
-      }
-
-      logger.info(`   ✅ Sent personalized broadcasts: ${sentCount}, Skipped (no available): ${skippedNoAvailable}`)
-
-      // Update truck requests with notified transporters
-      for (const tr of requests) {
-        await db.updateTruckRequest(tr.id, {
-          notifiedTransporters: matchingTransporters
-        });
-      }
-
-      // FCM Push notifications (QUEUED for reliability)
+    if (sentTransporters.length > 0) {
       await queueService.queuePushNotificationBatch(
-        matchingTransporters,
+        sentTransporters,
         {
           title: `🚛 ${extendedBroadcast.trucksNeededOfThisType}x ${vehicleType.toUpperCase()} Required!`,
           body: `${extendedBroadcast.pickup.city || extendedBroadcast.pickup.address} → ${extendedBroadcast.drop.city || extendedBroadcast.drop.address}`,
           data: {
-            type: 'new_truck_request',
+            type: 'new_broadcast',
             orderId: extendedBroadcast.orderId,
-            truckRequestId: extendedBroadcast.truckRequestId
+            broadcastId: extendedBroadcast.broadcastId,
+            truckRequestId: extendedBroadcast.truckRequestId,
+            legacyType: 'new_truck_request'
           }
         }
-      );
+      ).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        logger.warn(`Failed to queue push notifications for order ${orderId}: ${message}`);
+      });
     }
+
+    logger.info('broadcast.enqueue.summary', {
+      orderId,
+      metricAccepted: 'broadcast.enqueue.accepted',
+      metricFailed: 'broadcast.enqueue.failed',
+      metricLatency: 'broadcast.enqueue.latency_ms',
+      acceptedCount: enqueueAcceptedTransporters.length,
+      failedCount: enqueueFailedTransporters.length,
+      skippedNoAvailable,
+      strictMode: FF_BROADCAST_STRICT_SENT_ACCOUNTING
+    });
+
+    return { sentTransporters, skippedNoAvailable };
   }
 
   /**
@@ -1225,6 +1366,75 @@ class OrderService {
     };
   }
 
+  private chunkTransporterIds(transporterIds: string[]): string[][] {
+    if (transporterIds.length <= this.TRANSPORTER_FANOUT_CHUNK_SIZE) {
+      return [transporterIds];
+    }
+    const chunks: string[][] = [];
+    for (let index = 0; index < transporterIds.length; index += this.TRANSPORTER_FANOUT_CHUNK_SIZE) {
+      chunks.push(transporterIds.slice(index, index + this.TRANSPORTER_FANOUT_CHUNK_SIZE));
+    }
+    return chunks;
+  }
+
+  private async emitToTransportersWithAdaptiveFanout(
+    transporterIds: string[],
+    events: Array<{ event: string; payload: Record<string, unknown> }>,
+    context: string
+  ): Promise<void> {
+    if (transporterIds.length === 0 || events.length === 0) return;
+
+    const uniqueTransporters = Array.from(new Set(transporterIds));
+    const useSynchronousEmit = !this.TRANSPORTER_FANOUT_QUEUE_ENABLED ||
+      uniqueTransporters.length <= this.TRANSPORTER_FANOUT_SYNC_THRESHOLD;
+
+    if (useSynchronousEmit) {
+      for (const eventSpec of events) {
+        emitToUsers(uniqueTransporters, eventSpec.event, eventSpec.payload);
+      }
+      return;
+    }
+
+    const chunks = this.chunkTransporterIds(uniqueTransporters);
+    const queued: Array<{ chunk: string[]; event: string; payload: Record<string, unknown>; promise: Promise<string[]> }> = [];
+
+    for (const eventSpec of events) {
+      for (const chunk of chunks) {
+        queued.push({
+          chunk,
+          event: eventSpec.event,
+          payload: eventSpec.payload,
+          promise: queueService.queueBroadcastBatch(chunk, eventSpec.event, eventSpec.payload)
+        });
+      }
+    }
+
+    const settled = await Promise.allSettled(queued.map((job) => job.promise));
+    let fallbackDeliveries = 0;
+
+    settled.forEach((result, index) => {
+      if (result.status === 'fulfilled') return;
+      const failedJob = queued[index];
+      fallbackDeliveries += failedJob.chunk.length;
+      emitToUsers(failedJob.chunk, failedJob.event, failedJob.payload);
+    });
+
+    if (fallbackDeliveries > 0) {
+      logger.warn(`[FANOUT] Queue fallback used for ${fallbackDeliveries} transporter deliveries`, {
+        context,
+        events: events.map((item) => item.event),
+        totalTransporters: uniqueTransporters.length
+      });
+    } else {
+      logger.info(`[FANOUT] Queued transporter fanout`, {
+        context,
+        events: events.map((item) => item.event),
+        totalTransporters: uniqueTransporters.length,
+        chunks: chunks.length
+      });
+    }
+  }
+
   private async setOrderExpiryTimer(orderId: string, timeoutMs: number): Promise<void> {
     // Cancel any existing timer
     await redisService.cancelTimer(this.TIMER_KEYS.ORDER_EXPIRY(orderId));
@@ -1238,6 +1448,108 @@ class OrderService {
 
     await redisService.setTimer(this.TIMER_KEYS.ORDER_EXPIRY(orderId), timerData, expiresAt);
     logger.info(`⏱️ Order expiry timer set for ${orderId} (${timeoutMs / 1000}s) [Redis-based]`);
+  }
+
+  private async clearProgressiveStepTimers(orderId: string): Promise<void> {
+    const pattern = `${this.ORDER_STEP_TIMER_PREFIX}${orderId}:*`;
+    const batch: string[] = [];
+
+    for await (const key of redisService.scanIterator(pattern, 200)) {
+      batch.push(key);
+      if (batch.length < 200) continue;
+      await Promise.allSettled(batch.map((timerKey) => redisService.cancelTimer(timerKey).catch(() => false)));
+      batch.length = 0;
+    }
+
+    if (batch.length > 0) {
+      await Promise.allSettled(batch.map((timerKey) => redisService.cancelTimer(timerKey).catch(() => false)));
+    }
+  }
+
+  async processExpiredTimers(): Promise<void> {
+    await this.processExpiredOrderTimers();
+    await this.processExpiredBroadcastStepTimers();
+  }
+
+  private async processExpiredOrderTimers(): Promise<void> {
+    const expiredTimers = await redisService.getExpiredTimers<{ orderId: string }>(
+      this.ORDER_EXPIRY_TIMER_PREFIX
+    );
+    for (const timer of expiredTimers) {
+      const orderId = timer.data?.orderId;
+      if (!orderId) {
+        await redisService.cancelTimer(timer.key).catch(() => false);
+        continue;
+      }
+
+      const lockKey = `${this.ORDER_STEP_TIMER_LOCK_PREFIX}expiry:${orderId}`;
+      const lock = await redisService.acquireLock(lockKey, 'order-expiry-checker', 30);
+      if (!lock.acquired) continue;
+
+      try {
+        await this.handleOrderExpiry(orderId);
+      } finally {
+        await redisService.cancelTimer(timer.key).catch(() => false);
+        await redisService.releaseLock(lockKey, 'order-expiry-checker').catch(() => {});
+      }
+    }
+  }
+
+  private async processExpiredBroadcastStepTimers(): Promise<void> {
+    const expiredTimers = await redisService.getExpiredTimers<{
+      orderId: string;
+      vehicleType: string;
+      vehicleSubtype: string;
+      stepIndex: number;
+      scheduledAtMs?: number;
+      stepWindowMs?: number;
+    }>(this.ORDER_STEP_TIMER_PREFIX);
+    for (const timer of expiredTimers) {
+      const data = timer.data;
+      if (!data?.orderId || !data.vehicleType || data.stepIndex == null) {
+        await redisService.cancelTimer(timer.key).catch(() => false);
+        continue;
+      }
+
+      const lockKey = `${this.ORDER_STEP_TIMER_LOCK_PREFIX}${data.orderId}:${data.vehicleType}:${data.vehicleSubtype}:${data.stepIndex}`;
+      const lock = await redisService.acquireLock(lockKey, 'order-step-checker', 30);
+      if (!lock.acquired) continue;
+
+      try {
+        const expectedAtMs = Date.parse(timer.expiresAt);
+        const triggerLatencyMs = Number.isFinite(expectedAtMs)
+          ? Math.max(0, Date.now() - expectedAtMs)
+          : 0;
+        if (triggerLatencyMs > 2_500) {
+          logger.warn('[ORDER STEP TIMER] Trigger latency above budget', {
+            orderId: data.orderId,
+            vehicleType: data.vehicleType,
+            vehicleSubtype: data.vehicleSubtype || '',
+            stepIndex: Number(data.stepIndex),
+            triggerLatencyMs,
+            expectedAt: timer.expiresAt
+          });
+        } else {
+          logger.debug('[ORDER STEP TIMER] Trigger latency', {
+            orderId: data.orderId,
+            vehicleType: data.vehicleType,
+            vehicleSubtype: data.vehicleSubtype || '',
+            stepIndex: Number(data.stepIndex),
+            triggerLatencyMs
+          });
+        }
+
+        await this.processProgressiveBroadcastStep({
+          orderId: data.orderId,
+          vehicleType: data.vehicleType,
+          vehicleSubtype: data.vehicleSubtype || '',
+          stepIndex: Number(data.stepIndex)
+        });
+      } finally {
+        await redisService.cancelTimer(timer.key).catch(() => false);
+        await redisService.releaseLock(lockKey, 'order-step-checker').catch(() => {});
+      }
+    }
   }
 
   /**
@@ -1366,11 +1678,15 @@ class OrderService {
         emittedAt: new Date().toISOString()
       };
 
-      // WebSocket: always emit immediately for real-time UI parity.
-      // Queue-based fanout can add polling latency and delay dismiss overlays.
-      emitToUsers(transporterIds, 'broadcast_expired', expiryPayload);
-      emitToUsers(transporterIds, 'broadcast_dismissed', expiredDismissData);
-      logger.info(`   📱 Instant expiry broadcast to ${transporterIds.length} transporters`);
+      await this.emitToTransportersWithAdaptiveFanout(
+        transporterIds,
+        [
+          { event: 'broadcast_expired', payload: expiryPayload },
+          { event: 'broadcast_dismissed', payload: expiredDismissData }
+        ],
+        'order_expiry'
+      );
+      logger.info(`   📱 Expiry broadcast dispatched to ${transporterIds.length} transporters`);
 
       // FCM: Push notification for background/closed app transporters
       await queueService.queuePushNotificationBatch(
@@ -1444,13 +1760,27 @@ class OrderService {
         });
 
         if (cancelledAssignments.length > 0) {
+          const vehicleIdsToRelease = Array.from(
+            new Set(
+              cancelledAssignments
+                .map((assignment) => assignment.vehicleId)
+                .filter((id): id is string => Boolean(id))
+            )
+          );
+          if (vehicleIdsToRelease.length > 0) {
+            await prismaClient.vehicle.updateMany({
+              where: {
+                id: { in: vehicleIdsToRelease }
+              },
+              data: {
+                status: VehicleStatus.available,
+                currentTripId: null,
+                assignedDriverId: null
+              }
+            }).catch(() => {});
+          }
+
           for (const assignment of cancelledAssignments) {
-            if (assignment.vehicleId) {
-              await prismaClient.vehicle.update({
-                where: { id: assignment.vehicleId },
-                data: { status: VehicleStatus.available, currentTripId: null, assignedDriverId: null }
-              }).catch(() => {});
-            }
             if (assignment.driverId) {
               this.emitDriverCancellationEvents(assignment.driverId, {
                 orderId,
@@ -1507,8 +1837,9 @@ class OrderService {
       logger.warn(`FCM: Failed to send expiry push to customer ${order.customerId}`, { error: errorMessage });
     });
 
-    // Cleanup timer from Redis
+    // Cleanup timers from Redis
     await redisService.cancelTimer(this.TIMER_KEYS.ORDER_EXPIRY(orderId));
+    await this.clearProgressiveStepTimers(orderId);
 
     // Clear customer active broadcast key (one-per-customer enforcement)
     await this.clearCustomerActiveBroadcast(order.customerId);
@@ -1571,9 +1902,10 @@ class OrderService {
       await db.updateTruckRequestsBatch(requestIds, { status: TruckRequestStatus.cancelled });
     }
 
-    // 2. Clear expiry timer from Redis
+    // 2. Clear timers from Redis
     await redisService.cancelTimer(this.TIMER_KEYS.ORDER_EXPIRY(orderId));
-    logger.info(`   Cleared expiry timer for ${orderId}`);
+    await this.clearProgressiveStepTimers(orderId);
+    logger.info(`   Cleared timers for ${orderId}`);
 
     // 3. Clear customer active broadcast key + idempotency keys
     await this.clearCustomerActiveBroadcast(customerId);
@@ -1588,12 +1920,15 @@ class OrderService {
 
     const cancelledAt = new Date().toISOString();
     const cancellationEventId = uuidv4();
+    const cancellationServerTimeMs = Date.now();
     const cancellationData = {
       type: 'order_cancelled',
       orderId,
       reason: reason || 'Cancelled by customer',
       cancelledAt,
       eventId: cancellationEventId,
+      eventVersion: 1,
+      serverTimeMs: cancellationServerTimeMs,
       emittedAt: new Date().toISOString()
     };
 
@@ -1608,14 +1943,20 @@ class OrderService {
         message: 'Sorry, the customer cancelled this order',
         cancelledAt,
         eventId: cancellationEventId,
+        eventVersion: 1,
+        serverTimeMs: cancellationServerTimeMs,
         emittedAt: new Date().toISOString()
       };
 
-      // WebSocket: always emit immediately for real-time UI parity.
-      // Queue-based fanout can add polling latency and delay dismiss overlays.
-      emitToUsers(transporterIds, 'order_cancelled', cancellationData);
-      emitToUsers(transporterIds, 'broadcast_dismissed', dismissedData);
-      logger.info(`   Instant cancellation broadcast to ${transporterIds.length} transporters`);
+      await this.emitToTransportersWithAdaptiveFanout(
+        transporterIds,
+        [
+          { event: 'order_cancelled', payload: cancellationData },
+          { event: 'broadcast_dismissed', payload: dismissedData }
+        ],
+        'order_cancelled'
+      );
+      logger.info(`   Cancellation broadcast dispatched to ${transporterIds.length} transporters`);
 
       await queueService.queuePushNotificationBatch(
         transporterIds,
@@ -1641,6 +1982,8 @@ class OrderService {
       cancelledAt,
       stateChangedAt: cancelledAt,
       eventId: cancellationEventId,
+      eventVersion: 1,
+      serverTimeMs: cancellationServerTimeMs,
       emittedAt: new Date().toISOString()
     });
 
@@ -1673,13 +2016,28 @@ class OrderService {
           where: { orderId, status: { in: [AssignmentStatus.pending, AssignmentStatus.driver_accepted, AssignmentStatus.en_route_pickup, AssignmentStatus.at_pickup, AssignmentStatus.in_transit] } },
           data: { status: AssignmentStatus.cancelled }
         });
+
+        const vehicleIdsToRelease = Array.from(
+          new Set(
+            activeAssignments
+              .map((assignment) => assignment.vehicleId)
+              .filter((id): id is string => Boolean(id))
+          )
+        );
+        if (vehicleIdsToRelease.length > 0) {
+          await prismaClient.vehicle.updateMany({
+            where: {
+              id: { in: vehicleIdsToRelease }
+            },
+            data: {
+              status: VehicleStatus.available,
+              currentTripId: null,
+              assignedDriverId: null
+            }
+          }).catch(() => {});
+        }
+
         for (const assignment of activeAssignments) {
-          if (assignment.vehicleId) {
-            await prismaClient.vehicle.update({
-              where: { id: assignment.vehicleId },
-              data: { status: VehicleStatus.available, currentTripId: null, assignedDriverId: null }
-            }).catch(() => {});
-          }
           if (assignment.driverId) {
             this.emitDriverCancellationEvents(assignment.driverId, {
               orderId,
@@ -2126,6 +2484,7 @@ class OrderService {
     // If fully filled, cancel expiry timer and clear active key
     if (newStatus === 'fully_filled') {
       await redisService.cancelTimer(this.TIMER_KEYS.ORDER_EXPIRY(orderId)).catch(() => {});
+      await this.clearProgressiveStepTimers(orderId).catch(() => {});
       await this.clearCustomerActiveBroadcast(customerId);
       logger.info(`Order ${orderId} fully filled! All ${orderTotalTrucks} trucks assigned.`);
     }
@@ -2167,7 +2526,149 @@ class OrderService {
   async getOrdersByCustomer(customerId: string): Promise<OrderRecord[]> {
     return await db.getOrdersByCustomer(customerId);
   }
+
+  /**
+   * Get order details and truck requests with role-aware access checks.
+   */
+  async getOrderWithRequests(orderId: string, userId: string, userRole: string) {
+    const order = await db.getOrderById(orderId);
+    if (!order) {
+      throw new AppError(404, 'ORDER_NOT_FOUND', 'Order not found');
+    }
+
+    const requests = await db.getTruckRequestsByOrder(orderId);
+
+    if (userRole === 'customer' && order.customerId !== userId) {
+      throw new AppError(403, 'FORBIDDEN', 'Access denied');
+    }
+
+    if (userRole === 'transporter') {
+      const canAccess = requests.some((request) => {
+        const notified = request.notifiedTransporters || [];
+        return notified.includes(userId) || request.assignedTransporterId === userId;
+      });
+      if (!canAccess) {
+        throw new AppError(403, 'FORBIDDEN', 'Access denied');
+      }
+    }
+
+    if (userRole === 'driver') {
+      const assignments = await prismaClient.assignment.findMany({
+        where: { orderId },
+        select: { driverId: true }
+      });
+      const canAccess = assignments.some((assignment) => assignment.driverId === userId);
+      if (!canAccess) {
+        throw new AppError(403, 'FORBIDDEN', 'Access denied');
+      }
+    }
+
+    return {
+      order,
+      requests,
+      summary: {
+        totalTrucks: order.totalTrucks,
+        trucksFilled: order.trucksFilled,
+        trucksSearching: requests.filter((request) => request.status === 'searching').length,
+        trucksExpired: requests.filter((request) => request.status === 'expired').length
+      }
+    };
+  }
+
+  /**
+   * Get active truck requests grouped by order for transporter control surfaces.
+   */
+  async getActiveTruckRequestsForTransporter(transporterId: string): Promise<ActiveTruckRequestOrderGroup[]> {
+    const requests = await db.getActiveTruckRequestsForTransporter(transporterId);
+    const byOrder = new Map<string, TruckRequestRecord[]>();
+
+    for (const request of requests) {
+      if (!byOrder.has(request.orderId)) {
+        byOrder.set(request.orderId, []);
+      }
+      byOrder.get(request.orderId)!.push(request);
+    }
+
+    const orderIds = Array.from(byOrder.keys());
+    const orders = await db.getOrdersByIds(orderIds);
+    const orderById = new Map(orders.map(order => [order.id, order]));
+
+    const grouped = Array.from(byOrder.entries()).map(([orderId, orderRequests]) => {
+      const order = orderById.get(orderId);
+      if (!order) return null;
+      return {
+        order,
+        requests: orderRequests.sort((left, right) => left.requestNumber - right.requestNumber)
+      };
+    });
+
+    return grouped
+      .filter((entry): entry is ActiveTruckRequestOrderGroup => entry !== null)
+      .sort((left, right) => {
+        return new Date(right.order.createdAt).getTime() - new Date(left.order.createdAt).getTime();
+      });
+  }
+
+  /**
+   * Get customer orders with pagination and per-order request summary.
+   */
+  async getCustomerOrders(customerId: string, page: number = 1, limit: number = 20) {
+    const boundedPage = Math.max(1, page);
+    const boundedLimit = Math.max(1, Math.min(limit, 100));
+    const orders = await db.getOrdersByCustomer(customerId);
+    const sortedOrders = orders.sort((left, right) => {
+      return new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime();
+    });
+
+    const total = sortedOrders.length;
+    const start = (boundedPage - 1) * boundedLimit;
+    const paginatedOrders = sortedOrders.slice(start, start + boundedLimit);
+
+    const ordersWithSummary = await Promise.all(
+      paginatedOrders.map(async (order) => {
+        const requests = await db.getTruckRequestsByOrder(order.id);
+        return {
+          ...order,
+          requestsSummary: {
+            total: requests.length,
+            searching: requests.filter((request) => request.status === 'searching').length,
+            assigned: requests.filter((request) => request.status === 'assigned').length,
+            completed: requests.filter((request) => request.status === 'completed').length,
+            expired: requests.filter((request) => request.status === 'expired').length
+          }
+        };
+      })
+    );
+
+    return {
+      orders: ordersWithSummary,
+      total,
+      hasMore: start + paginatedOrders.length < total
+    };
+  }
+}
+
+const ORDER_TIMER_CHECK_INTERVAL_MS = 2_000;
+let orderTimerCheckerInterval: NodeJS.Timeout | null = null;
+
+function startOrderTimerChecker(): void {
+  if (orderTimerCheckerInterval) return;
+  orderTimerCheckerInterval = setInterval(async () => {
+    try {
+      await orderService.processExpiredTimers();
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      logger.warn(`[ORDER TIMER] Failed to process timers: ${errorMessage}`);
+    }
+  }, ORDER_TIMER_CHECK_INTERVAL_MS);
+}
+
+export function stopOrderTimerChecker(): void {
+  if (!orderTimerCheckerInterval) return;
+  clearInterval(orderTimerCheckerInterval);
+  orderTimerCheckerInterval = null;
 }
 
 // Export singleton
 export const orderService = new OrderService();
+startOrderTimerChecker();

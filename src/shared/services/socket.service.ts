@@ -61,6 +61,13 @@ const SERVER_INSTANCE_ID = `server_${process.pid}_${Date.now().toString(36)}`;
 
 // Flag to track if Redis adapter is initialized
 let redisPubSubInitialized = false;
+let redisAdapterMode: 'enabled' | 'disabled' | 'disabled_by_config' | 'failed' = 'disabled';
+let redisAdapterLastError: string | null = null;
+const SOCKET_EVENT_VERSION = 1;
+const SOCKET_MULTI_ROOM_EMIT_CHUNK_SIZE = Math.max(
+  25,
+  parseInt(process.env.SOCKET_MULTI_ROOM_EMIT_CHUNK_SIZE || '300', 10) || 300
+);
 
 /**
  * Socket Events
@@ -462,8 +469,11 @@ export function initializeSocket(server: HttpServer): Server {
  * clients connected to other ECS tasks — no manual publishToRedis needed.
  */
 async function setupRedisAdapter(socketServer: Server): Promise<void> {
-  const redisUrl = process.env.REDIS_URL;
+  const redisUrl = resolveSocketAdapterRedisUrl();
   if (process.env.REDIS_ENABLED !== 'true' || !redisUrl) {
+    redisPubSubInitialized = false;
+    redisAdapterMode = 'disabled';
+    redisAdapterLastError = null;
     logger.info('[Socket] No Redis — single-instance mode');
     return;
   }
@@ -471,18 +481,10 @@ async function setupRedisAdapter(socketServer: Server): Promise<void> {
   // Explicit opt-out: set REDIS_PUBSUB_DISABLED=true for environments that
   // don't support Redis pub/sub commands (e.g. AWS ElastiCache Serverless).
   if (process.env.REDIS_PUBSUB_DISABLED === 'true') {
+    redisPubSubInitialized = false;
+    redisAdapterMode = 'disabled_by_config';
+    redisAdapterLastError = null;
     logger.info('[Socket] REDIS_PUBSUB_DISABLED=true — skipping Redis adapter, running in single-instance mode per ECS task');
-    return;
-  }
-
-  // Heuristic fallback: rediss:// (TLS) is the ElastiCache Serverless URL scheme,
-  // which does not support PSUBSCRIBE. Disable adapter to prevent worker crash.
-  // Override: set REDIS_PUBSUB_DISABLED=false explicitly if your TLS Redis supports pub/sub
-  // (e.g. Redis Enterprise, Azure Cache for Redis — they support pub/sub over TLS).
-  if (redisUrl.startsWith('rediss://') && process.env.REDIS_PUBSUB_DISABLED !== 'false') {
-    logger.info('[Socket] TLS Redis detected (rediss://) — skipping Redis adapter (heuristic: ElastiCache Serverless does not support pub/sub)');
-    logger.info('[Socket] To enable cross-instance delivery on a pub/sub-capable TLS Redis, set REDIS_PUBSUB_DISABLED=false');
-    logger.info('[Socket] Running in single-instance mode per ECS task');
     return;
   }
 
@@ -511,12 +513,55 @@ async function setupRedisAdapter(socketServer: Server): Promise<void> {
 
     socketServer.adapter(createAdapter(pubClient, subClient));
     redisPubSubInitialized = true;
+    redisAdapterMode = 'enabled';
+    redisAdapterLastError = null;
     logger.info(`[Socket] Redis adapter initialized (Instance: ${SERVER_INSTANCE_ID})`);
     logger.info('   Cross-instance WebSocket delivery ENABLED');
   } catch (error: any) {
+    redisPubSubInitialized = false;
+    redisAdapterMode = 'failed';
+    redisAdapterLastError = error?.message || 'unknown';
     logger.error(`[Socket] Failed to initialize Redis adapter: ${error.message}`);
     logger.warn('[Socket] Falling back to single-instance mode');
   }
+}
+
+function resolveSocketAdapterRedisUrl(): string | null {
+  const directUrl = process.env.REDIS_URL?.trim();
+  if (directUrl) {
+    return directUrl;
+  }
+
+  const host = process.env.REDIS_HOST?.trim();
+  if (!host) {
+    return null;
+  }
+
+  if (host.startsWith('redis://') || host.startsWith('rediss://')) {
+    return host;
+  }
+
+  const port = (process.env.REDIS_PORT || '6379').trim();
+  const password = process.env.REDIS_PASSWORD?.trim();
+  const useTls = process.env.NODE_ENV === 'production' || process.env.REDIS_TLS === 'true';
+  const scheme = useTls ? 'rediss' : 'redis';
+  const auth = password ? `:${encodeURIComponent(password)}@` : '';
+  return `${scheme}://${auth}${host}:${port}`;
+}
+
+function withSocketMeta(data: any): any {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    return data;
+  }
+  if (Object.prototype.hasOwnProperty.call(data, 'eventVersion') ||
+      Object.prototype.hasOwnProperty.call(data, 'serverTimeMs')) {
+    return data;
+  }
+  return {
+    ...data,
+    eventVersion: SOCKET_EVENT_VERSION,
+    serverTimeMs: Date.now()
+  };
 }
 
 /**
@@ -532,7 +577,7 @@ export function emitToUser(userId: string, event: string, data: any): void {
   }
 
   // With @socket.io/redis-adapter, this automatically reaches all instances
-  io.to(`user:${userId}`).emit(event, data);
+  io.to(`user:${userId}`).emit(event, withSocketMeta(data));
 
   const localSocketCount = userSockets.get(userId)?.size || 0;
   logger.debug(`[Socket] Emitted ${event} to user:${userId} (${localSocketCount} local sockets)`);
@@ -544,7 +589,7 @@ export function emitToUser(userId: string, event: string, data: any): void {
  */
 export function emitToBooking(bookingId: string, event: string, data: any): void {
   if (!io) return;
-  io.to(`booking:${bookingId}`).emit(event, data);
+  io.to(`booking:${bookingId}`).emit(event, withSocketMeta(data));
   logger.debug(`Emitted ${event} to booking ${bookingId}`);
 }
 
@@ -554,7 +599,7 @@ export function emitToBooking(bookingId: string, event: string, data: any): void
  */
 export function emitToTrip(tripId: string, event: string, data: any): void {
   if (!io) return;
-  io.to(`trip:${tripId}`).emit(event, data);
+  io.to(`trip:${tripId}`).emit(event, withSocketMeta(data));
 }
 
 /**
@@ -563,7 +608,7 @@ export function emitToTrip(tripId: string, event: string, data: any): void {
  */
 export function emitToAll(event: string, data: any): void {
   if (!io) return;
-  io.emit(event, data);
+  io.emit(event, withSocketMeta(data));
   logger.debug(`Broadcast ${event} to all clients`);
 }
 
@@ -595,7 +640,7 @@ export function getIO(): Server | null {
  */
 export function emitToOrder(orderId: string, event: string, data: any): void {
   if (!io) return;
-  io.to(`order:${orderId}`).emit(event, data);
+  io.to(`order:${orderId}`).emit(event, withSocketMeta(data));
   logger.debug(`Emitted ${event} to order ${orderId}`);
 }
 
@@ -640,8 +685,12 @@ export function emitToUsers(userIds: string[], event: string, data: any): void {
   if (!io || userIds.length === 0) return;
 
   const uniqueUserIds = Array.from(new Set(userIds));
-  for (const userId of uniqueUserIds) {
-    io.to(`user:${userId}`).emit(event, data);
+  const payload = withSocketMeta(data);
+  const userRooms = uniqueUserIds.map((userId) => `user:${userId}`);
+
+  for (let index = 0; index < userRooms.length; index += SOCKET_MULTI_ROOM_EMIT_CHUNK_SIZE) {
+    const roomChunk = userRooms.slice(index, index + SOCKET_MULTI_ROOM_EMIT_CHUNK_SIZE);
+    io.to(roomChunk).emit(event, payload);
   }
 
   logger.debug(`Batch emitted ${event} to ${uniqueUserIds.length} users`);
@@ -655,7 +704,7 @@ export function emitToUsers(userIds: string[], event: string, data: any): void {
 export function emitToRoom(room: string, event: string, data: any): void {
   if (!io) return;
 
-  io.to(room).emit(event, data);
+  io.to(room).emit(event, withSocketMeta(data));
 
   logger.debug(`Emitted ${event} to room ${room}`);
 }
@@ -668,8 +717,20 @@ export function emitToRoom(room: string, event: string, data: any): void {
 export function emitToAllTransporters(event: string, data: any): void {
   if (!io) return;
 
-  io.to('role:transporter').emit(event, data);
+  io.to('role:transporter').emit(event, withSocketMeta(data));
   logger.debug(`Broadcast ${event} to transporters`);
+}
+
+export function getRedisAdapterStatus(): {
+  enabled: boolean;
+  mode: 'enabled' | 'disabled' | 'disabled_by_config' | 'failed';
+  lastError: string | null;
+} {
+  return {
+    enabled: redisPubSubInitialized,
+    mode: redisAdapterMode,
+    lastError: redisAdapterLastError
+  };
 }
 
 // Types
@@ -720,4 +781,5 @@ export const socketService = {
   
   // Redis adapter status
   isRedisPubSubEnabled: () => redisPubSubInitialized,
+  getRedisAdapterStatus,
 };

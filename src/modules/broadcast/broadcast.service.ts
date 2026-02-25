@@ -134,16 +134,22 @@ class BroadcastService {
   }
   
   /**
-   * Get active broadcasts for a driver/transporter
+   * Get active broadcasts for compatibility / migration path.
    * 
    * Returns BOTH:
    * 1. Legacy Bookings (single vehicle type)
    * 2. New Orders with multiple vehicle types (requestedVehicles array)
    * 
-   * Filters to only show vehicles matching the transporter's fleet
+   * NOTE:
+   * Canonical transporter feed should prefer /bookings/requests/active.
+   * This compatibility service remains for fallback and older clients.
    */
   async getActiveBroadcasts(params: GetActiveBroadcastsParams) {
     const { driverId, vehicleType } = params;
+    logger.info('[BroadcastCompat] Resolving active feed via legacy broadcast service', {
+      route_alias_used: true,
+      actorId: driverId
+    });
     
     // Get user to find their transporter
     const user = await db.getUserById(driverId);

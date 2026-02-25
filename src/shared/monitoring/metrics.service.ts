@@ -151,6 +151,47 @@ class MetricsService {
       sum: new Map(),
       count: new Map()
     });
+
+    // Tracking stream metrics
+    this.counters.set('tracking_stream_publish_success_total', {
+      name: 'tracking_stream_publish_success_total',
+      help: 'Total tracking telemetry records published successfully',
+      labels: {}
+    });
+
+    this.counters.set('tracking_stream_publish_fail_total', {
+      name: 'tracking_stream_publish_fail_total',
+      help: 'Total tracking telemetry records failed to publish',
+      labels: {}
+    });
+
+    this.counters.set('tracking_stream_dropped_total', {
+      name: 'tracking_stream_dropped_total',
+      help: 'Total tracking telemetry records dropped due to backpressure or retry exhaustion',
+      labels: {}
+    });
+
+    this.counters.set('tracking_stream_retry_total', {
+      name: 'tracking_stream_retry_total',
+      help: 'Total tracking telemetry records retried for stream publishing',
+      labels: {}
+    });
+
+    this.counters.set('tracking_queue_dropped_total', {
+      name: 'tracking_queue_dropped_total',
+      help: 'Total tracking queue events dropped by queue hard limit policy',
+      labels: {}
+    });
+
+    this.histograms.set('tracking_stream_batch_size', {
+      name: 'tracking_stream_batch_size',
+      help: 'Tracking stream publish batch size',
+      buckets: [1, 5, 10, 25, 50, 100, 250, 500],
+      values: new Map(),
+      bucketCounts: new Map(),
+      sum: new Map(),
+      count: new Map()
+    });
     
     // WebSocket connections
     this.gauges.set('websocket_connections', {
@@ -183,6 +224,24 @@ class MetricsService {
     this.gauges.set('http_active_requests', {
       name: 'http_active_requests',
       help: 'Number of currently active HTTP requests',
+      value: 0
+    });
+
+    this.gauges.set('tracking_stream_buffer_depth', {
+      name: 'tracking_stream_buffer_depth',
+      help: 'Current in-memory buffer depth before tracking stream flush',
+      value: 0
+    });
+
+    this.gauges.set('tracking_queue_depth', {
+      name: 'tracking_queue_depth',
+      help: 'Current tracking queue depth',
+      value: 0
+    });
+
+    this.gauges.set('tracking_queue_inflight', {
+      name: 'tracking_queue_inflight',
+      help: 'Current tracking queue in-flight workers/jobs',
       value: 0
     });
   }

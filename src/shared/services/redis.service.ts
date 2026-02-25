@@ -100,7 +100,9 @@ interface IRedisClient {
 
   // Lists (for queues - PRODUCTION SCALABILITY)
   lPush(key: string, value: string): Promise<number>;
+  lPushMany(key: string, values: string[]): Promise<number>;
   rPush(key: string, value: string): Promise<number>;
+  lRange(key: string, start: number, stop: number): Promise<string[]>;
   lTrim(key: string, start: number, stop: number): Promise<void>;
   rPop(key: string): Promise<string | null>;
   lLen(key: string): Promise<number>;
@@ -118,6 +120,7 @@ interface IRedisClient {
   hSet(key: string, field: string, value: string): Promise<void>;
   hGet(key: string, field: string): Promise<string | null>;
   hGetAll(key: string): Promise<Record<string, string>>;
+  hGetAllBatch(keys: string[]): Promise<Record<string, string>[]>;
   hDel(key: string, ...fields: string[]): Promise<number>;
   hMSet(key: string, data: Record<string, string>): Promise<void>;
 
@@ -310,6 +313,23 @@ class InMemoryRedisClient implements IRedisClient {
     return entry.value.length;
   }
 
+  async lPushMany(key: string, values: string[]): Promise<number> {
+    if (values.length === 0) {
+      return this.lLen(key);
+    }
+
+    let entry = this.store.get(key);
+    if (!entry || entry.type !== 'list') {
+      entry = { value: [] as string[], type: 'list' };
+      this.store.set(key, entry);
+    }
+
+    for (const value of values) {
+      entry.value.unshift(value);
+    }
+    return entry.value.length;
+  }
+
   /**
    * Push value to right of list (append)
    * SCALABILITY: Used for location history append
@@ -322,6 +342,23 @@ class InMemoryRedisClient implements IRedisClient {
     }
     entry.value.push(value);
     return entry.value.length;
+  }
+
+  /**
+   * Get list range (inclusive indices)
+   * SCALABILITY: Used for reading tracking history slices
+   */
+  async lRange(key: string, start: number, stop: number): Promise<string[]> {
+    if (this.isExpired(key)) return [];
+    const entry = this.store.get(key);
+    if (!entry || entry.type !== 'list') return [];
+
+    const len = entry.value.length;
+    if (len === 0) return [];
+    const normalStart = start < 0 ? Math.max(0, len + start) : Math.max(0, start);
+    const normalStop = stop < 0 ? len + stop : Math.min(stop, len - 1);
+    if (normalStart > normalStop || normalStart >= len) return [];
+    return entry.value.slice(normalStart, normalStop + 1);
   }
 
   /**
@@ -469,6 +506,11 @@ class InMemoryRedisClient implements IRedisClient {
     const entry = this.store.get(key);
     if (!entry || entry.type !== 'hash') return {};
     return Object.fromEntries(entry.value);
+  }
+
+  async hGetAllBatch(keys: string[]): Promise<Record<string, string>[]> {
+    if (keys.length === 0) return [];
+    return Promise.all(keys.map((key) => this.hGetAll(key)));
   }
 
   async hDel(key: string, ...fields: string[]): Promise<number> {
@@ -859,8 +901,19 @@ class RealRedisClient implements IRedisClient {
     return this.client.lpush(key, value);
   }
 
+  async lPushMany(key: string, values: string[]): Promise<number> {
+    if (values.length === 0) {
+      return this.lLen(key);
+    }
+    return this.client.lpush(key, ...values);
+  }
+
   async rPush(key: string, value: string): Promise<number> {
     return this.client.rpush(key, value);
+  }
+
+  async lRange(key: string, start: number, stop: number): Promise<string[]> {
+    return this.client.lrange(key, start, stop);
   }
 
   async lTrim(key: string, start: number, stop: number): Promise<void> {
@@ -939,6 +992,27 @@ class RealRedisClient implements IRedisClient {
 
   async hGetAll(key: string): Promise<Record<string, string>> {
     return this.client.hgetall(key);
+  }
+
+  async hGetAllBatch(keys: string[]): Promise<Record<string, string>[]> {
+    if (keys.length === 0) return [];
+    const pipeline = this.client.pipeline();
+    keys.forEach((key) => pipeline.hgetall(key));
+    const responses = await pipeline.exec();
+    if (!responses || !Array.isArray(responses)) {
+      return keys.map(() => ({}));
+    }
+
+    return responses.map((entry: any) => {
+      const [error, value] = Array.isArray(entry) ? entry : [null, {}];
+      if (error) {
+        return {};
+      }
+      if (value && typeof value === 'object') {
+        return value as Record<string, string>;
+      }
+      return {};
+    });
   }
 
   async hDel(key: string, ...fields: string[]): Promise<number> {
@@ -1248,8 +1322,16 @@ class RedisService {
     return this.client.lPush(key, value);
   }
 
+  async lPushMany(key: string, values: string[]): Promise<number> {
+    return this.client.lPushMany(key, values);
+  }
+
   async rPush(key: string, value: string): Promise<number> {
     return this.client.rPush(key, value);
+  }
+
+  async lRange(key: string, start: number, stop: number): Promise<string[]> {
+    return this.client.lRange(key, start, stop);
   }
 
   async lTrim(key: string, start: number, stop: number): Promise<void> {
@@ -1598,6 +1680,10 @@ class RedisService {
 
   async hGetAll(key: string): Promise<Record<string, string>> {
     return this.client.hGetAll(key);
+  }
+
+  async hGetAllBatch(keys: string[]): Promise<Record<string, string>[]> {
+    return this.client.hGetAllBatch(keys);
   }
 
   async hDel(key: string, ...fields: string[]): Promise<number> {

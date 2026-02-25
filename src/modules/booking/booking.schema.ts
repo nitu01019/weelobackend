@@ -86,6 +86,12 @@ export const truckSelectionSchema = z.object({
 });
 
 /**
+ * Vehicle requirement payload used by customer app canonical order APIs.
+ * Shape intentionally mirrors `truckSelectionSchema` for backward compatibility.
+ */
+export const vehicleRequirementSchema = truckSelectionSchema;
+
+/**
  * Create Booking Schema (LEGACY - Single truck type)
  * Kept for backward compatibility
  */
@@ -137,8 +143,9 @@ export const createOrderSchema = z.object({
   // Distance - total for all legs combined
   distanceKm: z.number().int().min(1),
   
-  // Array of truck selections - each type/subtype with quantity
-  trucks: z.array(truckSelectionSchema).min(1).max(50),
+  // Compatibility: allow either legacy `trucks` or canonical `vehicleRequirements`.
+  trucks: z.array(truckSelectionSchema).min(1).max(50).optional(),
+  vehicleRequirements: z.array(vehicleRequirementSchema).min(1).max(50).optional(),
   
   // Goods info (applies to all trucks in order)
   goodsType: z.string().max(100).optional(),
@@ -156,6 +163,10 @@ export const createOrderSchema = z.object({
     return false;
   },
   { message: 'Either routePoints OR both pickup and drop must be provided' }
+).refine(
+  // Payload compatibility guard: one of trucks / vehicleRequirements must exist.
+  (data) => Array.isArray(data.trucks) || Array.isArray(data.vehicleRequirements),
+  { message: 'Either trucks OR vehicleRequirements must be provided' }
 );
 
 /**

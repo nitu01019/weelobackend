@@ -3,13 +3,12 @@
  * BROADCAST MODULE - ROUTES
  * =============================================================================
  * 
- * API routes for broadcast management (booking requests sent to drivers).
+ * API routes for legacy broadcast compatibility.
  * 
  * FLOW:
  * 1. Customer creates booking → Backend creates broadcast
- * 2. Drivers see active broadcasts via GET /broadcasts/active
- * 3. Driver accepts → POST /broadcasts/:id/accept
- * 4. Driver declines → POST /broadcasts/:id/decline
+ * 2. Canonical transporter feed is served by /bookings/requests/active.
+ * 3. /broadcasts/* endpoints remain as compatibility aliases during migration.
  * 
  * =============================================================================
  */
@@ -19,6 +18,7 @@ import { z } from 'zod';
 import { broadcastService } from './broadcast.service';
 import { authMiddleware, roleGuard } from '../../shared/middleware/auth.middleware';
 import { validateSchema } from '../../shared/utils/validation.utils';
+import { logger } from '../../shared/services/logger.service';
 
 const router = Router();
 
@@ -39,9 +39,9 @@ const idempotencyKeyHeaderSchema = z
 
 /**
  * @route   GET /broadcasts/active
- * @desc    Get active broadcasts for driver/transporter
+ * @desc    Compatibility active feed for driver/transporter (legacy route)
  * @access  Driver, Transporter
- * @query   driverId, vehicleType (optional), maxDistance (optional)
+ * @query   transporterId?, driverId?, vehicleType?, maxDistance?
  */
 router.get(
   '/active',
@@ -49,10 +49,18 @@ router.get(
   roleGuard(['driver', 'transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const { driverId, vehicleType, maxDistance } = req.query;
+      const { driverId, transporterId, vehicleType, maxDistance } = req.query;
+      const actorId = (transporterId as string) || (driverId as string) || req.user!.userId;
+
+      logger.info('[OrderIngress] active_broadcast_feed_request', {
+        route_path: '/api/v1/broadcasts/active',
+        route_alias_used: true,
+        role: req.user!.role,
+        actorId
+      });
       
       const broadcasts = await broadcastService.getActiveBroadcasts({
-        driverId: driverId as string || req.user!.userId,
+        driverId: actorId,
         vehicleType: vehicleType as string,
         maxDistance: maxDistance ? parseFloat(maxDistance as string) : undefined
       });

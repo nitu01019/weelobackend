@@ -14,16 +14,27 @@
  */
 
 import { Router, Request, Response, NextFunction } from 'express';
-import { orderService, CreateOrderRequest } from './order.service';
+import { orderService } from './order.service';
 import { db } from '../../shared/database/db';
 import { authMiddleware, roleGuard } from '../../shared/middleware/auth.middleware';
 import { logger } from '../../shared/services/logger.service';
 import { emitToUser } from '../../shared/services/socket.service';
 import { redisService } from '../../shared/services/redis.service';
 import { bookingQueue, trackingQueue, Priority } from '../../shared/resilience/request-queue';
+import {
+  buildCreateOrderResponseData,
+  normalizeCreateOrderInput,
+  toCreateOrderServiceRequest
+} from './order.contract';
 import { z } from 'zod';
 
 const router = Router();
+
+const ACTIVE_ORDER_STATUSES = new Set(['created', 'broadcasting', 'active', 'partially_filled']);
+
+function normalizeOrderStatus(status: unknown): string {
+  return typeof status === 'string' ? status.toLowerCase() : '';
+}
 
 // =============================================================================
 // VALIDATION SCHEMAS
@@ -48,11 +59,15 @@ const createOrderSchema = z.object({
   pickup: locationSchema,
   drop: locationSchema,
   distanceKm: z.number().min(0),
-  vehicleRequirements: z.array(vehicleRequirementSchema).min(1).max(20),
+  vehicleRequirements: z.array(vehicleRequirementSchema).min(1).max(20).optional(),
+  trucks: z.array(vehicleRequirementSchema).min(1).max(20).optional(),
   goodsType: z.string().optional(),
   cargoWeightKg: z.number().optional(),
   scheduledAt: z.string().optional()
-});
+}).refine(
+  (data) => Array.isArray(data.vehicleRequirements) || Array.isArray(data.trucks),
+  { message: 'Either vehicleRequirements OR trucks must be provided' }
+);
 
 const acceptRequestSchema = z.object({
   truckRequestId: z.string().uuid(),
@@ -89,7 +104,7 @@ router.get(
           hasActiveOrder: !!activeOrder,
           activeOrder: activeOrder ? {
             orderId: activeOrder.id,
-            status: activeOrder.status,
+            status: normalizeOrderStatus(activeOrder.status),
             createdAt: activeOrder.createdAt
           } : null
         }
@@ -131,6 +146,12 @@ router.post(
       // =================================================================
       const lockKey = `order:create:${user.userId}`;
       const lockAcquired = await redisService.acquireLock(lockKey, user.userId, 10);
+
+      logger.info('[OrderIngress] create_order_request', {
+        route_path: '/api/v1/orders',
+        route_alias_used: true,
+        customerId: user.userId
+      });
       
       if (!lockAcquired.acquired) {
         logger.warn(`🔒 Concurrent order request blocked for customer ${user.phone}`);
@@ -167,7 +188,7 @@ router.post(
             data: {
               activeOrderId: activeOrder.id,
               createdAt: activeOrder.createdAt,
-              status: activeOrder.status
+              status: normalizeOrderStatus(activeOrder.status)
             }
           }
         });
@@ -182,13 +203,17 @@ router.post(
       const rateLimit = await orderService.checkRateLimit(rateLimitKey, 5, 60); // 5 per minute
       if (!rateLimit.allowed) {
         logger.warn(`🚫 Rate limit exceeded for customer ${user.phone}`);
+        const retryAfterMs = Math.max(1000, (rateLimit.retryAfter || 1) * 1000);
+        res.setHeader('Retry-After', Math.ceil(retryAfterMs / 1000).toString());
         res.status(429).json({
           success: false,
           error: {
             code: 'RATE_LIMIT_EXCEEDED',
             message: `Too many requests. Please wait ${rateLimit.retryAfter} seconds before trying again.`,
+            retryAfterMs,
             data: {
               retryAfter: rateLimit.retryAfter,
+              retryAfterMs,
               limit: 5,
               window: '1 minute'
             }
@@ -217,6 +242,7 @@ router.post(
         }
         
         const data = validationResult.data;
+        const normalizedInput = normalizeCreateOrderInput(data);
         
         // Extract idempotency key from header
         const idempotencyKey = req.headers['x-idempotency-key'] as string | undefined;
@@ -224,108 +250,30 @@ router.post(
           logger.debug(`🔑 Idempotency key received: ${idempotencyKey.substring(0, 8)}...`);
         }
         
-        // Create order request - validated data has required fields
-        const orderRequest: CreateOrderRequest = {
-          customerId: user.userId,
-          customerName: user.name || 'Customer',
-          customerPhone: user.phone,
-          pickup: {
-            latitude: data.pickup.latitude,
-            longitude: data.pickup.longitude,
-            address: data.pickup.address,
-            city: data.pickup.city,
-            state: data.pickup.state
+        const orderRequest = toCreateOrderServiceRequest(
+          normalizedInput,
+          {
+            id: user.userId,
+            name: user.name || 'Customer',
+            phone: user.phone
           },
-          drop: {
-          latitude: data.drop.latitude,
-          longitude: data.drop.longitude,
-          address: data.drop.address,
-          city: data.drop.city,
-          state: data.drop.state
-        },
-        distanceKm: data.distanceKm,
-        vehicleRequirements: data.vehicleRequirements.map(vr => ({
-          vehicleType: vr.vehicleType,
-          vehicleSubtype: vr.vehicleSubtype,
-          quantity: vr.quantity,
-          pricePerTruck: vr.pricePerTruck
-        })),
-        goodsType: data.goodsType,
-        cargoWeightKg: data.cargoWeightKg,
-        scheduledAt: data.scheduledAt,
-        idempotencyKey: idempotencyKey  // Pass idempotency key to service
-      };
+          idempotencyKey
+        );
       
       // Create order and broadcast
       const result = await orderService.createOrder(orderRequest);
       
       logger.info(`Order created by ${user.phone}: ${result.orderId}`);
       
-      // Format response to match Android app's expected structure
-      // Android expects: { order: OrderData, truckRequests: [...], broadcastSummary: {...}, timeoutSeconds: int }
-      const responseData = {
-        order: {
-          id: result.orderId,
-          customerId: user.userId,
-          customerName: user.name || 'Customer',
-          customerPhone: user.phone,
-          // Android app expects: { coordinates: { latitude, longitude }, address }
-          pickup: {
-            coordinates: {
-              latitude: data.pickup.latitude,
-              longitude: data.pickup.longitude
-            },
-            address: data.pickup.address
-          },
-          drop: {
-            coordinates: {
-              latitude: data.drop.latitude,
-              longitude: data.drop.longitude
-            },
-            address: data.drop.address
-          },
-          distanceKm: data.distanceKm,
-          totalTrucks: result.totalTrucks,
-          trucksFilled: 0,
-          totalAmount: result.totalAmount,
-          goodsType: data.goodsType || null,
-          weight: data.cargoWeightKg ? `${data.cargoWeightKg} kg` : null,
-          status: 'active',
-          scheduledAt: data.scheduledAt || null,
-          expiresAt: result.expiresAt,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString()
-        },
-        truckRequests: result.truckRequests.map((tr, index) => ({
-          id: tr.id,
-          orderId: result.orderId,
-          requestNumber: index + 1,
-          vehicleType: tr.vehicleType,
-          vehicleSubtype: tr.vehicleSubtype,
-          pricePerTruck: tr.pricePerTruck,
-          status: 'searching',
-          assignedTransporterId: null,
-          assignedTransporterName: null,
-          assignedVehicleNumber: null,
-          assignedDriverName: null,
-          assignedDriverPhone: null,
-          tripId: null,
-          assignedAt: null,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString()
-        })),
-        broadcastSummary: {
-          totalRequests: result.totalTrucks,
-          totalTransportersNotified: result.truckRequests.reduce((sum, tr) => sum + tr.matchingTransporters, 0),
-          groupedBy: result.truckRequests.map(tr => ({
-            vehicleType: tr.vehicleType,
-            vehicleSubtype: tr.vehicleSubtype,
-            count: tr.quantity,
-            transportersNotified: tr.matchingTransporters
-          }))
-        },
-        timeoutSeconds: 60  // 1 minute timeout for broadcasts
-      };
+      const responseData = buildCreateOrderResponseData(
+        result,
+        normalizedInput,
+        {
+          id: user.userId,
+          name: user.name || 'Customer',
+          phone: user.phone
+        }
+      );
       
       res.status(201).json({
         success: true,
@@ -972,14 +920,14 @@ router.get(
       const remainingMs = Math.max(0, expiresAt - now);
       const remainingSeconds = Math.floor(remainingMs / 1000);
       
-      // Order is active if PENDING and has time remaining
-      const isActive = order.status === 'PENDING' && remainingSeconds > 0;
+      const normalizedStatus = normalizeOrderStatus(order.status);
+      const isActive = ACTIVE_ORDER_STATUSES.has(normalizedStatus) && remainingSeconds > 0;
       
       res.json({
         success: true,
         data: {
           orderId: order.id,
-          status: order.status,
+          status: normalizedStatus,
           remainingSeconds,
           isActive,
           expiresAt: order.expiresAt

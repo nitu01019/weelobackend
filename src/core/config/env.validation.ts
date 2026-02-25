@@ -131,6 +131,69 @@ const ENV_VARS: EnvVar[] = [
     validator: (v) => !isNaN(parseInt(v)),
     description: 'Redis server port'
   },
+  {
+    name: 'TRACKING_QUEUE_HARD_LIMIT',
+    required: false,
+    default: '200000',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) > 0,
+    description: 'Hard queue depth cap for tracking telemetry queue'
+  },
+  {
+    name: 'TRACKING_QUEUE_DEPTH_SAMPLE_MS',
+    required: false,
+    default: '500',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 100,
+    description: 'Tracking queue depth sampling interval in milliseconds'
+  },
+  {
+    name: 'REDIS_QUEUE_WORKERS',
+    required: false,
+    default: '16',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) > 0 && parseInt(v) <= 256,
+    description: 'Default Redis queue worker count per queue'
+  },
+  {
+    name: 'REDIS_QUEUE_TRACKING_WORKERS',
+    required: false,
+    default: '48',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) > 0 && parseInt(v) <= 512,
+    description: 'Redis queue worker count for tracking-events queue'
+  },
+  {
+    name: 'REDIS_QUEUE_BLOCKING_POP_TIMEOUT_SEC',
+    required: false,
+    default: '1',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 1 && parseInt(v) <= 30,
+    description: 'Redis BRPOP blocking timeout in seconds'
+  },
+  {
+    name: 'ORDER_TRANSPORTER_FANOUT_QUEUE_ENABLED',
+    required: false,
+    default: 'true',
+    validator: (v) => ['true', 'false'].includes(v),
+    description: 'Use queued chunk fanout for high-cardinality transporter socket emits'
+  },
+  {
+    name: 'ORDER_TRANSPORTER_FANOUT_SYNC_THRESHOLD',
+    required: false,
+    default: '64',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) > 0,
+    description: 'Transporter count below which order fanout stays synchronous'
+  },
+  {
+    name: 'ORDER_TRANSPORTER_FANOUT_QUEUE_CHUNK_SIZE',
+    required: false,
+    default: '500',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 25,
+    description: 'Chunk size for queued transporter fanout batches'
+  },
+  {
+    name: 'SOCKET_MULTI_ROOM_EMIT_CHUNK_SIZE',
+    required: false,
+    default: '300',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 25,
+    description: 'Socket.IO room chunk size for multi-user direct emits'
+  },
 
   // ==========================================================================
   // SMS PROVIDER
@@ -206,6 +269,46 @@ const ENV_VARS: EnvVar[] = [
     name: 'S3_BUCKET',
     required: false,
     description: 'S3 bucket for file uploads'
+  },
+  {
+    name: 'TRACKING_STREAM_ENABLED',
+    required: false,
+    default: 'false',
+    validator: (v) => ['true', 'false'].includes(v),
+    description: 'Enable async tracking stream fanout'
+  },
+  {
+    name: 'TRACKING_STREAM_PROVIDER',
+    required: false,
+    default: 'none',
+    validator: (v) => ['none', 'kinesis'].includes(v.toLowerCase()),
+    description: 'Tracking stream sink provider (none or kinesis)'
+  },
+  {
+    name: 'TRACKING_KINESIS_STREAM',
+    required: false,
+    description: 'Kinesis stream name for tracking telemetry fanout'
+  },
+  {
+    name: 'TRACKING_STREAM_BATCH_SIZE',
+    required: false,
+    default: '100',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 1 && parseInt(v) <= 500,
+    description: 'Tracking stream publish batch size'
+  },
+  {
+    name: 'TRACKING_STREAM_FLUSH_MS',
+    required: false,
+    default: '250',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 10 && parseInt(v) <= 10000,
+    description: 'Tracking stream max flush interval in milliseconds'
+  },
+  {
+    name: 'TRACKING_STREAM_MAX_RETRIES',
+    required: false,
+    default: '3',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 0 && parseInt(v) <= 10,
+    description: 'Tracking stream publish retry attempts'
   },
 
   // ==========================================================================
@@ -356,6 +459,21 @@ export function validateEnvironment(): ValidationResult {
     if (!process.env.AWS_SNS_REGION && !process.env.AWS_REGION) {
       result.warnings.push('AWS_SNS_REGION not set, defaulting to ap-south-1');
     }
+  }
+
+  const trackingStreamEnabled = process.env.TRACKING_STREAM_ENABLED === 'true';
+  const trackingStreamProvider = (process.env.TRACKING_STREAM_PROVIDER || 'none').toLowerCase();
+  if (trackingStreamEnabled) {
+    if (trackingStreamProvider === 'none') {
+      result.valid = false;
+      result.errors.push('TRACKING_STREAM_ENABLED=true requires TRACKING_STREAM_PROVIDER to be set (kinesis)');
+    }
+    if (trackingStreamProvider === 'kinesis' && !process.env.TRACKING_KINESIS_STREAM) {
+      result.valid = false;
+      result.errors.push('TRACKING_KINESIS_STREAM is required when TRACKING_STREAM_PROVIDER=kinesis');
+    }
+  } else if (trackingStreamProvider !== 'none') {
+    result.warnings.push('TRACKING_STREAM_PROVIDER is set but TRACKING_STREAM_ENABLED=false; tracking stream remains disabled');
   }
 
   return result;

@@ -50,7 +50,7 @@ import { validateAndLogEnvironment } from './core/config/env.validation';
 // Config & Services
 import { config } from './config/environment';
 import { logger } from './shared/services/logger.service';
-import { initializeSocket, getConnectedUserCount, getConnectionStats } from './shared/services/socket.service';
+import { initializeSocket, getConnectedUserCount, getConnectionStats, getRedisAdapterStatus } from './shared/services/socket.service';
 
 // Middleware
 import { errorHandler } from './shared/middleware/error.middleware';
@@ -269,6 +269,7 @@ app.use(rateLimiter);
 
 app.get('/health', async (_req, res) => {
   const stats = await db.getStats();
+  const socketAdapter = getRedisAdapterStatus();
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
@@ -285,6 +286,10 @@ app.get('/health', async (_req, res) => {
     redis: {
       connected: redisService.isConnected(),
       mode: redisService.isRedisEnabled() ? 'redis' : 'memory'
+    },
+    socket: {
+      connectedUsers: getConnectedUserCount(),
+      adapter: socketAdapter
     },
     security: {
       helmet: true,
@@ -507,12 +512,14 @@ const gracefulShutdown = async (signal: string) => {
   try {
     const { stopBookingExpiryChecker } = require('./modules/booking/booking.service');
     const { stopOrderExpiryChecker } = require('./modules/booking/order.service');
+    const { stopOrderTimerChecker } = require('./modules/order/order.service');
     const { stopAssignmentExpiryChecker } = require('./modules/assignment/assignment.service');
     const { broadcastService } = require('./modules/broadcast/broadcast.service');
     const { stopStaleTransporterCleanup } = require('./shared/services/transporter-online.service');
     const { trackingService } = require('./modules/tracking/tracking.service');
     stopBookingExpiryChecker();
     stopOrderExpiryChecker();
+    stopOrderTimerChecker();
     stopAssignmentExpiryChecker();
     broadcastService?.stopExpiryChecker?.();
     stopStaleTransporterCleanup();

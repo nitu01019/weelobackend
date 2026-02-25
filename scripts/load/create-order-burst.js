@@ -4,6 +4,10 @@ import { check, sleep } from 'k6';
 const BASE_URL = __ENV.API_BASE_URL || 'http://localhost:3000';
 const CUSTOMER_TOKEN = __ENV.CUSTOMER_TOKEN || '';
 const RUN_ID = __ENV.LOAD_TEST_RUN_ID || `phase8-create-${Date.now()}`;
+const CREATE_ROUTE_MODE = (__ENV.CREATE_ROUTE_MODE || 'canonical').toLowerCase();
+const CREATE_PATH = CREATE_ROUTE_MODE === 'legacy_orders'
+  ? '/api/v1/orders'
+  : '/api/v1/bookings/orders';
 
 export const options = {
   scenarios: {
@@ -62,7 +66,7 @@ export default function () {
     ]
   };
 
-  const res = http.post(`${BASE_URL}/api/v1/orders`, JSON.stringify(payload), headers());
+  const res = http.post(`${BASE_URL}${CREATE_PATH}`, JSON.stringify(payload), headers());
 
   check(res, {
     'create-order status is 201 or 400-active-order': (r) => r.status === 201 || r.status === 400,

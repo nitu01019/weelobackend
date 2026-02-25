@@ -23,6 +23,8 @@
 import { logger } from './logger.service';
 import { EventEmitter } from 'events';
 import { redisService } from './redis.service';
+import { createTrackingStreamSink } from './tracking-stream-sink';
+import { metrics } from '../monitoring/metrics.service';
 
 // =============================================================================
 // TYPES
@@ -41,6 +43,22 @@ export interface QueueJob<T = any> {
 }
 
 export type JobProcessor<T = any> = (job: QueueJob<T>) => Promise<void>;
+
+export interface TrackingEventPayload {
+  driverId: string;
+  tripId: string;
+  bookingId?: string;
+  orderId?: string;
+  latitude: number;
+  longitude: number;
+  speed: number;
+  bearing: number;
+  ts: string;
+  source: 'gps' | 'batch_sync' | 'system';
+}
+
+const TRACKING_QUEUE_HARD_LIMIT = Math.max(1000, parseInt(process.env.TRACKING_QUEUE_HARD_LIMIT || '200000', 10) || 200000);
+const TRACKING_QUEUE_DEPTH_SAMPLE_MS = Math.max(100, parseInt(process.env.TRACKING_QUEUE_DEPTH_SAMPLE_MS || '500', 10) || 500);
 
 // =============================================================================
 // IN-MEMORY QUEUE (Development / Single Server)
@@ -249,6 +267,10 @@ class InMemoryQueue extends EventEmitter {
       totalProcessing: this.processing.size
     };
   }
+
+  async getQueueDepth(queueName: string): Promise<number> {
+    return this.queues.get(queueName)?.length || 0;
+  }
 }
 
 // =============================================================================
@@ -280,11 +302,13 @@ class RedisQueue extends EventEmitter {
   private processors: Map<string, JobProcessor> = new Map();
   private processing: Set<string> = new Set();
   private isRunning: boolean = false;
-  private pollIntervals: Map<string, NodeJS.Timeout> = new Map();
+  private queueInFlight: Map<string, number> = new Map();
+  private queueWorkers: Map<string, Set<number>> = new Map();
   
   // Configuration
-  private readonly concurrency: number = 10;
-  private readonly pollInterval: number = 1000; // 1 second for Redis (less aggressive)
+  private readonly defaultWorkerCount = Math.max(1, parseInt(process.env.REDIS_QUEUE_WORKERS || '16', 10) || 16);
+  private readonly trackingWorkerCount = Math.max(1, parseInt(process.env.REDIS_QUEUE_TRACKING_WORKERS || '48', 10) || 48);
+  private readonly blockingPopTimeoutSec = Math.max(1, parseInt(process.env.REDIS_QUEUE_BLOCKING_POP_TIMEOUT_SEC || '1', 10) || 1);
   private readonly queuePrefix: string = 'queue:';
   private readonly deadLetterPrefix: string = 'dlq:';
   
@@ -360,6 +384,7 @@ class RedisQueue extends EventEmitter {
     const queueKey = this.getQueueKey(queueName);
     
     try {
+      const serializedJobs: string[] = [];
       for (const jobData of jobs) {
         const job: QueueJob<T> = {
           id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
@@ -371,8 +396,12 @@ class RedisQueue extends EventEmitter {
           createdAt: Date.now()
         };
         
-        await redisService.lPush(queueKey, JSON.stringify(job));
         ids.push(job.id);
+        serializedJobs.push(JSON.stringify(job));
+      }
+
+      if (serializedJobs.length > 0) {
+        await redisService.lPushMany(queueKey, serializedJobs);
       }
       
       logger.debug(`Redis Queue: Batch of ${ids.length} jobs added to ${queueName}`);
@@ -385,58 +414,104 @@ class RedisQueue extends EventEmitter {
   
   /**
    * Register a processor for a queue
-   * Starts polling for jobs in that queue
+   * Starts worker loops for that queue
    */
   process(queueName: string, processor: JobProcessor): void {
     this.processors.set(queueName, processor);
-    
-    // Start polling for this queue if not already running
-    if (!this.pollIntervals.has(queueName)) {
-      this.startPolling(queueName);
+
+    if (!this.isRunning) {
+      this.start();
+    } else {
+      this.startWorkersForQueue(queueName);
     }
     
     logger.info(`Redis Queue: Processor registered for ${queueName}`);
   }
   
   /**
-   * Start polling a queue for jobs
+   * Start queue workers
    */
-  private startPolling(queueName: string): void {
-    const poll = async () => {
-      if (this.processing.size >= this.concurrency) return;
-      
-      const processor = this.processors.get(queueName);
-      if (!processor) return;
-      
+  private startWorkersForQueue(queueName: string): void {
+    const processor = this.processors.get(queueName);
+    if (!processor || !this.isRunning) return;
+
+    const targetWorkers = this.getWorkerCount(queueName);
+    if (!this.queueWorkers.has(queueName)) {
+      this.queueWorkers.set(queueName, new Set());
+    }
+    const workers = this.queueWorkers.get(queueName)!;
+
+    for (let workerId = 0; workerId < targetWorkers; workerId += 1) {
+      if (workers.has(workerId)) continue;
+      workers.add(workerId);
+      this.runWorkerLoop(queueName, workerId, processor).catch((error: any) => {
+        logger.error(`Redis Queue: Worker crashed for ${queueName}`, {
+          workerId,
+          message: error?.message || 'unknown'
+        });
+      });
+    }
+  }
+
+  private getWorkerCount(queueName: string): number {
+    if (queueName === QueueService.QUEUES.TRACKING_EVENTS) {
+      return this.trackingWorkerCount;
+    }
+    return this.defaultWorkerCount;
+  }
+
+  private async runWorkerLoop(queueName: string, workerId: number, processor: JobProcessor): Promise<void> {
+    const queueKey = this.getQueueKey(queueName);
+
+    while (this.isRunning && this.processors.get(queueName) === processor) {
       try {
-        const queueKey = this.getQueueKey(queueName);
-        
-        // RPOP to get oldest job (FIFO)
-        const jobStr = await redisService.rPop(queueKey);
-        
-        if (jobStr) {
-          const job: QueueJob = JSON.parse(jobStr);
-          
-          // Check if job should be delayed
-          if (job.processAfter && Date.now() < job.processAfter) {
-            // Re-queue for later
-            await redisService.lPush(queueKey, JSON.stringify(job));
-            return;
-          }
-          
-          this.processing.add(job.id);
-          await this.processJob(queueName, job, processor);
+        const jobStr = await redisService.brPop(queueKey, this.blockingPopTimeoutSec);
+        if (!jobStr) {
+          continue;
         }
+
+        const job: QueueJob = JSON.parse(jobStr);
+        if (job.processAfter && Date.now() < job.processAfter) {
+          await redisService.lPush(queueKey, JSON.stringify(job));
+          await this.sleep(Math.min(200, Math.max(10, job.processAfter - Date.now())));
+          continue;
+        }
+
+        this.processing.add(job.id);
+        this.incrementInFlight(queueName);
+        await this.processJob(queueName, job, processor);
       } catch (error: any) {
-        logger.error(`Redis Queue: Polling error for ${queueName}:`, error.message);
+        logger.error(`Redis Queue: Worker error for ${queueName}`, {
+          workerId,
+          message: error?.message || 'unknown'
+        });
+        await this.sleep(50);
       }
-    };
-    
-    const intervalId = setInterval(poll, this.pollInterval);
-    this.pollIntervals.set(queueName, intervalId);
-    
-    // Initial poll
-    poll();
+    }
+
+    const workers = this.queueWorkers.get(queueName);
+    workers?.delete(workerId);
+  }
+
+  private async sleep(ms: number): Promise<void> {
+    await new Promise<void>((resolve) => setTimeout(resolve, ms));
+  }
+
+  private incrementInFlight(queueName: string): void {
+    const current = this.queueInFlight.get(queueName) || 0;
+    this.queueInFlight.set(queueName, current + 1);
+    if (queueName === QueueService.QUEUES.TRACKING_EVENTS) {
+      metrics.setGauge('tracking_queue_inflight', current + 1);
+    }
+  }
+
+  private decrementInFlight(queueName: string): void {
+    const current = this.queueInFlight.get(queueName) || 0;
+    const next = Math.max(0, current - 1);
+    this.queueInFlight.set(queueName, next);
+    if (queueName === QueueService.QUEUES.TRACKING_EVENTS) {
+      metrics.setGauge('tracking_queue_inflight', next);
+    }
   }
   
   /**
@@ -475,6 +550,7 @@ class RedisQueue extends EventEmitter {
       }
     } finally {
       this.processing.delete(job.id);
+      this.decrementInFlight(queueName);
     }
   }
   
@@ -482,7 +558,11 @@ class RedisQueue extends EventEmitter {
    * Start processing (called automatically when processor is registered)
    */
   start(): void {
+    if (this.isRunning) return;
     this.isRunning = true;
+    for (const queueName of this.processors.keys()) {
+      this.startWorkersForQueue(queueName);
+    }
     logger.info('🚀 Redis Queue processor started');
   }
   
@@ -491,13 +571,7 @@ class RedisQueue extends EventEmitter {
    */
   stop(): void {
     this.isRunning = false;
-    
-    // Clear all polling intervals
-    for (const [queueName, intervalId] of this.pollIntervals) {
-      clearInterval(intervalId);
-      logger.debug(`Redis Queue: Stopped polling for ${queueName}`);
-    }
-    this.pollIntervals.clear();
+    this.queueWorkers.clear();
     
     logger.info('⏹️ Redis Queue processor stopped');
   }
@@ -519,7 +593,7 @@ class RedisQueue extends EventEmitter {
       queueStats.push({
         name: queueName,
         pending,
-        processing: 0 // Redis doesn't track in-flight easily
+        processing: this.queueInFlight.get(queueName) || 0
       });
     }
     
@@ -528,6 +602,10 @@ class RedisQueue extends EventEmitter {
       totalPending: queueStats.reduce((sum, q) => sum + q.pending, 0),
       totalProcessing: this.processing.size
     };
+  }
+
+  async getQueueDepth(queueName: string): Promise<number> {
+    return redisService.lLen(this.getQueueKey(queueName));
   }
 }
 
@@ -542,6 +620,7 @@ interface IQueue {
   start(): void;
   stop(): void;
   getStats(): any;
+  getQueueDepth(queueName: string): Promise<number>;
 }
 
 // =============================================================================
@@ -551,11 +630,15 @@ interface IQueue {
 class QueueService {
   private queue: IQueue;
   private isRedisMode: boolean = false;
+  private readonly trackingStreamSink = createTrackingStreamSink();
+  private trackingDepthSnapshot: { depth: number; sampledAtMs: number } = { depth: 0, sampledAtMs: 0 };
+  private trackingDepthSampleInFlight: Promise<void> | null = null;
   
   // Queue names for organization
   static readonly QUEUES = {
     BROADCAST: 'broadcast',           // Broadcast notifications to transporters
     PUSH_NOTIFICATION: 'push',        // FCM push notifications
+    TRACKING_EVENTS: 'tracking-events', // Driver telemetry stream fanout
     EMAIL: 'email',                   // Email notifications (future)
     SMS: 'sms',                       // SMS notifications (future)
     ANALYTICS: 'analytics',           // Analytics events
@@ -598,6 +681,12 @@ class QueueService {
       const { sendPushNotification } = require('./fcm.service');
       const { userId, notification } = job.data;
       await sendPushNotification(userId, notification);
+    });
+
+    // Tracking stream processor (sink pluggable via env/integration service).
+    // Default sink is no-op to avoid blocking hot path when no sink is configured.
+    this.queue.process(QueueService.QUEUES.TRACKING_EVENTS, async (job) => {
+      await this.trackingStreamSink.publishTrackingEvents([job.data as TrackingEventPayload]);
     });
     
     logger.info('📋 Queue processors registered');
@@ -675,6 +764,61 @@ class QueueService {
     
     return this.queue.addBatch(QueueService.QUEUES.PUSH_NOTIFICATION, jobs);
   }
+
+  /**
+   * Queue tracking telemetry event for async fanout (Kinesis/MSK adapter later).
+   */
+  async queueTrackingEvent(event: TrackingEventPayload): Promise<string> {
+    await this.refreshTrackingQueueDepth(false);
+    if (this.trackingDepthSnapshot.depth >= TRACKING_QUEUE_HARD_LIMIT) {
+      metrics.incrementCounter('tracking_queue_dropped_total', { reason: 'hard_limit' });
+      logger.warn('Tracking event dropped due to queue hard limit', {
+        hardLimit: TRACKING_QUEUE_HARD_LIMIT,
+        depth: this.trackingDepthSnapshot.depth
+      });
+      return `dropped-${Date.now()}`;
+    }
+
+    return this.queue.add(
+      QueueService.QUEUES.TRACKING_EVENTS,
+      'tracking_event',
+      event,
+      { priority: -1, maxAttempts: 2 }
+    );
+  }
+
+  private async refreshTrackingQueueDepth(force: boolean): Promise<void> {
+    const nowMs = Date.now();
+    const shouldRefresh = force ||
+      (nowMs - this.trackingDepthSnapshot.sampledAtMs >= TRACKING_QUEUE_DEPTH_SAMPLE_MS);
+    if (!shouldRefresh) return;
+
+    if (this.trackingDepthSampleInFlight) {
+      await this.trackingDepthSampleInFlight;
+      return;
+    }
+
+    this.trackingDepthSampleInFlight = (async () => {
+      try {
+        const depth = await this.queue.getQueueDepth(QueueService.QUEUES.TRACKING_EVENTS);
+        this.trackingDepthSnapshot = { depth, sampledAtMs: Date.now() };
+        metrics.setGauge('tracking_queue_depth', depth);
+        if (depth >= Math.floor(TRACKING_QUEUE_HARD_LIMIT * 0.8)) {
+          logger.warn('Tracking queue depth nearing hard limit', {
+            depth,
+            hardLimit: TRACKING_QUEUE_HARD_LIMIT
+          });
+        }
+      } catch (error: any) {
+        logger.warn('Failed to sample tracking queue depth', {
+          message: error?.message || 'unknown'
+        });
+      }
+    })();
+
+    await this.trackingDepthSampleInFlight;
+    this.trackingDepthSampleInFlight = null;
+  }
   
   /**
    * Add custom job (full method name)
@@ -722,6 +866,11 @@ class QueueService {
    */
   stop(): void {
     this.queue.stop();
+    this.trackingStreamSink.flush().catch((error: any) => {
+      logger.warn('Failed to flush tracking stream sink during queue shutdown', {
+        message: error?.message || 'unknown'
+      });
+    });
   }
 }
 

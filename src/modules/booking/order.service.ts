@@ -1,4 +1,8 @@
 /**
+ * @deprecated Legacy booking order service. Runtime order ingress is now handled by
+ * `src/modules/order/order.service.ts` through `/api/v1/bookings/orders` and `/api/v1/orders` route bindings.
+ */
+/**
  * =============================================================================
  * ORDER SERVICE - Multi-Truck Request System
  * =============================================================================

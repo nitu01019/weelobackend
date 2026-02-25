@@ -52,6 +52,10 @@ import {
   TripStatusUpdateInput,
   TRACKING_CONFIG
 } from './tracking.schema';
+import {
+  assertBookingTrackingAccess,
+  assertTripTrackingAccess
+} from './tracking-access.policy';
 
 // =============================================================================
 // REDIS KEYS
@@ -69,6 +73,8 @@ const REDIS_KEYS = {
 
   /** Fleet active drivers: fleet:{transporterId} */
   FLEET_DRIVERS: (transporterId: string) => `fleet:${transporterId}`,
+  /** Index of transporter IDs that currently have active fleet sets */
+  ACTIVE_FLEET_TRANSPORTERS: 'fleet:index:transporters',
 
   /** Active trips by booking: booking:trips:{bookingId} */
   BOOKING_TRIPS: (bookingId: string) => `booking:trips:${bookingId}`,
@@ -93,6 +99,11 @@ const TTL = {
   HISTORY: 86400 * 7,      // 7 days - keep history for analytics
 };
 
+const HISTORY_PERSIST_MIN_INTERVAL_MS = parseInt(process.env.TRACKING_HISTORY_MIN_INTERVAL_MS || '15000', 10);
+const HISTORY_PERSIST_MIN_MOVEMENT_METERS = parseInt(process.env.TRACKING_HISTORY_MIN_MOVEMENT_METERS || '75', 10);
+const HISTORY_STATE_MAX_ENTRIES = parseInt(process.env.TRACKING_HISTORY_STATE_MAX_ENTRIES || '50000', 10);
+const TRACKING_STREAM_ENABLED = process.env.TRACKING_STREAM_ENABLED === 'true';
+
 // =============================================================================
 // TYPES
 // =============================================================================
@@ -112,6 +123,13 @@ interface LocationData {
   accuracy?: number;
   status: string;
   lastUpdated: string;  // ISO string for Redis
+}
+
+interface HistoryPersistState {
+  latitude: number;
+  longitude: number;
+  timestampMs: number;
+  status: string;
 }
 
 /**
@@ -135,6 +153,8 @@ export interface FleetTrackingResponse {
 }
 
 class TrackingService {
+  private readonly historyPersistStateByTrip = new Map<string, HistoryPersistState>();
+
   /**
    * ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
    * ┃  UPDATE DRIVER LOCATION - The Core of Live Tracking                   ┃
@@ -182,6 +202,13 @@ class TrackingService {
         lastUpdated: now
       };
 
+      const historyEntry: LocationHistoryEntry = {
+        latitude: data.latitude,
+        longitude: data.longitude,
+        speed: data.speed || 0,
+        timestamp: now
+      };
+
       // 3. Store in Redis (both trip and driver location)
       await Promise.all([
         // Trip location (for trip tracking)
@@ -191,13 +218,10 @@ class TrackingService {
         redisService.setJSON(REDIS_KEYS.DRIVER_LOCATION(driverId), locationData, TTL.LOCATION),
       ]);
 
-      // 4. Add to history (fire and forget)
-      this.addToHistory(data.tripId, {
-        latitude: data.latitude,
-        longitude: data.longitude,
-        speed: data.speed || 0,
-        timestamp: now
-      });
+      // 4. Add to history (fire-and-forget), but sample to reduce hot-path write load.
+      if (this.shouldPersistHistoryPoint(data.tripId, historyEntry, locationData.status)) {
+        this.addToHistory(data.tripId, historyEntry);
+      }
 
       // 5. Broadcast via WebSocket - THE KEY FOR REAL-TIME
       const broadcastPayload = {
@@ -222,6 +246,19 @@ class TrackingService {
       if (existing?.transporterId) {
         emitToUser(existing.transporterId, SocketEvent.LOCATION_UPDATED, broadcastPayload);
       }
+
+      this.publishTrackingEventAsync({
+        driverId,
+        tripId: data.tripId,
+        bookingId: existing?.bookingId,
+        orderId: existing?.orderId,
+        latitude: data.latitude,
+        longitude: data.longitude,
+        speed: data.speed || 0,
+        bearing: data.bearing || 0,
+        ts: now,
+        source: 'gps'
+      });
 
       logger.debug('📍 Location updated', { tripId: data.tripId, driverId, lat: data.latitude, lng: data.longitude });
 
@@ -408,6 +445,26 @@ class TrackingService {
         if (existing?.transporterId) {
           emitToUser(existing.transporterId, SocketEvent.LOCATION_UPDATED, broadcastPayload);
         }
+
+        this.rememberHistoryPersistState(tripId, {
+          latitude: newestValidPoint.latitude,
+          longitude: newestValidPoint.longitude,
+          timestampMs: new Date(newestValidPoint.timestamp).getTime(),
+          status: locationData.status
+        });
+
+        this.publishTrackingEventAsync({
+          driverId,
+          tripId,
+          bookingId: existing?.bookingId,
+          orderId: existing?.orderId,
+          latitude: newestValidPoint.latitude,
+          longitude: newestValidPoint.longitude,
+          speed: newestValidPoint.speed || 0,
+          bearing: newestValidPoint.bearing || 0,
+          ts: newestValidPoint.timestamp,
+          source: 'batch_sync'
+        });
       }
 
       logger.info(`📦 Batch complete: ${result.accepted} accepted, ${result.stale} stale, ${result.duplicate} duplicate, ${result.invalid} invalid`, { tripId });
@@ -499,7 +556,21 @@ class TrackingService {
       // Cap at last 1000 points (lTrim keeps indices -1000 to -1)
       await redisService.lTrim(key, -1000, -1);
       await redisService.expire(key, TTL.HISTORY);
-    } catch (error) {
+    } catch (error: any) {
+      if (String(error?.message || error).includes('WRONGTYPE')) {
+        // Backward compatibility: older versions stored history as JSON string.
+        // Reset key type once and retry list write.
+        const key = REDIS_KEYS.TRIP_HISTORY(tripId);
+        try {
+          await redisService.del(key);
+          await redisService.rPush(key, JSON.stringify(entry));
+          await redisService.lTrim(key, -1000, -1);
+          await redisService.expire(key, TTL.HISTORY);
+          return;
+        } catch (retryError) {
+          logger.warn(`Failed to recover history key type: ${retryError}`);
+        }
+      }
       // Non-critical - log but don't throw
       logger.warn(`Failed to add to history: ${error}`);
     }
@@ -546,12 +617,12 @@ class TrackingService {
 
     // Add driver to transporter's fleet
     if (transporterId) {
-      await redisService.sAdd(REDIS_KEYS.FLEET_DRIVERS(transporterId), driverId);
-      await redisService.expire(REDIS_KEYS.FLEET_DRIVERS(transporterId), TTL.TRIP);
+      await this.addDriverToFleet(transporterId, driverId);
     }
 
     // Initialize empty history
-    await redisService.setJSON(REDIS_KEYS.TRIP_HISTORY(tripId), [], TTL.HISTORY);
+    await redisService.del(REDIS_KEYS.TRIP_HISTORY(tripId));
+    this.historyPersistStateByTrip.delete(tripId);
 
     logger.info('🚀 Tracking initialized', { tripId, driverId, bookingId });
   }
@@ -857,9 +928,10 @@ class TrackingService {
    */
   async getTripTracking(
     tripId: string,
-    _userId: string,
-    _userRole: string
+    userId: string,
+    userRole: string
   ): Promise<TrackingResponse> {
+    await assertTripTrackingAccess(tripId, userId, userRole);
     const location = await redisService.getJSON<LocationData>(REDIS_KEYS.TRIP_LOCATION(tripId));
 
     if (!location) {
@@ -896,11 +968,16 @@ class TrackingService {
    */
   async getBookingTracking(
     bookingId: string,
-    _userId?: string,
-    _userRole?: string
+    userId?: string,
+    userRole?: string
   ): Promise<BookingTrackingResponse> {
+    const scopedUserId = userId || '';
+    const scopedRole = userRole || '';
+    const scope = await assertBookingTrackingAccess(bookingId, scopedUserId, scopedRole);
+
     // Get all trip IDs for this booking
-    const tripIds = await redisService.sMembers(REDIS_KEYS.BOOKING_TRIPS(bookingId));
+    const redisTripIds = await redisService.sMembers(REDIS_KEYS.BOOKING_TRIPS(bookingId));
+    const tripIds = Array.from(new Set([...scope.tripIds, ...redisTripIds]));
 
     const trucks: TrackingResponse[] = [];
 
@@ -912,7 +989,7 @@ class TrackingService {
     const locations = await Promise.all(locationPromises);
 
     for (const location of locations) {
-      if (location && location.bookingId === bookingId) {
+      if (location && (location.bookingId === bookingId || location.orderId === bookingId)) {
         trucks.push({
           tripId: location.tripId,
           driverId: location.driverId,
@@ -987,11 +1064,25 @@ class TrackingService {
    */
   async getTripHistory(
     tripId: string,
-    _userId: string,
-    _userRole: string,
+    userId: string,
+    userRole: string,
     query: GetTrackingQuery
   ): Promise<LocationHistoryEntry[]> {
-    const history = await redisService.getJSON<LocationHistoryEntry[]>(REDIS_KEYS.TRIP_HISTORY(tripId)) || [];
+    await assertTripTrackingAccess(tripId, userId, userRole);
+    const historyKey = REDIS_KEYS.TRIP_HISTORY(tripId);
+    const rawHistory = await redisService.lRange(historyKey, 0, -1);
+    let history: LocationHistoryEntry[] = rawHistory.map((entry) => {
+      try {
+        return JSON.parse(entry) as LocationHistoryEntry;
+      } catch {
+        return null;
+      }
+    }).filter((entry): entry is LocationHistoryEntry => entry !== null);
+
+    // Backward compatibility for pre-list history keys.
+    if (history.length === 0) {
+      history = await redisService.getJSON<LocationHistoryEntry[]>(historyKey) || [];
+    }
 
     let filtered = history;
 
@@ -1036,6 +1127,10 @@ class TrackingService {
       // Remove driver from active fleet
       if (location.transporterId) {
         await redisService.sRem(REDIS_KEYS.FLEET_DRIVERS(location.transporterId), location.driverId);
+        const fleetSize = await redisService.sCard(REDIS_KEYS.FLEET_DRIVERS(location.transporterId));
+        if (fleetSize <= 0) {
+          await redisService.sRem(REDIS_KEYS.ACTIVE_FLEET_TRANSPORTERS, location.transporterId);
+        }
       }
 
       // Broadcast completion
@@ -1046,7 +1141,85 @@ class TrackingService {
       });
     }
 
+    this.historyPersistStateByTrip.delete(tripId);
+
     logger.info('✅ Tracking completed', { tripId });
+  }
+
+  private shouldPersistHistoryPoint(tripId: string, entry: LocationHistoryEntry, status: string): boolean {
+    const timestampMs = new Date(entry.timestamp).getTime();
+    if (!Number.isFinite(timestampMs)) return false;
+
+    const previous = this.historyPersistStateByTrip.get(tripId);
+    if (!previous) {
+      this.rememberHistoryPersistState(tripId, {
+        latitude: entry.latitude,
+        longitude: entry.longitude,
+        timestampMs,
+        status
+      });
+      return true;
+    }
+
+    const isStatusChange = previous.status !== status;
+    if (timestampMs <= previous.timestampMs && !isStatusChange) {
+      return false;
+    }
+
+    const elapsedMs = Math.max(0, timestampMs - previous.timestampMs);
+    const movedMeters = haversineDistanceMeters(
+      previous.latitude,
+      previous.longitude,
+      entry.latitude,
+      entry.longitude
+    );
+    const shouldPersist = isStatusChange ||
+      elapsedMs >= HISTORY_PERSIST_MIN_INTERVAL_MS ||
+      movedMeters >= HISTORY_PERSIST_MIN_MOVEMENT_METERS;
+
+    if (shouldPersist) {
+      this.rememberHistoryPersistState(tripId, {
+        latitude: entry.latitude,
+        longitude: entry.longitude,
+        timestampMs,
+        status
+      });
+    }
+    return shouldPersist;
+  }
+
+  private rememberHistoryPersistState(tripId: string, state: HistoryPersistState): void {
+    if (this.historyPersistStateByTrip.has(tripId)) {
+      this.historyPersistStateByTrip.delete(tripId);
+    }
+    this.historyPersistStateByTrip.set(tripId, state);
+    if (this.historyPersistStateByTrip.size > HISTORY_STATE_MAX_ENTRIES) {
+      const oldestKey = this.historyPersistStateByTrip.keys().next().value;
+      if (oldestKey) {
+        this.historyPersistStateByTrip.delete(oldestKey);
+      }
+    }
+  }
+
+  private publishTrackingEventAsync(event: {
+    driverId: string;
+    tripId: string;
+    bookingId?: string;
+    orderId?: string;
+    latitude: number;
+    longitude: number;
+    speed: number;
+    bearing: number;
+    ts: string;
+    source: 'gps' | 'batch_sync' | 'system';
+  }): void {
+    if (!TRACKING_STREAM_ENABLED) return;
+    queueService.queueTrackingEvent(event).catch((error) => {
+      logger.warn(`[TRACKING] Failed to enqueue tracking event: ${error.message}`, {
+        tripId: event.tripId,
+        driverId: event.driverId
+      });
+    });
   }
 
   /**
@@ -1055,6 +1228,7 @@ class TrackingService {
   async addDriverToFleet(transporterId: string, driverId: string): Promise<void> {
     await redisService.sAdd(REDIS_KEYS.FLEET_DRIVERS(transporterId), driverId);
     await redisService.expire(REDIS_KEYS.FLEET_DRIVERS(transporterId), TTL.TRIP);
+    await redisService.sAdd(REDIS_KEYS.ACTIVE_FLEET_TRANSPORTERS, transporterId);
     logger.debug('Driver added to fleet', { transporterId, driverId });
   }
 
@@ -1063,6 +1237,10 @@ class TrackingService {
    */
   async removeDriverFromFleet(transporterId: string, driverId: string): Promise<void> {
     await redisService.sRem(REDIS_KEYS.FLEET_DRIVERS(transporterId), driverId);
+    const fleetSize = await redisService.sCard(REDIS_KEYS.FLEET_DRIVERS(transporterId));
+    if (fleetSize <= 0) {
+      await redisService.sRem(REDIS_KEYS.ACTIVE_FLEET_TRANSPORTERS, transporterId);
+    }
     // Also delete their location
     await redisService.del(REDIS_KEYS.DRIVER_LOCATION(driverId));
     logger.debug('Driver removed from fleet', { transporterId, driverId });
@@ -1129,75 +1307,91 @@ class TrackingService {
     if (!lock.acquired) return;
 
     try {
-      // =====================================================================
-      // IMPORTANT: Fleet driver sets are stored as fleet:{transporterId}
-      // But Redis also has fleet:vehicles:*, fleet:drivers:*, fleet:driver:*,
-      // fleet:snapshot:* — we MUST NOT match those.
-      //
-      // APPROACH: Get all fleet:* keys, then filter to only keys that are
-      // a bare UUID (no colons after 'fleet:'), which are the driver SETS.
-      // =====================================================================
-      const allFleetKeys: string[] = [];
-      for await (const key of redisService.scanIterator('fleet:*')) {
-        allFleetKeys.push(key);
+      let transporterIds = await redisService.sMembers(REDIS_KEYS.ACTIVE_FLEET_TRANSPORTERS);
+
+      // Backward compatibility fallback for historical deployments that populated
+      // only fleet:{transporterId} sets and not the active transporter index.
+      if (transporterIds.length === 0) {
+        const allFleetKeys: string[] = [];
+        for await (const key of redisService.scanIterator('fleet:*')) {
+          allFleetKeys.push(key);
+        }
+        const uuidRegex = /^fleet:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        transporterIds = allFleetKeys
+          .filter(key => uuidRegex.test(key))
+          .map(key => key.replace('fleet:', ''));
+        transporterIds = Array.from(new Set(transporterIds));
+        if (transporterIds.length > 0) {
+          await redisService.sAdd(REDIS_KEYS.ACTIVE_FLEET_TRANSPORTERS, ...transporterIds);
+        }
       }
 
-      // Filter: only bare fleet:{uuid} keys (no sub-keys like fleet:vehicles:xxx)
-      // UUID pattern: 8-4-4-4-12 hex chars
-      const uuidRegex = /^fleet:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-      const fleetKeys = allFleetKeys.filter(key => uuidRegex.test(key));
+      const locationBatchSize = Math.max(
+        25,
+        Math.min(400, parseInt(process.env.TRACKING_OFFLINE_CHECK_BATCH_SIZE || '120', 10) || 120)
+      );
 
-      for (const fleetKey of fleetKeys) {
-        const transporterId = fleetKey.replace('fleet:', '');
-
+      for (const transporterId of transporterIds) {
         const driverIds = await redisService.sMembers(REDIS_KEYS.FLEET_DRIVERS(transporterId));
+        if (driverIds.length === 0) {
+          await redisService.sRem(REDIS_KEYS.ACTIVE_FLEET_TRANSPORTERS, transporterId);
+          continue;
+        }
 
-        for (const driverId of driverIds) {
-          const location = await redisService.getJSON<LocationData>(REDIS_KEYS.DRIVER_LOCATION(driverId));
-          if (!location) continue;
-
-          const lastUpdateMs = new Date(location.lastUpdated).getTime();
-          const ageSeconds = (Date.now() - lastUpdateMs) / 1000;
-
-          // 2 minutes = 120 seconds threshold
-          if (ageSeconds > 120) {
-            // Check cooldown (don't spam — max once per 5 minutes per driver)
-            const cooldownKey = `offline:notified:${driverId}`;
-            const alreadyNotified = await redisService.get(cooldownKey);
-            if (alreadyNotified) continue;
-
-            // Set cooldown (5 minutes)
-            await redisService.set(cooldownKey, '1', 300);
-
-            // Notify transporter via WebSocket
-            emitToUser(transporterId, 'driver_may_be_offline', {
-              driverId,
-              driverName: location.vehicleNumber, // vehicleNumber is more useful for identification
-              vehicleNumber: location.vehicleNumber,
-              tripId: location.tripId,
-              lastSeenSeconds: Math.round(ageSeconds),
-              lastLatitude: location.latitude,
-              lastLongitude: location.longitude,
-              message: `Driver (${location.vehicleNumber}) hasn't sent GPS for ${Math.round(ageSeconds / 60)} minutes`
-            });
-
-            // FCM push to transporter
-            queueService.queuePushNotification(transporterId, {
-              title: '⚠️ Driver May Be Offline',
-              body: `${location.vehicleNumber} hasn't sent GPS for ${Math.round(ageSeconds / 60)} min`,
-              data: {
-                type: 'driver_offline',
-                driverId,
-                tripId: location.tripId,
-                vehicleNumber: location.vehicleNumber,
-                lastSeenSeconds: String(Math.round(ageSeconds))
-              }
-            }).catch(err => {
-              logger.warn('[OFFLINE CHECKER] FCM push failed', { error: err.message });
-            });
-
-            logger.warn(`[OFFLINE CHECKER] Driver ${driverId} (${location.vehicleNumber}) offline for ${Math.round(ageSeconds)}s`);
+        const offlineDrivers: Array<{ driverId: string; location: LocationData; ageSeconds: number }> = [];
+        for (let i = 0; i < driverIds.length; i += locationBatchSize) {
+          const chunk = driverIds.slice(i, i + locationBatchSize);
+          const chunkResults = await Promise.all(
+            chunk.map(async (driverId) => {
+              const location = await redisService.getJSON<LocationData>(REDIS_KEYS.DRIVER_LOCATION(driverId));
+              if (!location) return null;
+              const lastUpdateMs = new Date(location.lastUpdated).getTime();
+              const ageSeconds = (Date.now() - lastUpdateMs) / 1000;
+              if (ageSeconds <= 120) return null;
+              return { driverId, location, ageSeconds };
+            })
+          );
+          for (const offlineDriver of chunkResults) {
+            if (offlineDriver) {
+              offlineDrivers.push(offlineDriver);
+            }
           }
+        }
+
+        for (const offlineDriver of offlineDrivers) {
+          const { driverId, location, ageSeconds } = offlineDriver;
+          const cooldownKey = `offline:notified:${driverId}`;
+          const alreadyNotified = await redisService.get(cooldownKey);
+          if (alreadyNotified) continue;
+
+          await redisService.set(cooldownKey, '1', 300);
+
+          emitToUser(transporterId, 'driver_may_be_offline', {
+            driverId,
+            driverName: location.vehicleNumber,
+            vehicleNumber: location.vehicleNumber,
+            tripId: location.tripId,
+            lastSeenSeconds: Math.round(ageSeconds),
+            lastLatitude: location.latitude,
+            lastLongitude: location.longitude,
+            message: `Driver (${location.vehicleNumber}) hasn't sent GPS for ${Math.round(ageSeconds / 60)} minutes`
+          });
+
+          queueService.queuePushNotification(transporterId, {
+            title: '⚠️ Driver May Be Offline',
+            body: `${location.vehicleNumber} hasn't sent GPS for ${Math.round(ageSeconds / 60)} min`,
+            data: {
+              type: 'driver_offline',
+              driverId,
+              tripId: location.tripId,
+              vehicleNumber: location.vehicleNumber,
+              lastSeenSeconds: String(Math.round(ageSeconds))
+            }
+          }).catch(err => {
+            logger.warn('[OFFLINE CHECKER] FCM push failed', { error: err.message });
+          });
+
+          logger.warn(`[OFFLINE CHECKER] Driver ${driverId} (${location.vehicleNumber}) offline for ${Math.round(ageSeconds)}s`);
         }
       }
     } finally {

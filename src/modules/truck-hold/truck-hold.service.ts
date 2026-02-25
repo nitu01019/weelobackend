@@ -75,6 +75,7 @@
  */
 
 import { v4 as uuidv4 } from 'uuid';
+import { Prisma } from '@prisma/client';
 import { db } from '../../shared/database/db';
 import { prismaClient } from '../../shared/database/prisma.service';
 import { logger } from '../../shared/services/logger.service';
@@ -755,27 +756,79 @@ class TruckHoldService {
       // =========================================================================
       const failedAssignments: Array<{ vehicleId: string; reason: string }> = [];
       const validatedVehicles: Array<{ vehicle: any; driver: any; truckRequestId: string }> = [];
-      
+      const activeDriverStatuses = ['pending', 'driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit'];
+      const seenVehicleIds = new Set<string>();
+      const seenDriverIds = new Set<string>();
+      const vehicleIds = assignments.map((assignment) => assignment.vehicleId);
+      const driverIds = assignments.map((assignment) => assignment.driverId);
+      const uniqueVehicleIds = Array.from(new Set(vehicleIds));
+      const uniqueDriverIds = Array.from(new Set(driverIds));
+
+      const [vehicleRows, driverRows, activeDriverAssignments] = await Promise.all([
+        prismaClient.vehicle.findMany({
+          where: { id: { in: uniqueVehicleIds } },
+          select: {
+            id: true,
+            transporterId: true,
+            status: true,
+            currentTripId: true,
+            vehicleType: true,
+            vehicleSubtype: true,
+            vehicleNumber: true
+          }
+        }),
+        prismaClient.user.findMany({
+          where: { id: { in: uniqueDriverIds } },
+          select: {
+            id: true,
+            name: true,
+            phone: true,
+            transporterId: true
+          }
+        }),
+        prismaClient.assignment.findMany({
+          where: {
+            driverId: { in: uniqueDriverIds },
+            status: { in: activeDriverStatuses as any }
+          },
+          select: {
+            driverId: true,
+            tripId: true
+          }
+        })
+      ]);
+
+      const vehicleMap = new Map(vehicleRows.map((vehicle) => [vehicle.id, vehicle]));
+      const driverMap = new Map(driverRows.map((driver) => [driver.id, driver]));
+      const activeDriverMap = new Map(activeDriverAssignments.map((assignment) => [assignment.driverId, assignment]));
+
       for (let i = 0; i < assignments.length; i++) {
         const { vehicleId, driverId } = assignments[i];
         const truckRequestId = hold.truckRequestIds[i];
-        
-        // Get vehicle
-        const vehicle = await db.getVehicleById(vehicleId);
+
+        if (seenVehicleIds.has(vehicleId)) {
+          failedAssignments.push({ vehicleId, reason: 'Duplicate vehicle in request payload' });
+          continue;
+        }
+        seenVehicleIds.add(vehicleId);
+
+        if (seenDriverIds.has(driverId)) {
+          failedAssignments.push({ vehicleId, reason: 'Duplicate driver in request payload' });
+          continue;
+        }
+        seenDriverIds.add(driverId);
+
+        const vehicle = vehicleMap.get(vehicleId);
         if (!vehicle) {
           failedAssignments.push({ vehicleId, reason: 'Vehicle not found' });
           continue;
         }
-        
-        // Check vehicle belongs to this transporter
+
         if (vehicle.transporterId !== transporterId) {
           failedAssignments.push({ vehicleId, reason: 'Vehicle does not belong to you' });
           continue;
         }
-        
-        // =====================================================================
-        // 🔒 CRITICAL: Check vehicle is AVAILABLE (not in another trip)
-        // =====================================================================
+
         if (vehicle.status !== 'available') {
           failedAssignments.push({
             vehicleId,
@@ -783,8 +836,7 @@ class TruckHoldService {
           });
           continue;
         }
-        
-        // Validate vehicle type matches
+
         if (vehicle.vehicleType.toLowerCase() !== hold.vehicleType.toLowerCase()) {
           failedAssignments.push({
             vehicleId,
@@ -792,24 +844,19 @@ class TruckHoldService {
           });
           continue;
         }
-        
-        // Get driver
-        const driver = await db.getUserById(driverId);
+
+        const driver = driverMap.get(driverId);
         if (!driver) {
           failedAssignments.push({ vehicleId, reason: 'Driver not found' });
           continue;
         }
-        
-        // Check driver belongs to this transporter
+
         if (driver.transporterId !== transporterId && driver.id !== transporterId) {
           failedAssignments.push({ vehicleId, reason: 'Driver does not belong to you' });
           continue;
         }
-        
-        // =====================================================================
-        // 🔒 CRITICAL: Check driver is AVAILABLE (not on another trip)
-        // =====================================================================
-        const activeAssignment = await db.getActiveAssignmentByDriver(driverId);
+
+        const activeAssignment = activeDriverMap.get(driverId);
         if (activeAssignment) {
           failedAssignments.push({
             vehicleId,
@@ -817,8 +864,7 @@ class TruckHoldService {
           });
           continue;
         }
-        
-        // ✅ All validations passed
+
         validatedVehicles.push({ vehicle, driver, truckRequestId });
       }
       
@@ -845,89 +891,196 @@ class TruckHoldService {
       
       const transporter = await db.getUserById(transporterId);
       const now = new Date().toISOString();
-      const assignmentIds: string[] = [];
-      const tripIds: string[] = [];
-      
-      for (const { vehicle, driver, truckRequestId } of validatedVehicles) {
-        const assignmentId = uuidv4();
-        const tripId = uuidv4();
-        
-        // Create assignment record
-        await db.createAssignment({
-          id: assignmentId,
-          bookingId: hold.orderId,
-          truckRequestId,
-          orderId: hold.orderId,
-          transporterId,
-          transporterName: transporter?.name || transporter?.businessName || '',
-          vehicleId: vehicle.id,
-          vehicleNumber: vehicle.vehicleNumber,
-          vehicleType: vehicle.vehicleType,
-          vehicleSubtype: vehicle.vehicleSubtype || '',
-          driverId: driver.id,
-          driverName: driver.name,
-          driverPhone: driver.phone,
-          tripId,
-          status: 'pending',
-          assignedAt: now
+      const confirmedAssignments = await prismaClient.$transaction(async (tx) => {
+        const txAssignments: Array<{
+          assignmentId: string;
+          tripId: string;
+          truckRequestId: string;
+          vehicle: any;
+          driver: any;
+          farePerTruck: number;
+        }> = [];
+
+        const currentOrder = await tx.order.findUnique({
+          where: { id: hold.orderId },
+          select: { id: true, totalTrucks: true, trucksFilled: true }
         });
-        
-        // Update truck request
-        await db.updateTruckRequest(truckRequestId, {
-          status: 'assigned',
-          assignedTo: transporterId,
-          assignedTransporterId: transporterId,
-          assignedTransporterName: transporter?.name || transporter?.businessName || '',
-          assignedVehicleId: vehicle.id,
-          assignedVehicleNumber: vehicle.vehicleNumber,
-          assignedDriverId: driver.id,
-          assignedDriverName: driver.name,
-          assignedDriverPhone: driver.phone,
-          tripId,
-          assignedAt: now,
-          heldBy: undefined,
-          heldAt: undefined
+        if (!currentOrder) {
+          throw new Error('ORDER_NOT_FOUND');
+        }
+
+        const txTruckRequests = await tx.truckRequest.findMany({
+          where: {
+            id: { in: hold.truckRequestIds },
+            orderId: hold.orderId
+          },
+          select: {
+            id: true,
+            orderId: true,
+            status: true,
+            heldById: true,
+            pricePerTruck: true
+          }
         });
-        
-        // =====================================================================
-        // 🔒 CRITICAL: Update vehicle status to prevent double-assignment
-        // =====================================================================
-        await db.updateVehicle(vehicle.id, {
-          status: 'in_transit',
-          currentTripId: tripId,
-          assignedDriverId: driver.id,
-          lastStatusChange: now
+        const txTruckRequestMap = new Map(txTruckRequests.map((truckRequest) => [truckRequest.id, truckRequest]));
+        if (txTruckRequests.length !== hold.truckRequestIds.length) {
+          throw new Error('TRUCK_REQUEST_NOT_FOUND');
+        }
+
+        const txBusyDrivers = await tx.assignment.findMany({
+          where: {
+            driverId: { in: uniqueDriverIds },
+            status: { in: activeDriverStatuses as any }
+          },
+          select: {
+            driverId: true,
+            tripId: true
+          }
         });
-        
-        assignmentIds.push(assignmentId);
-        tripIds.push(tripId);
-        
-        logger.info(`   ✅ Assignment created: ${vehicle.vehicleNumber} → ${driver.name} (Trip: ${tripId.substring(0, 8)})`);
-        
+        if (txBusyDrivers.length > 0) {
+          const busyDriver = txBusyDrivers[0];
+          throw new Error(`DRIVER_BUSY:${busyDriver.driverId}:${busyDriver.tripId}`);
+        }
+
+        for (const { vehicle, driver, truckRequestId } of validatedVehicles) {
+          const truckRequest = txTruckRequestMap.get(truckRequestId);
+          if (!truckRequest || truckRequest.orderId !== hold.orderId) {
+            throw new Error(`TRUCK_REQUEST_NOT_FOUND:${truckRequestId}`);
+          }
+          if (truckRequest.status !== 'held' || truckRequest.heldById !== transporterId) {
+            throw new Error(`TRUCK_REQUEST_NOT_HELD:${truckRequestId}`);
+          }
+
+          const assignmentId = uuidv4();
+          const tripId = uuidv4();
+
+          const vehicleUpdated = await tx.vehicle.updateMany({
+            where: {
+              id: vehicle.id,
+              transporterId,
+              status: 'available' as any
+            },
+            data: {
+              status: 'in_transit' as any,
+              currentTripId: tripId,
+              assignedDriverId: driver.id,
+              lastStatusChange: now
+            }
+          });
+          if (vehicleUpdated.count === 0) {
+            throw new Error(`VEHICLE_UNAVAILABLE:${vehicle.id}`);
+          }
+
+          const requestUpdated = await tx.truckRequest.updateMany({
+            where: {
+              id: truckRequestId,
+              orderId: hold.orderId,
+              status: 'held' as any,
+              heldById: transporterId
+            },
+            data: {
+              status: 'assigned' as any,
+              assignedTransporterId: transporterId,
+              assignedTransporterName: transporter?.name || transporter?.businessName || '',
+              assignedVehicleId: vehicle.id,
+              assignedVehicleNumber: vehicle.vehicleNumber,
+              assignedDriverId: driver.id,
+              assignedDriverName: driver.name,
+              assignedDriverPhone: driver.phone || '',
+              tripId,
+              assignedAt: now,
+              heldById: null,
+              heldAt: null
+            }
+          });
+          if (requestUpdated.count === 0) {
+            throw new Error(`TRUCK_REQUEST_STATE_CHANGED:${truckRequestId}`);
+          }
+
+          await tx.assignment.create({
+            data: {
+              id: assignmentId,
+              bookingId: hold.orderId,
+              truckRequestId,
+              orderId: hold.orderId,
+              transporterId,
+              transporterName: transporter?.name || transporter?.businessName || '',
+              vehicleId: vehicle.id,
+              vehicleNumber: vehicle.vehicleNumber,
+              vehicleType: vehicle.vehicleType,
+              vehicleSubtype: vehicle.vehicleSubtype || '',
+              driverId: driver.id,
+              driverName: driver.name,
+              driverPhone: driver.phone || '',
+              tripId,
+              status: 'pending' as any,
+              assignedAt: now
+            }
+          });
+
+          txAssignments.push({
+            assignmentId,
+            tripId,
+            truckRequestId,
+            vehicle,
+            driver,
+            farePerTruck: truckRequest.pricePerTruck
+          });
+        }
+
+        const updatedOrder = await tx.order.update({
+          where: { id: hold.orderId },
+          data: { trucksFilled: { increment: txAssignments.length } },
+          select: { trucksFilled: true, totalTrucks: true }
+        });
+        const newStatus: 'active' | 'partially_filled' | 'fully_filled' =
+          updatedOrder.trucksFilled >= updatedOrder.totalTrucks ? 'fully_filled' : 'partially_filled';
+        await tx.order.update({
+          where: { id: hold.orderId },
+          data: { status: newStatus as any }
+        });
+
+        return {
+          assignments: txAssignments,
+          newTrucksFilled: updatedOrder.trucksFilled,
+          newStatus
+        };
+      }, {
+        isolationLevel: Prisma.TransactionIsolationLevel.Serializable
+      });
+      const assignmentIds = confirmedAssignments.assignments.map((assignment) => assignment.assignmentId);
+      const tripIds = confirmedAssignments.assignments.map((assignment) => assignment.tripId);
+      const newTrucksFilled = confirmedAssignments.newTrucksFilled;
+      const newStatus = confirmedAssignments.newStatus;
+
+      for (const assignment of confirmedAssignments.assignments) {
+        logger.info(
+          `   ✅ Assignment created: ${assignment.vehicle.vehicleNumber} → ${assignment.driver.name} (Trip: ${assignment.tripId.substring(0, 8)})`
+        );
+
         // =====================================================================
         // STEP 4: Notify driver about trip assignment
         // =====================================================================
         const driverNotification = {
           type: 'trip_assigned',
-          assignmentId,
-          tripId,
+          assignmentId: assignment.assignmentId,
+          tripId: assignment.tripId,
           orderId: order.id,
-          truckRequestId,
+          truckRequestId: assignment.truckRequestId,
           pickup: order.pickup,
           drop: order.drop,
           routePoints: order.routePoints,
-          vehicleNumber: vehicle.vehicleNumber,
-          farePerTruck: hold.vehicleSubtype ? 
-            (await db.getTruckRequestById(truckRequestId))?.pricePerTruck || 0 : 0,
+          vehicleNumber: assignment.vehicle.vehicleNumber,
+          farePerTruck: assignment.farePerTruck,
           distanceKm: order.distanceKm,
           customerName: order.customerName,
           customerPhone: order.customerPhone,
           assignedAt: now,
           message: `New trip assigned! ${order.pickup.address} → ${order.drop.address}`
         };
-        
-        socketService.emitToUser(driver.id, 'trip_assigned', driverNotification);
-        
+
+        socketService.emitToUser(assignment.driver.id, 'trip_assigned', driverNotification);
+
         // =====================================================================
         // FCM PUSH BACKUP: Driver may have app in background (no WebSocket)
         // =====================================================================
@@ -935,36 +1088,22 @@ class TruckHoldService {
         // EASY UNDERSTANDING: WebSocket = foreground, FCM = background
         // MODULARITY: Fire-and-forget, doesn't block assignment flow
         // =====================================================================
-        queueService.queuePushNotification(driver.id, {
+        queueService.queuePushNotification(assignment.driver.id, {
           title: '🚛 New Trip Assigned!',
           body: `${order.pickup.address} → ${order.drop.address}`,
           data: {
             type: 'trip_assigned',
-            assignmentId,
-            tripId,
+            assignmentId: assignment.assignmentId,
+            tripId: assignment.tripId,
             orderId: order.id,
-            vehicleNumber: vehicle.vehicleNumber
+            vehicleNumber: assignment.vehicle.vehicleNumber
           }
         }).catch(err => {
-          logger.warn(`FCM: Failed to queue trip_assigned push for driver ${driver.id}`, err);
+          logger.warn(`FCM: Failed to queue trip_assigned push for driver ${assignment.driver.id}`, err);
         });
-        
-        logger.info(`   📢 Notified driver ${driver.name} (WebSocket + FCM)`);
+
+        logger.info(`   📢 Notified driver ${assignment.driver.name} (WebSocket + FCM)`);
       }
-      
-      // =========================================================================
-      // STEP 5: Update order progress (atomic increment — prevents race condition)
-      // =========================================================================
-      const updatedOrder = await prismaClient.order.update({
-        where: { id: hold.orderId },
-        data: { trucksFilled: { increment: validatedVehicles.length } }
-      });
-      const newTrucksFilled = updatedOrder.trucksFilled;
-      let newStatus: 'active' | 'partially_filled' | 'fully_filled' = 'partially_filled';
-      if (newTrucksFilled >= updatedOrder.totalTrucks) {
-        newStatus = 'fully_filled';
-      }
-      await db.updateOrder(hold.orderId, { status: newStatus });
       
       // =========================================================================
       // STEP 6: Notify customer about truck confirmation
@@ -972,12 +1111,12 @@ class TruckHoldService {
       const customerNotification = {
         type: 'trucks_confirmed',
         orderId: order.id,
-        trucksConfirmed: validatedVehicles.length,
+        trucksConfirmed: confirmedAssignments.assignments.length,
         totalTrucksConfirmed: newTrucksFilled,
         totalTrucksNeeded: order.totalTrucks,
         remainingTrucks: order.totalTrucks - newTrucksFilled,
         isFullyFilled: newTrucksFilled >= order.totalTrucks,
-        assignments: validatedVehicles.map(({ vehicle, driver }, i) => ({
+        assignments: confirmedAssignments.assignments.map(({ vehicle, driver }, i) => ({
           vehicleNumber: vehicle.vehicleNumber,
           vehicleType: vehicle.vehicleType,
           driverName: driver.name,
@@ -988,7 +1127,7 @@ class TruckHoldService {
           name: transporter?.name || transporter?.businessName || '',
           phone: transporter?.phone || ''
         },
-        message: `${validatedVehicles.length} truck(s) confirmed! ${newTrucksFilled}/${order.totalTrucks} total.`
+        message: `${confirmedAssignments.assignments.length} truck(s) confirmed! ${newTrucksFilled}/${order.totalTrucks} total.`
       };
       
       socketService.emitToUser(order.customerId, 'trucks_confirmed', customerNotification);
@@ -1003,11 +1142,11 @@ class TruckHoldService {
           : '🚛 Trucks Confirmed!',
         body: newTrucksFilled >= order.totalTrucks
           ? `All ${order.totalTrucks} trucks assigned. Track now!`
-          : `${validatedVehicles.length} truck(s) confirmed. ${newTrucksFilled}/${order.totalTrucks} total.`,
+          : `${confirmedAssignments.assignments.length} truck(s) confirmed. ${newTrucksFilled}/${order.totalTrucks} total.`,
         data: {
           type: 'trucks_confirmed',
           orderId: order.id,
-          trucksConfirmed: String(validatedVehicles.length),
+          trucksConfirmed: String(confirmedAssignments.assignments.length),
           totalTrucksConfirmed: String(newTrucksFilled),
           totalTrucksNeeded: String(order.totalTrucks),
           isFullyFilled: String(newTrucksFilled >= order.totalTrucks)
@@ -1034,7 +1173,7 @@ class TruckHoldService {
       
       return {
         success: true,
-        message: `${validatedVehicles.length} truck(s) assigned successfully!`,
+        message: `${confirmedAssignments.assignments.length} truck(s) assigned successfully!`,
         assignmentIds,
         tripIds
       };
@@ -1248,6 +1387,7 @@ class TruckHoldService {
       // Get all transporters who were notified about this order
       const truckRequests = db.getTruckRequestsByOrder ? await db.getTruckRequestsByOrder(orderId) : [];
       const notifiedTransporterIds = new Set<string>();
+      const queuedBroadcasts: Array<Promise<unknown>> = [];
       
       for (const tr of truckRequests) {
         if (tr.notifiedTransporters) {
@@ -1293,7 +1433,7 @@ class TruckHoldService {
           // Skip if transporter has no available trucks
           if (trucksYouCanProvide <= 0) {
             // Notify them that they can't participate anymore
-            socketService.emitToUser(transporterId, 'broadcast_update', {
+            queuedBroadcasts.push(queueService.queueBroadcast(transporterId, 'broadcast_update', {
               type: 'no_available_trucks',
               orderId,
               vehicleType,
@@ -1303,12 +1443,14 @@ class TruckHoldService {
               yourAvailableTrucks: transporterAvailability.available,
               message: 'You have no available trucks for this order',
               timestamp: new Date().toISOString()
-            });
+            }).catch((error) => {
+              logger.warn(`[TruckHold] Failed to queue no_available_trucks update for transporter ${transporterId}: ${String((error as Error)?.message || error)}`);
+            }));
             continue;
           }
           
           // Send personalized update
-          socketService.emitToUser(transporterId, 'broadcast_update', {
+          queuedBroadcasts.push(queueService.queueBroadcast(transporterId, 'broadcast_update', {
             type: 'availability_changed',
             orderId,
             vehicleType,
@@ -1330,10 +1472,16 @@ class TruckHoldService {
             isFullyAssigned: availability.isFullyAssigned,
             
             timestamp: new Date().toISOString()
-          });
+          }).catch((error) => {
+            logger.warn(`[TruckHold] Failed to queue availability update for transporter ${transporterId}: ${String((error as Error)?.message || error)}`);
+          }));
           
           logger.debug(`   📱 → ${transporterId.substring(0, 8)}: can provide ${trucksYouCanProvide}/${trucksStillSearching}`);
         }
+      }
+
+      if (queuedBroadcasts.length > 0) {
+        await Promise.allSettled(queuedBroadcasts);
       }
       
       // Also broadcast general update for any listeners (e.g., admin dashboard)

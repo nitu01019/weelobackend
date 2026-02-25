@@ -261,11 +261,15 @@ export class RequestQueue {
         next();
       } catch (error) {
         if (error instanceof QueueFullError) {
-          res.status(503).json({
+          // Queue saturation is a transient throttle condition, not a server fault.
+          const retryAfterMs = 2000;
+          res.setHeader('Retry-After', Math.ceil(retryAfterMs / 1000).toString());
+          res.status(429).json({
             success: false,
             error: {
-              code: 'SERVICE_UNAVAILABLE',
-              message: error.message
+              code: 'REQUEST_QUEUE_SATURATED',
+              message: error.message,
+              retryAfterMs
             }
           });
         } else if (error instanceof QueueTimeoutError) {

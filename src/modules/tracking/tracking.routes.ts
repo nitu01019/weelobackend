@@ -15,6 +15,7 @@ import { validateRequest } from '../../shared/utils/validation.utils';
 import { googleMapsService } from '../../shared/services/google-maps.service';
 import { redisService } from '../../shared/services/redis.service';
 import { db } from '../../shared/database/db';
+import { prismaClient } from '../../shared/database/prisma.service';
 
 // Redis key builders (matching tracking.service.ts)
 const DRIVER_LOCATION_KEY = (driverId: string) => `driver:location:${driverId}`;
@@ -26,6 +27,7 @@ import {
   DriverOnlineStatus 
 } from './tracking.schema';
 import { z } from 'zod';
+import { assertBookingTrackingAccess } from './tracking-access.policy';
 
 const router = Router();
 
@@ -112,28 +114,39 @@ router.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { bookingId } = req.params;
+      const requesterId = req.user!.userId;
+      const requesterRole = req.user!.role;
 
-      // Get booking to verify access + get drop location
+      // Resolve booking/order to verify access + get drop location
       const booking = await db.getBookingById(bookingId);
-      if (!booking) {
+      const order = booking ? null : await db.getOrderById(bookingId);
+      if (!booking && !order) {
         return res.status(404).json({
           success: false,
           error: { code: 'BOOKING_NOT_FOUND', message: 'Booking not found' }
         });
       }
 
-      // Access check: customer owns this booking
-      if (req.user!.role === 'customer' && booking.customerId !== req.user!.userId) {
-        return res.status(403).json({
-          success: false,
-          error: { code: 'FORBIDDEN', message: 'Access denied' }
-        });
+      // Access check:
+      // - Customer: must own booking
+      // - Transporter/Driver: must be part of assignment scope for booking/order
+      if (requesterRole === 'customer') {
+        const customerOwnsEntity =
+          (booking?.customerId === requesterId) || (order?.customerId === requesterId);
+        if (!customerOwnsEntity) {
+          return res.status(403).json({
+            success: false,
+            error: { code: 'FORBIDDEN', message: 'Access denied' }
+          });
+        }
+      } else {
+        await assertBookingTrackingAccess(bookingId, requesterId, requesterRole);
       }
 
-      // Get drop location from booking
-      // booking.drop stores { latitude, longitude, address, city }
-      const dropLat = booking.drop?.latitude || booking.drop?.lat;
-      const dropLng = booking.drop?.longitude || booking.drop?.lng;
+      // Get drop location from booking/order payload
+      const dropSource = booking?.drop || order?.drop;
+      const dropLat = dropSource?.latitude || dropSource?.lat;
+      const dropLng = dropSource?.longitude || dropSource?.lng;
       if (!dropLat || !dropLng) {
         return res.json({
           success: true,
@@ -142,24 +155,45 @@ router.get(
       }
 
       // Get all active truck positions from Redis
-      const assignments = await db.getAssignmentsByBooking(bookingId);
+      const assignments = await prismaClient.assignment.findMany({
+        where: {
+          OR: [
+            { bookingId },
+            { orderId: bookingId }
+          ]
+        },
+        select: {
+          tripId: true,
+          driverId: true,
+          status: true
+        }
+      });
+      const activeAssignments = assignments.filter(
+        assignment => !['completed', 'cancelled', 'driver_declined'].includes(assignment.status)
+      );
       const activeTrucks: Array<{ tripId: string; lat: number; lng: number }> = [];
+      const redisBatchSize = Math.max(
+        25,
+        Math.min(500, parseInt(process.env.TRACKING_ETA_REDIS_BATCH_SIZE || '120', 10) || 120)
+      );
 
-      for (const assignment of assignments) {
-        // Skip completed/cancelled
-        if (['completed', 'cancelled', 'driver_declined'].includes(assignment.status)) continue;
-
-        // Get current location from Redis (real-time)
-        const location = await redisService.getJSON<any>(
-          DRIVER_LOCATION_KEY(assignment.driverId)
+      for (let i = 0; i < activeAssignments.length; i += redisBatchSize) {
+        const chunk = activeAssignments.slice(i, i + redisBatchSize);
+        const chunkResults = await Promise.all(
+          chunk.map(async (assignment) => {
+            const location = await redisService.getJSON<any>(DRIVER_LOCATION_KEY(assignment.driverId));
+            if (!location || !location.latitude || !location.longitude) {
+              return null;
+            }
+            return {
+              tripId: assignment.tripId,
+              lat: location.latitude,
+              lng: location.longitude
+            };
+          })
         );
-
-        if (location && location.latitude && location.longitude) {
-          activeTrucks.push({
-            tripId: assignment.tripId,
-            lat: location.latitude,
-            lng: location.longitude
-          });
+        for (const truck of chunkResults) {
+          if (truck) activeTrucks.push(truck);
         }
       }
 

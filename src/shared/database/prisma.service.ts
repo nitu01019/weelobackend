@@ -600,6 +600,33 @@ class PrismaDatabaseService {
     return result;
   }
 
+  /**
+   * Compatibility lookup for degraded geo matching fallback.
+   *
+   * Returns transporter IDs owning the exact normalized vehicleKey.
+   * This is intentionally bounded because it is used only when Redis GEO path fails.
+   */
+  async getTransportersByVehicleKey(vehicleKey: string, limit: number = 800): Promise<string[]> {
+    const normalizedKey = this.normalizeVehicleString(vehicleKey);
+    if (!normalizedKey) return [];
+
+    const vehicles = await this.prisma.vehicle.findMany({
+      where: {
+        isActive: true,
+        vehicleKey: {
+          equals: normalizedKey,
+          mode: 'insensitive'
+        }
+      },
+      select: {
+        transporterId: true
+      },
+      take: Math.max(1, Math.min(limit, 2000))
+    });
+
+    return [...new Set(vehicles.map(vehicle => vehicle.transporterId))];
+  }
+
   async updateVehicle(id: string, updates: Partial<VehicleRecord>): Promise<VehicleRecord | undefined> {
     try {
       const { createdAt, updatedAt, ...data } = updates as any;
@@ -722,6 +749,15 @@ class PrismaDatabaseService {
   async getOrderById(id: string): Promise<OrderRecord | undefined> {
     const order = await this.prisma.order.findUnique({ where: { id } });
     return order ? this.toOrderRecord(order) : undefined;
+  }
+
+  async getOrdersByIds(ids: string[]): Promise<OrderRecord[]> {
+    const uniqueIds = Array.from(new Set(ids.map(id => id.trim()).filter(id => id.length > 0)));
+    if (uniqueIds.length === 0) return [];
+    const orders = await this.prisma.order.findMany({
+      where: { id: { in: uniqueIds } }
+    });
+    return orders.map(o => this.toOrderRecord(o));
   }
 
   async getOrdersByCustomer(customerId: string, limit: number = DEFAULT_PAGE_SIZE): Promise<OrderRecord[]> {
@@ -931,22 +967,79 @@ class PrismaDatabaseService {
 
   async getActiveTruckRequestsForTransporter(transporterId: string): Promise<TruckRequestRecord[]> {
     const vehicles = await this.getVehiclesByTransporter(transporterId);
-    const vehicleKeys = new Set(
-      vehicles
-        .filter(v => v.isActive)
-        .map(v => `${this.normalizeVehicleString(v.vehicleType)}_${this.normalizeVehicleString(v.vehicleSubtype)}`)
+    const activeVehiclePairs = Array.from(
+      new Map(
+        vehicles
+          .filter(v => v.isActive)
+          .map(v => {
+            const normalizedType = this.normalizeVehicleString(v.vehicleType);
+            const normalizedSubtype = this.normalizeVehicleString(v.vehicleSubtype);
+            return [
+              `${normalizedType}_${normalizedSubtype}`,
+              { vehicleType: normalizedType, vehicleSubtype: normalizedSubtype }
+            ] as const;
+          })
+      ).values()
     );
+    if (activeVehiclePairs.length === 0) {
+      return [];
+    }
 
+    try {
+      return await this.getActiveTruckRequestsForTransporterIndexed(
+        transporterId,
+        activeVehiclePairs
+      );
+    } catch (error: any) {
+      logger.warn('[DB] Indexed transporter request query failed, falling back to in-memory filter', {
+        transporterId,
+        error: error?.message || 'unknown'
+      });
+    }
+
+    const vehicleKeys = new Set(activeVehiclePairs.map(pair => `${pair.vehicleType}_${pair.vehicleSubtype}`));
     const requests = await this.prisma.truckRequest.findMany({
-      where: { status: 'searching' }
+      where: { status: 'searching' },
+      orderBy: { createdAt: 'desc' },
+      take: 500
     });
 
     return requests
-      .filter(r => {
-        const requestKey = `${this.normalizeVehicleString(r.vehicleType)}_${this.normalizeVehicleString(r.vehicleSubtype)}`;
-        return vehicleKeys.has(requestKey);
+      .filter(request => {
+        const requestKey = `${this.normalizeVehicleString(request.vehicleType)}_${this.normalizeVehicleString(request.vehicleSubtype)}`;
+        if (!vehicleKeys.has(requestKey)) return false;
+        return (request.notifiedTransporters || []).includes(transporterId);
       })
-      .map(r => this.toTruckRequestRecord(r));
+      .map(request => this.toTruckRequestRecord(request));
+  }
+
+  async getActiveTruckRequestsForTransporterIndexed(
+    transporterId: string,
+    vehiclePairs: Array<{ vehicleType: string; vehicleSubtype: string }>,
+    limit: number = 500
+  ): Promise<TruckRequestRecord[]> {
+    if (vehiclePairs.length === 0) return [];
+
+    const requests = await this.prisma.truckRequest.findMany({
+      where: {
+        status: 'searching',
+        notifiedTransporters: { has: transporterId },
+        OR: vehiclePairs.map(pair => ({
+          vehicleType: {
+            equals: pair.vehicleType,
+            mode: 'insensitive'
+          },
+          vehicleSubtype: {
+            equals: pair.vehicleSubtype,
+            mode: 'insensitive'
+          }
+        }))
+      },
+      orderBy: { createdAt: 'desc' },
+      take: Math.max(1, Math.min(limit, 1000))
+    });
+
+    return requests.map(request => this.toTruckRequestRecord(request));
   }
 
   async getTruckRequestsByVehicleType(vehicleType: string, vehicleSubtype?: string): Promise<TruckRequestRecord[]> {

@@ -45,6 +45,8 @@
 
 import { logger } from './logger.service';
 import { redisService, GeoMember } from './redis.service';
+import { db } from '../database/db';
+import { haversineDistanceKm } from '../utils/geospatial.utils';
 
 // =============================================================================
 // GEOHASH IMPLEMENTATION (Simple version - no external dependency)
@@ -147,6 +149,9 @@ const REDIS_KEYS = {
   
   /** Driver's current vehicle key: driver:vehicle:{transporterId} */
   DRIVER_VEHICLE: (transporterId: string) => `driver:vehicle:${transporterId}`,
+
+  /** Driver's indexed vehicle keys set: driver:vehicle:keys:{transporterId} */
+  DRIVER_VEHICLE_KEYS: (transporterId: string) => `driver:vehicle:keys:${transporterId}`,
   
   /** All online drivers set: online:drivers */
   ONLINE_DRIVERS: 'online:drivers',
@@ -197,6 +202,20 @@ class AvailabilityService {
   
   /** Default search radius in km */
   private readonly DEFAULT_SEARCH_RADIUS_KM = 50;
+
+  /**
+   * GEO failure fallback throttling (per vehicleKey+radius).
+   * Prevents DB pressure during Redis incidents.
+   */
+  private readonly GEO_FALLBACK_MIN_INTERVAL_MS = parseInt(
+    process.env.GEO_FALLBACK_MIN_INTERVAL_MS || '1500',
+    10
+  );
+  private readonly GEO_FALLBACK_MAX_CANDIDATES = parseInt(
+    process.env.GEO_FALLBACK_MAX_CANDIDATES || '800',
+    10
+  );
+  private readonly geoFallbackLastRunMs = new Map<string, number>();
   
   constructor() {
     logger.info('[Availability] Redis-powered service initialized');
@@ -256,15 +275,21 @@ class AvailabilityService {
     const now = Date.now();
     
     try {
-      // 1. Get previous vehicle key (if driver changed vehicle)
+      // 1. Get previously indexed vehicle keys.
       const previousVehicleKey = await redisService.get(
         REDIS_KEYS.DRIVER_VEHICLE(transporterId)
       );
+      const previousVehicleKeys = await redisService.sMembers(
+        REDIS_KEYS.DRIVER_VEHICLE_KEYS(transporterId)
+      ).catch(() => []);
       
-      // 2. If vehicle changed, remove from old geo index
-      if (previousVehicleKey && previousVehicleKey !== vehicleKey) {
+      // 2. If vehicle changed, remove stale geo index entries.
+      const staleVehicleKeys = new Set(previousVehicleKeys);
+      if (previousVehicleKey) staleVehicleKeys.add(previousVehicleKey);
+      for (const staleKey of staleVehicleKeys) {
+        if (!staleKey || staleKey === vehicleKey) continue;
         await redisService.geoRemove(
-          REDIS_KEYS.GEO_DRIVERS(previousVehicleKey),
+          REDIS_KEYS.GEO_DRIVERS(staleKey),
           transporterId
         );
       }
@@ -293,6 +318,9 @@ class AvailabilityService {
         vehicleKey,
         this.DRIVER_TTL_SECONDS
       );
+      await redisService.del(REDIS_KEYS.DRIVER_VEHICLE_KEYS(transporterId));
+      await redisService.sAdd(REDIS_KEYS.DRIVER_VEHICLE_KEYS(transporterId), vehicleKey);
+      await redisService.expire(REDIS_KEYS.DRIVER_VEHICLE_KEYS(transporterId), this.DRIVER_TTL_SECONDS);
       
       // 5. Update geo index (only if NOT on trip)
       if (!isOnTrip) {
@@ -320,6 +348,98 @@ class AvailabilityService {
       throw error;
     }
   }
+
+  /**
+   * Multi-vehicle variant for transporter heartbeat.
+   * Indexes all active fleet vehicle keys at the same transporter location.
+   */
+  async updateAvailabilityForVehicleKeysAsync(data: {
+    transporterId: string;
+    driverId?: string;
+    vehicleEntries: Array<{ vehicleKey: string; vehicleId: string }>;
+    latitude: number;
+    longitude: number;
+    isOnTrip?: boolean;
+  }): Promise<void> {
+    const {
+      transporterId,
+      driverId,
+      vehicleEntries,
+      latitude,
+      longitude,
+      isOnTrip = false
+    } = data;
+
+    const normalizedEntries = Array.from(
+      new Map(
+        vehicleEntries
+          .filter(entry => entry.vehicleKey && entry.vehicleId)
+          .map(entry => [entry.vehicleKey, entry])
+      ).values()
+    );
+    if (normalizedEntries.length === 0) {
+      throw new Error('No vehicle keys provided for availability sync');
+    }
+
+    const primary = normalizedEntries[0];
+    const currentVehicleKeys = normalizedEntries.map(entry => entry.vehicleKey);
+    const now = Date.now();
+
+    const previousVehicleKey = await redisService.get(
+      REDIS_KEYS.DRIVER_VEHICLE(transporterId)
+    );
+    const previousVehicleKeys = await redisService.sMembers(
+      REDIS_KEYS.DRIVER_VEHICLE_KEYS(transporterId)
+    ).catch(() => []);
+
+    const staleVehicleKeys = new Set(previousVehicleKeys);
+    if (previousVehicleKey) staleVehicleKeys.add(previousVehicleKey);
+    for (const staleKey of staleVehicleKeys) {
+      if (!staleKey || currentVehicleKeys.includes(staleKey)) continue;
+      await redisService.geoRemove(REDIS_KEYS.GEO_DRIVERS(staleKey), transporterId);
+    }
+
+    const details: Record<string, string> = {
+      transporterId,
+      vehicleKey: primary.vehicleKey,
+      vehicleId: primary.vehicleId,
+      vehicleKeys: currentVehicleKeys.join(','),
+      latitude: latitude.toString(),
+      longitude: longitude.toString(),
+      lastSeen: now.toString(),
+      isOnTrip: isOnTrip.toString(),
+    };
+    if (driverId) details.driverId = driverId;
+
+    await redisService.hMSet(REDIS_KEYS.DRIVER_DETAILS(transporterId), details);
+    await redisService.expire(REDIS_KEYS.DRIVER_DETAILS(transporterId), this.DRIVER_TTL_SECONDS);
+    await redisService.set(
+      REDIS_KEYS.DRIVER_VEHICLE(transporterId),
+      primary.vehicleKey,
+      this.DRIVER_TTL_SECONDS
+    );
+    await redisService.del(REDIS_KEYS.DRIVER_VEHICLE_KEYS(transporterId));
+    await redisService.sAdd(REDIS_KEYS.DRIVER_VEHICLE_KEYS(transporterId), ...currentVehicleKeys);
+    await redisService.expire(REDIS_KEYS.DRIVER_VEHICLE_KEYS(transporterId), this.DRIVER_TTL_SECONDS);
+
+    if (!isOnTrip) {
+      await Promise.all(currentVehicleKeys.map((key) =>
+        redisService.geoAdd(
+          REDIS_KEYS.GEO_DRIVERS(key),
+          longitude,
+          latitude,
+          transporterId
+        )
+      ));
+      await redisService.sAdd(REDIS_KEYS.ONLINE_DRIVERS, transporterId);
+    } else {
+      await Promise.all(currentVehicleKeys.map((key) =>
+        redisService.geoRemove(REDIS_KEYS.GEO_DRIVERS(key), transporterId)
+      ));
+    }
+
+    logger.debug(`[Availability] Updated multi-vehicle index: ${transporterId} keys=${currentVehicleKeys.length}`);
+  }
   
   /**
    * Mark driver as offline (remove from availability)
@@ -345,11 +465,21 @@ class AvailabilityService {
       const vehicleKey = await redisService.get(
         REDIS_KEYS.DRIVER_VEHICLE(transporterId)
       );
+      const vehicleKeys = await redisService.sMembers(
+        REDIS_KEYS.DRIVER_VEHICLE_KEYS(transporterId)
+      ).catch(() => []);
       
       // 2. Remove from geo index
       if (vehicleKey) {
         await redisService.geoRemove(
           REDIS_KEYS.GEO_DRIVERS(vehicleKey),
+          transporterId
+        );
+      }
+      for (const indexedKey of vehicleKeys) {
+        if (!indexedKey || indexedKey === vehicleKey) continue;
+        await redisService.geoRemove(
+          REDIS_KEYS.GEO_DRIVERS(indexedKey),
           transporterId
         );
       }
@@ -360,6 +490,7 @@ class AvailabilityService {
       // 4. Delete driver details
       await redisService.del(REDIS_KEYS.DRIVER_DETAILS(transporterId));
       await redisService.del(REDIS_KEYS.DRIVER_VEHICLE(transporterId));
+      await redisService.del(REDIS_KEYS.DRIVER_VEHICLE_KEYS(transporterId));
       
       logger.info(`[Availability] Offline: ${transporterId}`);
       
@@ -416,7 +547,8 @@ class AvailabilityService {
     radiusKm: number = this.DEFAULT_SEARCH_RADIUS_KM
   ): Promise<string[]> {
     try {
-      // Use Redis GEORADIUS to find nearby drivers
+      // Runtime matching source of truth: Redis GEO index (authoritative hot path).
+      // Geohash helpers in this file are auxiliary utilities and not the primary matcher.
       const nearbyDrivers = await redisService.geoRadius(
         REDIS_KEYS.GEO_DRIVERS(vehicleKey),
         longitude,
@@ -424,31 +556,32 @@ class AvailabilityService {
         radiusKm,
         'km'
       );
-      
-      // Filter out drivers who are on trip or have stale data
+
+      // Batch Redis hash lookups to avoid N round-trips under burst.
+      const detailsMap = await this.loadDriverDetailsMap(
+        nearbyDrivers.map((driver) => driver.member)
+      );
+
+      // Filter out drivers who are on trip or stale.
       const validDrivers: Array<{ id: string; distance: number }> = [];
-      
       for (const driver of nearbyDrivers) {
-        // Check if driver details exist and not on trip
-        const details = await redisService.hGetAll(
-          REDIS_KEYS.DRIVER_DETAILS(driver.member)
-        );
-        
-        // Skip if no details (TTL expired = offline)
-        if (!details || Object.keys(details).length === 0) {
-          // Clean up stale geo entry
+        const details = detailsMap.get(driver.member) || {};
+
+        // Skip if no details (TTL expired = offline).
+        if (Object.keys(details).length === 0) {
+          // Clean up stale geo entry in background-safe path.
           await redisService.geoRemove(
             REDIS_KEYS.GEO_DRIVERS(vehicleKey),
             driver.member
           );
           continue;
         }
-        
-        // Skip if on trip
+
+        // Skip if on trip.
         if (details.isOnTrip === 'true') {
           continue;
         }
-        
+
         validDrivers.push({
           id: driver.member,
           distance: driver.distance || 0
@@ -459,6 +592,13 @@ class AvailabilityService {
       const result = validDrivers.slice(0, limit).map(d => d.id);
       
       logger.info(`[Availability] Found ${result.length} available for ${vehicleKey} within ${radiusKm}km of (${latitude}, ${longitude})`);
+      logger.info('[Availability] matching.source=redis_geo', {
+        matchingSource: 'redis_geo',
+        vehicleKey,
+        radiusKm,
+        candidates: nearbyDrivers.length,
+        matched: result.length
+      });
       
       return result;
       
@@ -479,6 +619,8 @@ class AvailabilityService {
     radiusKm: number = this.DEFAULT_SEARCH_RADIUS_KM
   ): Promise<NearbyDriver[]> {
     try {
+      // Runtime matching source of truth: Redis GEO index (authoritative hot path).
+      // Geohash helpers are intentionally retained as utility/fallback helpers.
       const nearbyDrivers = await redisService.geoRadius(
         REDIS_KEYS.GEO_DRIVERS(vehicleKey),
         longitude,
@@ -486,35 +628,178 @@ class AvailabilityService {
         radiusKm,
         'km'
       );
-      
+
+      const detailsMap = await this.loadDriverDetailsMap(
+        nearbyDrivers.map((driver) => driver.member)
+      );
       const result: NearbyDriver[] = [];
-      
+
       for (const driver of nearbyDrivers) {
         if (result.length >= limit) break;
-        
-        const details = await redisService.hGetAll(
-          REDIS_KEYS.DRIVER_DETAILS(driver.member)
-        );
-        
-        if (!details || Object.keys(details).length === 0) continue;
+
+        const details = detailsMap.get(driver.member) || {};
+        if (Object.keys(details).length === 0) continue;
         if (details.isOnTrip === 'true') continue;
-        
+
+        const driverLat = Number(details.latitude);
+        const driverLng = Number(details.longitude);
+        if (!Number.isFinite(driverLat) || !Number.isFinite(driverLng)) continue;
+
         result.push({
           transporterId: driver.member,
           distance: driver.distance || 0,
-          vehicleKey: details.vehicleKey,
-          vehicleId: details.vehicleId,
-          latitude: parseFloat(details.latitude),
-          longitude: parseFloat(details.longitude)
+          vehicleKey: details.vehicleKey || vehicleKey,
+          vehicleId: details.vehicleId || '',
+          latitude: driverLat,
+          longitude: driverLng
         });
       }
+      logger.info('[Availability] matching.source=redis_geo', {
+        matchingSource: 'redis_geo',
+        vehicleKey,
+        radiusKm,
+        candidates: nearbyDrivers.length,
+        matched: result.length
+      });
       
       return result;
-      
+
     } catch (error: any) {
       logger.error(`[Availability] getAvailableTransportersWithDetails failed: ${error.message}`);
+      return this.getAvailableTransportersWithFallback({
+        vehicleKey,
+        latitude,
+        longitude,
+        limit,
+        radiusKm,
+        errorMessage: error?.message || 'unknown'
+      });
+    }
+  }
+
+  private async getAvailableTransportersWithFallback(params: {
+    vehicleKey: string;
+    latitude: number;
+    longitude: number;
+    limit: number;
+    radiusKm: number;
+    errorMessage: string;
+  }): Promise<NearbyDriver[]> {
+    const { vehicleKey, latitude, longitude, limit, radiusKm, errorMessage } = params;
+    const normalizedVehicleKey = vehicleKey.trim().toLowerCase();
+    const now = Date.now();
+    const throttleKey = `${normalizedVehicleKey}|${Math.round(radiusKm * 10)}`;
+    const lastRun = this.geoFallbackLastRunMs.get(throttleKey) ?? 0;
+    if (now - lastRun < this.GEO_FALLBACK_MIN_INTERVAL_MS) {
+      logger.warn('[Availability] GEO fallback throttled', {
+        vehicleKey,
+        radiusKm,
+        waitMs: this.GEO_FALLBACK_MIN_INTERVAL_MS - (now - lastRun),
+        reason: errorMessage
+      });
       return [];
     }
+    this.geoFallbackLastRunMs.set(throttleKey, now);
+    if (this.geoFallbackLastRunMs.size > 3000) {
+      const oldestKey = this.geoFallbackLastRunMs.keys().next().value;
+      if (oldestKey) {
+        this.geoFallbackLastRunMs.delete(oldestKey);
+      }
+    }
+
+    try {
+      logger.info('[Availability] matching.source=fallback_db', {
+        matchingSource: 'fallback_db',
+        vehicleKey: normalizedVehicleKey,
+        radiusKm,
+        reason: errorMessage
+      });
+      const candidateTransporters = await db.getTransportersByVehicleKey(
+        normalizedVehicleKey,
+        this.GEO_FALLBACK_MAX_CANDIDATES
+      );
+      if (candidateTransporters.length === 0) {
+        logger.warn('[Availability] GEO fallback found no candidate transporters', {
+          vehicleKey: normalizedVehicleKey,
+          radiusKm
+        });
+        return [];
+      }
+
+      const detailsMap = await this.loadDriverDetailsMap(candidateTransporters);
+      const result: NearbyDriver[] = [];
+      for (const transporterId of candidateTransporters) {
+        if (result.length >= limit) break;
+
+        const details = detailsMap.get(transporterId) || {};
+        if (Object.keys(details).length === 0) continue;
+        if (details.isOnTrip === 'true') continue;
+
+        const indexedKeys = (details.vehicleKeys || '')
+          .split(',')
+          .map((key) => key.trim().toLowerCase())
+          .filter(Boolean);
+        const currentVehicleKey = (details.vehicleKey || '').trim().toLowerCase();
+        const keyMatches = currentVehicleKey === normalizedVehicleKey || indexedKeys.includes(normalizedVehicleKey);
+        if (!keyMatches) continue;
+
+        const candidateLat = Number(details.latitude);
+        const candidateLng = Number(details.longitude);
+        if (!Number.isFinite(candidateLat) || !Number.isFinite(candidateLng)) continue;
+
+        const distanceKm = haversineDistanceKm(
+          latitude,
+          longitude,
+          candidateLat,
+          candidateLng
+        );
+        if (distanceKm > radiusKm) continue;
+
+        result.push({
+          transporterId,
+          distance: distanceKm,
+          vehicleKey: details.vehicleKey || normalizedVehicleKey,
+          vehicleId: details.vehicleId || '',
+          latitude: candidateLat,
+          longitude: candidateLng
+        });
+      }
+
+      result.sort((left, right) => left.distance - right.distance);
+      logger.warn('[Availability] GEO fallback served results from DB+Redis details', {
+        vehicleKey: normalizedVehicleKey,
+        radiusKm,
+        matched: result.length,
+        candidatesScanned: candidateTransporters.length
+      });
+      return result.slice(0, limit);
+    } catch (fallbackError: any) {
+      logger.error('[Availability] GEO fallback failed', {
+        vehicleKey: normalizedVehicleKey,
+        radiusKm,
+        sourceError: errorMessage,
+        fallbackError: fallbackError?.message || 'unknown'
+      });
+      return [];
+    }
+  }
+
+  private async loadDriverDetailsMap(
+    transporterIds: string[]
+  ): Promise<Map<string, Record<string, string>>> {
+    const uniqueIds = Array.from(new Set(transporterIds.filter(Boolean)));
+    if (uniqueIds.length === 0) return new Map();
+
+    const keys = uniqueIds.map((id) => REDIS_KEYS.DRIVER_DETAILS(id));
+    const detailsList = await redisService.hGetAllBatch(keys).catch(() =>
+      uniqueIds.map(() => ({} as Record<string, string>))
+    );
+
+    const detailsMap = new Map<string, Record<string, string>>();
+    uniqueIds.forEach((id, index) => {
+      detailsMap.set(id, detailsList[index] || {});
+    });
+    return detailsMap;
   }
   
   /**

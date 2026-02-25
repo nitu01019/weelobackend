@@ -540,6 +540,7 @@ model TruckRequest {
   @@index([heldById])                      // Held by transporter
   @@index([assignedTransporterId])         // Assigned to transporter
   @@index([status, vehicleType])           // Active requests by type
+  @@index([notifiedTransporters], type: Gin) // Fast membership lookup for transporter feed
 }
 
 // =============================================================================
@@ -925,4 +926,3 @@ model Rating {
   @@index([stars])                     // Rating distribution analytics
   @@index([customerId])               // Customer's given ratings
 }
-

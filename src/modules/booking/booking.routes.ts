@@ -16,13 +16,21 @@
 
 import { Router, Request, Response, NextFunction } from 'express';
 import { bookingService } from './booking.service';
-import { orderService } from './order.service';
+import { orderService as canonicalOrderService } from '../order/order.service';
 import { authMiddleware, roleGuard } from '../../shared/middleware/auth.middleware';
 import { prismaClient } from '../../shared/database/prisma.service';
 import { logger } from '../../shared/services/logger.service';
+import { redisService } from '../../shared/services/redis.service';
+import { bookingQueue, Priority } from '../../shared/resilience/request-queue';
 import { validateRequest } from '../../shared/utils/validation.utils';
 import { createBookingSchema, createOrderSchema, getBookingsQuerySchema } from './booking.schema';
+import {
+  buildCreateOrderResponseData,
+  normalizeCreateOrderInput,
+  toCreateOrderServiceRequest
+} from '../order/order.contract';
 const router = Router();
+const FF_LEGACY_BOOKING_PROXY_TO_ORDER = process.env.FF_LEGACY_BOOKING_PROXY_TO_ORDER === 'true';
 
 /**
  * @route   POST /bookings
@@ -36,6 +44,107 @@ router.post(
   validateRequest(createBookingSchema),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
+      logger.info('[OrderIngress] create_booking_request_legacy', {
+        route_path: '/api/v1/bookings',
+        route_alias_used: true,
+        customerId: req.user!.userId
+      });
+
+      res.setHeader('X-Weelo-Legacy-Proxy', FF_LEGACY_BOOKING_PROXY_TO_ORDER ? 'true' : 'false');
+      res.setHeader('X-Weelo-Canonical-Path', '/bookings/orders');
+
+      if (FF_LEGACY_BOOKING_PROXY_TO_ORDER) {
+        const customerId = req.user!.userId;
+        const legacyPayload = req.body as {
+          pickup: unknown;
+          drop: unknown;
+          vehicleType: string;
+          vehicleSubtype: string;
+          trucksNeeded: number;
+          distanceKm: number;
+          pricePerTruck: number;
+          goodsType?: string;
+          cargoWeightKg?: number;
+          weight?: string;
+          scheduledAt?: string;
+        };
+
+        const canonicalInput = normalizeCreateOrderInput({
+          pickup: legacyPayload.pickup,
+          drop: legacyPayload.drop,
+          distanceKm: legacyPayload.distanceKm,
+          goodsType: legacyPayload.goodsType,
+          cargoWeightKg: legacyPayload.cargoWeightKg,
+          weight: legacyPayload.weight,
+          scheduledAt: legacyPayload.scheduledAt,
+          vehicleRequirements: [{
+            vehicleType: legacyPayload.vehicleType,
+            vehicleSubtype: legacyPayload.vehicleSubtype,
+            quantity: legacyPayload.trucksNeeded,
+            pricePerTruck: legacyPayload.pricePerTruck
+          }]
+        });
+
+        const idempotencyKey = req.headers['x-idempotency-key'] as string | undefined;
+        const serviceRequest = toCreateOrderServiceRequest(
+          canonicalInput,
+          {
+            id: customerId,
+            name: 'Customer',
+            phone: req.user!.phone
+          },
+          idempotencyKey
+        );
+        const result = await canonicalOrderService.createOrder(serviceRequest);
+        const responseData = buildCreateOrderResponseData(
+          result,
+          canonicalInput,
+          {
+            id: customerId,
+            name: 'Customer',
+            phone: req.user!.phone
+          }
+        );
+
+        logger.info('[OrderIngress] legacy_proxy_used=true', {
+          customerId,
+          orderId: result.orderId,
+          route_path: '/api/v1/bookings',
+          canonical_path: '/api/v1/bookings/orders'
+        });
+
+        res.status(201).json({
+          success: true,
+          data: {
+            booking: {
+              id: responseData.order.id,
+              customerId: responseData.order.customerId,
+              customerName: responseData.order.customerName,
+              customerPhone: responseData.order.customerPhone,
+              pickup: responseData.order.pickup,
+              drop: responseData.order.drop,
+              vehicleType: legacyPayload.vehicleType,
+              vehicleSubtype: legacyPayload.vehicleSubtype,
+              trucksNeeded: legacyPayload.trucksNeeded,
+              trucksFilled: responseData.order.trucksFilled ?? 0,
+              distanceKm: responseData.order.distanceKm,
+              pricePerTruck: legacyPayload.pricePerTruck,
+              totalAmount: responseData.order.totalAmount,
+              goodsType: responseData.order.goodsType,
+              weight: legacyPayload.weight,
+              status: responseData.order.status,
+              scheduledAt: responseData.order.scheduledAt,
+              expiresAt: responseData.order.expiresAt,
+              createdAt: responseData.order.createdAt,
+              updatedAt: responseData.order.updatedAt,
+              matchingTransportersCount: responseData.broadcastSummary.totalTransportersNotified,
+              timeoutSeconds: responseData.timeoutSeconds
+            }
+          }
+        });
+        return;
+      }
+
       const booking = await bookingService.createBooking(
         req.user!.userId,
         req.user!.phone,
@@ -265,21 +374,83 @@ router.post(
   '/orders',
   authMiddleware,
   roleGuard(['customer']),
+  bookingQueue.middleware({ priority: Priority.HIGH, timeout: 15000 }),
   validateRequest(createOrderSchema),
   async (req: Request, res: Response, next: NextFunction) => {
+    const customerId = req.user!.userId;
+    const lockKey = `order:create:${customerId}`;
     try {
-      const result = await orderService.createOrder(
-        req.user!.userId,
-        req.user!.phone,
-        req.body
+      const lockAcquired = await redisService.acquireLock(lockKey, customerId, 10);
+      if (!lockAcquired.acquired) {
+        res.status(409).json({
+          success: false,
+          error: {
+            code: 'CONCURRENT_REQUEST',
+            message: 'Another order request is being processed. Please wait a moment and try again.',
+            data: {
+              retryAfter: 2
+            }
+          }
+        });
+        return;
+      }
+
+      const rateLimit = await canonicalOrderService.checkRateLimit(`order_create:${customerId}`, 5, 60);
+      if (!rateLimit.allowed) {
+        const retryAfterMs = Math.max(1000, (rateLimit.retryAfter || 1) * 1000);
+        res.setHeader('Retry-After', Math.ceil(retryAfterMs / 1000).toString());
+        res.status(429).json({
+          success: false,
+          error: {
+            code: 'RATE_LIMIT_EXCEEDED',
+            message: `Too many requests. Please wait ${rateLimit.retryAfter} seconds before trying again.`,
+            retryAfterMs,
+            data: {
+              retryAfter: rateLimit.retryAfter,
+              retryAfterMs,
+              limit: 5,
+              window: '1 minute'
+            }
+          }
+        });
+        return;
+      }
+
+      logger.info('[OrderIngress] create_order_request', {
+        route_path: '/api/v1/bookings/orders',
+        route_alias_used: false,
+        customerId
+      });
+
+      const normalizedInput = normalizeCreateOrderInput(req.body);
+      const idempotencyKey = req.headers['x-idempotency-key'] as string | undefined;
+      const serviceRequest = toCreateOrderServiceRequest(
+        normalizedInput,
+        {
+          id: customerId,
+          name: 'Customer',
+          phone: req.user!.phone
+        },
+        idempotencyKey
       );
+      const result = await canonicalOrderService.createOrder(serviceRequest);
       
       res.status(201).json({
         success: true,
-        data: result
+        data: buildCreateOrderResponseData(
+          result,
+          normalizedInput,
+          {
+            id: req.user!.userId,
+            name: 'Customer',
+            phone: req.user!.phone
+          }
+        )
       });
     } catch (error) {
       next(error);
+    } finally {
+      await redisService.releaseLock(lockKey, customerId).catch(() => {});
     }
   }
 );
@@ -298,7 +469,7 @@ router.get(
       const page = parseInt(req.query.page as string) || 1;
       const limit = parseInt(req.query.limit as string) || 20;
       
-      const result = await orderService.getCustomerOrders(req.user!.userId, page, limit);
+      const result = await canonicalOrderService.getCustomerOrders(req.user!.userId, page, limit);
       
       res.json({
         success: true,
@@ -320,7 +491,7 @@ router.get(
   authMiddleware,
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const result = await orderService.getOrderWithRequests(
+      const result = await canonicalOrderService.getOrderWithRequests(
         req.params.id,
         req.user!.userId,
         req.user!.role
@@ -329,6 +500,107 @@ router.get(
       res.json({
         success: true,
         data: result
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
+ * @route   POST /bookings/orders/:orderId/cancel
+ * @desc    Cancel order (canonical alias path)
+ * @access  Customer only
+ */
+router.post(
+  '/orders/:orderId/cancel',
+  authMiddleware,
+  roleGuard(['customer']),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      logger.info('[OrderIngress] cancel_order_request', {
+        route_path: '/api/v1/bookings/orders/:orderId/cancel',
+        route_alias_used: false,
+        customerId: req.user!.userId,
+        orderId: req.params.orderId
+      });
+
+      const { orderId } = req.params;
+      const { reason } = req.body ?? {};
+      const result = await canonicalOrderService.cancelOrder(orderId, req.user!.userId, reason);
+
+      if (!result.success) {
+        return res.status(400).json({
+          success: false,
+          error: {
+            code: 'CANCEL_FAILED',
+            message: result.message
+          }
+        });
+      }
+
+      res.json({
+        success: true,
+        data: {
+          orderId,
+          status: 'cancelled',
+          reason: reason || 'Cancelled by customer',
+          transportersNotified: result.transportersNotified,
+          cancelledAt: new Date().toISOString()
+        }
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
+ * @route   GET /bookings/orders/:orderId/status
+ * @desc    Get order status + remaining seconds (canonical alias path)
+ * @access  Customer only
+ */
+router.get(
+  '/orders/:orderId/status',
+  authMiddleware,
+  roleGuard(['customer']),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { orderId } = req.params;
+      logger.info('[OrderIngress] order_status_request', {
+        route_path: '/api/v1/bookings/orders/:orderId/status',
+        route_alias_used: false,
+        customerId: req.user!.userId,
+        orderId
+      });
+
+      const details = await canonicalOrderService.getOrderDetails(orderId);
+      if (!details) {
+        return res.status(404).json({
+          success: false,
+          error: {
+            code: 'ORDER_NOT_FOUND',
+            message: 'Order not found'
+          }
+        });
+      }
+
+      const nowMs = Date.now();
+      const expiresAtMs = new Date(details.expiresAt).getTime();
+      const remainingMs = Math.max(0, expiresAtMs - nowMs);
+      const remainingSeconds = Math.floor(remainingMs / 1000);
+      const activeStatuses = new Set(['created', 'broadcasting', 'active', 'partially_filled']);
+      const isActive = activeStatuses.has(details.status) && remainingSeconds > 0;
+
+      res.json({
+        success: true,
+        data: {
+          orderId: details.id,
+          status: details.status,
+          remainingSeconds,
+          isActive,
+          expiresAt: details.expiresAt
+        }
       });
     } catch (error) {
       next(error);
@@ -350,7 +622,7 @@ router.get(
   roleGuard(['transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const result = await orderService.getActiveTruckRequestsForTransporter(req.user!.userId);
+      const result = await canonicalOrderService.getActiveTruckRequestsForTransporter(req.user!.userId);
       
       res.json({
         success: true,
@@ -390,7 +662,7 @@ router.post(
         });
       }
       
-      const request = await orderService.acceptTruckRequest(
+      const request = await canonicalOrderService.acceptTruckRequest(
         req.params.id,
         req.user!.userId,
         vehicleId,

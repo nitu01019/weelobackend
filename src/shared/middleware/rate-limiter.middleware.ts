@@ -29,6 +29,7 @@
  */
 
 import rateLimit from 'express-rate-limit';
+import { Request, Response } from 'express';
 import { config } from '../../config/environment';
 import { redisService } from '../services/redis.service';
 import { logger } from '../services/logger.service';
@@ -164,6 +165,32 @@ function createStore(windowMs: number, name: string): any {
   return undefined;
 }
 
+function resolveRetryAfterMs(req: Request, fallbackWindowMs: number): number {
+  const rateLimitMeta = (req as any).rateLimit;
+  const resetAtMs = rateLimitMeta?.resetTime instanceof Date
+    ? rateLimitMeta.resetTime.getTime()
+    : null;
+  if (resetAtMs == null) {
+    return Math.max(1000, fallbackWindowMs);
+  }
+  return Math.max(1000, resetAtMs - Date.now());
+}
+
+function throttleHandler(code: string, message: string, fallbackWindowMs: number) {
+  return (req: Request, res: Response) => {
+    const retryAfterMs = resolveRetryAfterMs(req, fallbackWindowMs);
+    res.setHeader('Retry-After', Math.ceil(retryAfterMs / 1000).toString());
+    res.status(429).json({
+      success: false,
+      error: {
+        code,
+        message,
+        retryAfterMs
+      }
+    });
+  };
+}
+
 // =============================================================================
 // RATE LIMITERS
 // =============================================================================
@@ -175,13 +202,11 @@ function createStore(windowMs: number, name: string): any {
 export const rateLimiter = rateLimit({
   windowMs: config.rateLimit.windowMs,
   max: config.rateLimit.maxRequests,
-  message: {
-    success: false,
-    error: {
-      code: 'RATE_LIMIT_EXCEEDED',
-      message: 'Too many requests. Please try again later.'
-    }
-  },
+  handler: throttleHandler(
+    'RATE_LIMIT_EXCEEDED',
+    'Too many requests. Please try again later.',
+    config.rateLimit.windowMs
+  ),
   standardHeaders: true,
   legacyHeaders: false,
   store: createStore(config.rateLimit.windowMs, 'global'),
@@ -196,13 +221,11 @@ export const rateLimiter = rateLimit({
 export const authRateLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 10,
-  message: {
-    success: false,
-    error: {
-      code: 'AUTH_RATE_LIMIT_EXCEEDED',
-      message: 'Too many authentication attempts. Please try again in 15 minutes.'
-    }
-  },
+  handler: throttleHandler(
+    'AUTH_RATE_LIMIT_EXCEEDED',
+    'Too many authentication attempts. Please try again in 15 minutes.',
+    15 * 60 * 1000
+  ),
   standardHeaders: true,
   legacyHeaders: false,
   store: createStore(15 * 60 * 1000, 'auth')
@@ -244,13 +267,11 @@ export const otpRateLimiter = rateLimit({
     const phone = req.body?.phone || req.body?.driverPhone || req.ip || 'unknown';
     return `otp:${phone}`;
   },
-  message: {
-    success: false,
-    error: {
-      code: 'OTP_RATE_LIMIT_EXCEEDED',
-      message: 'Too many OTP attempts. Please try again in 2 minutes.'
-    }
-  },
+  handler: throttleHandler(
+    'OTP_RATE_LIMIT_EXCEEDED',
+    'Too many OTP attempts. Please try again in 2 minutes.',
+    2 * 60 * 1000
+  ),
   standardHeaders: true,
   legacyHeaders: false,
   store: createStore(2 * 60 * 1000, 'otp'),
@@ -269,13 +290,11 @@ export const profileRateLimiter = rateLimit({
     // Rate limit by user ID for authenticated requests
     return `profile:${(req as any).user?.userId || req.ip || 'unknown'}`;
   },
-  message: {
-    success: false,
-    error: {
-      code: 'PROFILE_RATE_LIMIT_EXCEEDED',
-      message: 'Too many profile updates. Please wait a moment.'
-    }
-  },
+  handler: throttleHandler(
+    'PROFILE_RATE_LIMIT_EXCEEDED',
+    'Too many profile updates. Please wait a moment.',
+    60 * 1000
+  ),
   standardHeaders: true,
   legacyHeaders: false,
   store: createStore(60 * 1000, 'profile')
@@ -293,13 +312,11 @@ export const trackingRateLimiter = rateLimit({
     // Rate limit by user ID for authenticated requests
     return `tracking:${(req as any).user?.userId || req.ip || 'unknown'}`;
   },
-  message: {
-    success: false,
-    error: {
-      code: 'TRACKING_RATE_LIMIT_EXCEEDED',
-      message: 'Too many location updates. Maximum 2 per second.'
-    }
-  },
+  handler: throttleHandler(
+    'TRACKING_RATE_LIMIT_EXCEEDED',
+    'Too many location updates. Maximum 2 per second.',
+    60 * 1000
+  ),
   standardHeaders: true,
   legacyHeaders: false,
   store: createStore(60 * 1000, 'tracking')
@@ -319,13 +336,11 @@ export const placesRateLimiter = rateLimit({
     // Rate limit by IP for unauthenticated geocoding requests
     return `places:${req.ip || 'unknown'}`;
   },
-  message: {
-    success: false,
-    error: {
-      code: 'PLACES_RATE_LIMIT_EXCEEDED',
-      message: 'Too many geocoding requests. Please slow down.'
-    }
-  },
+  handler: throttleHandler(
+    'PLACES_RATE_LIMIT_EXCEEDED',
+    'Too many geocoding requests. Please slow down.',
+    60 * 1000
+  ),
   standardHeaders: true,
   legacyHeaders: false,
   store: createStore(60 * 1000, 'places')

@@ -18,6 +18,7 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { truckHoldService } from './truck-hold.service';
 import { authMiddleware, roleGuard } from '../../shared/middleware/auth.middleware';
 import { logger } from '../../shared/services/logger.service';
+import { redisService } from '../../shared/services/redis.service';
 
 const router = Router();
 
@@ -172,6 +173,7 @@ router.post(
     try {
       const transporterId = req.user!.userId;
       const { holdId, assignments } = req.body;
+      let idempotencyCacheKey: string | null = null;
       
       // Validate required fields
       if (!holdId) {
@@ -201,6 +203,22 @@ router.post(
           });
         }
       }
+
+      const idempotencyKey = (req.header('X-Idempotency-Key') || req.header('x-idempotency-key') || '').trim();
+      idempotencyCacheKey = idempotencyKey
+        ? `idempotency:truck-hold:confirm:${transporterId}:${holdId}:${idempotencyKey}`
+        : null;
+
+      if (idempotencyCacheKey) {
+        try {
+          const cached = await redisService.getJSON<{ status: number; body: any }>(idempotencyCacheKey);
+          if (cached) {
+            return res.status(cached.status).json(cached.body);
+          }
+        } catch (cacheError: any) {
+          logger.warn(`[TruckHoldRoutes] Idempotency read failed: ${cacheError?.message || 'unknown'}`);
+        }
+      }
       
       logger.info(`[TruckHoldRoutes] Confirm with assignments: ${holdId} by ${transporterId} (${assignments.length} trucks)`);
       
@@ -211,24 +229,34 @@ router.post(
       );
       
       if (result.success) {
-        res.json({
+        const responseBody = {
           success: true,
           data: {
             assignmentIds: result.assignmentIds,
             tripIds: result.tripIds
           },
           message: result.message
-        });
+        };
+        if (idempotencyCacheKey) {
+          await redisService.setJSON(idempotencyCacheKey, { status: 200, body: responseBody }, 120)
+            .catch(() => {});
+        }
+        res.json(responseBody);
       } else {
         // Return 400 with detailed failure info
-        res.status(400).json({
+        const responseBody = {
           success: false,
           error: { 
             code: 'CONFIRM_FAILED', 
             message: result.message,
             failedAssignments: result.failedAssignments
           }
-        });
+        };
+        if (idempotencyCacheKey) {
+          await redisService.setJSON(idempotencyCacheKey, { status: 400, body: responseBody }, 45)
+            .catch(() => {});
+        }
+        res.status(400).json(responseBody);
       }
     } catch (error) {
       next(error);

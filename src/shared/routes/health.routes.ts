@@ -27,7 +27,7 @@ import { defaultQueue, bookingQueue, trackingQueue, authQueue } from '../resilie
 import { cacheService } from '../services/cache.service';
 import { redisService } from '../services/redis.service';
 import { logger } from '../services/logger.service';
-import { getConnectionStats, getIO } from '../services/socket.service';
+import { getConnectionStats, getIO, getRedisAdapterStatus } from '../services/socket.service';
 import { smsService } from '../../modules/auth/sms.service';
 
 const router = Router();
@@ -99,6 +99,14 @@ router.get('/health/ready', async (_req: Request, res: Response) => {
     const circuitBreakers = circuitBreakerRegistry.getAllStats();
     const openCircuits = circuitBreakers.filter(cb => cb.state === 'OPEN');
     checks.circuits = openCircuits.length === 0;
+
+    // Socket adapter readiness (for cross-instance fanout in ECS)
+    const adapterStatus = getRedisAdapterStatus();
+    if (redisService.isRedisEnabled() && process.env.REDIS_PUBSUB_DISABLED !== 'true') {
+      checks.socketPubSub = adapterStatus.enabled;
+    } else {
+      checks.socketPubSub = true;
+    }
     
     // Determine overall status
     const isReady = Object.values(checks).every(v => v);
@@ -250,6 +258,7 @@ router.get('/version', (_req: Request, res: Response) => {
 router.get('/health/websocket', (_req: Request, res: Response) => {
   const io = getIO();
   const stats = getConnectionStats();
+  const adapterStatus = getRedisAdapterStatus();
   
   // Get detailed socket info
   const connectedSockets: any[] = [];
@@ -269,6 +278,7 @@ router.get('/health/websocket', (_req: Request, res: Response) => {
   res.json({
     status: io ? 'initialized' : 'NOT INITIALIZED',
     stats,
+    adapter: adapterStatus,
     connectedSockets,
     socketCount: connectedSockets.length,
     message: connectedSockets.length === 0 

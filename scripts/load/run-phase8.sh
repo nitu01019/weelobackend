@@ -23,9 +23,20 @@ run_round() {
   k6 run "${SCRIPT_DIR}/create-order-burst.js" \
     -e API_BASE_URL="${API_BASE_URL}" \
     -e LOAD_TEST_RUN_ID="${run_id}-create" \
+    -e CREATE_ROUTE_MODE="canonical" \
     -e RATE="${rate}" \
     -e DURATION="${duration}" \
     --summary-export "${REPORT_DIR}/${run_id}-create-summary.json"
+
+  if [[ "${RUN_ALIAS_PROBE:-false}" == "true" ]]; then
+    k6 run "${SCRIPT_DIR}/create-order-burst.js" \
+      -e API_BASE_URL="${API_BASE_URL}" \
+      -e LOAD_TEST_RUN_ID="${run_id}-create-alias" \
+      -e CREATE_ROUTE_MODE="legacy_orders" \
+      -e RATE="20" \
+      -e DURATION="1m" \
+      --summary-export "${REPORT_DIR}/${run_id}-create-alias-summary.json"
+  fi
 
   k6 run "${SCRIPT_DIR}/accept-race-contention.js" \
     -e API_BASE_URL="${API_BASE_URL}" \
@@ -44,6 +55,21 @@ run_round() {
     -e LOAD_TEST_RUN_ID="${run_id}-reconnect" \
     -e DURATION="${duration}" \
     --summary-export "${REPORT_DIR}/${run_id}-reconnect-summary.json"
+
+  if [[ -n "${DRIVER_TOKEN:-}" && -n "${TRIP_ID:-}" ]]; then
+    k6 run "${SCRIPT_DIR}/tracking-heartbeat-flood.js" \
+      -e API_BASE_URL="${API_BASE_URL}" \
+      -e DRIVER_TOKEN="${DRIVER_TOKEN}" \
+      -e TRIP_ID="${TRIP_ID}" \
+      -e TRACKING_RATE="${TRACKING_RATE:-250}" \
+      -e TRACKING_PREALLOCATED_VUS="${TRACKING_PREALLOCATED_VUS:-100}" \
+      -e TRACKING_MAX_VUS="${TRACKING_MAX_VUS:-1000}" \
+      -e LOAD_TEST_RUN_ID="${run_id}-tracking" \
+      -e DURATION="${duration}" \
+      --summary-export "${REPORT_DIR}/${run_id}-tracking-summary.json"
+  else
+    echo "[phase8] Skipping tracking-heartbeat-flood (set DRIVER_TOKEN and TRIP_ID to enable)."
+  fi
 }
 
 run_round "baseline" "80" "2m"
