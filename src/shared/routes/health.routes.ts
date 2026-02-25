@@ -103,7 +103,9 @@ router.get('/health/ready', async (_req: Request, res: Response) => {
     // Socket adapter readiness (for cross-instance fanout in ECS)
     const adapterStatus = getRedisAdapterStatus();
     if (redisService.isRedisEnabled() && process.env.REDIS_PUBSUB_DISABLED !== 'true') {
-      checks.socketPubSub = adapterStatus.enabled;
+      // If pub/sub is unsupported by the managed Redis mode, we allow readiness
+      // and rely on HTTP + fallback paths instead of marking the whole task unready.
+      checks.socketPubSub = adapterStatus.enabled || adapterStatus.mode === 'disabled_by_capability';
     } else {
       checks.socketPubSub = true;
     }

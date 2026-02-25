@@ -524,9 +524,20 @@ process.on('uncaughtException', (error) => {
 });
 
 process.on('unhandledRejection', (reason) => {
+  const message = reason instanceof Error ? reason.message : String(reason);
   logger.error('Unhandled rejection', reason);
-  // Exit to prevent zombie process with corrupt state.
-  // ECS/cluster will restart the worker automatically.
+
+  // Guardrail for managed Redis modes that reject pub/sub commands.
+  // We already fall back to no-adapter mode; don't crash the worker for this known case.
+  const isKnownSocketPubSubCapabilityError =
+    /unknown command 'psubscribe'/i.test(message) ||
+    /socket\.io#\/#\*/i.test(message);
+  if (isKnownSocketPubSubCapabilityError) {
+    logger.warn('Ignoring known non-fatal Redis pub/sub capability error');
+    return;
+  }
+
+  // Exit for unknown unhandled rejections to avoid corrupt process state.
   process.exit(1);
 });
 

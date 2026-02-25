@@ -28,13 +28,84 @@
 
 import cluster from 'cluster';
 import os from 'os';
+import { existsSync, readFileSync } from 'fs';
 import { logger } from './shared/services/logger.service';
 
-// Number of CPU cores
+// Number of host CPU cores
 const numCPUs = os.cpus().length;
 
-// Configurable worker count (default: all cores, or set WORKERS env)
-const WORKER_COUNT = parseInt(process.env.WORKERS || '') || numCPUs;
+function parsePositiveInt(value: string | undefined): number | null {
+  if (!value) return null;
+  const parsed = parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function getCgroupCpuLimit(): number | null {
+  // cgroup v2
+  try {
+    const cpuMaxPath = '/sys/fs/cgroup/cpu.max';
+    if (existsSync(cpuMaxPath)) {
+      const content = readFileSync(cpuMaxPath, 'utf8').trim();
+      const [quotaRaw, periodRaw] = content.split(/\s+/);
+      if (quotaRaw && periodRaw && quotaRaw !== 'max') {
+        const quota = parseInt(quotaRaw, 10);
+        const period = parseInt(periodRaw, 10);
+        if (quota > 0 && period > 0) {
+          return Math.max(1, Math.floor(quota / period));
+        }
+      }
+    }
+  } catch {
+    // Best-effort only
+  }
+
+  // cgroup v1 fallback
+  try {
+    const quotaPath = '/sys/fs/cgroup/cpu/cpu.cfs_quota_us';
+    const periodPath = '/sys/fs/cgroup/cpu/cpu.cfs_period_us';
+    if (existsSync(quotaPath) && existsSync(periodPath)) {
+      const quota = parseInt(readFileSync(quotaPath, 'utf8').trim(), 10);
+      const period = parseInt(readFileSync(periodPath, 'utf8').trim(), 10);
+      if (quota > 0 && period > 0) {
+        return Math.max(1, Math.floor(quota / period));
+      }
+    }
+  } catch {
+    // Best-effort only
+  }
+
+  return null;
+}
+
+function resolveWorkerCount(): number {
+  // Explicit override always wins
+  const explicitWorkers = parsePositiveInt(process.env.WORKERS);
+  if (explicitWorkers) return explicitWorkers;
+
+  const webConcurrency = parsePositiveInt(process.env.WEB_CONCURRENCY);
+  if (webConcurrency) return webConcurrency;
+
+  // ECS/Fargate style CPU units: 1024 = 1 vCPU
+  const containerCpuUnits = parsePositiveInt(process.env.CONTAINER_CPU);
+  if (containerCpuUnits) {
+    return Math.max(1, Math.floor(containerCpuUnits / 1024));
+  }
+
+  const cgroupLimit = getCgroupCpuLimit();
+  if (cgroupLimit) return cgroupLimit;
+
+  // In containerized production, defaulting to all host CPUs causes severe over-forking.
+  const isContainerized = Boolean(
+    process.env.ECS_CONTAINER_METADATA_URI_V4 ||
+    process.env.ECS_CONTAINER_METADATA_URI ||
+    process.env.KUBERNETES_SERVICE_HOST
+  );
+  if (isContainerized) return 1;
+
+  return numCPUs;
+}
+
+const WORKER_COUNT = resolveWorkerCount();
 
 // Track worker restart counts to prevent infinite restart loops
 const workerRestarts = new Map<number, { count: number; lastRestart: number }>();
