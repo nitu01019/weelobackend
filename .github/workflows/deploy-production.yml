@@ -106,11 +106,14 @@ jobs:
 
             RUNNING=$(echo "$SERVICE_JSON" | python3 -c "import json,sys; s=json.load(sys.stdin); print(s['runningCount'])")
             DESIRED=$(echo "$SERVICE_JSON" | python3 -c "import json,sys; s=json.load(sys.stdin); print(s['desiredCount'])")
-            DEPLOYMENTS=$(echo "$SERVICE_JSON" | python3 -c "import json,sys; s=json.load(sys.stdin); print(len([d for d in s['deployments'] if d['status']=='PRIMARY' and d['rolloutState']=='COMPLETED']))")
+            PENDING=$(echo "$SERVICE_JSON" | python3 -c "import json,sys; s=json.load(sys.stdin); print(s.get('pendingCount', 0))")
+            PRIMARY_STATE=$(echo "$SERVICE_JSON" | python3 -c "import json,sys; s=json.load(sys.stdin); d=next((x for x in s.get('deployments',[]) if x.get('status')=='PRIMARY'),{}); print(d.get('rolloutState','UNKNOWN'))")
+            DEPLOYMENTS_STATE=$(echo "$SERVICE_JSON" | python3 -c "import json,sys; s=json.load(sys.stdin); print(' | '.join([f\"{d.get('status')}:{d.get('rolloutState','UNKNOWN')} running={d.get('runningCount')}/{d.get('desiredCount')}\" for d in s.get('deployments',[])]))")
 
-            echo "  Running: $RUNNING/$DESIRED  |  PRIMARY+COMPLETED deployments: $DEPLOYMENTS"
+            echo "  Running: $RUNNING/$DESIRED  Pending: $PENDING  PrimaryState: $PRIMARY_STATE"
+            echo "  Deployments: $DEPLOYMENTS_STATE"
 
-            if [ "$RUNNING" = "$DESIRED" ] && [ "$DEPLOYMENTS" = "1" ]; then
+            if [ "$RUNNING" = "$DESIRED" ] && [ "$PENDING" = "0" ] && [ "$PRIMARY_STATE" = "COMPLETED" ]; then
               echo "✅ ECS service is stable! ($RUNNING/$DESIRED tasks running)"
               break
             fi
@@ -129,6 +132,13 @@ jobs:
 
           if [ $ATTEMPT -ge $MAX_RETRIES ]; then
             echo "❌ Timed out waiting for ECS to stabilize after $((MAX_RETRIES * SLEEP_SECONDS))s"
+            echo "📋 Recent ECS service events:"
+            aws ecs describe-services \
+              --cluster ${{ env.ECS_CLUSTER }} \
+              --services ${{ env.ECS_SERVICE }} \
+              --region ${{ env.AWS_REGION }} \
+              --query 'services[0].events[0:12].[createdAt,message]' \
+              --output table || true
             exit 1
           fi
 
