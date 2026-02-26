@@ -724,23 +724,32 @@ class RealRedisClient implements IRedisClient {
       // CRITICAL: Enable TLS for ElastiCache Serverless (requires rediss://)
       const useTls = this.config.url.startsWith('rediss://');
       this.client = new Redis(this.config.url, {
-        maxRetriesPerRequest: 3, // Fast fail per command (not total retries)
+        maxRetriesPerRequest: 1, // Fast fail — 1 retry max to avoid stacking latency
         retryStrategy: (times: number) => {
           if (times > this.config.maxRetries) {
             logger.error(`[Redis] Max retries (${this.config.maxRetries}) exceeded`);
             return null; // Stop retrying
           }
-          const delay = Math.min(times * this.config.retryDelayMs, 10000);
+          // CRITICAL FIX: exponential backoff capped at 3s (was linear up to 10s)
+          // Prevents reconnect storm when ElastiCache Serverless drops connections.
+          const delay = Math.min(Math.pow(2, times) * 200, 3000);
           logger.warn(`[Redis] Retry ${times}/${this.config.maxRetries} in ${delay}ms`);
           return delay;
         },
         connectTimeout: this.config.connectionTimeoutMs,
-        // CRITICAL FIX: ioredis does NOT support 'commandTimeout'.
-        // Instead, use enableOfflineQueue=false to reject commands immediately
-        // when disconnected, preventing infinite hangs.
+        // CRITICAL FIX: commandTimeout 3000ms — commands abort fast so API
+        // requests don't hang. ElastiCache Serverless silently drops idle TCP
+        // connections; without a short timeout every command hangs until the
+        // socket OS timeout (~minutes).
+        commandTimeout: this.config.commandTimeoutMs,
         enableOfflineQueue: false,
         enableReadyCheck: true,
         lazyConnect: false,
+        // CRITICAL FIX: keepAlive 1000ms (was 10000ms) — sends TCP keepalive
+        // probes every 1s so the OS detects dead connections within ~3s instead
+        // of waiting for commandTimeout. This prevents the silent-drop problem
+        // on ElastiCache Serverless which has a 20s idle connection timeout.
+        keepAlive: 1000,
         // TLS required for ElastiCache Serverless
         tls: useTls ? { rejectUnauthorized: false } : undefined,
       });
@@ -937,17 +946,13 @@ class RealRedisClient implements IRedisClient {
   }
 
   /**
-   * Blocking pop from right of list with timeout
-   * SCALABILITY: Used by workers for efficient polling (no CPU waste)
-   * PRODUCTION: True blocking operation, efficient for high-scale workers
+   * Pop from right of list (non-blocking)
+   * Uses RPOP instead of BRPOP to avoid ioredis commandTimeout conflicts.
+   * The caller (queue worker) handles the polling interval with sleep.
    */
-  async brPop(key: string, timeoutSeconds: number): Promise<string | null> {
-    const result = await this.client.brpop(key, timeoutSeconds);
-    // brpop returns [key, value] or null
-    if (result && result.length === 2) {
-      return result[1];
-    }
-    return null;
+  async brPop(key: string, _timeoutSeconds: number): Promise<string | null> {
+    const result = await this.client.rpop(key);
+    return result ?? null;
   }
 
   // =========== Sets ===========
@@ -1206,8 +1211,8 @@ class RedisService {
           maxRetries: parseInt(process.env.REDIS_MAX_RETRIES || '5', 10),
           retryDelayMs: parseInt(process.env.REDIS_RETRY_DELAY_MS || '1000', 10),
           maxConnections: parseInt(process.env.REDIS_MAX_CONNECTIONS || '20', 10),
-          connectionTimeoutMs: parseInt(process.env.REDIS_CONNECTION_TIMEOUT_MS || '10000', 10),
-          commandTimeoutMs: parseInt(process.env.REDIS_COMMAND_TIMEOUT_MS || '3000', 10), // Used for reference only
+          connectionTimeoutMs: parseInt(process.env.REDIS_CONNECTION_TIMEOUT_MS || '3000', 10),
+          commandTimeoutMs: parseInt(process.env.REDIS_COMMAND_TIMEOUT_MS || '3000', 10),
         };
 
         logger.info(`[Redis] Initializing connection (timeout: ${config.connectionTimeoutMs}ms, retries: ${config.maxRetries})`);

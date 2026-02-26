@@ -70,23 +70,23 @@ class InMemoryQueue extends EventEmitter {
   private processing: Set<string> = new Set();
   private isRunning: boolean = false;
   private processInterval: ReturnType<typeof setInterval> | null = null;
-  
+
   // Configuration
   private readonly concurrency: number = 10;
   private readonly pollInterval: number = 100; // ms
-  
+
   constructor() {
     super();
     this.start();
   }
-  
+
   /**
    * Add a job to the queue
    */
   async add<T>(
-    queueName: string, 
-    type: string, 
-    data: T, 
+    queueName: string,
+    type: string,
+    data: T,
     options?: {
       priority?: number;
       delay?: number;
@@ -103,13 +103,13 @@ class InMemoryQueue extends EventEmitter {
       createdAt: Date.now(),
       processAfter: options?.delay ? Date.now() + options.delay : undefined
     };
-    
+
     if (!this.queues.has(queueName)) {
       this.queues.set(queueName, []);
     }
-    
+
     const queue = this.queues.get(queueName)!;
-    
+
     // Insert by priority (higher priority first)
     const insertIndex = queue.findIndex(j => j.priority < job.priority);
     if (insertIndex === -1) {
@@ -117,13 +117,13 @@ class InMemoryQueue extends EventEmitter {
     } else {
       queue.splice(insertIndex, 0, job);
     }
-    
+
     logger.debug(`Job ${job.id} added to queue ${queueName} (type: ${type})`);
     this.emit('job:added', { queueName, job });
-    
+
     return job.id;
   }
-  
+
   /**
    * Add multiple jobs at once (batch)
    */
@@ -138,7 +138,7 @@ class InMemoryQueue extends EventEmitter {
     }
     return ids;
   }
-  
+
   /**
    * Register a processor for a queue
    */
@@ -146,18 +146,18 @@ class InMemoryQueue extends EventEmitter {
     this.processors.set(queueName, processor);
     logger.info(`Processor registered for queue: ${queueName}`);
   }
-  
+
   /**
    * Start processing jobs
    */
   start(): void {
     if (this.isRunning) return;
-    
+
     this.isRunning = true;
     this.processInterval = setInterval(() => this.tick(), this.pollInterval);
     logger.info('🚀 Queue processor started');
   }
-  
+
   /**
    * Stop processing jobs
    */
@@ -169,63 +169,63 @@ class InMemoryQueue extends EventEmitter {
     }
     logger.info('⏹️ Queue processor stopped');
   }
-  
+
   /**
    * Process tick - check for jobs to process
    */
   private async tick(): Promise<void> {
     if (this.processing.size >= this.concurrency) return;
-    
+
     for (const [queueName, queue] of this.queues) {
       const processor = this.processors.get(queueName);
       if (!processor) continue;
-      
+
       // Find next processable job
       const jobIndex = queue.findIndex(job => {
         if (this.processing.has(job.id)) return false;
         if (job.processAfter && Date.now() < job.processAfter) return false;
         return true;
       });
-      
+
       if (jobIndex === -1) continue;
-      
+
       const job = queue[jobIndex];
       this.processing.add(job.id);
-      
+
       // Process asynchronously
       this.processJob(queueName, job, processor, jobIndex);
-      
+
       // Respect concurrency limit
       if (this.processing.size >= this.concurrency) break;
     }
   }
-  
+
   /**
    * Process a single job
    */
   private async processJob(
-    queueName: string, 
-    job: QueueJob, 
+    queueName: string,
+    job: QueueJob,
     processor: JobProcessor,
     _jobIndex: number
   ): Promise<void> {
     try {
       job.attempts++;
       await processor(job);
-      
+
       // Success - remove from queue
       const queue = this.queues.get(queueName);
       if (queue) {
         const idx = queue.indexOf(job);
         if (idx !== -1) queue.splice(idx, 1);
       }
-      
+
       this.emit('job:completed', { queueName, job });
       logger.debug(`Job ${job.id} completed (${queueName})`);
-      
+
     } catch (error: any) {
       job.error = error.message;
-      
+
       if (job.attempts >= job.maxAttempts) {
         // Max retries reached - move to dead letter
         const queue = this.queues.get(queueName);
@@ -233,7 +233,7 @@ class InMemoryQueue extends EventEmitter {
           const idx = queue.indexOf(job);
           if (idx !== -1) queue.splice(idx, 1);
         }
-        
+
         this.emit('job:failed', { queueName, job, error: error.message });
         logger.error(`Job ${job.id} failed permanently: ${error.message}`);
       } else {
@@ -246,7 +246,7 @@ class InMemoryQueue extends EventEmitter {
       this.processing.delete(job.id);
     }
   }
-  
+
   /**
    * Get queue stats
    */
@@ -260,7 +260,7 @@ class InMemoryQueue extends EventEmitter {
       pending: jobs.length,
       processing: jobs.filter(j => this.processing.has(j.id)).length
     }));
-    
+
     return {
       queues: queueStats,
       totalPending: queueStats.reduce((sum, q) => sum + q.pending, 0),
@@ -304,41 +304,41 @@ class RedisQueue extends EventEmitter {
   private isRunning: boolean = false;
   private queueInFlight: Map<string, number> = new Map();
   private queueWorkers: Map<string, Set<number>> = new Map();
-  
+
   // Configuration
-  private readonly defaultWorkerCount = Math.max(1, parseInt(process.env.REDIS_QUEUE_WORKERS || '16', 10) || 16);
-  private readonly trackingWorkerCount = Math.max(1, parseInt(process.env.REDIS_QUEUE_TRACKING_WORKERS || '48', 10) || 48);
-  private readonly blockingPopTimeoutSec = Math.max(1, parseInt(process.env.REDIS_QUEUE_BLOCKING_POP_TIMEOUT_SEC || '1', 10) || 1);
+  private readonly defaultWorkerCount = Math.max(1, parseInt(process.env.REDIS_QUEUE_WORKERS || '2', 10) || 2);
+  private readonly trackingWorkerCount = Math.max(1, parseInt(process.env.REDIS_QUEUE_TRACKING_WORKERS || '4', 10) || 4);
+  private readonly blockingPopTimeoutSec = Math.max(1, parseInt(process.env.REDIS_QUEUE_BLOCKING_POP_TIMEOUT_SEC || '2', 10) || 2);
   private readonly queuePrefix: string = 'queue:';
   private readonly deadLetterPrefix: string = 'dlq:';
-  
+
   constructor() {
     super();
     logger.info('🚀 Redis Queue initialized (Production Mode)');
   }
-  
+
   /**
    * Get Redis key for a queue
    */
   private getQueueKey(queueName: string): string {
     return `${this.queuePrefix}${queueName}`;
   }
-  
+
   /**
    * Get Redis key for dead letter queue
    */
   private getDeadLetterKey(queueName: string): string {
     return `${this.deadLetterPrefix}${queueName}`;
   }
-  
+
   /**
    * Add a job to the queue
    * Uses Redis LPUSH for O(1) insertion
    */
   async add<T>(
-    queueName: string, 
-    type: string, 
-    data: T, 
+    queueName: string,
+    type: string,
+    data: T,
     options?: {
       priority?: number;
       delay?: number;
@@ -355,23 +355,23 @@ class RedisQueue extends EventEmitter {
       createdAt: Date.now(),
       processAfter: options?.delay ? Date.now() + options.delay : undefined
     };
-    
+
     const queueKey = this.getQueueKey(queueName);
-    
+
     try {
       // Use LPUSH to add to head of list (FIFO with BRPOP)
       await redisService.lPush(queueKey, JSON.stringify(job));
-      
+
       logger.debug(`Redis Queue: Job ${job.id} added to ${queueName} (type: ${type})`);
       this.emit('job:added', { queueName, job });
-      
+
       return job.id;
     } catch (error: any) {
       logger.error(`Redis Queue: Failed to add job to ${queueName}:`, error.message);
       throw error;
     }
   }
-  
+
   /**
    * Add multiple jobs at once (batch)
    * SCALABILITY: Uses Redis pipeline for efficiency
@@ -382,7 +382,7 @@ class RedisQueue extends EventEmitter {
   ): Promise<string[]> {
     const ids: string[] = [];
     const queueKey = this.getQueueKey(queueName);
-    
+
     try {
       const serializedJobs: string[] = [];
       for (const jobData of jobs) {
@@ -395,7 +395,7 @@ class RedisQueue extends EventEmitter {
           maxAttempts: 3,
           createdAt: Date.now()
         };
-        
+
         ids.push(job.id);
         serializedJobs.push(JSON.stringify(job));
       }
@@ -403,7 +403,7 @@ class RedisQueue extends EventEmitter {
       if (serializedJobs.length > 0) {
         await redisService.lPushMany(queueKey, serializedJobs);
       }
-      
+
       logger.debug(`Redis Queue: Batch of ${ids.length} jobs added to ${queueName}`);
       return ids;
     } catch (error: any) {
@@ -411,7 +411,7 @@ class RedisQueue extends EventEmitter {
       throw error;
     }
   }
-  
+
   /**
    * Register a processor for a queue
    * Starts worker loops for that queue
@@ -424,10 +424,10 @@ class RedisQueue extends EventEmitter {
     } else {
       this.startWorkersForQueue(queueName);
     }
-    
+
     logger.info(`Redis Queue: Processor registered for ${queueName}`);
   }
-  
+
   /**
    * Start queue workers
    */
@@ -467,6 +467,8 @@ class RedisQueue extends EventEmitter {
       try {
         const jobStr = await redisService.brPop(queueKey, this.blockingPopTimeoutSec);
         if (!jobStr) {
+          // Queue empty — sleep before polling again to avoid busy-spinning
+          await this.sleep(500);
           continue;
         }
 
@@ -485,7 +487,11 @@ class RedisQueue extends EventEmitter {
           workerId,
           message: error?.message || 'unknown'
         });
-        await this.sleep(50);
+        // CRITICAL FIX: Use 2000ms backoff (was 50ms) to prevent Redis command
+        // storm. 6 workers × 50ms = 120 commands/sec on a dead connection,
+        // exhausting ElastiCache Serverless connection limit and causing every
+        // API request (OTP, rate-limit, toggle) to hang for commandTimeout ms.
+        await this.sleep(2000);
       }
     }
 
@@ -513,30 +519,30 @@ class RedisQueue extends EventEmitter {
       metrics.setGauge('tracking_queue_inflight', next);
     }
   }
-  
+
   /**
    * Process a single job
    */
   private async processJob(
-    queueName: string, 
-    job: QueueJob, 
+    queueName: string,
+    job: QueueJob,
     processor: JobProcessor
   ): Promise<void> {
     try {
       job.attempts++;
       await processor(job);
-      
+
       this.emit('job:completed', { queueName, job });
       logger.debug(`Redis Queue: Job ${job.id} completed (${queueName})`);
-      
+
     } catch (error: any) {
       job.error = error.message;
-      
+
       if (job.attempts >= job.maxAttempts) {
         // Max retries reached - move to dead letter queue
         const dlqKey = this.getDeadLetterKey(queueName);
         await redisService.lPush(dlqKey, JSON.stringify(job));
-        
+
         this.emit('job:failed', { queueName, job, error: error.message });
         logger.error(`Redis Queue: Job ${job.id} failed permanently, moved to DLQ`);
       } else {
@@ -544,7 +550,7 @@ class RedisQueue extends EventEmitter {
         job.processAfter = Date.now() + Math.pow(2, job.attempts) * 1000;
         const queueKey = this.getQueueKey(queueName);
         await redisService.lPush(queueKey, JSON.stringify(job));
-        
+
         this.emit('job:retry', { queueName, job, attempt: job.attempts });
         logger.warn(`Redis Queue: Job ${job.id} failed, retry ${job.attempts}/${job.maxAttempts}`);
       }
@@ -553,7 +559,7 @@ class RedisQueue extends EventEmitter {
       this.decrementInFlight(queueName);
     }
   }
-  
+
   /**
    * Start processing (called automatically when processor is registered)
    */
@@ -565,17 +571,17 @@ class RedisQueue extends EventEmitter {
     }
     logger.info('🚀 Redis Queue processor started');
   }
-  
+
   /**
    * Stop processing jobs
    */
   stop(): void {
     this.isRunning = false;
     this.queueWorkers.clear();
-    
+
     logger.info('⏹️ Redis Queue processor stopped');
   }
-  
+
   /**
    * Get queue stats
    */
@@ -585,18 +591,18 @@ class RedisQueue extends EventEmitter {
     totalProcessing: number;
   }> {
     const queueStats: { name: string; pending: number; processing: number }[] = [];
-    
+
     for (const queueName of this.processors.keys()) {
       const queueKey = this.getQueueKey(queueName);
       const pending = await redisService.lLen(queueKey);
-      
+
       queueStats.push({
         name: queueName,
         pending,
         processing: this.queueInFlight.get(queueName) || 0
       });
     }
-    
+
     return {
       queues: queueStats,
       totalPending: queueStats.reduce((sum, q) => sum + q.pending, 0),
@@ -633,7 +639,7 @@ class QueueService {
   private readonly trackingStreamSink = createTrackingStreamSink();
   private trackingDepthSnapshot: { depth: number; sampledAtMs: number } = { depth: 0, sampledAtMs: 0 };
   private trackingDepthSampleInFlight: Promise<void> | null = null;
-  
+
   // Queue names for organization
   static readonly QUEUES = {
     BROADCAST: 'broadcast',           // Broadcast notifications to transporters
@@ -645,14 +651,18 @@ class QueueService {
     CLEANUP: 'cleanup',               // Cleanup/maintenance tasks
     CUSTOM_BOOKING: 'custom-booking'  // Custom booking events
   };
-  
+
   constructor() {
     // PRODUCTION: Auto-select Redis queue if available
     // SCALABILITY: Redis queue persists across restarts, shared across ECS tasks
     const isProduction = process.env.NODE_ENV === 'production';
     const redisEnabled = process.env.REDIS_ENABLED === 'true';
-    
-    if (isProduction && redisEnabled) {
+    // REDIS_QUEUE_ENABLED defaults to same as REDIS_ENABLED, but can be explicitly
+    // set to 'false' to use InMemoryQueue even when Redis is enabled (e.g. when
+    // BRPOP workers are saturating the Redis connection pool).
+    const redisQueueEnabled = process.env.REDIS_QUEUE_ENABLED !== 'false' && redisEnabled;
+
+    if (isProduction && redisQueueEnabled) {
       this.queue = new RedisQueue();
       this.isRedisMode = true;
       logger.info('✅ Queue Service: Using Redis Queue (Production Mode)');
@@ -661,10 +671,10 @@ class QueueService {
       this.isRedisMode = false;
       logger.info('📦 Queue Service: Using In-Memory Queue (Development Mode)');
     }
-    
+
     this.registerDefaultProcessors();
   }
-  
+
   /**
    * Register default job processors
    */
@@ -675,7 +685,7 @@ class QueueService {
       const { transporterId, event, data } = job.data;
       emitToUser(transporterId, event, data);
     });
-    
+
     // Push notification processor
     this.queue.process(QueueService.QUEUES.PUSH_NOTIFICATION, async (job) => {
       const { sendPushNotification } = require('./fcm.service');
@@ -688,16 +698,16 @@ class QueueService {
     this.queue.process(QueueService.QUEUES.TRACKING_EVENTS, async (job) => {
       await this.trackingStreamSink.publishTrackingEvents([job.data as TrackingEventPayload]);
     });
-    
+
     logger.info('📋 Queue processors registered');
   }
-  
+
   /**
    * Queue a broadcast to a transporter
    */
   async queueBroadcast(
-    transporterId: string, 
-    event: string, 
+    transporterId: string,
+    event: string,
     data: any,
     priority: number = 0
   ): Promise<string> {
@@ -708,7 +718,7 @@ class QueueService {
       { priority }
     );
   }
-  
+
   /**
    * Queue broadcasts to multiple transporters (batch)
    */
@@ -722,10 +732,10 @@ class QueueService {
       data: { transporterId, event, data },
       priority: 0
     }));
-    
+
     return this.queue.addBatch(QueueService.QUEUES.BROADCAST, jobs);
   }
-  
+
   /**
    * Queue a push notification
    */
@@ -744,7 +754,7 @@ class QueueService {
       { maxAttempts: 3 }
     );
   }
-  
+
   /**
    * Queue push notifications to multiple users (batch)
    */
@@ -761,7 +771,7 @@ class QueueService {
       data: { userId, notification },
       priority: 0
     }));
-    
+
     return this.queue.addBatch(QueueService.QUEUES.PUSH_NOTIFICATION, jobs);
   }
 
@@ -819,7 +829,7 @@ class QueueService {
     await this.trackingDepthSampleInFlight;
     this.trackingDepthSampleInFlight = null;
   }
-  
+
   /**
    * Add custom job (full method name)
    */
@@ -831,7 +841,7 @@ class QueueService {
   ): Promise<string> {
     return this.queue.add(queueName, type, data, options);
   }
-  
+
   /**
    * Add job to queue (alias for addJob)
    * 
@@ -846,21 +856,21 @@ class QueueService {
   ): Promise<string> {
     return this.queue.add(queueName, type, data, options);
   }
-  
+
   /**
    * Register custom processor
    */
   registerProcessor(queueName: string, processor: JobProcessor): void {
     this.queue.process(queueName, processor);
   }
-  
+
   /**
    * Get queue statistics
    */
   getStats() {
     return this.queue.getStats();
   }
-  
+
   /**
    * Stop all queue processing
    */
