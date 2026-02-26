@@ -24,8 +24,7 @@
 
 import { Server as HttpServer } from 'http';
 import { Server, Socket } from 'socket.io';
-import { createAdapter } from '@socket.io/redis-adapter';
-import Redis from 'ioredis';
+import { createAdapter } from '@socket.io/redis-streams-adapter';
 import jwt from 'jsonwebtoken';
 import { config } from '../../config/environment';
 import { logger } from './logger.service';
@@ -460,158 +459,60 @@ export function initializeSocket(server: HttpServer): Server {
 }
 
 // =============================================================================
-// REDIS ADAPTER SETUP - Replaces manual pub/sub with @socket.io/redis-adapter
+// REDIS STREAMS ADAPTER SETUP
+// =============================================================================
+// Uses @socket.io/redis-streams-adapter instead of @socket.io/redis-adapter.
+// WHY: The original adapter needs PSUBSCRIBE, which ElastiCache Serverless
+//      rejects → cross-instance delivery was silently DISABLED.
+// FIX: Redis Streams adapter uses XADD/XREAD — fully supported by ElastiCache
+//      Serverless. Same sub-millisecond latency, zero packet loss on Redis
+//      reconnects (streams persist, unlike pub/sub fire-and-forget).
 // =============================================================================
 
-/**
- * Set up @socket.io/redis-adapter for automatic cross-instance delivery.
- * With the adapter, every io.to(room).emit() call automatically reaches
- * clients connected to other ECS tasks — no manual publishToRedis needed.
- */
 async function setupRedisAdapter(socketServer: Server): Promise<void> {
-  const redisUrl = resolveSocketAdapterRedisUrl();
-  if (process.env.REDIS_ENABLED !== 'true' || !redisUrl) {
+  if (process.env.REDIS_ENABLED !== 'true') {
     redisPubSubInitialized = false;
     redisAdapterMode = 'disabled';
     redisAdapterLastError = null;
-    logger.info('[Socket] No Redis — single-instance mode');
+    logger.info('[Socket] REDIS_ENABLED is not true — single-instance mode');
     return;
   }
 
-  // Explicit opt-out: set REDIS_PUBSUB_DISABLED=true for environments that
-  // don't support Redis pub/sub commands (e.g. AWS ElastiCache Serverless).
+  // Explicit opt-out (e.g., for local dev without Redis)
   if (process.env.REDIS_PUBSUB_DISABLED === 'true') {
     redisPubSubInitialized = false;
     redisAdapterMode = 'disabled_by_config';
     redisAdapterLastError = null;
-    logger.info('[Socket] REDIS_PUBSUB_DISABLED=true — skipping Redis adapter, running in single-instance mode per ECS task');
+    logger.info('[Socket] REDIS_PUBSUB_DISABLED=true — single-instance mode');
     return;
   }
 
-  let pubClient: Redis | null = null;
-  let subClient: Redis | null = null;
-
   try {
-    // Preflight capability probe: some managed Redis modes do not support pub/sub
-    // commands required by Socket.IO adapter (PSUBSCRIBE/PUBLISH).
-    // NOTE: We test with a pattern similar to what Socket.IO actually uses
-    // because ElastiCache Serverless may reject certain patterns.
-    const probeClient = new Redis(redisUrl, { lazyConnect: true });
-    probeClient.on('error', (err: Error) => {
-      logger.warn(`[Socket] Redis probe client error: ${err.message}`);
-    });
-    try {
-      await probeClient.connect();
-      // Test with a pattern that resembles Socket.IO's actual subscription
-      await probeClient.psubscribe('socket.io#__probe__#*');
-      await probeClient.punsubscribe('socket.io#__probe__#*');
-    } catch (probeError: any) {
-      const message = probeError?.message || 'unknown';
-      redisPubSubInitialized = false;
-      redisAdapterMode = 'disabled_by_capability';
-      redisAdapterLastError = message;
-      logger.warn(`[Socket] Redis pub/sub unsupported in this environment (${message})`);
-      logger.warn('[Socket] Running without Redis adapter; cross-instance socket fanout disabled');
-      return;
-    } finally {
-      try {
-        await probeClient.quit();
-      } catch {
-        probeClient.disconnect();
-      }
+    // Redis Streams adapter only needs ONE Redis client (not pub+sub pair).
+    // It reuses the existing redisService connection → no extra connections.
+    // Uses XADD/XREAD (Redis Streams) instead of PSUBSCRIBE:
+    //   - Works with ElastiCache Serverless out of the box
+    //   - Resilient to temporary Redis disconnects (resumes stream)
+    //   - Same sub-ms latency as pub/sub — zero performance impact
+    const client = redisService.getClient();
+    if (!client) {
+      throw new Error('Redis client not available — redisService may not be initialized yet');
     }
 
-    pubClient = new Redis(redisUrl, { lazyConnect: true });
-    subClient = new Redis(redisUrl, { lazyConnect: true });
-
-    // Track whether sub client hits a psubscribe error AFTER adapter init
-    let postAdapterSubError = false;
-
-    // Attach error handlers before connect to avoid unhandled rejections
-    pubClient.on('error', (err: Error) => {
-      logger.warn(`[Socket] Redis pub client error: ${err.message}`);
-    });
-    subClient.on('error', (err: Error) => {
-      logger.warn(`[Socket] Redis sub client error: ${err.message}`);
-      // Detect psubscribe failures that happen AFTER createAdapter()
-      if (/unknown command.*psubscribe/i.test(err.message) ||
-        /psubscribe/i.test(err.message)) {
-        postAdapterSubError = true;
-      }
-    });
-
-    await Promise.all([
-      pubClient.connect().catch((err: Error) => {
-        logger.warn(`[Socket] Redis pub client connect failed: ${err.message}`);
-        throw err;
-      }),
-      subClient.connect().catch((err: Error) => {
-        logger.warn(`[Socket] Redis sub client connect failed: ${err.message}`);
-        throw err;
-      })
-    ]);
-
-    socketServer.adapter(createAdapter(pubClient, subClient));
-
-    // CRITICAL: Wait briefly to see if the adapter's internal psubscribe fails.
-    // createAdapter() triggers PSUBSCRIBE asynchronously; if ElastiCache rejects
-    // it, the error surfaces ~50-200ms later. We wait and then check.
-    await new Promise(resolve => setTimeout(resolve, 500));
-
-    if (postAdapterSubError) {
-      // Adapter's internal psubscribe was rejected — tear down and fall back
-      logger.warn('[Socket] Redis adapter psubscribe rejected after init — tearing down adapter');
-      try {
-        await pubClient.quit().catch(() => pubClient?.disconnect());
-        await subClient.quit().catch(() => subClient?.disconnect());
-      } catch { /* best effort cleanup */ }
-      redisPubSubInitialized = false;
-      redisAdapterMode = 'disabled_by_capability';
-      redisAdapterLastError = 'psubscribe rejected post-init';
-      logger.warn('[Socket] Running without Redis adapter; cross-instance socket fanout disabled');
-      return;
-    }
+    socketServer.adapter(createAdapter(client));
 
     redisPubSubInitialized = true;
     redisAdapterMode = 'enabled';
     redisAdapterLastError = null;
-    logger.info(`[Socket] Redis adapter initialized (Instance: ${SERVER_INSTANCE_ID})`);
-    logger.info('   Cross-instance WebSocket delivery ENABLED');
+    logger.info(`[Socket] Redis Streams adapter initialized (Instance: ${SERVER_INSTANCE_ID})`);
+    logger.info('   Cross-instance WebSocket delivery ENABLED (ElastiCache Serverless compatible)');
   } catch (error: any) {
-    // Clean up clients on failure
-    try {
-      if (pubClient) await pubClient.quit().catch(() => pubClient?.disconnect());
-      if (subClient) await subClient.quit().catch(() => subClient?.disconnect());
-    } catch { /* best effort cleanup */ }
     redisPubSubInitialized = false;
     redisAdapterMode = 'failed';
     redisAdapterLastError = error?.message || 'unknown';
-    logger.error(`[Socket] Failed to initialize Redis adapter: ${error.message}`);
-    logger.warn('[Socket] Falling back to single-instance mode');
+    logger.error(`[Socket] Failed to initialize Redis Streams adapter: ${error.message}`);
+    logger.warn('[Socket] Falling back to single-instance mode — cross-task socket delivery disabled');
   }
-}
-
-function resolveSocketAdapterRedisUrl(): string | null {
-  const directUrl = process.env.REDIS_URL?.trim();
-  if (directUrl) {
-    return directUrl;
-  }
-
-  const host = process.env.REDIS_HOST?.trim();
-  if (!host) {
-    return null;
-  }
-
-  if (host.startsWith('redis://') || host.startsWith('rediss://')) {
-    return host;
-  }
-
-  const port = (process.env.REDIS_PORT || '6379').trim();
-  const password = process.env.REDIS_PASSWORD?.trim();
-  const useTls = process.env.NODE_ENV === 'production' || process.env.REDIS_TLS === 'true';
-  const scheme = useTls ? 'rediss' : 'redis';
-  const auth = password ? `:${encodeURIComponent(password)}@` : '';
-  return `${scheme}://${auth}${host}:${port}`;
 }
 
 function withSocketMeta(data: any): any {

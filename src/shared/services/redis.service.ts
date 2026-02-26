@@ -141,6 +141,9 @@ interface IRedisClient {
 
   // Lua scripts (for atomic operations)
   eval(script: string, keys: string[], args: string[]): Promise<any>;
+
+  // Raw client access (for Socket.IO Redis Streams adapter)
+  getRawClient(): any;
 }
 
 interface IRedisTransaction {
@@ -166,6 +169,10 @@ class InMemoryRedisClient implements IRedisClient {
     this.cleanupInterval = setInterval(() => this.cleanup(), 10000);
     this.cleanupInterval.unref();
     logger.info('📦 [Redis] In-memory fallback initialized (development mode)');
+  }
+
+  getRawClient(): any {
+    return null; // No real ioredis client in in-memory mode
   }
 
   private cleanup(): void {
@@ -715,6 +722,10 @@ class RealRedisClient implements IRedisClient {
 
   constructor(private config: RedisConfig) { }
 
+  getRawClient(): any {
+    return this.client;
+  }
+
   async connect(): Promise<void> {
     try {
       // Dynamic import of ioredis (production dependency)
@@ -1258,6 +1269,14 @@ class RedisService {
    */
   isRedisEnabled(): boolean {
     return this.useRedis;
+  }
+
+  /**
+   * Get the raw underlying ioredis client for Socket.IO Redis Streams adapter.
+   * Returns null if using in-memory mode (adapter won't be init'd without Redis).
+   */
+  getClient(): any {
+    return this.client.getRawClient();
   }
 
   /**
