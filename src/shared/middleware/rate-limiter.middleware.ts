@@ -210,8 +210,19 @@ export const rateLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   store: createStore(config.rateLimit.windowMs, 'global'),
-  // Skip rate limiting in development if needed
-  skip: () => config.isDevelopment && false // Set to true to disable in dev
+  // CRITICAL FIX: Skip rate limiting for ALB/ELB health checkers and /health path.
+  // ELB health checker fires every 30s from internal IPs and has no way to
+  // back off — hitting 429 caused ALB to mark tasks unhealthy during deploy.
+  skip: (req: Request) => {
+    if (req.path === '/health' || req.path === '/health/live' || req.path === '/health/ready') {
+      return true;
+    }
+    const ua = req.headers['user-agent'] || '';
+    if (ua.includes('ELB-HealthChecker') || ua.includes('HealthChecker')) {
+      return true;
+    }
+    return config.isDevelopment && false;
+  }
 });
 
 /**
