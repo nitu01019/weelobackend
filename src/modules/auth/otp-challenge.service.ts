@@ -25,14 +25,14 @@ export interface OtpChallengeIssueResult {
 
 export type OtpChallengeVerifyResult =
   | {
-      ok: true;
-      consumed: true;
-    }
+    ok: true;
+    consumed: true;
+  }
   | {
-      ok: false;
-      code: OtpVerifyCode;
-      attemptsRemaining?: number;
-    };
+    ok: false;
+    code: OtpVerifyCode;
+    attemptsRemaining?: number;
+  };
 
 export interface OtpChallengeKey {
   phone: string;
@@ -68,7 +68,7 @@ interface DeleteChallengeParams {
 }
 
 class OtpChallengeService {
-  private readonly verifyLockTtlMs = 10_000;
+  private readonly verifyLockTtlMs = 3_000;
 
   async issueChallenge(params: IssueChallengeParams): Promise<OtpChallengeIssueResult> {
     const expiresAt = new Date(Date.now() + config.otp.expiryMinutes * 60 * 1000);
@@ -81,37 +81,52 @@ class OtpChallengeService {
       attempts: 0
     };
 
-    let storedInRedis = false;
-    try {
-      await redisService.setJSON(params.redisKey, {
+    // LATENCY FIX: Run Redis and DB stores in parallel instead of sequentially.
+    // Each store is independent — one failing should not delay the other.
+    const REDIS_STORE_TIMEOUT_MS = 2000;
+
+    const redisStorePromise = Promise.race([
+      redisService.setJSON(params.redisKey, {
         otp: record.hash,
         expiresAt: record.expiresAt,
         attempts: 0
-      }, ttlSeconds);
-      storedInRedis = true;
-    } catch (error: any) {
+      }, ttlSeconds),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Redis store timed out')), REDIS_STORE_TIMEOUT_MS)
+      )
+    ]);
+
+    // FIX: Pass Date object instead of ISO string for expires_at.
+    // PostgreSQL rejects implicit text→timestamptz conversion when using
+    // parameterised $4::timestamptz with a string value.
+    const dbStorePromise = db.prisma?.$executeRawUnsafe(
+      `INSERT INTO "OtpStore" (phone, role, otp, expires_at, attempts)
+       VALUES ($1, $2, $3, $4, 0)
+       ON CONFLICT (phone, role) DO UPDATE SET otp = $3, expires_at = $4, attempts = 0`,
+      params.dbKey.phone,
+      params.dbKey.role,
+      record.hash,
+      expiresAt          // Date object — Prisma/pg driver handles timestamptz natively
+    ) ?? Promise.resolve(0);
+
+    const [redisResult, dbResult] = await Promise.allSettled([
+      redisStorePromise,
+      dbStorePromise
+    ]);
+
+    const storedInRedis = redisResult.status === 'fulfilled';
+    const storedInDb = dbResult.status === 'fulfilled';
+
+    if (!storedInRedis) {
       logger.warn('[OTP CHALLENGE] Redis store failed', {
         ...params.logContext,
-        error: error?.message || 'unknown'
+        error: (redisResult as PromiseRejectedResult).reason?.message || 'unknown'
       });
     }
-
-    let storedInDb = false;
-    try {
-      await db.prisma?.$executeRawUnsafe(
-        `INSERT INTO "OtpStore" (phone, role, otp, expires_at, attempts)
-         VALUES ($1, $2, $3, $4, 0)
-         ON CONFLICT (phone, role) DO UPDATE SET otp = $3, expires_at = $4, attempts = 0`,
-        params.dbKey.phone,
-        params.dbKey.role,
-        record.hash,
-        record.expiresAt
-      );
-      storedInDb = true;
-    } catch (error: any) {
+    if (!storedInDb) {
       logger.warn('[OTP CHALLENGE] DB store failed', {
         ...params.logContext,
-        error: error?.message || 'unknown'
+        error: (dbResult as PromiseRejectedResult).reason?.message || 'unknown'
       });
     }
 

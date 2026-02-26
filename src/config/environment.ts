@@ -37,11 +37,11 @@ dotenv.config();
  */
 function getRequired(key: string, devDefault?: string): string {
   const value = process.env[key];
-  
+
   if (value && value.trim() !== '') {
     return value;
   }
-  
+
   // In development, use default or generate secure value
   if (process.env.NODE_ENV !== 'production') {
     if (devDefault) {
@@ -53,7 +53,7 @@ function getRequired(key: string, devDefault?: string): string {
     console.warn(`⚠️  [CONFIG] ${key} not set, auto-generated for development`);
     return generated;
   }
-  
+
   // In production, this is a fatal error
   throw new Error(
     `❌ FATAL: ${key} is required in production!\n` +
@@ -169,8 +169,8 @@ export const config = {
 
   // Rate Limiting
   rateLimit: {
-    windowMs: getNumber('RATE_LIMIT_WINDOW_MS', 15 * 60 * 1000), // 15 minutes
-    maxRequests: getNumber('RATE_LIMIT_MAX_REQUESTS', 100),
+    windowMs: getNumber('RATE_LIMIT_WINDOW_MS', 60 * 1000), // 1 minute
+    maxRequests: getNumber('RATE_LIMIT_MAX_REQUESTS', 1000),
   },
 
   // Logging
@@ -185,7 +185,7 @@ export const config = {
   isProduction: getOptional('NODE_ENV', 'development') === 'production',
   isDevelopment: getOptional('NODE_ENV', 'development') === 'development',
   isTest: getOptional('NODE_ENV', 'development') === 'test',
-  
+
   // Security Features
   security: {
     enableHeaders: getBoolean('ENABLE_SECURITY_HEADERS', true),
@@ -205,7 +205,7 @@ export const config = {
 function validateConfig(): void {
   const warnings: string[] = [];
   const errors: string[] = [];
-  
+
   // Production-specific checks
   if (config.isProduction) {
     // CORS should not be wildcard in production (warn, don't block — mobile API backend)
@@ -217,12 +217,12 @@ function validateConfig(): void {
     if (!config.googleMaps.enabled) {
       warnings.push('GOOGLE_MAPS_API_KEY is not set — Places/Geocoding features will be unavailable');
     }
-    
+
     // Redis should be enabled for scalability
     if (!config.redis.enabled) {
       warnings.push('REDIS_ENABLED is false - enable Redis for horizontal scaling');
     }
-    
+
     // SMS provider should be configured
     if (config.sms.provider === 'console') {
       warnings.push('SMS_PROVIDER is "console" - configure Twilio or MSG91 for real SMS');
@@ -233,14 +233,14 @@ function validateConfig(): void {
       warnings.push('SMS_RETRIEVER_HASH is not set — Android SMS Retriever OTP autofill may fail. Set the 11-char app hash for the deployed app signing key.');
     }
   }
-  
+
   // Log warnings
   if (warnings.length > 0) {
     console.warn('\n⚠️  Configuration Warnings:');
     warnings.forEach(w => console.warn(`   - ${w}`));
     console.warn('');
   }
-  
+
   // Throw on errors
   if (errors.length > 0) {
     throw new Error(`Configuration Errors:\n${errors.map(e => `  - ${e}`).join('\n')}`);

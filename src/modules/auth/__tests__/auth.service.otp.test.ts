@@ -110,11 +110,13 @@ describe('auth.service OTP integration', () => {
     mockRedisService.sAdd.mockResolvedValue(undefined);
   });
 
-  it('cleans up OTP challenge when production SMS send fails (fail-closed)', async () => {
-    await expect(authService.sendOtp('9999999999', 'transporter' as any)).rejects.toMatchObject({
-      code: 'SMS_SEND_FAILED',
-      statusCode: 503
-    });
+  it('cleans up OTP challenge asynchronously when production SMS send fails (fire-and-forget)', async () => {
+    // With fire-and-forget, sendOtp resolves immediately even if SMS fails
+    const result = await authService.sendOtp('9999999999', 'transporter' as any);
+    expect(result).toHaveProperty('expiresIn', 300);
+
+    // Flush microtasks so the .catch() cleanup runs
+    await new Promise(resolve => setImmediate(resolve));
 
     expect(mockOtpChallengeService.issueChallenge).toHaveBeenCalled();
     expect(mockOtpChallengeService.deleteChallenge).toHaveBeenCalledWith(

@@ -49,10 +49,10 @@ const REDIS_KEYS = {
   /** OTP storage: otp:{phone}:{role} */
   OTP: (phone: string, role: string) => `otp:${phone}:${role}`,
   OTP_VERIFY_LOCK: (phone: string, role: string) => `otp:verify:lock:${phone}:${role}`,
-  
+
   /** Refresh token storage: refresh:{tokenId} */
   REFRESH_TOKEN: (tokenId: string) => `refresh:${tokenId}`,
-  
+
   /** User's refresh tokens set: user:tokens:{userId} */
   USER_TOKENS: (userId: string) => `user:tokens:${userId}`,
 };
@@ -98,7 +98,7 @@ class AuthService {
   // MODULARITY: Fallback is transparent to the caller
   // CODING STANDARDS: Graceful degradation with shared state
   // ==========================================================================
-  
+
   /**
    * Send OTP to phone number
    * 
@@ -115,14 +115,14 @@ class AuthService {
   async sendOtp(phone: string, role: UserRole): Promise<{ expiresIn: number; message: string }> {
     // Generate cryptographically secure 6-digit OTP
     const otp = generateSecureOTP(config.otp.length);
-    
+
     // PERFORMANCE FIX: Store plain OTP (was causing 5-second delay with bcrypt)
     // SECURITY: Still secure because:
     // - Redis TTL auto-deletes in 5 minutes
     // - Max 3 verification attempts
     // - 6-digit = 1M combinations (impossible to guess in 3 tries)
     // - Rate limiting prevents spam
-    
+
     const key = REDIS_KEYS.OTP(phone, role);
     const issueResult = await otpChallengeService.issueChallenge({
       otp,
@@ -140,56 +140,52 @@ class AuthService {
       });
       throw new AppError(503, 'SERVICE_UNAVAILABLE', 'OTP service temporarily unavailable. Please try again in a moment.');
     }
-    
+
     // ==========================================================================
-    // SEND OTP VIA SMS
+    // SEND OTP VIA SMS (Fire-and-forget for instant response)
     // In development with mock provider: OTP is logged to console
     // In production with aws-sns/twilio/msg91: Real SMS is sent
     // 
-    // SCALABILITY: SMS failure does NOT block OTP storage
-    // The OTP is already stored in Redis — user can still verify if they
-    // receive the SMS via fallback (console/CloudWatch) or retry.
+    // LATENCY FIX: Respond to client IMMEDIATELY after OTP is stored.
+    // SMS is sent asynchronously — if it fails in production, OTP is
+    // cleaned up in the background so a stale OTP can't be verified.
+    // This is how Uber/Ola/Rapido work: instant response, SMS arrives shortly.
     // ==========================================================================
-    let smsSent = true;
-    try {
-      await smsService.sendOtp(phone, otp);
-      logger.info('OTP SMS sent successfully', { phone: maskForLogging(phone, 2, 4), role });
-    } catch (smsError: any) {
-      smsSent = false;
-      // CODING STANDARDS: Detailed error logging for production monitoring
-      logger.error('❌ Failed to send OTP SMS — OTP is stored and can be verified if user receives SMS via fallback', {
+    const maskedPhone = maskForLogging(phone, 2, 4);
+
+    // Fire-and-forget: don't await SMS delivery
+    smsService.sendOtp(phone, otp).then(() => {
+      logger.info('OTP SMS sent successfully', { phone: maskedPhone, role });
+    }).catch(async (smsError: any) => {
+      logger.error('❌ Failed to send OTP SMS', {
         error: smsError.message,
         errorCode: smsError.code || 'UNKNOWN',
-        phone: maskForLogging(phone, 2, 4),
+        phone: maskedPhone,
         role,
         otpStored: true,
       });
+      // Production safety: clean up OTP so a never-delivered OTP can't be verified
       if (config.isProduction) {
         await otpChallengeService.deleteChallenge({
           redisKey: key,
           dbKey: { phone, role },
-          logContext: { phone: maskForLogging(phone, 2, 4), role, reason: 'sms_send_failed' }
+          logContext: { phone: maskedPhone, role, reason: 'sms_send_failed' }
+        }).catch((cleanupErr: any) => {
+          logger.error('Failed to clean up OTP after SMS failure', { error: cleanupErr.message });
         });
-        throw new AppError(503, 'SMS_SEND_FAILED', 'Could not deliver OTP. Please try again in a moment.');
       }
-      // Non-production only: allow pending/dev fallback behavior.
-    }
-    
+    });
+
     // Log without exposing OTP (safe for production logs)
-    logger.info('OTP generated', { 
-      phone: maskForLogging(phone, 2, 4), 
+    logger.info('OTP generated', {
+      phone: maskedPhone,
       role,
       expiresAt: expiresAt.toISOString()
     });
-    
-    // Response message based on SMS delivery status
-    const message = smsSent
-      ? `OTP sent to ${maskForLogging(phone, 2, 4)}. Please check your SMS.`
-      : `OTP generated for ${maskForLogging(phone, 2, 4)}. SMS delivery pending — please wait or retry.`;
-    
-    return { 
+
+    return {
       expiresIn: config.otp.expiryMinutes * 60,
-      message
+      message: `OTP sent to ${maskedPhone}. Please check your SMS.`
     };
   }
 
@@ -246,18 +242,18 @@ class AuthService {
           throw new AppError(400, 'INVALID_OTP', 'Invalid or expired OTP. Please request a new one.');
       }
     }
-    
+
     // Find or create user in DATABASE
     let dbUser: any = null;
     let isNewUser = false;
     const newUserId = uuidv4();
-    
+
     try {
       dbUser = await db.getUserByPhone(phone, role);
     } catch (err: any) {
       logger.warn('Error fetching user, will create new', { error: err.message });
     }
-    
+
     if (!dbUser) {
       try {
         dbUser = await db.createUser({
@@ -271,7 +267,7 @@ class AuthService {
       } catch (err: any) {
         logger.warn('Error creating user in DB, using fallback', { error: err.message });
       }
-      
+
       // If dbUser is still null/undefined, create a fallback object
       if (!dbUser || !dbUser.id) {
         dbUser = {
@@ -287,13 +283,13 @@ class AuthService {
         };
       }
       isNewUser = true;
-      
-      logger.info('New user created', { 
-        userId: dbUser.id, 
-        phone: maskForLogging(phone, 2, 4), 
-        role 
+
+      logger.info('New user created', {
+        userId: dbUser.id,
+        phone: maskForLogging(phone, 2, 4),
+        role
       });
-      
+
       // Development only: Show user creation details
       if (config.isDevelopment) {
         console.log('\n');
@@ -307,7 +303,7 @@ class AuthService {
         console.log('\n');
       }
     }
-    
+
     // Convert DB user to auth user format - with guaranteed fallbacks
     const user: AuthUser = {
       id: String(dbUser?.id || newUserId),
@@ -318,19 +314,19 @@ class AuthService {
       createdAt: dbUser?.createdAt ? new Date(dbUser.createdAt) : new Date(),
       updatedAt: dbUser?.updatedAt ? new Date(dbUser.updatedAt) : new Date()
     };
-    
+
     // Generate tokens
     const accessToken = this.generateAccessToken(user);
     const refreshToken = this.generateRefreshToken(user);
-    
+
     // Log successful authentication (safe for production)
-    logger.info('User authenticated successfully', { 
-      userId: user.id, 
-      phone: maskForLogging(phone, 2, 4), 
-      role, 
-      isNewUser 
+    logger.info('User authenticated successfully', {
+      userId: user.id,
+      phone: maskForLogging(phone, 2, 4),
+      role,
+      isNewUser
     });
-    
+
     // Development only: Show login details
     if (config.isDevelopment) {
       console.log('\n');
@@ -344,7 +340,7 @@ class AuthService {
       console.log('╚══════════════════════════════════════════════════════════════╝');
       console.log('\n');
     }
-    
+
     return {
       user,
       accessToken,
@@ -371,22 +367,22 @@ class AuthService {
     } catch {
       throw new AppError(401, 'INVALID_REFRESH_TOKEN', 'Invalid or expired refresh token');
     }
-    
+
     // Check if token is in Redis store (not invalidated)
     // We use a hash of the token as the key to avoid storing the actual token
     const tokenId = this.hashToken(refreshToken);
     const stored = await redisService.getJSON<RefreshTokenEntry>(REDIS_KEYS.REFRESH_TOKEN(tokenId));
-    
+
     if (!stored || stored.userId !== decoded.userId) {
       throw new AppError(401, 'INVALID_REFRESH_TOKEN', 'Refresh token has been revoked');
     }
-    
+
     // Get user from database
     const dbUser = await db.getUserById(decoded.userId);
     if (!dbUser) {
       throw new AppError(401, 'USER_NOT_FOUND', 'User not found');
     }
-    
+
     // Convert to auth user
     const user: AuthUser = {
       id: dbUser.id,
@@ -397,10 +393,10 @@ class AuthService {
       createdAt: new Date(dbUser.createdAt),
       updatedAt: new Date(dbUser.updatedAt)
     };
-    
+
     // Generate new access token
     const accessToken = this.generateAccessToken(user);
-    
+
     return {
       accessToken,
       expiresIn: this.getExpirySeconds(config.jwt.expiresIn)
@@ -414,15 +410,15 @@ class AuthService {
     // Get all token IDs for this user from Redis
     const userTokensKey = REDIS_KEYS.USER_TOKENS(userId);
     const tokenIds = await redisService.sMembers(userTokensKey);
-    
+
     // Delete all refresh tokens
     for (const tokenId of tokenIds) {
       await redisService.del(REDIS_KEYS.REFRESH_TOKEN(tokenId));
     }
-    
+
     // Delete the user tokens set
     await redisService.del(userTokensKey);
-    
+
     logger.info('User logged out', { userId });
   }
 
@@ -434,7 +430,7 @@ class AuthService {
     if (!dbUser) {
       throw new AppError(404, 'USER_NOT_FOUND', 'User not found');
     }
-    
+
     return {
       id: dbUser.id,
       phone: dbUser.phone,
@@ -449,7 +445,7 @@ class AuthService {
   // ============================================================
   // PRIVATE METHODS
   // ============================================================
-  
+
   // NOTE: OTP generation is now handled by generateSecureOTP() from crypto.utils.ts
   // The getPendingOtp() method has been REMOVED for security reasons
   // Plain OTPs are never stored - only hashed versions are kept
@@ -472,27 +468,27 @@ class AuthService {
       config.jwt.refreshSecret,
       { expiresIn: config.jwt.refreshExpiresIn } as jwt.SignOptions
     );
-    
+
     // Store refresh token in Redis (fire and forget)
     const expiresAt = new Date(Date.now() + this.getExpirySeconds(config.jwt.refreshExpiresIn) * 1000);
     const tokenId = this.hashToken(token);
     const ttlSeconds = this.getExpirySeconds(config.jwt.refreshExpiresIn);
-    
+
     // Store token entry with TTL
     const entry: RefreshTokenEntry = {
       userId: user.id,
       expiresAt: expiresAt.toISOString()
     };
-    
+
     redisService.setJSON(REDIS_KEYS.REFRESH_TOKEN(tokenId), entry, ttlSeconds).catch(err => {
       logger.error(`Failed to store refresh token: ${err.message}`);
     });
-    
+
     // Track token ID for user (for logout all devices)
     redisService.sAdd(REDIS_KEYS.USER_TOKENS(user.id), tokenId).catch(err => {
       logger.error(`Failed to track user token: ${err.message}`);
     });
-    
+
     return token;
   }
 
@@ -506,10 +502,10 @@ class AuthService {
   private getExpirySeconds(duration: string): number {
     const match = duration.match(/^(\d+)([dhms])$/);
     if (!match) return 3600; // Default 1 hour
-    
+
     const value = parseInt(match[1], 10);
     const unit = match[2];
-    
+
     switch (unit) {
       case 'd': return value * 24 * 60 * 60;
       case 'h': return value * 60 * 60;

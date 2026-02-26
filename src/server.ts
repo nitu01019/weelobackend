@@ -206,6 +206,10 @@ fcmService.initialize().then(() => {
 // MIDDLEWARE - Security & Performance
 // =============================================================================
 
+// Trust proxy - MUST be first before any middleware that uses req.ip (rate limiter, etc.)
+// Without this, req.ip returns ALB's internal IP — all users share one rate limit bucket.
+app.set('trust proxy', 1);
+
 // Request ID for tracking (must be first)
 app.use(requestIdMiddleware);
 
@@ -260,12 +264,10 @@ app.use(requestLogger);
 // Metrics collection middleware (track request duration, counts)
 app.use(metricsMiddleware);
 
-// Rate limiting
-app.use(rateLimiter);
-
 // =============================================================================
-// HEALTH CHECK
+// HEALTH & MONITORING ROUTES - BEFORE rate limiter so ALB health checks never get throttled
 // =============================================================================
+app.use('/', healthRoutes);
 
 app.get('/health/runtime', async (_req, res) => {
   try {
@@ -311,16 +313,14 @@ app.get('/health/runtime', async (_req, res) => {
   }
 });
 
+// Rate limiting - AFTER health routes so ALB health checks are never throttled
+app.use(rateLimiter);
+
 // =============================================================================
 // API ROUTES
 // =============================================================================
 
 const API_PREFIX = '/api/v1';
-
-// =============================================================================
-// HEALTH & MONITORING ROUTES (No auth required)
-// =============================================================================
-app.use('/', healthRoutes);
 
 // =============================================================================
 // API ROUTES
@@ -427,13 +427,6 @@ app.use(errorHandler);
 // =============================================================================
 
 const PORT = config.port || 3000;
-
-// =============================================================================
-// TRUST PROXY - Required for rate limiting behind AWS ALB
-// =============================================================================
-// Without this, req.ip returns ALB's internal IP — all users share one rate limit bucket.
-// '1' = trust the first proxy (ALB). Required for correct client IP extraction.
-app.set('trust proxy', 1);
 
 server.listen(PORT, '0.0.0.0', async () => {
   // ==========================================================================

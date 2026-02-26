@@ -83,38 +83,38 @@ export const SocketEvent = {
   LOCATION_UPDATED: 'location_updated',
   ASSIGNMENT_STATUS_CHANGED: 'assignment_status_changed',
   NEW_BROADCAST: 'new_broadcast',
-  
+
   // Booking lifecycle events
   BOOKING_EXPIRED: 'booking_expired',           // No transporters accepted in time
   BOOKING_FULLY_FILLED: 'booking_fully_filled', // All trucks assigned
   BOOKING_PARTIALLY_FILLED: 'booking_partially_filled', // Some trucks assigned
   NO_VEHICLES_AVAILABLE: 'no_vehicles_available', // No matching transporters found
   BROADCAST_COUNTDOWN: 'broadcast_countdown',   // Timer tick for UI
-  
+
   // NEW: Real-time truck request updates (for multi-truck system)
   TRUCK_REQUEST_ACCEPTED: 'truck_request_accepted',     // A transporter accepted 1 truck
   TRUCKS_REMAINING_UPDATE: 'trucks_remaining_update',   // Update remaining truck count
   REQUEST_NO_LONGER_AVAILABLE: 'request_no_longer_available', // Request taken by someone else
   ORDER_STATUS_UPDATE: 'order_status_update',           // Overall order status changed
-  
+
   // Fleet/Vehicle events (for real-time fleet updates)
   VEHICLE_REGISTERED: 'vehicle_registered',
   VEHICLE_UPDATED: 'vehicle_updated',
   VEHICLE_DELETED: 'vehicle_deleted',
   VEHICLE_STATUS_CHANGED: 'vehicle_status_changed',
   FLEET_UPDATED: 'fleet_updated',
-  
+
   // Driver events (for real-time driver updates)
   DRIVER_ADDED: 'driver_added',
   DRIVER_UPDATED: 'driver_updated',
   DRIVER_DELETED: 'driver_deleted',
   DRIVER_STATUS_CHANGED: 'driver_status_changed',
   DRIVERS_UPDATED: 'drivers_updated',
-  
+
   // Lightning-fast notification events
   NEW_ORDER_ALERT: 'new_order_alert',           // Urgent notification with sound
   ACCEPT_CONFIRMATION: 'accept_confirmation',   // Confirm acceptance to transporter
-  
+
   ERROR: 'error',
 
   // Driver presence events
@@ -122,7 +122,7 @@ export const SocketEvent = {
   DRIVER_ONLINE: 'driver_online',               // Driver came online
   DRIVER_OFFLINE: 'driver_offline',             // Driver went offline
   DRIVER_TIMEOUT: 'driver_timeout',             // Driver didn't accept in time
-  
+
   // Client -> Server
   JOIN_BOOKING: 'join_booking',
   LEAVE_BOOKING: 'leave_booking',
@@ -155,25 +155,25 @@ export function initializeSocket(server: HttpServer): Server {
       methods: ['GET', 'POST'],
       credentials: true
     },
-    
+
     // Performance optimizations
     pingTimeout: 20000,           // 20s - How long to wait for pong
     pingInterval: 25000,          // 25s - How often to send ping
     upgradeTimeout: 10000,        // 10s - Timeout for upgrade
-    
+
     // Transports - WebSocket preferred
     transports: ['websocket', 'polling'],
     allowUpgrades: true,
-    
+
     // Buffer and payload limits
     maxHttpBufferSize: 10 * 1024 * 1024,  // 10MB max message size
-    
+
     // Connection state recovery (for reconnection)
     connectionStateRecovery: {
       maxDisconnectionDuration: 2 * 60 * 1000,  // 2 minutes
       skipMiddlewares: false
     },
-    
+
     // Per-message deflate compression
     perMessageDeflate: {
       threshold: 1024,  // Only compress messages > 1KB
@@ -242,7 +242,7 @@ export function initializeSocket(server: HttpServer): Server {
 
     if (globalCount > MAX_CONNECTIONS_PER_USER) {
       // Decrement since we won't be keeping this connection
-      try { await redisService.incrBy(connKey, -1); } catch {}
+      try { await redisService.incrBy(connKey, -1); } catch { }
       const oldestSocketId = userSocketSet.values().next().value;
       if (oldestSocketId) {
         logger.warn(`[Socket] Global connection limit (${MAX_CONNECTIONS_PER_USER}) exceeded for ${userId}, disconnecting oldest: ${oldestSocketId}`);
@@ -254,7 +254,7 @@ export function initializeSocket(server: HttpServer): Server {
         userSocketSet.delete(oldestSocketId);
         socketUsers.delete(oldestSocketId);
         // Re-add this new connection
-        try { await redisService.incr(connKey); } catch {}
+        try { await redisService.incr(connKey); } catch { }
       }
     }
 
@@ -321,7 +321,7 @@ export function initializeSocket(server: HttpServer): Server {
           userSockets.delete(userId);
         }
         // Decrement Redis connection counter (cross-instance tracking)
-        try { redisService.incrBy(`socket:conncount:${userId}`, -1).catch(() => {}); } catch {}
+        try { redisService.incrBy(`socket:conncount:${userId}`, -1).catch(() => { }); } catch { }
       }
       socketUsers.delete(socket.id);
     });
@@ -488,17 +488,23 @@ async function setupRedisAdapter(socketServer: Server): Promise<void> {
     return;
   }
 
+  let pubClient: Redis | null = null;
+  let subClient: Redis | null = null;
+
   try {
     // Preflight capability probe: some managed Redis modes do not support pub/sub
     // commands required by Socket.IO adapter (PSUBSCRIBE/PUBLISH).
+    // NOTE: We test with a pattern similar to what Socket.IO actually uses
+    // because ElastiCache Serverless may reject certain patterns.
     const probeClient = new Redis(redisUrl, { lazyConnect: true });
     probeClient.on('error', (err: Error) => {
       logger.warn(`[Socket] Redis probe client error: ${err.message}`);
     });
     try {
       await probeClient.connect();
-      await probeClient.psubscribe('__weelo_socket_probe__');
-      await probeClient.punsubscribe('__weelo_socket_probe__');
+      // Test with a pattern that resembles Socket.IO's actual subscription
+      await probeClient.psubscribe('socket.io#__probe__#*');
+      await probeClient.punsubscribe('socket.io#__probe__#*');
     } catch (probeError: any) {
       const message = probeError?.message || 'unknown';
       redisPubSubInitialized = false;
@@ -515,8 +521,11 @@ async function setupRedisAdapter(socketServer: Server): Promise<void> {
       }
     }
 
-    const pubClient = new Redis(redisUrl, { lazyConnect: true });
-    const subClient = new Redis(redisUrl, { lazyConnect: true });
+    pubClient = new Redis(redisUrl, { lazyConnect: true });
+    subClient = new Redis(redisUrl, { lazyConnect: true });
+
+    // Track whether sub client hits a psubscribe error AFTER adapter init
+    let postAdapterSubError = false;
 
     // Attach error handlers before connect to avoid unhandled rejections
     pubClient.on('error', (err: Error) => {
@@ -524,6 +533,11 @@ async function setupRedisAdapter(socketServer: Server): Promise<void> {
     });
     subClient.on('error', (err: Error) => {
       logger.warn(`[Socket] Redis sub client error: ${err.message}`);
+      // Detect psubscribe failures that happen AFTER createAdapter()
+      if (/unknown command.*psubscribe/i.test(err.message) ||
+        /psubscribe/i.test(err.message)) {
+        postAdapterSubError = true;
+      }
     });
 
     await Promise.all([
@@ -538,12 +552,37 @@ async function setupRedisAdapter(socketServer: Server): Promise<void> {
     ]);
 
     socketServer.adapter(createAdapter(pubClient, subClient));
+
+    // CRITICAL: Wait briefly to see if the adapter's internal psubscribe fails.
+    // createAdapter() triggers PSUBSCRIBE asynchronously; if ElastiCache rejects
+    // it, the error surfaces ~50-200ms later. We wait and then check.
+    await new Promise(resolve => setTimeout(resolve, 500));
+
+    if (postAdapterSubError) {
+      // Adapter's internal psubscribe was rejected — tear down and fall back
+      logger.warn('[Socket] Redis adapter psubscribe rejected after init — tearing down adapter');
+      try {
+        await pubClient.quit().catch(() => pubClient?.disconnect());
+        await subClient.quit().catch(() => subClient?.disconnect());
+      } catch { /* best effort cleanup */ }
+      redisPubSubInitialized = false;
+      redisAdapterMode = 'disabled_by_capability';
+      redisAdapterLastError = 'psubscribe rejected post-init';
+      logger.warn('[Socket] Running without Redis adapter; cross-instance socket fanout disabled');
+      return;
+    }
+
     redisPubSubInitialized = true;
     redisAdapterMode = 'enabled';
     redisAdapterLastError = null;
     logger.info(`[Socket] Redis adapter initialized (Instance: ${SERVER_INSTANCE_ID})`);
     logger.info('   Cross-instance WebSocket delivery ENABLED');
   } catch (error: any) {
+    // Clean up clients on failure
+    try {
+      if (pubClient) await pubClient.quit().catch(() => pubClient?.disconnect());
+      if (subClient) await subClient.quit().catch(() => subClient?.disconnect());
+    } catch { /* best effort cleanup */ }
     redisPubSubInitialized = false;
     redisAdapterMode = 'failed';
     redisAdapterLastError = error?.message || 'unknown';
@@ -580,7 +619,7 @@ function withSocketMeta(data: any): any {
     return data;
   }
   if (Object.prototype.hasOwnProperty.call(data, 'eventVersion') ||
-      Object.prototype.hasOwnProperty.call(data, 'serverTimeMs')) {
+    Object.prototype.hasOwnProperty.call(data, 'serverTimeMs')) {
     return data;
   }
   return {
@@ -676,12 +715,12 @@ export function emitToOrder(orderId: string, event: string, data: any): void {
  */
 export function getConnectionStats(): ConnectionStats {
   const socketCount = io?.sockets.sockets.size || 0;
-  
+
   // Count by role
   let customers = 0;
   let transporters = 0;
   let drivers = 0;
-  
+
   io?.sockets.sockets.forEach(socket => {
     switch (socket.data.role) {
       case 'customer': customers++; break;
@@ -689,7 +728,7 @@ export function getConnectionStats(): ConnectionStats {
       case 'driver': drivers++; break;
     }
   });
-  
+
   return {
     totalConnections: socketCount,
     uniqueUsers: userSockets.size,
@@ -783,7 +822,7 @@ export const socketService = {
   // Initialization
   initialize: initializeSocket,
   getIO,
-  
+
   // Emit functions
   emitToUser,
   emitToUsers,
@@ -793,18 +832,18 @@ export const socketService = {
   emitToRoom,
   emitToAll,
   emitToAllTransporters,
-  
+
   // Alias for emitToAll (used by truck-hold service)
   broadcastToAll: emitToAll,
-  
+
   // Connection utilities
   isUserConnected,
   getConnectedUserCount,
   getConnectionStats,
-  
+
   // Server instance ID (for debugging)
   getServerInstanceId: () => SERVER_INSTANCE_ID,
-  
+
   // Redis adapter status
   isRedisPubSubEnabled: () => redisPubSubInitialized,
   getRedisAdapterStatus,

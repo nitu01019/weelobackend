@@ -154,12 +154,12 @@ class RedisRateLimitStore {
  */
 function createStore(windowMs: number, name: string): any {
   const redisEnabled = process.env.REDIS_ENABLED === 'true';
-  
+
   if (redisEnabled) {
     logger.info(`🔒 [RateLimit] Redis store enabled for "${name}" limiter`);
     return new RedisRateLimitStore(windowMs, `rl:${name}:`);
   }
-  
+
   // In-memory fallback (development or Redis unavailable)
   // express-rate-limit uses its built-in MemoryStore when store is undefined
   return undefined;
@@ -266,17 +266,18 @@ export const otpRateLimiter = rateLimit({
   windowMs: 2 * 60 * 1000, // 2 minutes
   max: 5, // 5 OTPs per phone per 2 minutes
   keyGenerator: (req) => {
-    // Rate limit by phone number — allows millions of concurrent users
-    // Each phone number gets its own bucket
+    // Rate limit by phone number + role — allows millions of concurrent users
+    // Each phone+role combination gets its own bucket
     //
     // CRITICAL: Different auth modules use different field names:
-    //   - Customer auth: req.body.phone
-    //   - Driver auth:   req.body.driverPhone
-    //   - Transporter:   req.body.phone
-    // We check ALL possible fields to ensure per-phone isolation.
-    // Without this, all requests with empty phone share one bucket = instant block.
+    //   - Customer auth: req.body.phone + req.body.role='customer'
+    //   - Transporter:   req.body.phone + req.body.role='transporter'
+    //   - Driver auth:   req.body.driverPhone (no role field, inferred as 'driver')
+    // We check ALL possible fields to ensure per-phone-per-role isolation.
+    // Without role, phone 1234 as Customer eats into Transporter's limit.
     const phone = req.body?.phone || req.body?.driverPhone || req.ip || 'unknown';
-    return `otp:${phone}`;
+    const role = req.body?.role || (req.body?.driverPhone ? 'driver' : 'customer');
+    return `otp:${phone}:${role}`;
   },
   handler: throttleHandler(
     'OTP_RATE_LIMIT_EXCEEDED',

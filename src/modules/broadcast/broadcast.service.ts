@@ -132,7 +132,7 @@ class BroadcastService {
   private incrementAcceptFailureMetric(code: string): void {
     this.acceptFailureMetrics[code] = (this.acceptFailureMetrics[code] || 0) + 1;
   }
-  
+
   /**
    * Get active broadcasts for compatibility / migration path.
    * 
@@ -150,90 +150,90 @@ class BroadcastService {
       route_alias_used: true,
       actorId: driverId
     });
-    
+
     // Get user to find their transporter
     const user = await db.getUserById(driverId);
     const transporterId = user?.transporterId || driverId;
-    
+
     // Get transporter's vehicle types for filtering
     const transporterVehicles = await db.getVehiclesByTransporter(transporterId);
     const transporterVehicleTypes = new Set(
       transporterVehicles.map(v => `${v.vehicleType.toLowerCase()}_${(v.vehicleSubtype || '').toLowerCase()}`)
     );
     const transporterTypesList = [...new Set(transporterVehicles.map(v => v.vehicleType.toLowerCase()))];
-    
+
     logger.info(`Transporter ${transporterId} has vehicle types: ${transporterTypesList.join(', ')}`);
-    
+
     const activeBroadcasts: any[] = [];
-    
+
     // ============== 1. Get Legacy Bookings ==============
     const bookings = await db.getActiveBookingsForTransporter(transporterId);
-    
+
     for (const booking of bookings) {
       // Filter by vehicle type if specified
       if (vehicleType && booking.vehicleType.toLowerCase() !== vehicleType.toLowerCase()) {
         continue;
       }
-      
+
       // Check if not expired
       if (new Date(booking.expiresAt) < new Date()) {
         continue;
       }
-      
+
       // Check if still needs trucks
       if (booking.trucksFilled >= booking.trucksNeeded) {
         continue;
       }
-      
+
       // Check if transporter has matching vehicle type
       if (!transporterTypesList.includes(booking.vehicleType.toLowerCase())) {
         continue;
       }
-      
+
       activeBroadcasts.push(this.mapBookingToBroadcast(booking));
     }
-    
+
     // ============== 2. Get New Orders (Multi-Vehicle) ==============
     const orders = db.getActiveOrders ? await db.getActiveOrders() : [];
-    
+
     logger.info(`[Broadcasts] Found ${orders.length} active orders`);
-    
+
     for (const order of orders) {
       logger.info(`[Broadcasts] Processing order ${order.id}, status: ${order.status}, trucks: ${order.trucksFilled}/${order.totalTrucks}`);
       // Check if not expired
       if (new Date(order.expiresAt) < new Date()) {
         continue;
       }
-      
+
       // Check if still needs trucks
       if (order.trucksFilled >= order.totalTrucks) {
         continue;
       }
-      
+
       // Get truck requests for this order
       const truckRequests = db.getTruckRequestsByOrder ? await db.getTruckRequestsByOrder(order.id) : [];
-      
+
       logger.info(`[Broadcasts] Order ${order.id} has ${truckRequests.length} truck requests`);
       truckRequests.forEach(tr => {
         logger.info(`[Broadcasts]   - ${tr.vehicleType}/${tr.vehicleSubtype}, status: ${tr.status}`);
       });
-      
+
       // Filter to only vehicle types the transporter has
       const relevantRequests = truckRequests.filter(tr => {
         const typeKey = `${tr.vehicleType.toLowerCase()}_${(tr.vehicleSubtype || '').toLowerCase()}`;
         return transporterVehicleTypes.has(typeKey) || transporterTypesList.includes(tr.vehicleType.toLowerCase());
       });
-      
+
       if (relevantRequests.length === 0) {
         continue; // No matching vehicle types for this transporter
       }
-      
+
       // Group by vehicle type to create requestedVehicles array
       const requestedVehiclesMap = new Map<string, any>();
-      
+
       for (const tr of relevantRequests) {
         const key = `${tr.vehicleType}_${tr.vehicleSubtype}`;
-        
+
         if (!requestedVehiclesMap.has(key)) {
           requestedVehiclesMap.set(key, {
             vehicleType: tr.vehicleType,
@@ -244,27 +244,27 @@ class BroadcastService {
             capacityTons: 0 // Could be fetched from vehicle catalog
           });
         }
-        
+
         const entry = requestedVehiclesMap.get(key)!;
         entry.count += 1;
         if (tr.status === 'assigned' || tr.status === 'completed') {
           entry.filledCount += 1;
         }
       }
-      
+
       const requestedVehicles = Array.from(requestedVehiclesMap.values());
-      
+
       logger.info(`[Broadcasts] Order ${order.id} grouped into ${requestedVehicles.length} vehicle types:`);
       requestedVehicles.forEach(rv => {
         logger.info(`[Broadcasts]   - ${rv.vehicleType}/${rv.vehicleSubtype}: ${rv.count} needed, ${rv.filledCount} filled`);
       });
-      
+
       // Calculate totals from relevant requests only
       const totalNeeded = requestedVehicles.reduce((sum, rv) => sum + rv.count, 0);
       const totalFilled = requestedVehicles.reduce((sum, rv) => sum + rv.filledCount, 0);
       const totalFare = requestedVehicles.reduce((sum, rv) => sum + (rv.count * rv.farePerTruck), 0);
       const avgFarePerTruck = totalNeeded > 0 ? totalFare / totalNeeded : 0;
-      
+
       // Build broadcast object with requestedVehicles
       activeBroadcasts.push({
         broadcastId: order.id,
@@ -287,16 +287,16 @@ class BroadcastService {
         },
         distance: order.distanceKm || 0,
         estimatedDuration: Math.round((order.distanceKm || 100) * 1.5),
-        
+
         // Multi-truck support
         requestedVehicles: requestedVehicles,
         totalTrucksNeeded: totalNeeded,
         trucksFilledSoFar: totalFilled,
-        
+
         // Legacy single type (first type for backward compat)
         vehicleType: requestedVehicles[0]?.vehicleType || '',
         vehicleSubtype: requestedVehicles[0]?.vehicleSubtype || '',
-        
+
         goodsType: order.goodsType || 'General',
         weight: order.cargoWeightKg ? `${order.cargoWeightKg} kg` : 'N/A',
         farePerTruck: avgFarePerTruck,
@@ -307,25 +307,25 @@ class BroadcastService {
         expiresAt: order.expiresAt
       });
     }
-    
+
     logger.info(`Found ${activeBroadcasts.length} active broadcasts for transporter ${transporterId}`);
-    
+
     return activeBroadcasts;
   }
-  
+
   /**
    * Get broadcast by ID
    */
   async getBroadcastById(broadcastId: string) {
     const booking = await db.getBookingById(broadcastId);
-    
+
     if (!booking) {
       throw new Error('Broadcast not found');
     }
-    
+
     return this.mapBookingToBroadcast(booking);
   }
-  
+
   /**
    * Accept a broadcast (assign driver/vehicle to booking)
    * 
@@ -781,40 +781,40 @@ class BroadcastService {
       }
     }
   }
-  
+
   /**
    * Decline a broadcast
    */
   async declineBroadcast(broadcastId: string, params: DeclineBroadcastParams) {
     const { driverId, reason, notes } = params;
-    
+
     // Just log the decline - no need to store for now
     logger.info(`Broadcast ${broadcastId} declined by ${driverId}. Reason: ${reason}`, { notes });
-    
+
     return { success: true };
   }
-  
+
   /**
    * Get broadcast history for a driver
    */
   async getBroadcastHistory(params: GetHistoryParams) {
     const { driverId, page, limit, status } = params;
-    
+
     // Get bookings for this driver
     let bookings = await db.getBookingsByDriver(driverId);
-    
+
     // Filter by status if provided
     if (status) {
       bookings = bookings.filter((b: BookingRecord) => b.status === status);
     }
-    
+
     const total = bookings.length;
     const pages = Math.ceil(total / limit);
-    
+
     // Paginate
     const start = (page - 1) * limit;
     const paginatedBookings = bookings.slice(start, start + limit);
-    
+
     return {
       broadcasts: paginatedBookings.map((b: BookingRecord) => this.mapBookingToBroadcast(b)),
       pagination: {
@@ -825,16 +825,16 @@ class BroadcastService {
       }
     };
   }
-  
+
   /**
    * Create a new broadcast (from transporter)
    */
   async createBroadcast(params: CreateBroadcastParams) {
     const broadcastId = uuidv4();
-    
+
     // Get customer info
     const customer = await db.getUserById(params.customerId);
-    
+
     const booking: Omit<BookingRecord, 'createdAt' | 'updatedAt'> = {
       id: broadcastId,
       customerId: params.customerId,
@@ -867,20 +867,20 @@ class BroadcastService {
       notifiedTransporters: [params.transporterId],
       expiresAt: params.expiresAt || new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString()
     };
-    
+
     const createdBooking = await db.createBooking(booking);
-    
+
     // TODO: Send push notifications to drivers
     const notifiedDrivers = 10; // Mock number
-    
+
     logger.info(`Broadcast ${broadcastId} created, ${notifiedDrivers} drivers notified`);
-    
+
     return {
       broadcast: this.mapBookingToBroadcast(createdBooking),
       notifiedDrivers
     };
   }
-  
+
   // ===========================================================================
   // BROADCAST EXPIRY & REAL-TIME UPDATES
   // ===========================================================================
@@ -894,37 +894,59 @@ class BroadcastService {
    * 
    * SCALABILITY: O(n) where n = active broadcasts. For millions of users,
    * use Redis sorted set with expiry times for O(log n) performance.
+   * 
+   * DISTRIBUTED LOCK: Each expired booking/order is locked individually
+   * to prevent duplicate processing across multiple ECS instances.
+   * Same pattern as processExpiredBookings() in booking.service.ts.
    */
   async checkAndExpireBroadcasts(): Promise<number> {
     const now = new Date();
     let expiredCount = 0;
-    
+
     // Get all active bookings
     const allBookings = db.getAllBookings ? await db.getAllBookings() : [];
-    
+
     for (const booking of allBookings) {
       // Check if expired and still active
       if (
-        booking.status === 'active' || 
+        booking.status === 'active' ||
         booking.status === 'partially_filled'
       ) {
         const expiresAt = new Date(booking.expiresAt);
         if (expiresAt < now) {
-          // Mark as expired in database
-          await db.updateBooking(booking.id, { status: 'expired' });
-          
-          // CRITICAL: Notify ALL transporters to remove this broadcast
-          this.emitBroadcastExpired(booking.id, 'timeout');
-          
-          // Notify customer that their request expired
-          this.notifyCustomerBroadcastExpired(booking);
-          
-          expiredCount++;
-          logger.info(`⏰ Broadcast ${booking.id} expired - notified all transporters`);
+          // Distributed lock: prevent duplicate processing across ECS instances
+          const lockKey = `lock:broadcast-expiry:${booking.id}`;
+          const lock = await redisService.acquireLock(lockKey, 'broadcast-expiry-checker', 15);
+
+          if (!lock.acquired) {
+            // Another instance is already processing this booking expiry
+            continue;
+          }
+
+          try {
+            // Mark as expired in database
+            await db.updateBooking(booking.id, { status: 'expired' });
+
+            // CRITICAL: Notify ALL transporters to remove this broadcast
+            this.emitBroadcastExpired(booking.id, 'timeout');
+
+            // Notify customer that their request expired
+            this.notifyCustomerBroadcastExpired(booking);
+
+            expiredCount++;
+            logger.info(`⏰ Broadcast ${booking.id} expired - notified all transporters`);
+          } catch (error: any) {
+            logger.error('Failed to process expired broadcast', {
+              bookingId: booking.id,
+              error: error.message
+            });
+          } finally {
+            await redisService.releaseLock(lockKey, 'broadcast-expiry-checker').catch(() => { });
+          }
         }
       }
     }
-    
+
     // Also check orders (multi-vehicle system)
     let allOrders: any[] = [];
     try {
@@ -935,32 +957,50 @@ class BroadcastService {
     } catch (error) {
       logger.debug('Could not get active orders for expiry check');
     }
-    
+
     for (const order of allOrders) {
       if (order.status === 'searching' || order.status === 'partially_filled') {
         const expiresAt = new Date(order.expiresAt);
         if (expiresAt < now) {
-          // Mark as expired
-          if (db.updateOrder) {
-            await db.updateOrder(order.id, { status: 'expired' });
+          // Distributed lock: prevent duplicate processing across ECS instances
+          const lockKey = `lock:broadcast-order-expiry:${order.id}`;
+          const lock = await redisService.acquireLock(lockKey, 'broadcast-expiry-checker', 15);
+
+          if (!lock.acquired) {
+            // Another instance is already processing this order expiry
+            continue;
           }
-          
-          // Notify ALL transporters
-          this.emitBroadcastExpired(order.id, 'timeout');
-          
-          expiredCount++;
-          logger.info(`⏰ Order ${order.id} expired - notified all transporters`);
+
+          try {
+            // Mark as expired
+            if (db.updateOrder) {
+              await db.updateOrder(order.id, { status: 'expired' });
+            }
+
+            // Notify ALL transporters
+            this.emitBroadcastExpired(order.id, 'timeout');
+
+            expiredCount++;
+            logger.info(`⏰ Order ${order.id} expired - notified all transporters`);
+          } catch (error: any) {
+            logger.error('Failed to process expired order broadcast', {
+              orderId: order.id,
+              error: error.message
+            });
+          } finally {
+            await redisService.releaseLock(lockKey, 'broadcast-expiry-checker').catch(() => { });
+          }
         }
       }
     }
-    
+
     if (expiredCount > 0) {
       logger.info(`🧹 Expired ${expiredCount} broadcast(s)`);
     }
-    
+
     return expiredCount;
   }
-  
+
   /**
    * Emit broadcast expired event to ALL transporters
    * This instantly removes the broadcast from their overlay/list
@@ -974,23 +1014,23 @@ class BroadcastService {
       orderId: broadcastId, // Alias for compatibility
       reason,
       timestamp: new Date().toISOString(),
-      message: reason === 'timeout' 
-        ? 'This booking request has expired' 
+      message: reason === 'timeout'
+        ? 'This booking request has expired'
         : reason === 'cancelled'
-        ? 'Customer cancelled this booking'
-        : 'All trucks have been assigned'
+          ? 'Customer cancelled this booking'
+          : 'All trucks have been assigned'
     };
-    
+
     logger.info(`📢 Broadcasting expiry event: ${broadcastId} (${reason})`);
-    
+
     // Emit to ALL connected transporters
     emitToAllTransporters(BroadcastEvents.BROADCAST_EXPIRED, payload);
-    
+
     // Also emit to the specific booking room (for any listeners)
     emitToRoom(`booking:${broadcastId}`, BroadcastEvents.BROADCAST_EXPIRED, payload);
     emitToRoom(`order:${broadcastId}`, BroadcastEvents.BROADCAST_EXPIRED, payload);
   }
-  
+
   /**
    * Emit trucks remaining update to ALL transporters
    * Called when a transporter accepts trucks - others see reduced availability
@@ -1019,22 +1059,22 @@ class BroadcastService {
       isFullyFilled: remaining === 0,
       timestamp: new Date().toISOString()
     };
-    
+
     logger.info(`📢 Trucks remaining update: ${broadcastId} - ${remaining}/${total} (${vehicleType})`);
-    
+
     // Emit to ALL transporters so they see updated availability
     emitToAllTransporters(BroadcastEvents.TRUCKS_REMAINING_UPDATE, payload);
-    
+
     // Also emit to booking/order room
     emitToRoom(`booking:${broadcastId}`, BroadcastEvents.TRUCKS_REMAINING_UPDATE, payload);
     emitToRoom(`order:${broadcastId}`, BroadcastEvents.TRUCKS_REMAINING_UPDATE, payload);
-    
+
     // If fully filled, emit that event too
     if (remaining === 0) {
       this.emitBroadcastExpired(broadcastId, 'fully_filled');
     }
   }
-  
+
   /**
    * Notify customer that their broadcast expired without being filled
    */
@@ -1048,10 +1088,10 @@ class BroadcastService {
         ? `Your booking expired with ${booking.trucksFilled}/${booking.trucksNeeded} trucks assigned`
         : 'Your booking expired. No transporters accepted in time.'
     };
-    
+
     // WebSocket to customer
     emitToUser(booking.customerId, 'booking_expired', payload);
-    
+
     // Push notification
     sendPushNotification(booking.customerId, {
       title: '⏰ Booking Expired',
@@ -1064,7 +1104,7 @@ class BroadcastService {
       logger.warn(`FCM to customer ${booking.customerId} failed: ${err.message}`);
     });
   }
-  
+
   /**
    * Start the broadcast expiry checker job
    * Runs every 5 seconds to check for expired broadcasts
@@ -1102,11 +1142,11 @@ class BroadcastService {
   private mapBookingToBroadcast(booking: BookingRecord) {
     // Import vehicle catalog to get capacity info
     const { getSubtypeConfig } = require('../pricing/vehicle-catalog');
-    
+
     // Get capacity information for the vehicle subtype
     const subtypeConfig = getSubtypeConfig(booking.vehicleType, booking.vehicleSubtype);
     const capacityTons = subtypeConfig ? subtypeConfig.capacityKg / 1000 : 0;
-    
+
     // Build requestedVehicles array for multi-truck UI compatibility
     const requestedVehicles = [{
       vehicleType: booking.vehicleType,
@@ -1116,7 +1156,7 @@ class BroadcastService {
       farePerTruck: booking.pricePerTruck,
       capacityTons: capacityTons
     }];
-    
+
     return {
       broadcastId: booking.id,
       customerId: booking.customerId,
@@ -1126,10 +1166,10 @@ class BroadcastService {
       dropLocation: booking.drop,
       distance: booking.distanceKm || 0,
       estimatedDuration: Math.round((booking.distanceKm || 100) * 1.5), // Rough estimate: 1.5 min per km
-      
+
       // Multi-truck support (NEW)
       requestedVehicles: requestedVehicles,
-      
+
       totalTrucksNeeded: booking.trucksNeeded,
       trucksFilledSoFar: booking.trucksFilled || 0,
       vehicleType: booking.vehicleType,
@@ -1142,7 +1182,7 @@ class BroadcastService {
       isUrgent: false,
       createdAt: booking.createdAt,
       expiresAt: booking.expiresAt,
-      
+
       // Enhanced: Capacity information for transporters
       capacityInfo: subtypeConfig ? {
         capacityKg: subtypeConfig.capacityKg,

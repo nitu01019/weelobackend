@@ -60,10 +60,10 @@ const metrics: GoogleMapsMetrics = {
 
 // Log metrics every 5 minutes for monitoring
 setInterval(() => {
-    const cacheHitRate = metrics.apiCalls.total > 0 
+    const cacheHitRate = metrics.apiCalls.total > 0
         ? ((metrics.cacheHits.total / (metrics.apiCalls.total + metrics.cacheHits.total)) * 100).toFixed(2)
         : '0.00';
-    
+
     logger.info('📊 Google Maps API Metrics (5min window)', {
         apiCalls: metrics.apiCalls,
         cacheHits: metrics.cacheHits,
@@ -71,7 +71,7 @@ setInterval(() => {
         errors: metrics.errors,
         avgResponseMs: metrics.avgResponseTimeMs,
     });
-    
+
     // Reset counters
     Object.keys(metrics.apiCalls).forEach(key => {
         (metrics.apiCalls as any)[key] = 0;
@@ -242,7 +242,9 @@ class GoogleMapsService {
                 params.append('avoid', 'highways|tolls');
             }
 
-            const response = await fetch(`${this.directionsUrl}?${params.toString()}`);
+            const response = await fetch(`${this.directionsUrl}?${params.toString()}`, {
+                signal: AbortSignal.timeout(5000)
+            });
             const data = await response.json() as GoogleDirectionsResponse;
 
             if (data.status !== 'OK') {
@@ -271,7 +273,7 @@ class GoogleMapsService {
 
             const responseTime = Date.now() - startTime;
             metrics.avgResponseTimeMs.routes = responseTime;
-            
+
             logger.debug(`📍 Google Route: ${Math.round(totalDistance / 1000)} km (${polyline.length} points) - ${responseTime}ms`);
 
             const result: DirectionsResult = {
@@ -337,7 +339,9 @@ class GoogleMapsService {
                 params.append('radius', '50000'); // 50km radius
             }
 
-            const response = await fetch(`${this.placesUrl}?${params.toString()}`);
+            const response = await fetch(`${this.placesUrl}?${params.toString()}`, {
+                signal: AbortSignal.timeout(5000)
+            });
             const data = await response.json() as GooglePlacesAutocompleteResponse;
 
             if (data.status !== 'OK' && data.status !== 'ZERO_RESULTS') {
@@ -351,7 +355,7 @@ class GoogleMapsService {
             const results: PlaceSearchResult[] = [];
             const predictions = data.predictions.slice(0, maxResults);
 
-            const detailsPromises = predictions.map(prediction => 
+            const detailsPromises = predictions.map(prediction =>
                 this.getPlaceDetails(prediction.place_id)
                     .then(details => ({ prediction, details }))
                     .catch(() => ({ prediction, details: null }))
@@ -374,7 +378,7 @@ class GoogleMapsService {
 
             const responseTime = Date.now() - startTime;
             metrics.avgResponseTimeMs.places = responseTime;
-            
+
             logger.debug(`📍 Google Places: ${results.length} results for "${query}" - ${responseTime}ms`);
             return results;
         } catch (error: any) {
@@ -402,7 +406,9 @@ class GoogleMapsService {
                 fields: 'geometry',
             });
 
-            const response = await fetch(`${this.placeDetailsUrl}?${params.toString()}`);
+            const response = await fetch(`${this.placeDetailsUrl}?${params.toString()}`, {
+                signal: AbortSignal.timeout(5000)
+            });
             const data = await response.json() as GooglePlaceDetailsResponse;
 
             if (data.status !== 'OK' || !data.result) {
@@ -454,7 +460,9 @@ class GoogleMapsService {
                 key: config.apiKey,
             });
 
-            const response = await fetch(`${this.geocodingUrl}?${params.toString()}`);
+            const response = await fetch(`${this.geocodingUrl}?${params.toString()}`, {
+                signal: AbortSignal.timeout(5000)
+            });
             const data = await response.json() as GoogleGeocodingResponse;
 
             if (data.status !== 'OK' || data.results.length === 0) {
@@ -473,7 +481,7 @@ class GoogleMapsService {
 
             const responseTime = Date.now() - startTime;
             metrics.avgResponseTimeMs.geocoding = responseTime;
-            
+
             logger.debug(`📍 Google Geocoding: ${result.formatted_address} - ${responseTime}ms`);
 
             const geocodingResult = {
