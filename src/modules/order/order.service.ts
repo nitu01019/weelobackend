@@ -308,6 +308,37 @@ class OrderService {
     return `order:notified:transporters:${orderId}:${generateVehicleKey(vehicleType, vehicleSubtype)}`;
   }
 
+  private makeVehicleGroupKey(vehicleType: string, vehicleSubtype: string): string {
+    return JSON.stringify([vehicleType, vehicleSubtype || '']);
+  }
+
+  private parseVehicleGroupKey(groupKey: string): { vehicleType: string; vehicleSubtype: string } {
+    try {
+      const parsed = JSON.parse(groupKey);
+      if (
+        Array.isArray(parsed) &&
+        typeof parsed[0] === 'string' &&
+        typeof parsed[1] === 'string'
+      ) {
+        return {
+          vehicleType: parsed[0],
+          vehicleSubtype: parsed[1]
+        };
+      }
+    } catch {
+      // Legacy fallback below
+    }
+
+    const splitIndex = groupKey.indexOf('_');
+    if (splitIndex === -1) {
+      return { vehicleType: groupKey, vehicleSubtype: '' };
+    }
+    return {
+      vehicleType: groupKey.slice(0, splitIndex),
+      vehicleSubtype: groupKey.slice(splitIndex + 1)
+    };
+  }
+
   // Redis key patterns for distributed timers
   private readonly TIMER_KEYS = {
     ORDER_EXPIRY: (orderId: string) => this.orderExpiryTimerKey(orderId)
@@ -893,7 +924,7 @@ class OrderService {
     const requestsByType = this.buildRequestsByType(truckRequests);
 
     for (const [typeKey, requests] of requestsByType) {
-      const [vehicleType, vehicleSubtype = ''] = typeKey.split('_');
+      const { vehicleType, vehicleSubtype } = this.parseVehicleGroupKey(typeKey);
       const alreadyNotified = await this.getNotifiedTransporters(orderId, vehicleType, vehicleSubtype);
       const stepCandidates = await progressiveRadiusMatcher.findCandidates({
         pickupLat: resolvedPickup.latitude,
@@ -1046,7 +1077,7 @@ class OrderService {
   private buildRequestsByType(requests: TruckRequestRecord[]): Map<string, TruckRequestRecord[]> {
     const requestsByType = new Map<string, TruckRequestRecord[]>();
     for (const request of requests) {
-      const key = `${request.vehicleType}_${request.vehicleSubtype}`;
+      const key = this.makeVehicleGroupKey(request.vehicleType, request.vehicleSubtype);
       if (!requestsByType.has(key)) {
         requestsByType.set(key, []);
       }
@@ -1180,7 +1211,7 @@ class OrderService {
 
     const requestedVehicles: any[] = [];
     for (const [key, reqs] of requestsByType) {
-      const [requestVehicleType, requestVehicleSubtype] = key.split('_');
+      const { vehicleType: requestVehicleType, vehicleSubtype: requestVehicleSubtype } = this.parseVehicleGroupKey(key);
       const first = reqs[0];
       requestedVehicles.push({
         vehicleType: requestVehicleType,

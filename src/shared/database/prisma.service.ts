@@ -11,6 +11,7 @@
 
 import { PrismaClient, UserRole, VehicleStatus, BookingStatus, OrderStatus, TruckRequestStatus, AssignmentStatus } from '@prisma/client';
 import { logger } from '../services/logger.service';
+import { generateVehicleKey, generateVehicleKeyCandidates } from '../services/vehicle-key.service';
 
 // =============================================================================
 // PAGINATION SAFETY — Prevents unbounded queries from exhausting memory
@@ -561,42 +562,51 @@ class PrismaDatabaseService {
    * only the ~100-1000 matching ones. ~100x improvement.
    */
   async getTransportersWithVehicleType(vehicleType: string, vehicleSubtype?: string): Promise<string[]> {
-    const searchKey = vehicleSubtype
-      ? `${this.normalizeVehicleString(vehicleType)}_${this.normalizeVehicleString(vehicleSubtype)}`
-      : this.normalizeVehicleString(vehicleType);
+    const vehicleKeyCandidates = vehicleSubtype
+      ? generateVehicleKeyCandidates(vehicleType, vehicleSubtype)
+      : [];
 
-    // OPTIMIZATION: Use vehicleKey WHERE clause for indexed lookup
-    // Try exact vehicleKey match first (fastest path — uses @@index([vehicleKey]))
-    let vehicles = await this.prisma.vehicle.findMany({
-      where: {
-        isActive: true,
-        vehicleKey: vehicleSubtype
-          ? searchKey                               // Exact match: "open_17ft"
-          : { startsWith: searchKey }               // Prefix match: "open_*"
-      },
-      select: { transporterId: true }
-    });
+    let vehicles: Array<{ transporterId: string; vehicleType?: string; vehicleSubtype?: string }> = [];
 
-    // Fallback: If no vehicleKey matches, try vehicleType + vehicleSubtype
-    // (for vehicles registered before vehicleKey was introduced)
-    if (vehicles.length === 0) {
-      const whereClause: any = {
-        isActive: true,
-        vehicleType: { mode: 'insensitive' as const, equals: vehicleType }
-      };
-      if (vehicleSubtype) {
-        whereClause.vehicleSubtype = { mode: 'insensitive' as const, equals: vehicleSubtype };
-      }
-
+    if (vehicleKeyCandidates.length > 0) {
       vehicles = await this.prisma.vehicle.findMany({
-        where: whereClause,
-        select: { transporterId: true }
+        where: {
+          isActive: true,
+          vehicleKey: { in: vehicleKeyCandidates }
+        },
+        select: { transporterId: true, vehicleType: true, vehicleSubtype: true }
       });
     }
 
-    // Deduplicate transporter IDs
+    // Fallback for legacy rows that do not have vehicleKey populated consistently.
+    if (vehicles.length === 0) {
+      const typeScopedVehicles = await this.prisma.vehicle.findMany({
+        where: {
+          isActive: true,
+          vehicleType: { mode: 'insensitive' as const, equals: vehicleType }
+        },
+        select: { transporterId: true, vehicleType: true, vehicleSubtype: true }
+      });
+
+      if (!vehicleSubtype) {
+        vehicles = typeScopedVehicles;
+      } else {
+        const candidateSet = new Set(vehicleKeyCandidates);
+        vehicles = typeScopedVehicles.filter((vehicle) => {
+          const ownTypeKey = generateVehicleKey(
+            vehicle.vehicleType || vehicleType,
+            vehicle.vehicleSubtype || ''
+          );
+          const requestedTypeKey = generateVehicleKey(vehicleType, vehicle.vehicleSubtype || '');
+          return candidateSet.has(ownTypeKey) || candidateSet.has(requestedTypeKey);
+        });
+      }
+    }
+
     const result = [...new Set(vehicles.map(v => v.transporterId))];
-    logger.info(`Found ${result.length} transporters with ${vehicleType}${vehicleSubtype ? '/' + vehicleSubtype : ''}`);
+    logger.info(`Found ${result.length} transporters with ${vehicleType}${vehicleSubtype ? '/' + vehicleSubtype : ''}`, {
+      matchingKeySource: vehicleSubtype ? 'vehicle_key_candidates' : 'vehicle_type_only'
+    });
     return result;
   }
 
@@ -969,10 +979,10 @@ class PrismaDatabaseService {
         vehicles
           .filter(v => v.isActive)
           .map(v => {
-            const normalizedType = this.normalizeVehicleString(v.vehicleType);
-            const normalizedSubtype = this.normalizeVehicleString(v.vehicleSubtype);
+            const normalizedType = (v.vehicleType || '').trim();
+            const normalizedSubtype = (v.vehicleSubtype || '').trim();
             return [
-              `${normalizedType}_${normalizedSubtype}`,
+              generateVehicleKey(normalizedType, normalizedSubtype),
               { vehicleType: normalizedType, vehicleSubtype: normalizedSubtype }
             ] as const;
           })
@@ -994,24 +1004,23 @@ class PrismaDatabaseService {
       });
     }
 
-    // PERF: Use GIN index on notifiedTransporters instead of in-memory filter
-    const vehicleKeys = new Set(activeVehiclePairs.map(pair => `${pair.vehicleType}_${pair.vehicleSubtype}`));
-    const vehicleTypes = activeVehiclePairs.map(pair => pair.vehicleType);
-    const vehicleSubtypes = activeVehiclePairs.map(pair => pair.vehicleSubtype);
+    // Fallback path: broad notified set + canonical vehicle-key matching.
+    const candidateVehicleKeys = new Set(
+      activeVehiclePairs.flatMap((pair) => generateVehicleKeyCandidates(pair.vehicleType, pair.vehicleSubtype))
+    );
     const requests = await this.prisma.truckRequest.findMany({
       where: {
         status: 'searching',
-        notifiedTransporters: { has: transporterId },
-        vehicleType: { in: vehicleTypes },
+        notifiedTransporters: { has: transporterId }
       },
       orderBy: { createdAt: 'desc' },
-      take: 200
+      take: 500
     });
 
     return requests
       .filter(request => {
-        const requestKey = `${this.normalizeVehicleString(request.vehicleType)}_${this.normalizeVehicleString(request.vehicleSubtype)}`;
-        return vehicleKeys.has(requestKey);
+        const requestKeys = generateVehicleKeyCandidates(request.vehicleType, request.vehicleSubtype || '');
+        return requestKeys.some((key) => candidateVehicleKeys.has(key));
       })
       .map(request => this.toTruckRequestRecord(request));
   }
@@ -1023,26 +1032,24 @@ class PrismaDatabaseService {
   ): Promise<TruckRequestRecord[]> {
     if (vehiclePairs.length === 0) return [];
 
+    const candidateVehicleKeys = new Set(
+      vehiclePairs.flatMap((pair) => generateVehicleKeyCandidates(pair.vehicleType, pair.vehicleSubtype))
+    );
     const requests = await this.prisma.truckRequest.findMany({
       where: {
         status: 'searching',
-        notifiedTransporters: { has: transporterId },
-        OR: vehiclePairs.map(pair => ({
-          vehicleType: {
-            equals: pair.vehicleType,
-            mode: 'insensitive'
-          },
-          vehicleSubtype: {
-            equals: pair.vehicleSubtype,
-            mode: 'insensitive'
-          }
-        }))
+        notifiedTransporters: { has: transporterId }
       },
       orderBy: { createdAt: 'desc' },
       take: Math.max(1, Math.min(limit, 1000))
     });
 
-    return requests.map(request => this.toTruckRequestRecord(request));
+    return requests
+      .filter((request) => {
+        const requestKeys = generateVehicleKeyCandidates(request.vehicleType, request.vehicleSubtype || '');
+        return requestKeys.some((key) => candidateVehicleKeys.has(key));
+      })
+      .map(request => this.toTruckRequestRecord(request));
   }
 
   async getTruckRequestsByVehicleType(vehicleType: string, vehicleSubtype?: string): Promise<TruckRequestRecord[]> {
@@ -1263,35 +1270,43 @@ class PrismaDatabaseService {
     vehicleType: string,
     vehicleSubtype?: string
   ): Promise<Array<{ transporterId: string; transporterName: string; totalOwned: number; available: number; inTransit: number }>> {
-    // OPTIMIZATION: Filter at DB level using indexes
-    const normalizedKey = vehicleSubtype
-      ? `${this.normalizeVehicleString(vehicleType)}_${this.normalizeVehicleString(vehicleSubtype)}`
-      : null;
+    const vehicleKeyCandidates = vehicleSubtype
+      ? generateVehicleKeyCandidates(vehicleType, vehicleSubtype)
+      : [];
 
-    // Try vehicleKey first (indexed), fallback to type+subtype
-    let matchingVehicles;
-    if (normalizedKey) {
+    let matchingVehicles: Array<{ transporterId: string; status: VehicleStatus; vehicleType?: string; vehicleSubtype?: string }> = [];
+    if (vehicleKeyCandidates.length > 0) {
       matchingVehicles = await this.prisma.vehicle.findMany({
         where: {
           isActive: true,
-          OR: [
-            { vehicleKey: normalizedKey },
-            {
-              vehicleType: { mode: 'insensitive' as const, equals: vehicleType },
-              vehicleSubtype: { mode: 'insensitive' as const, equals: vehicleSubtype! }
-            }
-          ]
+          vehicleKey: { in: vehicleKeyCandidates }
         },
-        select: { transporterId: true, status: true }
+        select: { transporterId: true, status: true, vehicleType: true, vehicleSubtype: true }
       });
-    } else {
-      matchingVehicles = await this.prisma.vehicle.findMany({
+    }
+
+    if (matchingVehicles.length === 0) {
+      const typeScopedVehicles = await this.prisma.vehicle.findMany({
         where: {
           isActive: true,
           vehicleType: { mode: 'insensitive' as const, equals: vehicleType }
         },
-        select: { transporterId: true, status: true }
+        select: { transporterId: true, status: true, vehicleType: true, vehicleSubtype: true }
       });
+
+      if (!vehicleSubtype) {
+        matchingVehicles = typeScopedVehicles;
+      } else {
+        const candidateSet = new Set(vehicleKeyCandidates);
+        matchingVehicles = typeScopedVehicles.filter((vehicle) => {
+          const ownTypeKey = generateVehicleKey(
+            vehicle.vehicleType || vehicleType,
+            vehicle.vehicleSubtype || ''
+          );
+          const requestedTypeKey = generateVehicleKey(vehicleType, vehicle.vehicleSubtype || '');
+          return candidateSet.has(ownTypeKey) || candidateSet.has(requestedTypeKey);
+        });
+      }
     }
 
     // Group by transporter

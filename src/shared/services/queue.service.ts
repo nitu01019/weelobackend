@@ -61,10 +61,9 @@ export interface TrackingEventPayload {
 const TRACKING_QUEUE_HARD_LIMIT = Math.max(1000, parseInt(process.env.TRACKING_QUEUE_HARD_LIMIT || '200000', 10) || 200000);
 const TRACKING_QUEUE_DEPTH_SAMPLE_MS = Math.max(100, parseInt(process.env.TRACKING_QUEUE_DEPTH_SAMPLE_MS || '500', 10) || 500);
 const FF_CANCELLED_ORDER_QUEUE_GUARD = process.env.FF_CANCELLED_ORDER_QUEUE_GUARD !== 'false';
-// FAIL-OPEN by default: broadcasts are only dropped when order is positively
-// confirmed as cancelled/expired. DB errors or missing data = broadcast goes through.
-// A stale broadcast reaching a captain is far less harmful than a valid one being dropped.
-const FF_CANCELLED_ORDER_QUEUE_GUARD_FAIL_OPEN = process.env.FF_CANCELLED_ORDER_QUEUE_GUARD_FAIL_OPEN !== 'false';
+// FAIL-CLOSED by default: if guard lookup is ambiguous, we prefer dropping stale
+// broadcast emissions to preserve cancellation correctness under race conditions.
+const FF_CANCELLED_ORDER_QUEUE_GUARD_FAIL_OPEN = process.env.FF_CANCELLED_ORDER_QUEUE_GUARD_FAIL_OPEN === 'true';
 const CANCELLED_ORDER_QUEUE_GUARD_CACHE_TTL_MS = Math.max(
   250,
   parseInt(process.env.CANCELLED_ORDER_QUEUE_GUARD_CACHE_TTL_MS || '1500', 10) || 1500

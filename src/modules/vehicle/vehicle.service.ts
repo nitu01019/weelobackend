@@ -19,6 +19,7 @@ import {
   UpdateVehicleInput,
   GetVehiclesQuery
 } from './vehicle.schema';
+import { getVehicleTypesCatalog } from './vehicle.catalog';
 
 // Socket events for real-time vehicle updates
 export const VehicleSocketEvents = {
@@ -581,18 +582,7 @@ class VehicleService {
    * Get vehicle types catalog (static)
    */
   async getVehicleTypes() {
-    return [
-      { type: 'mini', name: 'Mini Truck', subtypes: ['Tata Ace', 'Mahindra Bolero', 'Ashok Leyland Dost'] },
-      { type: 'lcv', name: 'LCV', subtypes: ['14 Feet', '17 Feet', '19 Feet'] },
-      { type: 'tipper', name: 'Tipper', subtypes: ['10-12 Ton', '16-18 Ton', '20-24 Ton'] },
-      { type: 'container', name: 'Container', subtypes: ['20 Feet', '24 Feet', '32 Feet', '40 Feet'] },
-      { type: 'trailer', name: 'Trailer', subtypes: ['20 Feet', '22 Feet', '40 Feet'] },
-      { type: 'tanker', name: 'Tanker', subtypes: ['10 KL', '12 KL', '16 KL', '20 KL'] },
-      { type: 'bulker', name: 'Bulker', subtypes: ['22 MT', '25 MT', '30 MT', '35 MT'] },
-      { type: 'open', name: 'Open Body', subtypes: ['14 Feet', '17 Feet', '19 Feet', '22 Feet'] },
-      { type: 'dumper', name: 'Dumper', subtypes: ['10 Wheel', '12 Wheel', '14 Wheel'] },
-      { type: 'tractor', name: 'Tractor Trolley', subtypes: ['Single Trolley', 'Double Trolley'] }
-    ];
+    return getVehicleTypesCatalog();
   }
 
   /**

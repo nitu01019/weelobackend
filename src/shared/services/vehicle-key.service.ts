@@ -77,6 +77,29 @@ const VEHICLE_TYPE_DISPLAY: Record<string, string> = {
   'pick': 'Pickup',
 };
 
+/**
+ * Canonical subtype aliases used to reconcile customer/captain naming variants.
+ * Keys/values are normalized keys (post normalizeString).
+ */
+const CANONICAL_SUBTYPE_ALIASES: Record<string, string> = {
+  'open_14_ft': '14_ft_open',
+  'open_17_ft': '17_ft_open',
+  'open_19_ft': '19_ft_open',
+  'open_22_ft': '22_ft_open',
+  'open_24_ft': '24_ft_open',
+  'cont_14_ft': '14_ft_cont',
+  'cont_17_ft': '17_ft_cont',
+  'cont_19_ft': '19_ft_cont',
+  'cont_20_ft': '20_ft_cont',
+  'cont_24_ft': '24_ft_cont',
+  'single_32_ft': '32_ft_s',
+  '32_ft_single': '32_ft_s',
+  'multi_32_ft': '32_ft_m',
+  '32_ft_multi': '32_ft_m',
+  'double_trolley': 'd_trolley',
+  'single_trolley': 's_trolley'
+};
+
 // =============================================================================
 // SERVICE CLASS
 // =============================================================================
@@ -98,14 +121,53 @@ class VehicleKeyService {
    */
   generateVehicleKey(vehicleType: string, vehicleSubtype: string): string {
     const normalizedType = this.normalizeString(vehicleType);
-    const normalizedSubtype = this.normalizeString(vehicleSubtype);
-    
+    const normalizedSubtypeRaw = this.normalizeString(vehicleSubtype);
+    const normalizedSubtype = this.canonicalizeSubtypeKey(
+      this.stripTypeTokenFromSubtype(normalizedSubtypeRaw, normalizedType)
+    );
+
     // Combine with underscore separator
     const key = `${normalizedType}_${normalizedSubtype}`;
     
     logger.debug(`[VehicleKey] Generated: "${vehicleType}/${vehicleSubtype}" => "${key}"`);
     
     return key;
+  }
+
+  /**
+   * Generate possible vehicle keys for compatibility matching.
+   * Includes legacy subtype order + canonical alias variants.
+   */
+  generateVehicleKeyCandidates(vehicleType: string, vehicleSubtype: string): string[] {
+    const normalizedType = this.normalizeString(vehicleType);
+    const normalizedSubtypeRaw = this.normalizeString(vehicleSubtype);
+    const normalizedSubtype = this.stripTypeTokenFromSubtype(normalizedSubtypeRaw, normalizedType);
+    const canonicalSubtype = this.canonicalizeSubtypeKey(normalizedSubtype);
+
+    const candidates = new Set<string>();
+    if (!normalizedType) return [];
+    if (!normalizedSubtype) {
+      candidates.add(normalizedType);
+      return [...candidates];
+    }
+
+    candidates.add(`${normalizedType}_${normalizedSubtypeRaw}`);
+    candidates.add(`${normalizedType}_${normalizedSubtype}`);
+    candidates.add(`${normalizedType}_${canonicalSubtype}`);
+
+    const directAlias = CANONICAL_SUBTYPE_ALIASES[normalizedSubtypeRaw]
+      || CANONICAL_SUBTYPE_ALIASES[normalizedSubtype];
+    if (directAlias) {
+      candidates.add(`${normalizedType}_${directAlias}`);
+    }
+
+    for (const [alias, canonical] of Object.entries(CANONICAL_SUBTYPE_ALIASES)) {
+      if (canonical === canonicalSubtype) {
+        candidates.add(`${normalizedType}_${alias}`);
+      }
+    }
+
+    return [...candidates];
   }
   
   /**
@@ -149,6 +211,43 @@ class VehicleKeyService {
     normalized = normalized.replace(/^_|_$/g, '');
     
     return normalized;
+  }
+
+  private canonicalizeSubtypeKey(subtypeKey: string): string {
+    if (!subtypeKey) return '';
+
+    const direct = CANONICAL_SUBTYPE_ALIASES[subtypeKey];
+    if (direct) return direct;
+
+    const tokens = subtypeKey.split('_').filter(Boolean);
+    if (tokens.length <= 1) return subtypeKey;
+
+    const normalizedTokens = Array.from(new Set(tokens));
+    normalizedTokens.sort((a, b) => {
+      const rankDiff = this.subtypeTokenRank(a) - this.subtypeTokenRank(b);
+      if (rankDiff !== 0) return rankDiff;
+      return a.localeCompare(b);
+    });
+
+    const reordered = normalizedTokens.join('_');
+    return CANONICAL_SUBTYPE_ALIASES[reordered] || reordered;
+  }
+
+  private subtypeTokenRank(token: string): number {
+    if (/^\d+$/.test(token)) return 0;
+    if (['ft', 't', 'kl', 'mt', 'w', 'ax'].includes(token)) return 1;
+    if (/^\d+(ft|t|kl|mt|w|ax)$/.test(token)) return 1;
+    return 2;
+  }
+
+  private stripTypeTokenFromSubtype(subtypeKey: string, normalizedType: string): string {
+    if (!subtypeKey || !normalizedType) return subtypeKey;
+    const tokens = subtypeKey.split('_').filter(Boolean);
+    if (tokens.length <= 1) return subtypeKey;
+
+    const filtered = tokens.filter((token) => token !== normalizedType);
+    if (filtered.length === 0) return subtypeKey;
+    return filtered.join('_');
   }
   
   /**
@@ -242,6 +341,9 @@ export const vehicleKeyService = new VehicleKeyService();
 // Also export individual functions for convenience
 export const generateVehicleKey = (type: string, subtype: string) => 
   vehicleKeyService.generateVehicleKey(type, subtype);
+
+export const generateVehicleKeyCandidates = (type: string, subtype: string) =>
+  vehicleKeyService.generateVehicleKeyCandidates(type, subtype);
 
 export const normalizeVehicleString = (str: string) => 
   vehicleKeyService.normalizeString(str);
