@@ -426,6 +426,16 @@ model Order {
   stateChangedAt DateTime?   @default(now()) // Timestamp of last state transition
 
   // =========================================
+  // DISPATCH OBSERVABILITY (Create/Broadcast lifecycle)
+  // =========================================
+  dispatchState         String   @default("queued") // queued|dispatching|dispatched|dispatch_failed
+  dispatchAttempts      Int      @default(0)
+  dispatchReasonCode    String?
+  onlineCandidatesCount Int      @default(0)
+  notifiedCount         Int      @default(0)
+  lastDispatchAt        DateTime?
+
+  // =========================================
   // CANCELLATION
   // =========================================
   cancelledAt        String?
@@ -457,6 +467,46 @@ model Order {
   @@index([createdAt])          // Recent orders
   @@index([customerId, status]) // Customer's active orders
   @@index([expiresAt])          // Expiring orders cleanup
+  @@index([dispatchState, createdAt])
+}
+
+// =============================================================================
+// ORDER IDEMPOTENCY (DB source of truth for duplicate-safe retries)
+// =============================================================================
+model OrderIdempotency {
+  id             String   @id @default(uuid())
+  customerId     String
+  idempotencyKey String
+  payloadHash    String
+  orderId        String
+  responseJson   Json
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([customerId, idempotencyKey])
+  @@index([customerId, createdAt])
+  @@index([orderId])
+}
+
+// =============================================================================
+// ORDER DISPATCH OUTBOX (durable broadcast replay)
+// =============================================================================
+model OrderDispatchOutbox {
+  id          String   @id @default(uuid())
+  orderId     String   @unique
+  payload     Json
+  status      String   @default("pending") // pending|processing|retrying|dispatched|failed
+  attempts    Int      @default(0)
+  maxAttempts Int      @default(8)
+  nextRetryAt DateTime @default(now())
+  lockedAt    DateTime?
+  processedAt DateTime?
+  lastError   String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([status, nextRetryAt, createdAt])
+  @@index([orderId, status])
 }
 
 // =============================================================================

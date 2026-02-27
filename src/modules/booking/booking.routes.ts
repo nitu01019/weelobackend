@@ -599,7 +599,13 @@ router.get(
           status: details.status,
           remainingSeconds,
           isActive,
-          expiresAt: details.expiresAt
+          expiresAt: details.expiresAt,
+          dispatchState: (details as any).dispatchState || 'queued',
+          dispatchAttempts: Number((details as any).dispatchAttempts || 0),
+          notifiedTransporters: Number((details as any).notifiedCount || 0),
+          onlineCandidates: Number((details as any).onlineCandidatesCount || 0),
+          reasonCode: (details as any).dispatchReasonCode || null,
+          serverTimeMs: Date.now()
         }
       });
     } catch (error) {

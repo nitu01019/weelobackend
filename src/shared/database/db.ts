@@ -221,6 +221,12 @@ export interface OrderRecord {
   
   status: 'created' | 'broadcasting' | 'active' | 'partially_filled' | 'fully_filled' | 'in_progress' | 'completed' | 'cancelled' | 'expired';
   stateChangedAt?: Date | string;
+  dispatchState?: 'queued' | 'dispatching' | 'dispatched' | 'dispatch_failed';
+  dispatchAttempts?: number;
+  dispatchReasonCode?: string | null;
+  onlineCandidatesCount?: number;
+  notifiedCount?: number;
+  lastDispatchAt?: Date | string | null;
 
   cancelledAt?: string;
   cancellationReason?: string;

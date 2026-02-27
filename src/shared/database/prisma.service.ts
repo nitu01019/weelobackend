@@ -150,6 +150,12 @@ export interface OrderRecord {
   weight?: string | null;
   cargoWeightKg?: number | null;
   status: 'active' | 'partially_filled' | 'fully_filled' | 'in_progress' | 'completed' | 'cancelled' | 'expired';
+  dispatchState?: 'queued' | 'dispatching' | 'dispatched' | 'dispatch_failed';
+  dispatchAttempts?: number;
+  dispatchReasonCode?: string | null;
+  onlineCandidatesCount?: number;
+  notifiedCount?: number;
+  lastDispatchAt?: string | null;
   cancelledAt?: string | null;
   cancellationReason?: string | null;
   scheduledAt?: string | null;
@@ -398,6 +404,12 @@ class PrismaDatabaseService {
       pickup: this.parseJsonField<LocationRecord>(order.pickup),
       drop: this.parseJsonField<LocationRecord>(order.drop),
       status: order.status as OrderRecord['status'],
+      dispatchState: (order.dispatchState || 'queued') as OrderRecord['dispatchState'],
+      dispatchAttempts: typeof order.dispatchAttempts === 'number' ? order.dispatchAttempts : 0,
+      dispatchReasonCode: order.dispatchReasonCode || null,
+      onlineCandidatesCount: typeof order.onlineCandidatesCount === 'number' ? order.onlineCandidatesCount : 0,
+      notifiedCount: typeof order.notifiedCount === 'number' ? order.notifiedCount : 0,
+      lastDispatchAt: order.lastDispatchAt ? new Date(order.lastDispatchAt).toISOString() : null,
       createdAt: order.createdAt.toISOString(),
       updatedAt: order.updatedAt.toISOString(),
     };

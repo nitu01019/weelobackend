@@ -307,6 +307,7 @@ export function buildCreateOrderResponseData(
       goodsType: normalized.goodsType ?? null,
       weight: normalized.cargoWeightKg != null ? `${normalized.cargoWeightKg} kg` : null,
       status: 'active',
+      dispatchState: result.dispatchState,
       scheduledAt: normalized.scheduledAt ?? null,
       expiresAt: result.expiresAt,
       expiresIn: result.expiresIn,
@@ -333,7 +334,9 @@ export function buildCreateOrderResponseData(
     })),
     broadcastSummary: {
       totalRequests: result.totalTrucks,
-      totalTransportersNotified: result.truckRequests.reduce((sum, request) => sum + request.matchingTransporters, 0),
+      totalTransportersNotified: result.notifiedTransporters > 0
+        ? result.notifiedTransporters
+        : result.truckRequests.reduce((sum, request) => sum + request.matchingTransporters, 0),
       groupedBy: result.truckRequests.map((request) => ({
         vehicleType: request.vehicleType,
         vehicleSubtype: request.vehicleSubtype,
@@ -341,6 +344,13 @@ export function buildCreateOrderResponseData(
         transportersNotified: request.matchingTransporters
       }))
     },
-    timeoutSeconds: result.expiresIn
+    timeoutSeconds: result.expiresIn,
+    dispatchState: result.dispatchState,
+    dispatchAttempts: result.dispatchAttempts,
+    onlineCandidates: result.onlineCandidates,
+    notifiedTransporters: result.notifiedTransporters,
+    reasonCode: result.reasonCode ?? null,
+    recoveryHint: 'check_active_order',
+    serverTimeMs: result.serverTimeMs
   };
 }

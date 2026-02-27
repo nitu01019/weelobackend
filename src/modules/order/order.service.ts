@@ -57,6 +57,43 @@ const CACHE_TTL = {
 };
 
 const FF_BROADCAST_STRICT_SENT_ACCOUNTING = process.env.FF_BROADCAST_STRICT_SENT_ACCOUNTING !== 'false';
+const FF_DB_STRICT_IDEMPOTENCY = process.env.FF_DB_STRICT_IDEMPOTENCY !== 'false';
+const FF_ORDER_DISPATCH_OUTBOX = process.env.FF_ORDER_DISPATCH_OUTBOX !== 'false';
+const FF_ORDER_DISPATCH_STATUS_EVENTS = process.env.FF_ORDER_DISPATCH_STATUS_EVENTS !== 'false';
+const ORDER_DISPATCH_OUTBOX_POLL_MS = Math.max(500, parseInt(process.env.ORDER_DISPATCH_OUTBOX_POLL_MS || '1500', 10) || 1500);
+const ORDER_DISPATCH_OUTBOX_BATCH_SIZE = Math.max(1, parseInt(process.env.ORDER_DISPATCH_OUTBOX_BATCH_SIZE || '20', 10) || 20);
+
+type OrderDispatchOutboxStatus = 'pending' | 'processing' | 'retrying' | 'dispatched' | 'failed';
+
+interface OrderDispatchOutboxPayload {
+  orderId: string;
+}
+
+interface DispatchAttemptContext {
+  request: CreateOrderRequest;
+  truckRequests: TruckRequestRecord[];
+  expiresAt: string;
+  pickup: { latitude: number; longitude: number; address: string; city?: string; state?: string };
+}
+
+interface DispatchAttemptOutcome {
+  dispatchState: CreateOrderResponse['dispatchState'];
+  reasonCode?: string;
+  onlineCandidates: number;
+  notifiedTransporters: number;
+  dispatchAttempts: number;
+}
+
+interface DispatchOutboxRow {
+  id: string;
+  orderId: string;
+  payload: Prisma.JsonValue;
+  status: string;
+  attempts: number;
+  maxAttempts: number;
+  nextRetryAt: Date;
+  lockedAt: Date | null;
+}
 
 // =============================================================================
 // TYPES
@@ -142,6 +179,12 @@ export interface CreateOrderResponse {
   orderId: string;
   totalTrucks: number;
   totalAmount: number;
+  dispatchState: 'queued' | 'dispatching' | 'dispatched' | 'dispatch_failed';
+  dispatchAttempts: number;
+  onlineCandidates: number;
+  notifiedTransporters: number;
+  reasonCode?: string;
+  serverTimeMs: number;
   truckRequests: {
     id: string;
     vehicleType: string;
@@ -290,6 +333,408 @@ class OrderService {
   private readonly ORDER_EXPIRY_TIMER_PREFIX = 'timer:order-expiry:';
   private readonly ORDER_STEP_TIMER_PREFIX = 'timer:order-broadcast-step:';
   private readonly ORDER_STEP_TIMER_LOCK_PREFIX = 'lock:order-broadcast-step:';
+  private outboxWorkerTimer: NodeJS.Timeout | null = null;
+  private outboxWorkerRunning = false;
+
+  constructor() {
+    if (FF_ORDER_DISPATCH_OUTBOX && process.env.NODE_ENV !== 'test') {
+      this.startDispatchOutboxWorker();
+    }
+  }
+
+  private startDispatchOutboxWorker(): void {
+    if (this.outboxWorkerTimer) return;
+
+    const poll = async (): Promise<void> => {
+      if (this.outboxWorkerRunning) return;
+      this.outboxWorkerRunning = true;
+      try {
+        await this.processDispatchOutboxBatch();
+      } catch (error: any) {
+        logger.error('Order dispatch outbox worker tick failed', {
+          error: error?.message || 'unknown'
+        });
+      } finally {
+        this.outboxWorkerRunning = false;
+      }
+    };
+
+    this.outboxWorkerTimer = setInterval(() => {
+      void poll();
+    }, ORDER_DISPATCH_OUTBOX_POLL_MS);
+    this.outboxWorkerTimer.unref?.();
+    void poll();
+
+    logger.info('Order dispatch outbox worker started', {
+      pollMs: ORDER_DISPATCH_OUTBOX_POLL_MS,
+      batchSize: ORDER_DISPATCH_OUTBOX_BATCH_SIZE
+    });
+  }
+
+  private calculateDispatchRetryDelayMs(attempt: number): number {
+    const cappedAttempt = Math.max(1, attempt);
+    const baseMs = Math.min(60_000, Math.pow(2, cappedAttempt) * 1000);
+    const jitterMs = Math.floor(Math.random() * 750);
+    return baseMs + jitterMs;
+  }
+
+  private parseDispatchOutboxPayload(payload: Prisma.JsonValue): OrderDispatchOutboxPayload | null {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return null;
+    }
+    const raw = payload as Record<string, unknown>;
+    const orderId = typeof raw.orderId === 'string' ? raw.orderId.trim() : '';
+    if (!orderId) return null;
+    return { orderId };
+  }
+
+  private async enqueueOrderDispatchOutbox(orderId: string): Promise<void> {
+    await (prismaClient as any).orderDispatchOutbox.upsert({
+      where: { orderId },
+      update: {
+        payload: { orderId },
+        status: 'pending',
+        nextRetryAt: new Date(),
+        lockedAt: null,
+        processedAt: null,
+        lastError: null
+      },
+      create: {
+        id: uuidv4(),
+        orderId,
+        payload: { orderId },
+        status: 'pending',
+        attempts: 0,
+        maxAttempts: 8,
+        nextRetryAt: new Date()
+      }
+    });
+  }
+
+  private async claimDispatchOutboxByOrderId(orderId: string): Promise<DispatchOutboxRow | null> {
+    const now = new Date();
+    const staleLockBefore = new Date(now.getTime() - 120_000);
+    const claim = await (prismaClient as any).orderDispatchOutbox.updateMany({
+      where: {
+        orderId,
+        status: { in: ['pending', 'retrying'] },
+        nextRetryAt: { lte: now },
+        OR: [{ lockedAt: null }, { lockedAt: { lt: staleLockBefore } }]
+      },
+      data: {
+        status: 'processing',
+        lockedAt: now
+      }
+    });
+    if (claim.count === 0) return null;
+    const row = await (prismaClient as any).orderDispatchOutbox.findUnique({
+      where: { orderId }
+    });
+    return row as DispatchOutboxRow | null;
+  }
+
+  private async claimReadyDispatchOutboxRows(limit: number): Promise<DispatchOutboxRow[]> {
+    const now = new Date();
+    const staleLockBefore = new Date(now.getTime() - 120_000);
+    const candidates = await (prismaClient as any).orderDispatchOutbox.findMany({
+      where: {
+        status: { in: ['pending', 'retrying'] },
+        nextRetryAt: { lte: now },
+        OR: [{ lockedAt: null }, { lockedAt: { lt: staleLockBefore } }]
+      },
+      orderBy: [{ nextRetryAt: 'asc' }, { createdAt: 'asc' }],
+      take: limit
+    });
+
+    const claimed: DispatchOutboxRow[] = [];
+    for (const candidate of candidates) {
+      const claim = await (prismaClient as any).orderDispatchOutbox.updateMany({
+        where: {
+          id: candidate.id,
+          status: { in: ['pending', 'retrying'] },
+          nextRetryAt: { lte: now },
+          OR: [{ lockedAt: null }, { lockedAt: { lt: staleLockBefore } }]
+        },
+        data: {
+          status: 'processing',
+          lockedAt: now
+        }
+      });
+      if (claim.count > 0) {
+        claimed.push({
+          id: candidate.id,
+          orderId: candidate.orderId,
+          payload: candidate.payload as Prisma.JsonValue,
+          status: 'processing',
+          attempts: candidate.attempts,
+          maxAttempts: candidate.maxAttempts,
+          nextRetryAt: candidate.nextRetryAt,
+          lockedAt: now
+        });
+      }
+    }
+
+    return claimed;
+  }
+
+  private async buildDispatchAttemptContext(orderId: string): Promise<{
+    order: OrderRecord;
+    context: DispatchAttemptContext | null;
+  } | null> {
+    const order = await db.getOrderById(orderId);
+    if (!order) return null;
+
+    const activeStatuses = new Set(['created', 'broadcasting', 'active', 'partially_filled']);
+    if (!activeStatuses.has(String(order.status))) {
+      return { order, context: null };
+    }
+
+    const truckRequests = await db.getTruckRequestsByOrder(orderId);
+    const pickup = order.pickup;
+    const requestFromOrder: CreateOrderRequest = {
+      customerId: order.customerId,
+      customerName: order.customerName,
+      customerPhone: order.customerPhone,
+      routePoints: order.routePoints,
+      pickup: order.pickup,
+      drop: order.drop,
+      distanceKm: order.distanceKm,
+      vehicleRequirements: [],
+      goodsType: order.goodsType || undefined,
+      cargoWeightKg: order.cargoWeightKg || undefined
+    };
+
+    return {
+      order,
+      context: {
+        request: requestFromOrder,
+        truckRequests,
+        expiresAt: order.expiresAt,
+        pickup
+      }
+    };
+  }
+
+  private async persistOrderDispatchSnapshot(
+    order: OrderRecord,
+    outcome: DispatchAttemptOutcome
+  ): Promise<void> {
+    await db.updateOrder(order.id, {
+      dispatchState: outcome.dispatchState,
+      dispatchAttempts: outcome.dispatchAttempts,
+      dispatchReasonCode: outcome.reasonCode || null,
+      onlineCandidatesCount: outcome.onlineCandidates,
+      notifiedCount: outcome.notifiedTransporters,
+      lastDispatchAt: new Date()
+    });
+
+    this.emitBroadcastStateChanged(order.customerId, {
+      orderId: order.id,
+      status: order.status,
+      dispatchState: outcome.dispatchState,
+      dispatchAttempts: outcome.dispatchAttempts,
+      reasonCode: outcome.reasonCode,
+      onlineCandidates: outcome.onlineCandidates,
+      notifiedTransporters: outcome.notifiedTransporters,
+      stateChangedAt: new Date().toISOString()
+    });
+  }
+
+  private async processDispatchOutboxRow(
+    row: DispatchOutboxRow,
+    providedContext?: DispatchAttemptContext
+  ): Promise<DispatchAttemptOutcome> {
+    const payload = this.parseDispatchOutboxPayload(row.payload);
+    const resolvedOrderId = payload?.orderId || row.orderId;
+    const attemptNumber = Math.max(1, row.attempts + 1);
+
+    const built = await this.buildDispatchAttemptContext(resolvedOrderId);
+    if (!built) {
+      await (prismaClient as any).orderDispatchOutbox.update({
+        where: { id: row.id },
+        data: {
+          status: 'failed',
+          attempts: attemptNumber,
+          lastError: 'ORDER_NOT_FOUND',
+          processedAt: new Date(),
+          lockedAt: null
+        }
+      });
+      return {
+        dispatchState: 'dispatch_failed',
+        reasonCode: 'ORDER_NOT_FOUND',
+        onlineCandidates: 0,
+        notifiedTransporters: 0,
+        dispatchAttempts: attemptNumber
+      };
+    }
+
+    const order = built.order;
+    const activeStatuses = new Set(['created', 'broadcasting', 'active', 'partially_filled']);
+    if (!activeStatuses.has(String(order.status))) {
+      await (prismaClient as any).orderDispatchOutbox.update({
+        where: { id: row.id },
+        data: {
+          status: 'failed',
+          attempts: attemptNumber,
+          lastError: 'ORDER_INACTIVE',
+          processedAt: new Date(),
+          lockedAt: null
+        }
+      });
+      const outcome: DispatchAttemptOutcome = {
+        dispatchState: 'dispatch_failed',
+        reasonCode: 'ORDER_INACTIVE',
+        onlineCandidates: 0,
+        notifiedTransporters: 0,
+        dispatchAttempts: attemptNumber
+      };
+      await this.persistOrderDispatchSnapshot(order, outcome);
+      return outcome;
+    }
+
+    const context = providedContext || built.context;
+    if (!context) {
+      const outcome: DispatchAttemptOutcome = {
+        dispatchState: 'dispatch_failed',
+        reasonCode: 'ORDER_INACTIVE',
+        onlineCandidates: 0,
+        notifiedTransporters: 0,
+        dispatchAttempts: attemptNumber
+      };
+      await this.persistOrderDispatchSnapshot(order, outcome);
+      return outcome;
+    }
+
+    try {
+      const stats = await this.broadcastToTransporters(
+        order.id,
+        context.request,
+        context.truckRequests,
+        context.expiresAt,
+        context.pickup
+      );
+
+      const noOnlineTransporters = stats.onlineCandidates === 0;
+      const transientDispatchGap = stats.onlineCandidates > 0 && stats.notifiedTransporters === 0;
+      const reasonCode = noOnlineTransporters
+        ? 'NO_ONLINE_TRANSPORTERS'
+        : transientDispatchGap
+          ? 'DISPATCH_RETRYING'
+          : undefined;
+      const dispatchState: CreateOrderResponse['dispatchState'] = stats.notifiedTransporters > 0
+        ? 'dispatched'
+        : 'dispatch_failed';
+
+      const shouldRetry = reasonCode === 'DISPATCH_RETRYING' && attemptNumber < row.maxAttempts;
+      let finalReasonCode = reasonCode;
+      if (shouldRetry) {
+        const delayMs = this.calculateDispatchRetryDelayMs(attemptNumber);
+        await (prismaClient as any).orderDispatchOutbox.update({
+          where: { id: row.id },
+          data: {
+            status: 'retrying',
+            attempts: attemptNumber,
+            nextRetryAt: new Date(Date.now() + delayMs),
+            lastError: 'DISPATCH_RETRYING',
+            lockedAt: null
+          }
+        });
+      } else if (reasonCode === 'DISPATCH_RETRYING') {
+        finalReasonCode = 'DISPATCH_FAILED';
+        await (prismaClient as any).orderDispatchOutbox.update({
+          where: { id: row.id },
+          data: {
+            status: 'failed',
+            attempts: attemptNumber,
+            processedAt: new Date(),
+            lastError: 'DISPATCH_RETRY_EXHAUSTED',
+            lockedAt: null
+          }
+        });
+      } else {
+        await (prismaClient as any).orderDispatchOutbox.update({
+          where: { id: row.id },
+          data: {
+            status: 'dispatched',
+            attempts: attemptNumber,
+            processedAt: new Date(),
+            lastError: null,
+            lockedAt: null
+          }
+        });
+      }
+
+      const outcome: DispatchAttemptOutcome = {
+        dispatchState,
+        reasonCode: finalReasonCode,
+        onlineCandidates: stats.onlineCandidates,
+        notifiedTransporters: stats.notifiedTransporters,
+        dispatchAttempts: attemptNumber
+      };
+      await this.persistOrderDispatchSnapshot(order, outcome);
+      return outcome;
+    } catch (error: any) {
+      const retryable = attemptNumber < row.maxAttempts;
+      const reasonCode = retryable ? 'DISPATCH_RETRYING' : 'DISPATCH_FAILED';
+      const updateData: any = retryable
+        ? {
+            status: 'retrying',
+            attempts: attemptNumber,
+            nextRetryAt: new Date(Date.now() + this.calculateDispatchRetryDelayMs(attemptNumber)),
+            lastError: error?.message || 'DISPATCH_FAILED',
+            lockedAt: null
+          }
+        : {
+            status: 'failed',
+            attempts: attemptNumber,
+            processedAt: new Date(),
+            lastError: error?.message || 'DISPATCH_FAILED',
+            lockedAt: null
+          };
+
+      await (prismaClient as any).orderDispatchOutbox.update({
+        where: { id: row.id },
+        data: updateData
+      });
+
+      const outcome: DispatchAttemptOutcome = {
+        dispatchState: 'dispatch_failed',
+        reasonCode,
+        onlineCandidates: 0,
+        notifiedTransporters: 0,
+        dispatchAttempts: attemptNumber
+      };
+      await this.persistOrderDispatchSnapshot(order, outcome);
+      return outcome;
+    }
+  }
+
+  private async processDispatchOutboxBatch(limit = ORDER_DISPATCH_OUTBOX_BATCH_SIZE): Promise<void> {
+    if (!FF_ORDER_DISPATCH_OUTBOX) return;
+    const rows = await this.claimReadyDispatchOutboxRows(limit);
+    for (const row of rows) {
+      try {
+        await this.processDispatchOutboxRow(row);
+      } catch (error: any) {
+        logger.error('Order dispatch outbox row processing failed', {
+          outboxId: row.id,
+          orderId: row.orderId,
+          error: error?.message || 'unknown'
+        });
+      }
+    }
+  }
+
+  private async processDispatchOutboxImmediately(
+    orderId: string,
+    context: DispatchAttemptContext
+  ): Promise<DispatchAttemptOutcome | null> {
+    if (!FF_ORDER_DISPATCH_OUTBOX) return null;
+    const row = await this.claimDispatchOutboxByOrderId(orderId);
+    if (!row) return null;
+    return this.processDispatchOutboxRow(row, context);
+  }
 
   private orderExpiryTimerKey(orderId: string): string {
     return `${this.ORDER_EXPIRY_TIMER_PREFIX}${orderId}`;
@@ -337,6 +782,89 @@ class OrderService {
       vehicleType: groupKey.slice(0, splitIndex),
       vehicleSubtype: groupKey.slice(splitIndex + 1)
     };
+  }
+
+  private buildRequestPayloadHash(request: CreateOrderRequest): string {
+    const routeFingerprint = (request.routePoints || [])
+      .map((point) => [
+        point.type,
+        Number(point.latitude).toFixed(5),
+        Number(point.longitude).toFixed(5),
+        (point.address || '').trim().toLowerCase()
+      ].join(':'))
+      .join('|');
+    const requirementsFingerprint = request.vehicleRequirements
+      .map((item) => [
+        (item.vehicleType || '').trim().toLowerCase(),
+        (item.vehicleSubtype || '').trim().toLowerCase(),
+        item.quantity,
+        item.pricePerTruck
+      ].join(':'))
+      .sort()
+      .join('|');
+
+    const payload = [
+      request.customerId,
+      routeFingerprint,
+      requirementsFingerprint,
+      Number(request.distanceKm || 0).toFixed(2),
+      (request.goodsType || '').trim().toLowerCase(),
+      request.cargoWeightKg ?? '',
+      request.scheduledAt ?? ''
+    ].join('::');
+
+    return crypto.createHash('sha256').update(payload).digest('hex');
+  }
+
+  private async getDbIdempotentResponse(
+    customerId: string,
+    idempotencyKey: string,
+    payloadHash: string
+  ): Promise<CreateOrderResponse | null> {
+    const row = await prismaClient.orderIdempotency.findUnique({
+      where: { customerId_idempotencyKey: { customerId, idempotencyKey } }
+    });
+    if (!row) return null;
+    if (row.payloadHash !== payloadHash) {
+      if (!FF_DB_STRICT_IDEMPOTENCY) {
+        logger.warn('Idempotency key reused with different payload while strict mode is disabled', {
+          customerId,
+          idempotencyKey: `${idempotencyKey.substring(0, 8)}...`
+        });
+        return null;
+      }
+      throw new AppError(409, 'IDEMPOTENCY_CONFLICT', 'Idempotency key reused with different payload');
+    }
+    return row.responseJson as unknown as CreateOrderResponse;
+  }
+
+  private async persistDbIdempotentResponse(
+    customerId: string,
+    idempotencyKey: string,
+    payloadHash: string,
+    orderId: string,
+    response: CreateOrderResponse
+  ): Promise<void> {
+    try {
+      await prismaClient.orderIdempotency.create({
+        data: {
+          id: uuidv4(),
+          customerId,
+          idempotencyKey,
+          payloadHash,
+          orderId,
+          responseJson: response as unknown as Prisma.InputJsonValue
+        }
+      });
+    } catch (error: any) {
+      if (error?.code !== 'P2002') {
+        throw error;
+      }
+      const existing = await this.getDbIdempotentResponse(customerId, idempotencyKey, payloadHash);
+      if (!existing) {
+        throw new AppError(409, 'IDEMPOTENCY_CONFLICT', 'Idempotency key conflict');
+      }
+    }
   }
 
   // Redis key patterns for distributed timers
@@ -471,6 +999,16 @@ class OrderService {
    * - routePoints are IMMUTABLE after creation
    */
   async createOrder(request: CreateOrderRequest): Promise<CreateOrderResponse> {
+    // Hard server-side validation (defense-in-depth in addition to route schema)
+    if (!Array.isArray(request.vehicleRequirements) || request.vehicleRequirements.length === 0) {
+      throw new AppError(400, 'VALIDATION_ERROR', 'At least one truck requirement is required');
+    }
+    const invalidQuantity = request.vehicleRequirements.find((item) => item.quantity <= 0);
+    if (invalidQuantity) {
+      throw new AppError(400, 'VALIDATION_ERROR', 'Truck quantity must be greater than zero');
+    }
+    const requestPayloadHash = this.buildRequestPayloadHash(request);
+
     // ==========================================================================
     // PER-CUSTOMER ORDER DEBOUNCE (3 second cooldown)
     // ==========================================================================
@@ -522,6 +1060,20 @@ class OrderService {
       } catch (error: any) {
         logger.warn(`⚠️ Idempotency cache error: ${error.message}. Proceeding with order creation.`);
         // Continue with order creation even if cache fails
+      }
+
+      const dbReplay = await this.getDbIdempotentResponse(
+        request.customerId,
+        request.idempotencyKey,
+        requestPayloadHash
+      );
+      if (dbReplay) {
+        logger.info('✅ DB Idempotency HIT: returning stored response', {
+          customerId: request.customerId,
+          idempotencyKey: `${request.idempotencyKey.substring(0, 8)}...`,
+          orderId: dbReplay.orderId
+        });
+        return dbReplay;
       }
     }
 
@@ -585,6 +1137,12 @@ class OrderService {
           orderId: existingDedupeId,
           totalTrucks,
           totalAmount,
+          dispatchState: 'dispatched',
+          dispatchAttempts: 1,
+          onlineCandidates: existingDedupeOrder.onlineCandidatesCount || 0,
+          notifiedTransporters: existingDedupeOrder.notifiedCount || 0,
+          reasonCode: existingDedupeOrder.dispatchReasonCode || undefined,
+          serverTimeMs: Date.now(),
           truckRequests: [],
           expiresAt: existingDedupeOrder.expiresAt,
           expiresIn: 0
@@ -598,6 +1156,9 @@ class OrderService {
 
     // Calculate totals
     const totalTrucks = request.vehicleRequirements.reduce((sum, req) => sum + req.quantity, 0);
+    if (totalTrucks <= 0) {
+      throw new AppError(400, 'VALIDATION_ERROR', 'Total trucks must be greater than zero');
+    }
 
     // ==========================================================================
     // SECURITY: Server-side price validation
@@ -750,6 +1311,12 @@ class OrderService {
       cargoWeightKg: request.cargoWeightKg,
       status: 'created',
       stateChangedAt: new Date(),
+      dispatchState: 'queued',
+      dispatchAttempts: 0,
+      dispatchReasonCode: null,
+      onlineCandidatesCount: 0,
+      notifiedCount: 0,
+      lastDispatchAt: null,
       scheduledAt: request.scheduledAt,
       expiresAt
     };
@@ -769,11 +1336,12 @@ class OrderService {
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
 
     // Emit lifecycle state: created
-    emitToUser(request.customerId, 'broadcast_state_changed', this.withEventMeta({
+    this.emitBroadcastStateChanged(request.customerId, {
       orderId,
       status: 'created',
-      stateChangedAt: new Date().toISOString()
-    }));
+      dispatchState: 'queued',
+      dispatchAttempts: 0
+    });
 
     // 2. Create TruckRequests for each vehicle type
     const truckRequests: TruckRequestRecord[] = [];
@@ -820,35 +1388,96 @@ class OrderService {
     // Batch create all truck requests
     await db.createTruckRequestsBatch(truckRequests);
 
-    // 3. Broadcast to matching transporters (per vehicle type)
-    // IMPORTANT: Wrapped in try-catch - broadcast errors should NEVER fail the order creation!
-    // The order is already created, so even if broadcast fails, customer can still track it
-    try {
-      await this.broadcastToTransporters(orderId, request, truckRequests, expiresAt, pickup);
-    } catch (broadcastError: any) {
-      // Log the error but DON'T throw - order is already created successfully
-      logger.error(`⚠️ Broadcast error (order still created): ${broadcastError.message}`);
-      logger.error(broadcastError.stack);
-    }
+    let dispatchState: CreateOrderResponse['dispatchState'] = 'dispatching';
+    let dispatchReasonCode: string | undefined;
+    let dispatchAttempts = 1;
+    let onlineCandidates = 0;
+    let notifiedTransporters = 0;
 
-    // Transition: created -> broadcasting (transporters have been notified)
-    await db.updateOrder(orderId, { status: 'broadcasting', stateChangedAt: new Date() });
-    emitToUser(request.customerId, 'broadcast_state_changed', this.withEventMeta({
+    // Transition: created -> broadcasting (dispatch in progress)
+    await db.updateOrder(orderId, {
+      status: 'broadcasting',
+      stateChangedAt: new Date(),
+      dispatchState: 'dispatching',
+      dispatchAttempts,
+      dispatchReasonCode: null,
+      lastDispatchAt: new Date()
+    });
+    this.emitBroadcastStateChanged(request.customerId, {
       orderId,
       status: 'broadcasting',
-      stateChangedAt: new Date().toISOString()
-    }));
+      dispatchState: 'dispatching',
+      dispatchAttempts
+    });
+
+    // 3. Dispatch through durable outbox (or fallback direct dispatch when flag disabled)
+    const dispatchContext: DispatchAttemptContext = {
+      request,
+      truckRequests,
+      expiresAt,
+      pickup
+    };
+
+    if (FF_ORDER_DISPATCH_OUTBOX) {
+      await this.enqueueOrderDispatchOutbox(orderId);
+      const immediateOutcome = await this.processDispatchOutboxImmediately(orderId, dispatchContext);
+      if (immediateOutcome) {
+        dispatchState = immediateOutcome.dispatchState;
+        dispatchReasonCode = immediateOutcome.reasonCode;
+        onlineCandidates = immediateOutcome.onlineCandidates;
+        notifiedTransporters = immediateOutcome.notifiedTransporters;
+        dispatchAttempts = immediateOutcome.dispatchAttempts;
+      } else {
+        dispatchState = 'dispatching';
+        dispatchReasonCode = 'DISPATCH_RETRYING';
+        dispatchAttempts = 1;
+      }
+    } else {
+      // IMPORTANT: Wrapped in try-catch - dispatch errors should NEVER fail order creation
+      try {
+        const dispatchStats = await this.broadcastToTransporters(orderId, request, truckRequests, expiresAt, pickup);
+        onlineCandidates = dispatchStats.onlineCandidates;
+        notifiedTransporters = dispatchStats.notifiedTransporters;
+
+        if (notifiedTransporters > 0) {
+          dispatchState = 'dispatched';
+        } else {
+          dispatchState = 'dispatch_failed';
+          dispatchReasonCode = dispatchStats.onlineCandidates === 0
+            ? 'NO_ONLINE_TRANSPORTERS'
+            : 'DISPATCH_RETRYING';
+        }
+      } catch (broadcastError: any) {
+        dispatchState = 'dispatch_failed';
+        dispatchReasonCode = 'DISPATCH_RETRYING';
+        logger.error(`⚠️ Broadcast error (order still created): ${broadcastError.message}`);
+        logger.error(broadcastError.stack);
+      }
+    }
 
     // 4. Set expiry timer
     this.setOrderExpiryTimer(orderId, this.BROADCAST_TIMEOUT_MS);
 
     // Transition: broadcasting -> active (timer started, awaiting responses)
-    await db.updateOrder(orderId, { status: 'active', stateChangedAt: new Date() });
-    emitToUser(request.customerId, 'broadcast_state_changed', this.withEventMeta({
+    await db.updateOrder(orderId, {
+      status: 'active',
+      stateChangedAt: new Date(),
+      dispatchState,
+      dispatchAttempts,
+      dispatchReasonCode: dispatchReasonCode || null,
+      onlineCandidatesCount: onlineCandidates,
+      notifiedCount: notifiedTransporters,
+      lastDispatchAt: new Date()
+    });
+    this.emitBroadcastStateChanged(request.customerId, {
       orderId,
       status: 'active',
-      stateChangedAt: new Date().toISOString()
-    }));
+      dispatchState,
+      dispatchAttempts,
+      reasonCode: dispatchReasonCode,
+      onlineCandidates,
+      notifiedTransporters
+    });
 
     // SCALABILITY: Calculate expiresIn for UI countdown timer
     // EASY UNDERSTANDING: UI always matches backend TTL
@@ -859,6 +1488,12 @@ class OrderService {
       orderId,
       totalTrucks,
       totalAmount,
+      dispatchState,
+      dispatchAttempts,
+      onlineCandidates,
+      notifiedTransporters,
+      reasonCode: dispatchReasonCode,
+      serverTimeMs: Date.now(),
       truckRequests: responseRequests,
       expiresAt,
       expiresIn  // NEW: UI uses this for countdown (backend-driven)
@@ -879,6 +1514,13 @@ class OrderService {
         await redisService.set(cacheKey, JSON.stringify(orderResponse), ttl);
         // Store pointer for cleanup on cancel/expiry
         await redisService.set(`idempotency:order:${request.customerId}:latest`, request.idempotencyKey, ttl);
+        await this.persistDbIdempotentResponse(
+          request.customerId,
+          request.idempotencyKey,
+          requestPayloadHash,
+          orderId,
+          orderResponse
+        );
         logger.info(`Idempotency cached: ${cacheKey.substring(0, 50)}... (TTL: ${ttl}s)`);
       } catch (error: unknown) {
         const message = error instanceof Error ? error.message : String(error);
@@ -920,8 +1562,10 @@ class OrderService {
     truckRequests: TruckRequestRecord[],
     expiresAt: string,
     resolvedPickup: { latitude: number; longitude: number; address: string; city?: string; state?: string }
-  ): Promise<void> {
+  ): Promise<{ onlineCandidates: number; notifiedTransporters: number }> {
     const requestsByType = this.buildRequestsByType(truckRequests);
+    let onlineCandidates = 0;
+    let notifiedTransporters = 0;
 
     for (const [typeKey, requests] of requestsByType) {
       const { vehicleType, vehicleSubtype } = this.parseVehicleGroupKey(typeKey);
@@ -935,6 +1579,7 @@ class OrderService {
         alreadyNotified
       });
       const targetTransporters = stepCandidates.map((candidate) => candidate.transporterId);
+      onlineCandidates += targetTransporters.length;
 
       if (targetTransporters.length > 0) {
         const sendResult = await this.broadcastVehicleTypePayload(
@@ -949,6 +1594,7 @@ class OrderService {
           expiresAt
         );
         await this.markTransportersNotified(orderId, vehicleType, vehicleSubtype, sendResult.sentTransporters);
+        notifiedTransporters += sendResult.sentTransporters.length;
       } else {
         logger.warn(`⚠️ No transporters found for ${vehicleType} (${vehicleSubtype}) in step 10km`);
       }
@@ -957,6 +1603,8 @@ class OrderService {
       // When demand is fulfilled before the timer fires, step processing exits early.
       await this.scheduleNextProgressiveStep(orderId, vehicleType, vehicleSubtype, 1);
     }
+
+    return { onlineCandidates, notifiedTransporters };
   }
 
   private async processProgressiveBroadcastStep(timerData: {
@@ -1395,6 +2043,32 @@ class OrderService {
       eventId: eventId || uuidv4(),
       emittedAt: new Date().toISOString()
     };
+  }
+
+  private emitBroadcastStateChanged(
+    customerId: string,
+    payload: {
+      orderId: string;
+      status: string;
+      dispatchState?: string;
+      dispatchAttempts?: number;
+      reasonCode?: string;
+      onlineCandidates?: number;
+      notifiedTransporters?: number;
+      stateChangedAt?: string;
+    }
+  ): void {
+    if (!FF_ORDER_DISPATCH_STATUS_EVENTS) return;
+    emitToUser(
+      customerId,
+      'broadcast_state_changed',
+      this.withEventMeta({
+        ...payload,
+        eventVersion: 1,
+        serverTimeMs: Date.now(),
+        stateChangedAt: payload.stateChangedAt || new Date().toISOString()
+      })
+    );
   }
 
   private chunkTransporterIds(transporterIds: string[]): string[][] {
@@ -1941,6 +2615,20 @@ class OrderService {
     // 3. Clear customer active broadcast key + idempotency keys
     await this.clearCustomerActiveBroadcast(customerId);
 
+    // 3b. Stop any pending/retrying dispatch outbox jobs for this cancelled order.
+    await (prismaClient as any).orderDispatchOutbox.updateMany({
+      where: {
+        orderId,
+        status: { in: ['pending', 'retrying', 'processing'] }
+      },
+      data: {
+        status: 'failed',
+        processedAt: new Date(),
+        lockedAt: null,
+        lastError: 'ORDER_CANCELLED'
+      }
+    });
+
     // 4. Collect and notify all notified transporters
     const notifiedTransporters = new Set<string>();
     for (const tr of truckRequests) {
@@ -2476,13 +3164,14 @@ class OrderService {
     });
 
     // Lifecycle update whenever order status changes due to accept flow.
-    emitToUser(customerId, 'broadcast_state_changed', {
+    emitToUser(customerId, 'broadcast_state_changed', this.withEventMeta({
       orderId,
       status: newStatus,
-      stateChangedAt: now,
-      eventId: customerEventId,
-      emittedAt: now
-    });
+      dispatchState: 'dispatched',
+      eventVersion: 1,
+      serverTimeMs: Date.now(),
+      stateChangedAt: now
+    }, customerEventId));
 
     if (newStatus === 'fully_filled') {
       const latestAssignment = {

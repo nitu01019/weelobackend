@@ -169,6 +169,13 @@ router.post(
       }
       
       logger.debug(`🔓 Lock acquired for customer ${user.phone}, processing order...`);
+
+      // Extract idempotency key early so route-level active-order guard does not
+      // block safe retries of the same booking attempt.
+      const idempotencyKey = req.headers['x-idempotency-key'] as string | undefined;
+      if (idempotencyKey) {
+        logger.debug(`🔑 Idempotency key received: ${idempotencyKey.substring(0, 8)}...`);
+      }
       
       // =================================================================
       // RULE 1: ONE ACTIVE ORDER PER CUSTOMER
@@ -177,22 +184,24 @@ router.post(
       // EASY UNDERSTANDING: Clear, user-friendly error message
       // SCALABILITY: Auto-expires old orders to prevent blocking
       // =================================================================
-      const activeOrder = await db.getActiveOrderByCustomer(user.userId);
-      if (activeOrder) {
-        logger.warn(`⚠️ Customer ${user.phone} already has active order: ${activeOrder.id}`);
-        res.status(400).json({
-          success: false,
-          error: {
-            code: 'ACTIVE_ORDER_EXISTS',
-            message: 'You already have an active order. Please wait for it to complete or cancel it first.',
-            data: {
-              activeOrderId: activeOrder.id,
-              createdAt: activeOrder.createdAt,
-              status: normalizeOrderStatus(activeOrder.status)
+      if (!idempotencyKey) {
+        const activeOrder = await db.getActiveOrderByCustomer(user.userId);
+        if (activeOrder) {
+          logger.warn(`⚠️ Customer ${user.phone} already has active order: ${activeOrder.id}`);
+          res.status(400).json({
+            success: false,
+            error: {
+              code: 'ACTIVE_ORDER_EXISTS',
+              message: 'You already have an active order. Please wait for it to complete or cancel it first.',
+              data: {
+                activeOrderId: activeOrder.id,
+                createdAt: activeOrder.createdAt,
+                status: normalizeOrderStatus(activeOrder.status)
+              }
             }
-          }
-        });
-        return;
+          });
+          return;
+        }
       }
       
       // =================================================================
@@ -243,12 +252,6 @@ router.post(
         
         const data = validationResult.data;
         const normalizedInput = normalizeCreateOrderInput(data);
-        
-        // Extract idempotency key from header
-        const idempotencyKey = req.headers['x-idempotency-key'] as string | undefined;
-        if (idempotencyKey) {
-          logger.debug(`🔑 Idempotency key received: ${idempotencyKey.substring(0, 8)}...`);
-        }
         
         const orderRequest = toCreateOrderServiceRequest(
           normalizedInput,
@@ -930,7 +933,13 @@ router.get(
           status: normalizedStatus,
           remainingSeconds,
           isActive,
-          expiresAt: order.expiresAt
+          expiresAt: order.expiresAt,
+          dispatchState: (order as any).dispatchState || 'queued',
+          dispatchAttempts: Number((order as any).dispatchAttempts || 0),
+          notifiedTransporters: Number((order as any).notifiedCount || 0),
+          onlineCandidates: Number((order as any).onlineCandidatesCount || 0),
+          reasonCode: (order as any).dispatchReasonCode || null,
+          serverTimeMs: Date.now()
         }
       });
     } catch (error: any) {
