@@ -287,27 +287,26 @@ class TransporterOnlineService {
 
   /**
    * Fallback: Filter transporters via DB `isAvailable` check.
-   * This is the old N+1 pattern — only used when Redis is unavailable.
+   * OPTIMIZED: Single findMany query instead of N+1 getUserById calls.
+   * Only used when Redis is unavailable.
    */
   private async filterOnlineViaDB(transporterIds: string[]): Promise<string[]> {
     try {
-      const results = await Promise.all(
-        transporterIds.map(async (transporterId) => {
-          const transporter = await db.getUserById(transporterId);
-          return {
-            transporterId,
-            isAvailable: transporter && transporter.isAvailable !== false
-          };
-        })
-      );
+      // PERF: Single query with IN clause — uses primary key index
+      const onlineUsers = await prismaClient.user.findMany({
+        where: {
+          id: { in: transporterIds },
+          isAvailable: true
+        },
+        select: { id: true }
+      });
 
-      const filtered = results
-        .filter(t => t.isAvailable)
-        .map(t => t.transporterId);
+      const onlineSet = new Set(onlineUsers.map(u => u.id));
+      const filtered = transporterIds.filter(id => onlineSet.has(id));
 
       const offlineCount = transporterIds.length - filtered.length;
       if (offlineCount > 0) {
-        logger.info(`📡 [TransporterOnline] Filtered ${offlineCount} offline transporters (${filtered.length}/${transporterIds.length} online) [DB fallback]`);
+        logger.info(`📡 [TransporterOnline] Filtered ${offlineCount} offline transporters (${filtered.length}/${transporterIds.length} online) [DB fallback - batched]`);
       }
 
       return filtered;

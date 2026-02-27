@@ -373,6 +373,7 @@ model Booking {
   @@index([vehicleType, vehicleSubtype]) // Matching
   @@index([createdAt])                   // Recent bookings
   @@index([customerId, status])          // Customer's active bookings
+  @@index([status, vehicleType])         // Transporter feed: status + vehicle type filter
 }
 
 // =============================================================================

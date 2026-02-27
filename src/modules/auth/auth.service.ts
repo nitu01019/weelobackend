@@ -40,6 +40,9 @@ import { generateSecureOTP, maskForLogging } from '../../shared/utils/crypto.uti
 import { redisService } from '../../shared/services/redis.service';
 import { smsService } from './sms.service';
 import { otpChallengeService } from './otp-challenge.service';
+import { fcmService } from '../../shared/services/fcm.service';
+import { availabilityService } from '../../shared/services/availability.service';
+import { ONLINE_TRANSPORTERS_SET, TRANSPORTER_PRESENCE_KEY } from '../../shared/services/transporter-online.service';
 
 // =============================================================================
 // REDIS KEY PATTERNS
@@ -419,7 +422,26 @@ class AuthService {
     // Delete the user tokens set
     await redisService.del(userTokensKey);
 
-    logger.info('User logged out', { userId });
+    // Best-effort hard cleanup for logout correctness across app restarts/retries.
+    // Keeps behavior additive and idempotent.
+    const userRole = await db.getUserById(userId)
+      .then((user) => user?.role?.toLowerCase())
+      .catch(() => undefined);
+
+    if (userRole === 'transporter' || userRole === 'driver') {
+      availabilityService.setOffline(userId);
+    }
+
+    const cleanupResults = await Promise.allSettled([
+      fcmService.removeAllTokens(userId),
+      redisService.del(`socket:conncount:${userId}`),
+      redisService.del(`driver:presence:${userId}`),
+      redisService.del(TRANSPORTER_PRESENCE_KEY(userId)),
+      redisService.sRem(ONLINE_TRANSPORTERS_SET, userId)
+    ]);
+    const cleanupFailures = cleanupResults.filter((result) => result.status === 'rejected').length;
+
+    logger.info('User logged out', { userId, cleanupFailures });
   }
 
   /**

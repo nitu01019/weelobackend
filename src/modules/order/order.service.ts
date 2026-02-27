@@ -1965,7 +1965,12 @@ class OrderService {
           body: `Order #${orderId.slice(-8).toUpperCase()} was cancelled by customer`,
           data: {
             type: 'order_cancelled',
-            orderId
+            orderId,
+            broadcastId: orderId,
+            cancelledAt,
+            eventId: cancellationEventId,
+            eventVersion: String(1),
+            serverTimeMs: String(cancellationServerTimeMs)
           }
         }
       ).catch((err: unknown) => {
@@ -1998,7 +2003,12 @@ class OrderService {
         data: {
           type: 'order_cancelled',
           orderId,
-          status: 'cancelled'
+          status: 'cancelled',
+          broadcastId: orderId,
+          cancelledAt,
+          eventId: cancellationEventId,
+          eventVersion: String(1),
+          serverTimeMs: String(cancellationServerTimeMs)
         }
       }
     ).catch((err: unknown) => {

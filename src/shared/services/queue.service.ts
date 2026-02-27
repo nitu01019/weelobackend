@@ -25,6 +25,7 @@ import { EventEmitter } from 'events';
 import { redisService } from './redis.service';
 import { createTrackingStreamSink } from './tracking-stream-sink';
 import { metrics } from '../monitoring/metrics.service';
+import { prismaClient } from '../database/prisma.service';
 
 // =============================================================================
 // TYPES
@@ -59,6 +60,12 @@ export interface TrackingEventPayload {
 
 const TRACKING_QUEUE_HARD_LIMIT = Math.max(1000, parseInt(process.env.TRACKING_QUEUE_HARD_LIMIT || '200000', 10) || 200000);
 const TRACKING_QUEUE_DEPTH_SAMPLE_MS = Math.max(100, parseInt(process.env.TRACKING_QUEUE_DEPTH_SAMPLE_MS || '500', 10) || 500);
+const FF_CANCELLED_ORDER_QUEUE_GUARD = process.env.FF_CANCELLED_ORDER_QUEUE_GUARD !== 'false';
+const FF_CANCELLED_ORDER_QUEUE_GUARD_FAIL_OPEN = process.env.FF_CANCELLED_ORDER_QUEUE_GUARD_FAIL_OPEN === 'true';
+const CANCELLED_ORDER_QUEUE_GUARD_CACHE_TTL_MS = Math.max(
+  250,
+  parseInt(process.env.CANCELLED_ORDER_QUEUE_GUARD_CACHE_TTL_MS || '1500', 10) || 1500
+);
 
 // =============================================================================
 // IN-MEMORY QUEUE (Development / Single Server)
@@ -639,6 +646,11 @@ class QueueService {
   private readonly trackingStreamSink = createTrackingStreamSink();
   private trackingDepthSnapshot: { depth: number; sampledAtMs: number } = { depth: 0, sampledAtMs: 0 };
   private trackingDepthSampleInFlight: Promise<void> | null = null;
+  private readonly cancelledOrderQueueGuardEnabled = FF_CANCELLED_ORDER_QUEUE_GUARD;
+  private readonly cancelledOrderQueueGuardFailOpen = FF_CANCELLED_ORDER_QUEUE_GUARD_FAIL_OPEN;
+  private readonly inactiveOrderStatuses = new Set(['cancelled', 'expired', 'completed', 'fully_filled']);
+  private readonly orderStatusCacheTtlMs = CANCELLED_ORDER_QUEUE_GUARD_CACHE_TTL_MS;
+  private readonly orderStatusCache = new Map<string, { status: string | null; expiresAt: number }>();
 
   // Queue names for organization
   static readonly QUEUES = {
@@ -683,6 +695,136 @@ class QueueService {
     this.queue.process(QueueService.QUEUES.BROADCAST, async (job) => {
       const { emitToUser } = require('./socket.service');
       const { transporterId, event, data } = job.data;
+
+      if (
+        this.cancelledOrderQueueGuardEnabled &&
+        (event === 'new_broadcast' || event === 'new_truck_request')
+      ) {
+        const metric = 'broadcast.queue.drop_inactive';
+        const metricLabelsBase = { event };
+        const orderId = this.resolveBroadcastOrderId(data);
+        if (!orderId) {
+          if (this.cancelledOrderQueueGuardFailOpen) {
+            metrics.incrementCounter('broadcast_queue_guard_fail_open_total', {
+              ...metricLabelsBase,
+              reason: 'missing_order_id'
+            });
+            logger.warn('broadcast.emit.guard_fail_open', {
+              metric,
+              dropReason: 'missing_order_id',
+              transporterId,
+              event
+            });
+            emitToUser(transporterId, event, data);
+            return;
+          }
+          metrics.incrementCounter('broadcast_queue_guard_dropped_total', {
+            ...metricLabelsBase,
+            reason: 'missing_order_id'
+          });
+          logger.warn('broadcast.emit.skipped_inactive', {
+            metric,
+            dropReason: 'missing_order_id',
+            transporterId,
+            event
+          });
+          return;
+        }
+
+        const lookupStartedAt = Date.now();
+        let lookupOutcome: 'active' | 'order_not_found' | 'order_inactive' | 'lookup_error' = 'active';
+        try {
+          const orderStatus = await this.getOrderStatusForQueueGuard(orderId);
+          if (!orderStatus) {
+            lookupOutcome = 'order_not_found';
+            if (this.cancelledOrderQueueGuardFailOpen) {
+              metrics.incrementCounter('broadcast_queue_guard_fail_open_total', {
+                ...metricLabelsBase,
+                reason: 'order_not_found'
+              });
+              logger.warn('broadcast.emit.guard_fail_open', {
+                metric,
+                dropReason: 'order_not_found',
+                transporterId,
+                orderId,
+                event
+              });
+              emitToUser(transporterId, event, data);
+              return;
+            }
+            metrics.incrementCounter('broadcast_queue_guard_dropped_total', {
+              ...metricLabelsBase,
+              reason: 'order_not_found'
+            });
+            logger.warn('broadcast.emit.skipped_inactive', {
+              metric,
+              dropReason: 'order_not_found',
+              transporterId,
+              orderId,
+              event
+            });
+            return;
+          }
+
+          if (this.inactiveOrderStatuses.has(orderStatus)) {
+            lookupOutcome = 'order_inactive';
+            metrics.incrementCounter('broadcast_queue_guard_dropped_total', {
+              ...metricLabelsBase,
+              reason: 'order_inactive'
+            });
+            logger.info('broadcast.emit.skipped_inactive', {
+              metric,
+              dropReason: 'order_inactive',
+              transporterId,
+              orderId,
+              orderStatus,
+              event
+            });
+            return;
+          }
+        } catch (error: any) {
+          lookupOutcome = 'lookup_error';
+          if (this.cancelledOrderQueueGuardFailOpen) {
+            metrics.incrementCounter('broadcast_queue_guard_fail_open_total', {
+              ...metricLabelsBase,
+              reason: 'lookup_error'
+            });
+            logger.warn('broadcast.emit.guard_fail_open', {
+              metric,
+              dropReason: 'lookup_error',
+              transporterId,
+              orderId,
+              event,
+              error: error?.message || 'unknown'
+            });
+            emitToUser(transporterId, event, data);
+            return;
+          }
+          metrics.incrementCounter('broadcast_queue_guard_dropped_total', {
+            ...metricLabelsBase,
+            reason: 'lookup_error'
+          });
+          logger.warn('broadcast.emit.skipped_inactive', {
+            metric,
+            dropReason: 'lookup_error',
+            transporterId,
+            orderId,
+            event,
+            error: error?.message || 'unknown'
+          });
+          return;
+        } finally {
+          metrics.observeHistogram(
+            'broadcast_queue_guard_lookup_latency_ms',
+            Math.max(0, Date.now() - lookupStartedAt),
+            {
+              ...metricLabelsBase,
+              outcome: lookupOutcome
+            }
+          );
+        }
+      }
+
       emitToUser(transporterId, event, data);
     });
 
@@ -700,6 +842,40 @@ class QueueService {
     });
 
     logger.info('📋 Queue processors registered');
+  }
+
+  private resolveBroadcastOrderId(data: any): string {
+    if (!data || typeof data !== 'object') return '';
+    const rawId = data.orderId || data.broadcastId || data.id;
+    return typeof rawId === 'string' ? rawId.trim() : '';
+  }
+
+  private async getOrderStatusForQueueGuard(orderId: string): Promise<string | null> {
+    const now = Date.now();
+    const cached = this.orderStatusCache.get(orderId);
+    if (cached && cached.expiresAt > now) {
+      return cached.status;
+    }
+
+    const order = await prismaClient.order.findUnique({
+      where: { id: orderId },
+      select: { status: true }
+    });
+    const normalizedStatus = typeof order?.status === 'string'
+      ? order.status.toLowerCase()
+      : null;
+
+    this.orderStatusCache.set(orderId, {
+      status: normalizedStatus,
+      expiresAt: now + this.orderStatusCacheTtlMs
+    });
+
+    if (this.orderStatusCache.size > 8000) {
+      const oldestKey = this.orderStatusCache.keys().next().value;
+      if (oldestKey) this.orderStatusCache.delete(oldestKey);
+    }
+
+    return normalizedStatus;
   }
 
   /**

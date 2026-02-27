@@ -30,7 +30,7 @@ import {
   toCreateOrderServiceRequest
 } from '../order/order.contract';
 const router = Router();
-const FF_LEGACY_BOOKING_PROXY_TO_ORDER = process.env.FF_LEGACY_BOOKING_PROXY_TO_ORDER === 'true';
+const FF_LEGACY_BOOKING_PROXY_TO_ORDER = process.env.FF_LEGACY_BOOKING_PROXY_TO_ORDER !== 'false';
 
 /**
  * @route   POST /bookings

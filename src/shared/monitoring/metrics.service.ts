@@ -183,10 +183,32 @@ class MetricsService {
       labels: {}
     });
 
+    this.counters.set('broadcast_queue_guard_dropped_total', {
+      name: 'broadcast_queue_guard_dropped_total',
+      help: 'Total broadcast queue jobs dropped by inactive-order guard',
+      labels: {}
+    });
+
+    this.counters.set('broadcast_queue_guard_fail_open_total', {
+      name: 'broadcast_queue_guard_fail_open_total',
+      help: 'Total broadcast queue jobs emitted via guard fail-open fallback',
+      labels: {}
+    });
+
     this.histograms.set('tracking_stream_batch_size', {
       name: 'tracking_stream_batch_size',
       help: 'Tracking stream publish batch size',
       buckets: [1, 5, 10, 25, 50, 100, 250, 500],
+      values: new Map(),
+      bucketCounts: new Map(),
+      sum: new Map(),
+      count: new Map()
+    });
+
+    this.histograms.set('broadcast_queue_guard_lookup_latency_ms', {
+      name: 'broadcast_queue_guard_lookup_latency_ms',
+      help: 'Broadcast queue guard order-status lookup latency in milliseconds',
+      buckets: this.latencyBuckets,
       values: new Map(),
       bucketCounts: new Map(),
       sum: new Map(),

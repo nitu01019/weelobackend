@@ -67,29 +67,29 @@ function encodeGeohash(lat: number, lng: number, precision: number = 5): string 
   let bit = 0;
   let ch = 0;
   let isLng = true;
-  
+
   while (hash.length < precision) {
     const range = isLng ? lngRange : latRange;
     const val = isLng ? lng : lat;
     const mid = (range[0] + range[1]) / 2;
-    
+
     if (val >= mid) {
       ch |= (1 << (4 - bit));
       range[0] = mid;
     } else {
       range[1] = mid;
     }
-    
+
     isLng = !isLng;
     bit++;
-    
+
     if (bit === 5) {
       hash += BASE32[ch];
       bit = 0;
       ch = 0;
     }
   }
-  
+
   return hash;
 }
 
@@ -109,29 +109,29 @@ function encodeGeohash(lat: number, lng: number, precision: number = 5): string 
  */
 function getNeighbors(geohash: string): string[] {
   if (!geohash || geohash.length === 0) return [geohash];
-  
+
   const neighbors: string[] = [geohash]; // Center
-  
+
   // Simplified but effective neighbor calculation
   // Uses last character variation for adjacent cells
   const lastChar = geohash[geohash.length - 1];
   const prefix = geohash.slice(0, -1);
   const idx = BASE32.indexOf(lastChar);
-  
+
   // Direct neighbors (N, S, E, W)
   if (idx > 0) neighbors.push(prefix + BASE32[idx - 1]);
   if (idx < 31) neighbors.push(prefix + BASE32[idx + 1]);
-  
+
   // Row-based neighbors (using 8-column layout of geohash)
   if (idx >= 8) neighbors.push(prefix + BASE32[idx - 8]);
   if (idx <= 23) neighbors.push(prefix + BASE32[idx + 8]);
-  
+
   // Diagonal neighbors
   if (idx > 0 && idx >= 8) neighbors.push(prefix + BASE32[idx - 9]);
   if (idx < 31 && idx >= 8) neighbors.push(prefix + BASE32[idx - 7]);
   if (idx > 0 && idx <= 23) neighbors.push(prefix + BASE32[idx + 7]);
   if (idx < 31 && idx <= 23) neighbors.push(prefix + BASE32[idx + 9]);
-  
+
   // Filter valid and unique
   return [...new Set(neighbors.filter(n => n && n.length === geohash.length))];
 }
@@ -143,16 +143,16 @@ function getNeighbors(geohash: string): string[] {
 const REDIS_KEYS = {
   /** Geospatial index: geo:drivers:{vehicleKey} */
   GEO_DRIVERS: (vehicleKey: string) => `geo:drivers:${vehicleKey}`,
-  
+
   /** Driver details hash: driver:details:{transporterId} */
   DRIVER_DETAILS: (transporterId: string) => `driver:details:${transporterId}`,
-  
+
   /** Driver's current vehicle key: driver:vehicle:{transporterId} */
   DRIVER_VEHICLE: (transporterId: string) => `driver:vehicle:${transporterId}`,
 
   /** Driver's indexed vehicle keys set: driver:vehicle:keys:{transporterId} */
   DRIVER_VEHICLE_KEYS: (transporterId: string) => `driver:vehicle:keys:${transporterId}`,
-  
+
   /** All online drivers set: online:drivers */
   ONLINE_DRIVERS: 'online:drivers',
 };
@@ -193,13 +193,13 @@ interface NearbyDriver {
 // =============================================================================
 
 class AvailabilityService {
-  
+
   /** TTL for driver details (60 seconds - auto-offline if no heartbeat) */
   private readonly DRIVER_TTL_SECONDS = 60;
-  
+
   /** Heartbeat interval recommendation for clients */
   readonly HEARTBEAT_INTERVAL_MS = 5 * 1000;
-  
+
   /** Default search radius in km */
   private readonly DEFAULT_SEARCH_RADIUS_KM = 50;
 
@@ -216,15 +216,15 @@ class AvailabilityService {
     10
   );
   private readonly geoFallbackLastRunMs = new Map<string, number>();
-  
+
   constructor() {
     logger.info('[Availability] Redis-powered service initialized');
   }
-  
+
   // ===========================================================================
   // MAIN API
   // ===========================================================================
-  
+
   /**
    * Update driver/transporter availability
    * 
@@ -249,7 +249,7 @@ class AvailabilityService {
       logger.error(`[Availability] Update failed: ${err.message}`);
     });
   }
-  
+
   /**
    * Async version of updateAvailability
    */
@@ -271,9 +271,9 @@ class AvailabilityService {
       longitude,
       isOnTrip = false
     } = data;
-    
+
     const now = Date.now();
-    
+
     try {
       // 1. Get previously indexed vehicle keys.
       const previousVehicleKey = await redisService.get(
@@ -282,7 +282,7 @@ class AvailabilityService {
       const previousVehicleKeys = await redisService.sMembers(
         REDIS_KEYS.DRIVER_VEHICLE_KEYS(transporterId)
       ).catch(() => []);
-      
+
       // 2. If vehicle changed, remove stale geo index entries.
       const staleVehicleKeys = new Set(previousVehicleKeys);
       if (previousVehicleKey) staleVehicleKeys.add(previousVehicleKey);
@@ -293,7 +293,7 @@ class AvailabilityService {
           transporterId
         );
       }
-      
+
       // 3. Store driver details (with TTL for auto-cleanup)
       const details: Record<string, string> = {
         transporterId,
@@ -304,14 +304,14 @@ class AvailabilityService {
         lastSeen: now.toString(),
         isOnTrip: isOnTrip.toString(),
       };
-      
+
       if (driverId) {
         details.driverId = driverId;
       }
-      
+
       await redisService.hMSet(REDIS_KEYS.DRIVER_DETAILS(transporterId), details);
       await redisService.expire(REDIS_KEYS.DRIVER_DETAILS(transporterId), this.DRIVER_TTL_SECONDS);
-      
+
       // 4. Store current vehicle key
       await redisService.set(
         REDIS_KEYS.DRIVER_VEHICLE(transporterId),
@@ -321,7 +321,7 @@ class AvailabilityService {
       await redisService.del(REDIS_KEYS.DRIVER_VEHICLE_KEYS(transporterId));
       await redisService.sAdd(REDIS_KEYS.DRIVER_VEHICLE_KEYS(transporterId), vehicleKey);
       await redisService.expire(REDIS_KEYS.DRIVER_VEHICLE_KEYS(transporterId), this.DRIVER_TTL_SECONDS);
-      
+
       // 5. Update geo index (only if NOT on trip)
       if (!isOnTrip) {
         await redisService.geoAdd(
@@ -330,19 +330,19 @@ class AvailabilityService {
           latitude,
           transporterId
         );
-        
+
         await redisService.sAdd(REDIS_KEYS.ONLINE_DRIVERS, transporterId);
-        
+
         logger.debug(`[Availability] Updated: ${transporterId} @ (${latitude}, ${longitude}) - ${vehicleKey}`);
       } else {
         await redisService.geoRemove(
           REDIS_KEYS.GEO_DRIVERS(vehicleKey),
           transporterId
         );
-        
+
         logger.debug(`[Availability] ${transporterId} on trip - removed from geo index`);
       }
-      
+
     } catch (error: any) {
       logger.error(`[Availability] updateAvailabilityAsync failed: ${error.message}`);
       throw error;
@@ -440,7 +440,7 @@ class AvailabilityService {
 
     logger.debug(`[Availability] Updated multi-vehicle index: ${transporterId} keys=${currentVehicleKeys.length}`);
   }
-  
+
   /**
    * Mark driver as offline (remove from availability)
    * 
@@ -455,7 +455,7 @@ class AvailabilityService {
       logger.error(`[Availability] setOffline failed: ${err.message}`);
     });
   }
-  
+
   /**
    * Async version of setOffline
    */
@@ -468,7 +468,7 @@ class AvailabilityService {
       const vehicleKeys = await redisService.sMembers(
         REDIS_KEYS.DRIVER_VEHICLE_KEYS(transporterId)
       ).catch(() => []);
-      
+
       // 2. Remove from geo index
       if (vehicleKey) {
         await redisService.geoRemove(
@@ -483,22 +483,22 @@ class AvailabilityService {
           transporterId
         );
       }
-      
+
       // 3. Remove from online set
       await redisService.sRem(REDIS_KEYS.ONLINE_DRIVERS, transporterId);
-      
+
       // 4. Delete driver details
       await redisService.del(REDIS_KEYS.DRIVER_DETAILS(transporterId));
       await redisService.del(REDIS_KEYS.DRIVER_VEHICLE(transporterId));
       await redisService.del(REDIS_KEYS.DRIVER_VEHICLE_KEYS(transporterId));
-      
+
       logger.info(`[Availability] Offline: ${transporterId}`);
-      
+
     } catch (error: any) {
       logger.error(`[Availability] setOfflineAsync failed: ${error.message}`);
     }
   }
-  
+
   /**
    * Get available transporters by vehicle key and location
    * 
@@ -523,7 +523,7 @@ class AvailabilityService {
     // But Redis is async, so we return empty and log warning
     // Use getAvailableTransportersAsync for proper async usage
     logger.warn('[Availability] getAvailableTransporters called synchronously - use getAvailableTransportersAsync instead');
-    
+
     // Trigger async version in background
     this.getAvailableTransportersAsync(vehicleKey, latitude, longitude, limit)
       .then(results => {
@@ -532,10 +532,10 @@ class AvailabilityService {
       .catch(err => {
         logger.error(`[Availability] Async search failed: ${err.message}`);
       });
-    
+
     return [];
   }
-  
+
   /**
    * Async version - USE THIS for proper Redis-powered searches
    */
@@ -587,10 +587,10 @@ class AvailabilityService {
           distance: driver.distance || 0
         });
       }
-      
+
       // Already sorted by distance from GEORADIUS
       const result = validDrivers.slice(0, limit).map(d => d.id);
-      
+
       logger.info(`[Availability] Found ${result.length} available for ${vehicleKey} within ${radiusKm}km of (${latitude}, ${longitude})`);
       logger.info('[Availability] matching.source=redis_geo', {
         matchingSource: 'redis_geo',
@@ -599,15 +599,15 @@ class AvailabilityService {
         candidates: nearbyDrivers.length,
         matched: result.length
       });
-      
+
       return result;
-      
+
     } catch (error: any) {
       logger.error(`[Availability] getAvailableTransportersAsync failed: ${error.message}`);
       return [];
     }
   }
-  
+
   /**
    * Get available transporters with full details
    */
@@ -661,7 +661,7 @@ class AvailabilityService {
         candidates: nearbyDrivers.length,
         matched: result.length
       });
-      
+
       return result;
 
     } catch (error: any) {
@@ -801,7 +801,7 @@ class AvailabilityService {
     });
     return detailsMap;
   }
-  
+
   /**
    * Get available transporters for MULTIPLE vehicle keys
    * Used when a booking has multiple vehicle types
@@ -822,7 +822,7 @@ class AvailabilityService {
     logger.warn('[Availability] getAvailableTransportersMulti called synchronously - use async version');
     return new Map();
   }
-  
+
   /**
    * Async version for multiple vehicle keys
    */
@@ -833,7 +833,7 @@ class AvailabilityService {
     limitPerType: number = 20
   ): Promise<Map<string, string[]>> {
     const result = new Map<string, string[]>();
-    
+
     // Run searches in parallel for better performance
     const searches = vehicleKeys.map(async (vehicleKey) => {
       const transporters = await this.getAvailableTransportersAsync(
@@ -841,16 +841,16 @@ class AvailabilityService {
       );
       return { vehicleKey, transporters };
     });
-    
+
     const results = await Promise.all(searches);
-    
+
     for (const { vehicleKey, transporters } of results) {
       result.set(vehicleKey, transporters);
     }
-    
+
     return result;
   }
-  
+
   /**
    * Check if a specific transporter is available
    */
@@ -859,7 +859,7 @@ class AvailabilityService {
     logger.warn('[Availability] isAvailable called synchronously - use isAvailableAsync');
     return false;
   }
-  
+
   /**
    * Async version of isAvailable
    */
@@ -868,18 +868,18 @@ class AvailabilityService {
       const details = await redisService.hGetAll(
         REDIS_KEYS.DRIVER_DETAILS(transporterId)
       );
-      
+
       if (!details || Object.keys(details).length === 0) {
         return false;
       }
-      
+
       return details.isOnTrip !== 'true';
-      
+
     } catch (error) {
       return false;
     }
   }
-  
+
   /**
    * Get driver details
    */
@@ -888,11 +888,11 @@ class AvailabilityService {
       const details = await redisService.hGetAll(
         REDIS_KEYS.DRIVER_DETAILS(transporterId)
       );
-      
+
       if (!details || Object.keys(details).length === 0) {
         return null;
       }
-      
+
       return {
         transporterId: details.transporterId,
         driverId: details.driverId,
@@ -903,12 +903,12 @@ class AvailabilityService {
         lastSeen: parseInt(details.lastSeen, 10),
         isOnTrip: details.isOnTrip === 'true'
       };
-      
+
     } catch (error) {
       return null;
     }
   }
-  
+
   /**
    * Get availability statistics
    */
@@ -916,7 +916,7 @@ class AvailabilityService {
     // Sync version - returns empty stats
     return { totalOnline: 0, byVehicleType: {}, byGeohash: {}, redisMode: true };
   }
-  
+
   /**
    * Async version of getStats
    */
@@ -925,39 +925,43 @@ class AvailabilityService {
       const totalOnline = await redisService.sCard(REDIS_KEYS.ONLINE_DRIVERS);
       const byVehicleType: Record<string, number> = {};
       const byGeohash: Record<string, number> = {};
-      
-      // Get breakdown by vehicle type
+
+      // Get breakdown by vehicle type (BATCHED — single pipeline instead of N GETs)
       const onlineDrivers = await redisService.sMembers(REDIS_KEYS.ONLINE_DRIVERS);
-      
-      for (const driverId of onlineDrivers.slice(0, 1000)) {
-        const vehicleKey = await redisService.get(REDIS_KEYS.DRIVER_VEHICLE(driverId));
-        if (vehicleKey) {
-          byVehicleType[vehicleKey] = (byVehicleType[vehicleKey] || 0) + 1;
+      const driverSlice = onlineDrivers.slice(0, 1000);
+
+      if (driverSlice.length > 0) {
+        const detailsMap = await this.loadDriverDetailsMap(driverSlice);
+        for (const [, details] of detailsMap.entries()) {
+          const vehicleKey = details.vehicleKey;
+          if (vehicleKey) {
+            byVehicleType[vehicleKey] = (byVehicleType[vehicleKey] || 0) + 1;
+          }
         }
       }
-      
+
       return {
         totalOnline,
         byVehicleType,
         byGeohash,
         redisMode: redisService.isRedisEnabled()
       };
-      
+
     } catch (error: any) {
       logger.error(`[Availability] getStatsAsync failed: ${error.message}`);
       return { totalOnline: 0, byVehicleType: {}, byGeohash: {}, redisMode: false };
     }
   }
-  
+
   /**
    * Health check
    */
   async healthCheck(): Promise<{ healthy: boolean; mode: string; latencyMs: number }> {
     const start = Date.now();
-    
+
     try {
       await redisService.sCard(REDIS_KEYS.ONLINE_DRIVERS);
-      
+
       return {
         healthy: true,
         mode: redisService.isRedisEnabled() ? 'redis' : 'memory',
@@ -971,7 +975,7 @@ class AvailabilityService {
       };
     }
   }
-  
+
   /**
    * Stop the service (for graceful shutdown)
    * Note: No cleanup interval needed with Redis - TTL handles expiration

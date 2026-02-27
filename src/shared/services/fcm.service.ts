@@ -205,6 +205,27 @@ class FCMService {
   }
 
   /**
+   * Remove all FCM tokens for a user (logout hard cleanup).
+   *
+   * Keeps backward compatibility with token-specific unregister while allowing
+   * server-side fail-safe cleanup when client logout sequence is interrupted.
+   */
+  async removeAllTokens(userId: string): Promise<void> {
+    if (this.isRedisAvailable()) {
+      try {
+        await redisService.del(FCM_TOKEN_KEY(userId));
+        logger.info(`FCM: All tokens removed for user ${userId} [Redis]`);
+        return;
+      } catch (error: any) {
+        logger.warn(`FCM: Redis removeAllTokens failed: ${error.message}. Using fallback.`);
+      }
+    }
+
+    userTokensFallback.delete(userId);
+    logger.info(`FCM: All tokens removed for user ${userId} [InMemory]`);
+  }
+
+  /**
    * Get all tokens for a user
    * 
    * SCALABILITY: Uses Redis SMEMBERS — returns all set members, O(N)

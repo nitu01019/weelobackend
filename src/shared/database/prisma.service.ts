@@ -252,8 +252,8 @@ function getPrismaClient(): PrismaClient {
     const pooledUrl = `${databaseUrl}${separator}connection_limit=${DB_POOL_CONFIG.connectionLimit}&pool_timeout=${DB_POOL_CONFIG.poolTimeout}`;
 
     prisma = new PrismaClient({
-      log: process.env.NODE_ENV === 'development' 
-        ? ['query', 'error', 'warn'] 
+      log: process.env.NODE_ENV === 'development'
+        ? ['query', 'error', 'warn']
         : ['error', 'warn'],
       datasources: {
         db: {
@@ -587,7 +587,7 @@ class PrismaDatabaseService {
       if (vehicleSubtype) {
         whereClause.vehicleSubtype = { mode: 'insensitive' as const, equals: vehicleSubtype };
       }
-      
+
       vehicles = await this.prisma.vehicle.findMany({
         where: whereClause,
         select: { transporterId: true }
@@ -689,7 +689,7 @@ class PrismaDatabaseService {
       select: { bookingId: true }
     });
     const bookingIds = assignments.map(a => a.bookingId).filter(Boolean) as string[];
-    
+
     const bookings = await this.prisma.booking.findMany({
       where: { id: { in: bookingIds } }
     });
@@ -778,10 +778,10 @@ class PrismaDatabaseService {
    */
   async getActiveOrderByCustomer(customerId: string): Promise<OrderRecord | undefined> {
     const now = new Date();
-    
+
     logger.info(`🔍 [getActiveOrderByCustomer] Checking for active order for customer: ${customerId}`);
     logger.info(`🕐 [getActiveOrderByCustomer] Current time: ${now.toISOString()}`);
-    
+
     // CRITICAL FIX: Query expired orders separately and update them first
     const expiredOrders = await this.prisma.order.findMany({
       where: {
@@ -790,33 +790,30 @@ class PrismaDatabaseService {
         expiresAt: { lte: now.toISOString() } // Orders that have expired
       }
     });
-    
-    // Auto-expire any found expired orders
+
+    // Auto-expire any found expired orders (BATCHED — 2 queries instead of 2N)
     if (expiredOrders.length > 0) {
-      logger.info(`🔄 [getActiveOrderByCustomer] Found ${expiredOrders.length} expired orders, updating...`);
-      
-      for (const expiredOrder of expiredOrders) {
-        logger.info(`   Expiring order: ${expiredOrder.id} (expired at: ${expiredOrder.expiresAt})`);
-        
-        // Update order status to expired
-        await this.prisma.order.update({
-          where: { id: expiredOrder.id },
-          data: { status: 'expired' }
-        });
-        
-        // Expire all unfilled truck requests
-        await this.prisma.truckRequest.updateMany({
-          where: {
-            orderId: expiredOrder.id,
-            status: { in: ['searching', 'held'] }
-          },
-          data: { status: 'expired' }
-        });
-      }
-      
-      logger.info(`✅ [getActiveOrderByCustomer] Expired ${expiredOrders.length} orders`);
+      const expiredIds = expiredOrders.map(o => o.id);
+      logger.info(`🔄 [getActiveOrderByCustomer] Batch-expiring ${expiredOrders.length} orders: ${expiredIds.join(', ')}`);
+
+      // Batch 1: Expire all orders in one query
+      await this.prisma.order.updateMany({
+        where: { id: { in: expiredIds } },
+        data: { status: 'expired' }
+      });
+
+      // Batch 2: Expire all unfilled truck requests in one query
+      await this.prisma.truckRequest.updateMany({
+        where: {
+          orderId: { in: expiredIds },
+          status: { in: ['searching', 'held'] }
+        },
+        data: { status: 'expired' }
+      });
+
+      logger.info(`✅ [getActiveOrderByCustomer] Expired ${expiredOrders.length} orders (batched)`);
     }
-    
+
     // Now find truly active orders (not expired, not cancelled, not completed)
     const activeOrder = await this.prisma.order.findFirst({
       where: {
@@ -828,12 +825,12 @@ class PrismaDatabaseService {
         createdAt: 'desc'
       }
     });
-    
+
     if (!activeOrder) {
       logger.info(`✅ [getActiveOrderByCustomer] No active order found for customer: ${customerId}`);
       return undefined;
     }
-    
+
     logger.warn(`⚠️  [getActiveOrderByCustomer] Active order found: ${activeOrder.id}, expires at: ${activeOrder.expiresAt}`);
     return this.toOrderRecord(activeOrder);
   }
@@ -866,7 +863,7 @@ class PrismaDatabaseService {
         expiresAt: { gt: now.toISOString() }
       }
     });
-    
+
     return orders
       .map(o => this.toOrderRecord(o))
       .filter(o => o.trucksFilled < o.totalTrucks);
@@ -918,7 +915,7 @@ class PrismaDatabaseService {
    */
   async createTruckRequestsBatch(requests: Omit<TruckRequestRecord, 'createdAt' | 'updatedAt'>[]): Promise<TruckRequestRecord[]> {
     if (requests.length === 0) return [];
-    
+
     // Batch INSERT — single round-trip
     await this.prisma.truckRequest.createMany({
       data: requests.map(request => ({
@@ -944,13 +941,13 @@ class PrismaDatabaseService {
       })),
       skipDuplicates: true,
     });
-    
+
     // Fetch the created records (createMany doesn't return them)
     const ids = requests.map(r => r.id);
     const created = await this.prisma.truckRequest.findMany({
       where: { id: { in: ids } }
     });
-    
+
     logger.info(`TruckRequests batch created: ${created.length} requests (single round-trip)`);
     return created.map(r => this.toTruckRequestRecord(r));
   }
@@ -997,18 +994,24 @@ class PrismaDatabaseService {
       });
     }
 
+    // PERF: Use GIN index on notifiedTransporters instead of in-memory filter
     const vehicleKeys = new Set(activeVehiclePairs.map(pair => `${pair.vehicleType}_${pair.vehicleSubtype}`));
+    const vehicleTypes = activeVehiclePairs.map(pair => pair.vehicleType);
+    const vehicleSubtypes = activeVehiclePairs.map(pair => pair.vehicleSubtype);
     const requests = await this.prisma.truckRequest.findMany({
-      where: { status: 'searching' },
+      where: {
+        status: 'searching',
+        notifiedTransporters: { has: transporterId },
+        vehicleType: { in: vehicleTypes },
+      },
       orderBy: { createdAt: 'desc' },
-      take: 500
+      take: 200
     });
 
     return requests
       .filter(request => {
         const requestKey = `${this.normalizeVehicleString(request.vehicleType)}_${this.normalizeVehicleString(request.vehicleSubtype)}`;
-        if (!vehicleKeys.has(requestKey)) return false;
-        return (request.notifiedTransporters || []).includes(transporterId);
+        return vehicleKeys.has(requestKey);
       })
       .map(request => this.toTruckRequestRecord(request));
   }
@@ -1088,21 +1091,21 @@ class PrismaDatabaseService {
    */
   async updateTruckRequestsBatch(ids: string[], updates: Partial<TruckRequestRecord>): Promise<number> {
     if (ids.length === 0) return 0;
-    
+
     // Build Prisma-compatible update data
     const { createdAt, updatedAt, heldBy, assignedTo, ...data } = updates as any;
     const prismaData: any = { ...data };
-    
+
     // Map legacy field names to Prisma field names
     if (heldBy !== undefined) prismaData.heldById = heldBy;
     if (assignedTo !== undefined) prismaData.assignedTransporterId = assignedTo;
     if (prismaData.status) prismaData.status = prismaData.status as TruckRequestStatus;
-    
+
     const result = await this.prisma.truckRequest.updateMany({
       where: { id: { in: ids } },
       data: prismaData,
     });
-    
+
     return result.count;
   }
 
@@ -1224,7 +1227,7 @@ class PrismaDatabaseService {
     vehicleSubtype?: string
   ): Promise<{ totalOwned: number; available: number; inTransit: number; maintenance: number }> {
     const vehicles = await this.getVehiclesByTransporter(transporterId);
-    
+
     const matchingVehicles = vehicles.filter(v => {
       if (!v.isActive) return false;
       if (!this.vehicleStringsMatch(v.vehicleType, vehicleType)) return false;
@@ -1264,7 +1267,7 @@ class PrismaDatabaseService {
     const normalizedKey = vehicleSubtype
       ? `${this.normalizeVehicleString(vehicleType)}_${this.normalizeVehicleString(vehicleSubtype)}`
       : null;
-    
+
     // Try vehicleKey first (indexed), fallback to type+subtype
     let matchingVehicles;
     if (normalizedKey) {
@@ -1273,8 +1276,10 @@ class PrismaDatabaseService {
           isActive: true,
           OR: [
             { vehicleKey: normalizedKey },
-            { vehicleType: { mode: 'insensitive' as const, equals: vehicleType }, 
-              vehicleSubtype: { mode: 'insensitive' as const, equals: vehicleSubtype! } }
+            {
+              vehicleType: { mode: 'insensitive' as const, equals: vehicleType },
+              vehicleSubtype: { mode: 'insensitive' as const, equals: vehicleSubtype! }
+            }
           ]
         },
         select: { transporterId: true, status: true }
@@ -1291,7 +1296,7 @@ class PrismaDatabaseService {
 
     // Group by transporter
     const transporterMap = new Map<string, { available: number; inTransit: number; total: number }>();
-    
+
     for (const vehicle of matchingVehicles) {
       if (!transporterMap.has(vehicle.transporterId)) {
         transporterMap.set(vehicle.transporterId, { available: 0, inTransit: 0, total: 0 });
@@ -1308,7 +1313,7 @@ class PrismaDatabaseService {
       where: { id: { in: transporterIds } },
       select: { id: true, name: true, businessName: true }
     });
-    
+
     // Create name lookup map
     const nameMap = new Map(
       transporters.map(t => [t.id, t.businessName || t.name || 'Unknown'])
