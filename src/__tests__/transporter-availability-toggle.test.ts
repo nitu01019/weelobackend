@@ -47,11 +47,13 @@ jest.mock('../shared/services/logger.service', () => ({
 // Mock prismaClient for DB operations
 const mockPrismaUpdate = jest.fn().mockResolvedValue({});
 const mockPrismaFindUnique = jest.fn();
+const mockPrismaFindMany = jest.fn().mockResolvedValue([]);
 jest.mock('../shared/database/prisma.service', () => ({
   prismaClient: {
     user: {
       update: (...args: any[]) => mockPrismaUpdate(...args),
       findUnique: (...args: any[]) => mockPrismaFindUnique(...args),
+      findMany: (...args: any[]) => mockPrismaFindMany(...args),
     },
   },
 }));
@@ -135,7 +137,9 @@ beforeEach(async () => {
   mockGetUserById.mockReset();
   mockPrismaUpdate.mockReset();
   mockPrismaFindUnique.mockReset();
+  mockPrismaFindMany.mockReset();
   mockPrismaUpdate.mockResolvedValue({});
+  mockPrismaFindMany.mockResolvedValue([]);
 });
 
 afterEach(async () => {
@@ -533,13 +537,13 @@ describe('Phase 3: Broadcast Optimization — Online Filtering', () => {
     });
 
     it('should return empty array when no transporters are online', async () => {
-      // DB fallback mock — all offline
-      mockGetUserById.mockResolvedValue({ isAvailable: false });
+      // DB fallback mock — no online users returned by findMany
+      mockPrismaFindMany.mockResolvedValue([]);
 
       const input = [TRANSPORTER_ID_1, TRANSPORTER_ID_2];
       const result = await transporterOnlineService.filterOnline(input);
 
-      // Redis set is empty → falls back to DB → all isAvailable=false → empty
+      // Redis set is empty → falls back to DB → findMany returns [] → empty
       expect(result).toHaveLength(0);
     });
 
@@ -757,11 +761,12 @@ describe('Edge Cases: Comprehensive Scenarios', () => {
 
     it('filterOnline should fall back to DB when Redis set is empty (Redis restart scenario)', async () => {
       // Redis set is empty (simulates Redis restart — set not rebuilt yet)
-      // DB fallback should be used
-      mockGetUserById
-        .mockResolvedValueOnce({ isAvailable: true })  // ID_1 online in DB
-        .mockResolvedValueOnce({ isAvailable: false })  // ID_2 offline in DB
-        .mockResolvedValueOnce({ isAvailable: true });  // ID_3 online in DB
+      // DB fallback uses findMany — returns only isAvailable=true users
+      mockPrismaFindMany.mockResolvedValue([
+        { id: TRANSPORTER_ID_1 },  // ID_1 online in DB
+        // ID_2 offline in DB (not returned by findMany)
+        { id: TRANSPORTER_ID_3 },  // ID_3 online in DB
+      ]);
 
       const input = [TRANSPORTER_ID_1, TRANSPORTER_ID_2, TRANSPORTER_ID_3];
       const result = await transporterOnlineService.filterOnline(input);
