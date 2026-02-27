@@ -222,7 +222,7 @@ const REDIS_KEYS = {
  * - Survives server restarts
  */
 class HoldStore {
-  
+
   /**
    * Add a new hold with distributed lock
    * Uses Redis SETNX for atomic "hold or fail" semantics
@@ -233,7 +233,7 @@ class HoldStore {
       // Sort IDs to prevent deadlocks when concurrent requests lock same trucks in different orders
       const sortedTruckIds = [...hold.truckRequestIds].sort();
       const lockResults: boolean[] = [];
-      
+
       for (const truckId of sortedTruckIds) {
         const lockKey = REDIS_KEYS.TRUCK_LOCK(truckId);
         const lockResult = await redisService.acquireLock(
@@ -242,7 +242,7 @@ class HoldStore {
           CONFIG.HOLD_DURATION_SECONDS
         );
         lockResults.push(lockResult.acquired);
-        
+
         if (!lockResult.acquired) {
           // Someone else got this truck - release any locks we got (in same sorted order)
           for (let i = 0; i < lockResults.length - 1; i++) {
@@ -259,37 +259,37 @@ class HoldStore {
           return false;
         }
       }
-      
+
       // 2. All locks acquired - store hold data
       const holdData: TruckHoldRedis = {
         ...hold,
         createdAt: hold.createdAt.toISOString(),
         expiresAt: hold.expiresAt.toISOString(),
       };
-      
+
       await redisService.setJSON(
         REDIS_KEYS.HOLD(hold.holdId),
         holdData,
         CONFIG.HOLD_DURATION_SECONDS + 5 // Extra buffer for cleanup
       );
-      
+
       // 3. Add to order index
       await redisService.sAdd(REDIS_KEYS.HOLDS_BY_ORDER(hold.orderId), hold.holdId);
       await redisService.expire(REDIS_KEYS.HOLDS_BY_ORDER(hold.orderId), CONFIG.HOLD_DURATION_SECONDS + 60);
-      
+
       // 4. Add to transporter index
       await redisService.sAdd(REDIS_KEYS.HOLDS_BY_TRANSPORTER(hold.transporterId), hold.holdId);
       await redisService.expire(REDIS_KEYS.HOLDS_BY_TRANSPORTER(hold.transporterId), CONFIG.HOLD_DURATION_SECONDS + 60);
-      
+
       logger.info(`[HoldStore] ✅ Hold ${hold.holdId} stored with ${hold.truckRequestIds.length} truck locks`);
       return true;
-      
+
     } catch (error: any) {
       logger.error(`[HoldStore] Failed to add hold: ${error.message}`);
       return false;
     }
   }
-  
+
   /**
    * Get hold by ID
    */
@@ -297,7 +297,7 @@ class HoldStore {
     try {
       const data = await redisService.getJSON<TruckHoldRedis>(REDIS_KEYS.HOLD(holdId));
       if (!data) return undefined;
-      
+
       return {
         ...data,
         createdAt: new Date(data.createdAt),
@@ -307,7 +307,7 @@ class HoldStore {
       return undefined;
     }
   }
-  
+
   /**
    * Update hold status
    */
@@ -315,24 +315,24 @@ class HoldStore {
     try {
       const hold = await this.get(holdId);
       if (!hold) return;
-      
+
       hold.status = status;
-      
+
       const holdData: TruckHoldRedis = {
         ...hold,
         createdAt: hold.createdAt.toISOString(),
         expiresAt: hold.expiresAt.toISOString(),
       };
-      
+
       // Get remaining TTL
       const ttl = await redisService.ttl(REDIS_KEYS.HOLD(holdId));
       await redisService.setJSON(REDIS_KEYS.HOLD(holdId), holdData, ttl > 0 ? ttl : 60);
-      
+
     } catch (error: any) {
       logger.error(`[HoldStore] Failed to update status: ${error.message}`);
     }
   }
-  
+
   /**
    * Remove a hold and release all locks
    */
@@ -340,7 +340,7 @@ class HoldStore {
     try {
       const hold = await this.get(holdId);
       if (!hold) return;
-      
+
       // Release all truck locks
       for (const truckId of hold.truckRequestIds) {
         await redisService.releaseLock(
@@ -348,21 +348,21 @@ class HoldStore {
           hold.transporterId
         );
       }
-      
+
       // Remove from indexes
       await redisService.sRem(REDIS_KEYS.HOLDS_BY_ORDER(hold.orderId), holdId);
       await redisService.sRem(REDIS_KEYS.HOLDS_BY_TRANSPORTER(hold.transporterId), holdId);
-      
+
       // Delete hold data
       await redisService.del(REDIS_KEYS.HOLD(holdId));
-      
+
       logger.info(`[HoldStore] Hold ${holdId} removed, locks released`);
-      
+
     } catch (error: any) {
       logger.error(`[HoldStore] Failed to remove hold: ${error.message}`);
     }
   }
-  
+
   /**
    * Get all active holds for an order
    */
@@ -370,20 +370,20 @@ class HoldStore {
     try {
       const holdIds = await redisService.sMembers(REDIS_KEYS.HOLDS_BY_ORDER(orderId));
       const activeHolds: TruckHold[] = [];
-      
+
       for (const holdId of holdIds) {
         const hold = await this.get(holdId);
         if (hold && hold.status === 'active' && new Date(hold.expiresAt) > new Date()) {
           activeHolds.push(hold);
         }
       }
-      
+
       return activeHolds;
     } catch (error) {
       return [];
     }
   }
-  
+
   /**
    * Get all expired holds (for cleanup)
    * Note: With Redis TTL, this is mostly for manual cleanup
@@ -393,23 +393,23 @@ class HoldStore {
     // This method is kept for compatibility but returns empty
     return [];
   }
-  
+
   /**
    * Get active hold by transporter for a specific order/vehicle type
    */
   async getTransporterHold(
-    transporterId: string, 
-    orderId: string, 
-    vehicleType: string, 
+    transporterId: string,
+    orderId: string,
+    vehicleType: string,
     vehicleSubtype: string
   ): Promise<TruckHold | undefined> {
     try {
       const holdIds = await redisService.sMembers(REDIS_KEYS.HOLDS_BY_TRANSPORTER(transporterId));
-      
+
       for (const holdId of holdIds) {
         const hold = await this.get(holdId);
         if (
-          hold && 
+          hold &&
           hold.status === 'active' &&
           hold.orderId === orderId &&
           hold.vehicleType.toLowerCase() === vehicleType.toLowerCase() &&
@@ -419,7 +419,7 @@ class HoldStore {
           return hold;
         }
       }
-      
+
       return undefined;
     } catch (error) {
       return undefined;
@@ -444,15 +444,15 @@ const holdStore = new HoldStore();
 
 class TruckHoldService {
   private cleanupInterval: NodeJS.Timeout | null = null;
-  
+
   constructor() {
     this.startCleanupJob();
   }
-  
+
   // ===========================================================================
   // PUBLIC METHODS
   // ===========================================================================
-  
+
   /**
    * HOLD TRUCKS
    * -----------
@@ -469,9 +469,9 @@ class TruckHoldService {
    */
   async holdTrucks(request: HoldTrucksRequest): Promise<HoldTrucksResponse> {
     const { orderId, transporterId, vehicleType, vehicleSubtype, quantity } = request;
-    
+
     logger.info(`[TruckHold] Hold request: ${quantity}x ${vehicleType} ${vehicleSubtype} for order ${orderId}`);
-    
+
     try {
       // 1. Validate quantity
       if (quantity < CONFIG.MIN_HOLD_QUANTITY || quantity > CONFIG.MAX_HOLD_QUANTITY) {
@@ -481,7 +481,7 @@ class TruckHoldService {
           error: 'INVALID_QUANTITY'
         };
       }
-      
+
       // 2. Check if transporter already has a hold for this type
       const existingHold = await holdStore.getTransporterHold(transporterId, orderId, vehicleType, vehicleSubtype);
       if (existingHold) {
@@ -491,10 +491,30 @@ class TruckHoldService {
           error: 'ALREADY_HOLDING'
         };
       }
-      
+
+      // 2b. CHECK ORDER STATUS — fail fast if cancelled/expired/completed
+      // This gives the Captain app a clear reason to dismiss the overlay
+      const order = await db.getOrderById(orderId);
+      if (!order) {
+        return {
+          success: false,
+          message: 'This request no longer exists.',
+          error: 'ORDER_NOT_FOUND'
+        };
+      }
+      const inactiveStatuses = ['cancelled', 'expired', 'completed', 'fully_filled'];
+      if (inactiveStatuses.includes(order.status)) {
+        logger.info(`[TruckHold] Order ${orderId} is ${order.status} — rejecting hold request`);
+        return {
+          success: false,
+          message: 'This request was cancelled.',
+          error: 'ORDER_CANCELLED'
+        };
+      }
+
       // 3. Get available truck requests
       const availableTrucks = await this.getAvailableTruckRequests(orderId, vehicleType, vehicleSubtype);
-      
+
       if (availableTrucks.length < quantity) {
         return {
           success: false,
@@ -502,11 +522,11 @@ class TruckHoldService {
           error: 'NOT_ENOUGH_AVAILABLE'
         };
       }
-      
+
       // 4. Select the requested quantity of trucks
       const selectedTrucks = availableTrucks.slice(0, quantity);
       const truckRequestIds = selectedTrucks.map(t => t.id);
-      
+
       // =================================================================
       // 🔒 CRITICAL: REDIS LOCK FIRST, DATABASE SECOND
       // =================================================================
@@ -521,10 +541,10 @@ class TruckHoldService {
       // - Losers get rejected instantly (no DB load)
       // - Database only handles 1 write, not 10
       // =================================================================
-      
+
       const now = new Date();
       const expiresAt = new Date(now.getTime() + CONFIG.HOLD_DURATION_SECONDS * 1000);
-      
+
       // 5. Create hold record (prepare, don't save yet)
       const holdId = `HOLD_${uuidv4().substring(0, 8).toUpperCase()}`;
       const hold: TruckHold = {
@@ -539,25 +559,25 @@ class TruckHoldService {
         expiresAt,
         status: 'active'
       };
-      
+
       // 6. 🔒 ACQUIRE REDIS LOCKS FIRST (this is the race condition prevention)
       // This uses SET NX EX - atomic "set if not exists with expiry"
       // If ANY truck is already locked, the whole operation fails fast
       const lockSuccess = await holdStore.add(hold);
-      
+
       if (!lockSuccess) {
         // ❌ LOCK FAILED - Someone else got these trucks
         // No DB changes were made, so no cleanup needed!
         // This is the power of "lock first" - instant rejection, zero DB load
         logger.info(`[TruckHold] ⚡ Lock failed for ${quantity} trucks - someone else got them`);
-        
+
         return {
           success: false,
           message: 'Trucks are no longer available. Someone else selected them.',
           error: 'LOCK_FAILED'
         };
       }
-      
+
       // 7. ✅ LOCK ACQUIRED - Now safe to update database
       // Only ONE transporter reaches here per truck set
       // Database write is guaranteed to be unique
@@ -568,12 +588,12 @@ class TruckHoldService {
           heldAt: now.toISOString()
         });
       }
-      
+
       // 7. Broadcast availability update to all connected clients
       this.broadcastAvailabilityUpdate(orderId);
-      
+
       logger.info(`[TruckHold] ✅ Held ${quantity} trucks. Hold ID: ${holdId}, Expires: ${expiresAt.toISOString()}`);
-      
+
       return {
         success: true,
         holdId,
@@ -581,7 +601,7 @@ class TruckHoldService {
         heldQuantity: quantity,
         message: `${quantity} truck(s) held for ${CONFIG.HOLD_DURATION_SECONDS} seconds. Please confirm.`
       };
-      
+
     } catch (error: any) {
       logger.error(`[TruckHold] Error holding trucks: ${error.message}`, error);
       return {
@@ -591,7 +611,7 @@ class TruckHoldService {
       };
     }
   }
-  
+
   /**
    * CONFIRM HOLD (Simple)
    * ---------------------
@@ -610,29 +630,29 @@ class TruckHoldService {
    */
   async confirmHold(holdId: string, transporterId: string): Promise<{ success: boolean; message: string; assignedTrucks?: string[] }> {
     logger.info(`[TruckHold] Simple confirm request: ${holdId} by ${transporterId}`);
-    
+
     try {
       // 1. Get hold record (async - Redis)
       const hold = await holdStore.get(holdId);
-      
+
       if (!hold) {
         return { success: false, message: 'Hold not found or expired' };
       }
-      
+
       if (hold.transporterId !== transporterId) {
         return { success: false, message: 'This hold belongs to another transporter' };
       }
-      
+
       if (hold.status !== 'active') {
         return { success: false, message: `Hold is ${hold.status}. Cannot confirm.` };
       }
-      
+
       if (hold.expiresAt <= new Date()) {
         // Release the hold
         await this.releaseHold(holdId, transporterId);
         return { success: false, message: 'Hold expired. Please try again.' };
       }
-      
+
       // 2. Mark trucks as assigned
       for (const truckId of hold.truckRequestIds) {
         await db.updateTruckRequest(truckId, {
@@ -644,33 +664,33 @@ class TruckHoldService {
           heldAt: undefined
         });
       }
-      
+
       // 3. Update order's filled count (atomic increment — prevents race condition)
       await prismaClient.order.update({
         where: { id: hold.orderId },
         data: { trucksFilled: { increment: hold.quantity } }
       });
-      
+
       // 4. Mark hold as confirmed (async - Redis)
       await holdStore.updateStatus(holdId, 'confirmed');
-      
+
       // 5. Broadcast update
       this.broadcastAvailabilityUpdate(hold.orderId);
-      
+
       logger.info(`[TruckHold] ✅ Confirmed hold ${holdId}. ${hold.quantity} trucks assigned to ${transporterId}`);
-      
+
       return {
         success: true,
         message: `${hold.quantity} truck(s) assigned successfully. Please assign drivers.`,
         assignedTrucks: hold.truckRequestIds
       };
-      
+
     } catch (error: any) {
       logger.error(`[TruckHold] Error confirming hold: ${error.message}`, error);
       return { success: false, message: 'Failed to confirm. Please try again.' };
     }
   }
-  
+
   /**
    * =============================================================================
    * CONFIRM HOLD WITH VEHICLE & DRIVER ASSIGNMENTS
@@ -717,30 +737,30 @@ class TruckHoldService {
     logger.info(`║  Transporter: ${transporterId}`);
     logger.info(`║  Assignments: ${assignments.length}`);
     logger.info(`╚══════════════════════════════════════════════════════════════╝`);
-    
+
     try {
       // =========================================================================
       // STEP 1: Validate hold exists and is active
       // =========================================================================
       const hold = await holdStore.get(holdId);
-      
+
       if (!hold) {
         return { success: false, message: 'Hold not found or expired' };
       }
-      
+
       if (hold.transporterId !== transporterId) {
         return { success: false, message: 'This hold belongs to another transporter' };
       }
-      
+
       if (hold.status !== 'active') {
         return { success: false, message: `Hold is ${hold.status}. Cannot confirm.` };
       }
-      
+
       if (hold.expiresAt <= new Date()) {
         await this.releaseHold(holdId, transporterId);
         return { success: false, message: 'Hold expired. Please try again.' };
       }
-      
+
       // Validate assignment count matches hold
       if (assignments.length !== hold.quantity) {
         return {
@@ -748,7 +768,7 @@ class TruckHoldService {
           message: `Expected ${hold.quantity} assignments but got ${assignments.length}`
         };
       }
-      
+
       // =========================================================================
       // STEP 2: Validate all vehicles are AVAILABLE
       // =========================================================================
@@ -867,20 +887,20 @@ class TruckHoldService {
 
         validatedVehicles.push({ vehicle, driver, truckRequestId });
       }
-      
+
       // If ANY assignment failed, reject the whole batch
       // This maintains atomicity - either all succeed or none
       if (failedAssignments.length > 0) {
         logger.warn(`[TruckHold] ❌ ${failedAssignments.length} assignments failed validation`);
         failedAssignments.forEach(f => logger.warn(`   - ${f.vehicleId}: ${f.reason}`));
-        
+
         return {
           success: false,
           message: `${failedAssignments.length} assignment(s) failed validation`,
           failedAssignments
         };
       }
-      
+
       // =========================================================================
       // STEP 3: All validations passed - Create assignments atomically
       // =========================================================================
@@ -888,7 +908,7 @@ class TruckHoldService {
       if (!order) {
         return { success: false, message: 'Order not found' };
       }
-      
+
       const transporter = await db.getUserById(transporterId);
       const now = new Date().toISOString();
       const confirmedAssignments = await prismaClient.$transaction(async (tx) => {
@@ -1104,7 +1124,7 @@ class TruckHoldService {
 
         logger.info(`   📢 Notified driver ${assignment.driver.name} (WebSocket + FCM)`);
       }
-      
+
       // =========================================================================
       // STEP 6: Notify customer about truck confirmation
       // =========================================================================
@@ -1129,9 +1149,9 @@ class TruckHoldService {
         },
         message: `${confirmedAssignments.assignments.length} truck(s) confirmed! ${newTrucksFilled}/${order.totalTrucks} total.`
       };
-      
+
       socketService.emitToUser(order.customerId, 'trucks_confirmed', customerNotification);
-      
+
       // =====================================================================
       // FCM PUSH BACKUP: Customer may have app in background (no WebSocket)
       // Phase 5: Customer notification chain — guaranteed delivery
@@ -1154,15 +1174,15 @@ class TruckHoldService {
       }).catch(err => {
         logger.warn(`FCM: Failed to queue trucks_confirmed push for customer ${order.customerId}`, err);
       });
-      
+
       logger.info(`📢 Notified customer - ${newTrucksFilled}/${order.totalTrucks} trucks confirmed (WebSocket + FCM)`);
-      
+
       // =========================================================================
       // STEP 7: Mark hold as confirmed and broadcast
       // =========================================================================
       await holdStore.updateStatus(holdId, 'confirmed');
       this.broadcastAvailabilityUpdate(hold.orderId);
-      
+
       logger.info(`╔══════════════════════════════════════════════════════════════╗`);
       logger.info(`║  ✅ HOLD CONFIRMED SUCCESSFULLY                              ║`);
       logger.info(`╠══════════════════════════════════════════════════════════════╣`);
@@ -1170,20 +1190,20 @@ class TruckHoldService {
       logger.info(`║  Order progress: ${newTrucksFilled}/${order.totalTrucks}`);
       logger.info(`║  Status: ${newStatus}`);
       logger.info(`╚══════════════════════════════════════════════════════════════╝`);
-      
+
       return {
         success: true,
         message: `${confirmedAssignments.assignments.length} truck(s) assigned successfully!`,
         assignmentIds,
         tripIds
       };
-      
+
     } catch (error: any) {
       logger.error(`[TruckHold] Error confirming with assignments: ${error.message}`, error);
       return { success: false, message: 'Failed to confirm. Please try again.' };
     }
   }
-  
+
   /**
    * RELEASE HOLD
    * ------------
@@ -1197,22 +1217,22 @@ class TruckHoldService {
    */
   async releaseHold(holdId: string, transporterId?: string): Promise<{ success: boolean; message: string }> {
     logger.info(`[TruckHold] Release request: ${holdId}`);
-    
+
     try {
       const hold = await holdStore.get(holdId);
-      
+
       if (!hold) {
         return { success: false, message: 'Hold not found' };
       }
-      
+
       if (transporterId && hold.transporterId !== transporterId) {
         return { success: false, message: 'This hold belongs to another transporter' };
       }
-      
+
       if (hold.status !== 'active') {
         return { success: true, message: 'Hold already released' };
       }
-      
+
       // 1. Mark trucks as searching (available) again
       for (const truckId of hold.truckRequestIds) {
         await db.updateTruckRequest(truckId, {
@@ -1221,24 +1241,24 @@ class TruckHoldService {
           heldAt: undefined
         });
       }
-      
+
       // 2. Mark hold as released (async - Redis)
       await holdStore.updateStatus(holdId, 'released');
       await holdStore.remove(holdId);
-      
+
       // 3. Broadcast update
       this.broadcastAvailabilityUpdate(hold.orderId);
-      
+
       logger.info(`[TruckHold] ✅ Released hold ${holdId}. ${hold.quantity} trucks available again.`);
-      
+
       return { success: true, message: 'Hold released. Trucks are available again.' };
-      
+
     } catch (error: any) {
       logger.error(`[TruckHold] Error releasing hold: ${error.message}`, error);
       return { success: false, message: 'Failed to release hold' };
     }
   }
-  
+
   /**
    * GET ORDER AVAILABILITY
    * ----------------------
@@ -1255,15 +1275,15 @@ class TruckHoldService {
         logger.warn(`[TruckHold] Order not found: ${orderId}`);
         return null;
       }
-      
+
       const truckRequests = db.getTruckRequestsByOrder ? await db.getTruckRequestsByOrder(orderId) : [];
-      
+
       // Group by vehicle type
       const truckGroups = new Map<string, {
         requests: any[];
         farePerTruck: number;
       }>();
-      
+
       for (const tr of truckRequests) {
         const key = `${tr.vehicleType}_${tr.vehicleSubtype || ''}`;
         if (!truckGroups.has(key)) {
@@ -1274,18 +1294,18 @@ class TruckHoldService {
         }
         truckGroups.get(key)!.requests.push(tr);
       }
-      
+
       // Calculate availability for each type
       const trucks: TruckAvailability[] = [];
       let totalValue = 0;
-      
+
       for (const [key, group] of truckGroups) {
         const [vehicleType, vehicleSubtype] = key.split('_');
-        
+
         const available = group.requests.filter(r => r.status === 'searching').length;
         const held = group.requests.filter(r => r.status === 'held').length;
         const assigned = group.requests.filter(r => r.status === 'assigned' || r.status === 'completed').length;
-        
+
         trucks.push({
           vehicleType,
           vehicleSubtype: vehicleSubtype || '',
@@ -1295,12 +1315,12 @@ class TruckHoldService {
           assigned,
           farePerTruck: group.farePerTruck
         });
-        
+
         totalValue += group.requests.length * group.farePerTruck;
       }
-      
+
       const isFullyAssigned = trucks.every(t => t.available === 0 && t.held === 0);
-      
+
       return {
         orderId,
         customerName: order.customerName || 'Customer',
@@ -1313,30 +1333,30 @@ class TruckHoldService {
         totalValue,
         isFullyAssigned
       };
-      
+
     } catch (error: any) {
       logger.error(`[TruckHold] Error getting availability: ${error.message}`, error);
       return null;
     }
   }
-  
+
   // ===========================================================================
   // PRIVATE METHODS
   // ===========================================================================
-  
+
   /**
    * Get available (not held, not assigned) truck requests for a vehicle type
    */
   private async getAvailableTruckRequests(orderId: string, vehicleType: string, vehicleSubtype: string): Promise<any[]> {
     const allRequests = db.getTruckRequestsByOrder ? await db.getTruckRequestsByOrder(orderId) : [];
-    
-    return allRequests.filter(tr => 
+
+    return allRequests.filter(tr =>
       tr.vehicleType.toLowerCase() === vehicleType.toLowerCase() &&
       (tr.vehicleSubtype || '').toLowerCase() === vehicleSubtype.toLowerCase() &&
       tr.status === 'searching'
     );
   }
-  
+
   /**
    * Broadcast availability update via WebSocket
    * 
@@ -1359,10 +1379,10 @@ class TruckHoldService {
   private broadcastAvailabilityUpdate(orderId: string): void {
     this.getOrderAvailability(orderId).then(async availability => {
       if (!availability) return;
-      
+
       const order = await db.getOrderById(orderId);
       if (!order) return;
-      
+
       logger.info(`╔══════════════════════════════════════════════════════════════╗`);
       logger.info(`║  📡 BROADCASTING AVAILABILITY UPDATE                         ║`);
       logger.info(`╠══════════════════════════════════════════════════════════════╣`);
@@ -1370,7 +1390,7 @@ class TruckHoldService {
       logger.info(`║  Filled: ${order.trucksFilled}/${order.totalTrucks}`);
       logger.info(`║  Fully Assigned: ${availability.isFullyAssigned}`);
       logger.info(`╚══════════════════════════════════════════════════════════════╝`);
-      
+
       // If fully assigned, broadcast closure to everyone
       if (availability.isFullyAssigned) {
         socketService.broadcastToAll('broadcast_closed', {
@@ -1382,26 +1402,26 @@ class TruckHoldService {
         logger.info(`   📢 Broadcast closed - all trucks assigned`);
         return;
       }
-      
+
       // Send personalized updates to each transporter
       // Get all transporters who were notified about this order
       const truckRequests = db.getTruckRequestsByOrder ? await db.getTruckRequestsByOrder(orderId) : [];
       const notifiedTransporterIds = new Set<string>();
       const queuedBroadcasts: Array<Promise<unknown>> = [];
-      
+
       for (const tr of truckRequests) {
         if (tr.notifiedTransporters) {
           tr.notifiedTransporters.forEach((id: string) => notifiedTransporterIds.add(id));
         }
       }
-      
+
       // For each vehicle type in the order, calculate personalized updates
       for (const truckType of availability.trucks) {
         const { vehicleType, vehicleSubtype, available: trucksStillSearching } = truckType;
-        
+
         // Skip if no trucks searching for this type
         if (trucksStillSearching <= 0) continue;
-        
+
         // Get availability snapshot for all transporters with this vehicle type
         // CRITICAL FIX: Must await — db is Prisma instance, this is async!
         const transporterSnapshot = await db.getTransportersAvailabilitySnapshot(vehicleType, vehicleSubtype) as Array<{
@@ -1411,25 +1431,25 @@ class TruckHoldService {
           available: number;
           inTransit: number;
         }>;
-        
+
         // Create map for quick lookup
         const availabilityMap = new Map(
           transporterSnapshot.map(t => [t.transporterId, t])
         );
-        
+
         // Send personalized update to each notified transporter
         for (const transporterId of notifiedTransporterIds) {
           const transporterAvailability = availabilityMap.get(transporterId);
-          
+
           // Skip if this transporter doesn't have this vehicle type
           if (!transporterAvailability) continue;
-          
+
           // Calculate personalized capacity
           const trucksYouCanProvide = Math.min(
             transporterAvailability.available,
             trucksStillSearching
           );
-          
+
           // Skip if transporter has no available trucks
           if (trucksYouCanProvide <= 0) {
             // Notify them that they can't participate anymore
@@ -1448,34 +1468,34 @@ class TruckHoldService {
             }));
             continue;
           }
-          
+
           // Send personalized update
           queuedBroadcasts.push(queueService.queueBroadcast(transporterId, 'broadcast_update', {
             type: 'availability_changed',
             orderId,
             vehicleType,
             vehicleSubtype,
-            
+
             // Order progress
             totalTrucksNeeded: order.totalTrucks,
             trucksFilled: order.trucksFilled,
             trucksStillNeeded: trucksStillSearching,
-            
+
             // Personalized for this transporter
             trucksYouCanProvide,
             maxTrucksYouCanProvide: trucksYouCanProvide,
             yourAvailableTrucks: transporterAvailability.available,
             yourTotalTrucks: transporterAvailability.totalOwned,
-            
+
             // Full availability info
             trucks: availability.trucks,
             isFullyAssigned: availability.isFullyAssigned,
-            
+
             timestamp: new Date().toISOString()
           }).catch((error) => {
             logger.warn(`[TruckHold] Failed to queue availability update for transporter ${transporterId}: ${String((error as Error)?.message || error)}`);
           }));
-          
+
           logger.debug(`   📱 → ${transporterId.substring(0, 8)}: can provide ${trucksYouCanProvide}/${trucksStillSearching}`);
         }
       }
@@ -1483,7 +1503,7 @@ class TruckHoldService {
       if (queuedBroadcasts.length > 0) {
         await Promise.allSettled(queuedBroadcasts);
       }
-      
+
       // Also broadcast general update for any listeners (e.g., admin dashboard)
       socketService.broadcastToAll('trucks_availability_updated', {
         orderId,
@@ -1493,11 +1513,11 @@ class TruckHoldService {
         totalTrucksNeeded: order.totalTrucks,
         timestamp: new Date().toISOString()
       });
-      
+
       logger.info(`   ✅ Personalized updates sent to ${notifiedTransporterIds.size} transporters`);
     });
   }
-  
+
   /**
    * Cleanup job - releases expired holds
    * Note: With Redis TTL, locks auto-expire. This is kept for any edge cases
@@ -1507,12 +1527,12 @@ class TruckHoldService {
     this.cleanupInterval = setInterval(async () => {
       try {
         const expiredHolds = await holdStore.getExpiredHolds();
-        
+
         for (const hold of expiredHolds) {
           logger.info(`[TruckHold] Auto-releasing expired hold: ${hold.holdId}`);
           await this.releaseHold(hold.holdId);
         }
-        
+
         if (expiredHolds.length > 0) {
           logger.info(`[TruckHold] Cleanup: Released ${expiredHolds.length} expired holds`);
         }
@@ -1520,10 +1540,10 @@ class TruckHoldService {
         logger.error(`[TruckHold] Cleanup job error: ${error.message}`);
       }
     }, CONFIG.CLEANUP_INTERVAL_MS);
-    
+
     logger.info(`[TruckHold] Cleanup job started (every ${CONFIG.CLEANUP_INTERVAL_MS / 1000}s)`);
   }
-  
+
   /**
    * Stop cleanup job (for graceful shutdown)
    */
