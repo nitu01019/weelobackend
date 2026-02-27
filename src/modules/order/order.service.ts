@@ -388,8 +388,12 @@ class OrderService {
     return { orderId };
   }
 
-  private async enqueueOrderDispatchOutbox(orderId: string): Promise<void> {
-    await (prismaClient as any).orderDispatchOutbox.upsert({
+  private orderDispatchOutboxDelegate(tx?: Prisma.TransactionClient) {
+    return tx?.orderDispatchOutbox ?? prismaClient.orderDispatchOutbox;
+  }
+
+  private async enqueueOrderDispatchOutbox(orderId: string, tx?: Prisma.TransactionClient): Promise<void> {
+    await this.orderDispatchOutboxDelegate(tx).upsert({
       where: { orderId },
       update: {
         payload: { orderId },
@@ -414,7 +418,7 @@ class OrderService {
   private async claimDispatchOutboxByOrderId(orderId: string): Promise<DispatchOutboxRow | null> {
     const now = new Date();
     const staleLockBefore = new Date(now.getTime() - 120_000);
-    const claim = await (prismaClient as any).orderDispatchOutbox.updateMany({
+    const claim = await this.orderDispatchOutboxDelegate().updateMany({
       where: {
         orderId,
         status: { in: ['pending', 'retrying'] },
@@ -427,7 +431,7 @@ class OrderService {
       }
     });
     if (claim.count === 0) return null;
-    const row = await (prismaClient as any).orderDispatchOutbox.findUnique({
+    const row = await this.orderDispatchOutboxDelegate().findUnique({
       where: { orderId }
     });
     return row as DispatchOutboxRow | null;
@@ -436,7 +440,7 @@ class OrderService {
   private async claimReadyDispatchOutboxRows(limit: number): Promise<DispatchOutboxRow[]> {
     const now = new Date();
     const staleLockBefore = new Date(now.getTime() - 120_000);
-    const candidates = await (prismaClient as any).orderDispatchOutbox.findMany({
+    const candidates = await this.orderDispatchOutboxDelegate().findMany({
       where: {
         status: { in: ['pending', 'retrying'] },
         nextRetryAt: { lte: now },
@@ -448,7 +452,7 @@ class OrderService {
 
     const claimed: DispatchOutboxRow[] = [];
     for (const candidate of candidates) {
-      const claim = await (prismaClient as any).orderDispatchOutbox.updateMany({
+      const claim = await this.orderDispatchOutboxDelegate().updateMany({
         where: {
           id: candidate.id,
           status: { in: ['pending', 'retrying'] },
@@ -550,7 +554,7 @@ class OrderService {
 
     const built = await this.buildDispatchAttemptContext(resolvedOrderId);
     if (!built) {
-      await (prismaClient as any).orderDispatchOutbox.update({
+      await this.orderDispatchOutboxDelegate().update({
         where: { id: row.id },
         data: {
           status: 'failed',
@@ -572,7 +576,7 @@ class OrderService {
     const order = built.order;
     const activeStatuses = new Set(['created', 'broadcasting', 'active', 'partially_filled']);
     if (!activeStatuses.has(String(order.status))) {
-      await (prismaClient as any).orderDispatchOutbox.update({
+      await this.orderDispatchOutboxDelegate().update({
         where: { id: row.id },
         data: {
           status: 'failed',
@@ -630,7 +634,7 @@ class OrderService {
       let finalReasonCode = reasonCode;
       if (shouldRetry) {
         const delayMs = this.calculateDispatchRetryDelayMs(attemptNumber);
-        await (prismaClient as any).orderDispatchOutbox.update({
+        await this.orderDispatchOutboxDelegate().update({
           where: { id: row.id },
           data: {
             status: 'retrying',
@@ -642,7 +646,7 @@ class OrderService {
         });
       } else if (reasonCode === 'DISPATCH_RETRYING') {
         finalReasonCode = 'DISPATCH_FAILED';
-        await (prismaClient as any).orderDispatchOutbox.update({
+        await this.orderDispatchOutboxDelegate().update({
           where: { id: row.id },
           data: {
             status: 'failed',
@@ -652,8 +656,19 @@ class OrderService {
             lockedAt: null
           }
         });
+      } else if (reasonCode === 'NO_ONLINE_TRANSPORTERS') {
+        await this.orderDispatchOutboxDelegate().update({
+          where: { id: row.id },
+          data: {
+            status: 'failed',
+            attempts: attemptNumber,
+            processedAt: new Date(),
+            lastError: 'NO_ONLINE_TRANSPORTERS',
+            lockedAt: null
+          }
+        });
       } else {
-        await (prismaClient as any).orderDispatchOutbox.update({
+        await this.orderDispatchOutboxDelegate().update({
           where: { id: row.id },
           data: {
             status: 'dispatched',
@@ -693,7 +708,7 @@ class OrderService {
             lockedAt: null
           };
 
-      await (prismaClient as any).orderDispatchOutbox.update({
+      await this.orderDispatchOutboxDelegate().update({
         where: { id: row.id },
         data: updateData
       });
@@ -1321,29 +1336,7 @@ class OrderService {
       expiresAt
     };
 
-    // Narrow serializable transaction: duplicate-check + insert (prevents race condition)
-    await prismaClient.$transaction(async (tx) => {
-      const dupBooking = await tx.booking.findFirst({
-        where: { customerId: request.customerId, status: { in: [BookingStatus.created, BookingStatus.broadcasting, BookingStatus.active, BookingStatus.partially_filled] } }
-      });
-      const dupOrder = await tx.order.findFirst({
-        where: { customerId: request.customerId, status: { in: [OrderStatus.created, OrderStatus.broadcasting, OrderStatus.active, OrderStatus.partially_filled] } }
-      });
-      if (dupBooking || dupOrder) {
-        throw new Error('Request already in progress. Cancel it first.');
-      }
-      await db.createOrder(order);
-    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
-
-    // Emit lifecycle state: created
-    this.emitBroadcastStateChanged(request.customerId, {
-      orderId,
-      status: 'created',
-      dispatchState: 'queued',
-      dispatchAttempts: 0
-    });
-
-    // 2. Create TruckRequests for each vehicle type
+    // 2. Prepare TruckRequests for each vehicle type
     const truckRequests: TruckRequestRecord[] = [];
     const responseRequests: CreateOrderResponse['truckRequests'] = [];
     let requestNumber = 1;
@@ -1385,24 +1378,89 @@ class OrderService {
       });
     }
 
-    // Batch create all truck requests
-    await db.createTruckRequestsBatch(truckRequests);
-
     let dispatchState: CreateOrderResponse['dispatchState'] = 'dispatching';
     let dispatchReasonCode: string | undefined;
     let dispatchAttempts = 1;
     let onlineCandidates = 0;
     let notifiedTransporters = 0;
 
-    // Transition: created -> broadcasting (dispatch in progress)
-    await db.updateOrder(orderId, {
-      status: 'broadcasting',
-      stateChangedAt: new Date(),
-      dispatchState: 'dispatching',
-      dispatchAttempts,
-      dispatchReasonCode: null,
-      lastDispatchAt: new Date()
+    // Narrow serializable transaction: duplicate-check + order + truckRequests + dispatch outbox bootstrap.
+    // This removes the crash window where order exists but outbox row does not.
+    await prismaClient.$transaction(async (tx) => {
+      const dupBooking = await tx.booking.findFirst({
+        where: { customerId: request.customerId, status: { in: [BookingStatus.created, BookingStatus.broadcasting, BookingStatus.active, BookingStatus.partially_filled] } }
+      });
+      const dupOrder = await tx.order.findFirst({
+        where: { customerId: request.customerId, status: { in: [OrderStatus.created, OrderStatus.broadcasting, OrderStatus.active, OrderStatus.partially_filled] } }
+      });
+      if (dupBooking || dupOrder) {
+        throw new Error('Request already in progress. Cancel it first.');
+      }
+
+      await tx.order.create({
+        data: {
+          ...order,
+          routePoints: order.routePoints as any,
+          stopWaitTimers: order.stopWaitTimers as any,
+          pickup: order.pickup as any,
+          drop: order.drop as any,
+          status: order.status as OrderStatus
+        }
+      });
+
+      if (truckRequests.length > 0) {
+        await tx.truckRequest.createMany({
+          data: truckRequests.map((truckRequest) => ({
+            id: truckRequest.id,
+            orderId: truckRequest.orderId,
+            requestNumber: truckRequest.requestNumber,
+            vehicleType: truckRequest.vehicleType,
+            vehicleSubtype: truckRequest.vehicleSubtype,
+            pricePerTruck: truckRequest.pricePerTruck,
+            status: truckRequest.status as TruckRequestStatus,
+            heldById: truckRequest.heldBy || null,
+            heldAt: truckRequest.heldAt || null,
+            assignedTransporterId: truckRequest.assignedTransporterId || truckRequest.assignedTo || null,
+            assignedTransporterName: truckRequest.assignedTransporterName || null,
+            assignedVehicleId: truckRequest.assignedVehicleId || null,
+            assignedVehicleNumber: truckRequest.assignedVehicleNumber || null,
+            assignedDriverId: truckRequest.assignedDriverId || null,
+            assignedDriverName: truckRequest.assignedDriverName || null,
+            assignedDriverPhone: truckRequest.assignedDriverPhone || null,
+            tripId: truckRequest.tripId || null,
+            notifiedTransporters: truckRequest.notifiedTransporters || [],
+            assignedAt: truckRequest.assignedAt || null
+          })),
+          skipDuplicates: true
+        });
+      }
+
+      await tx.order.update({
+        where: { id: orderId },
+        data: {
+          status: OrderStatus.broadcasting,
+          stateChangedAt: new Date(),
+          dispatchState: 'dispatching',
+          dispatchAttempts,
+          dispatchReasonCode: null,
+          lastDispatchAt: new Date()
+        }
+      });
+
+      if (FF_ORDER_DISPATCH_OUTBOX) {
+        await this.enqueueOrderDispatchOutbox(orderId, tx);
+      }
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+
+    // Emit lifecycle state: created
+    this.emitBroadcastStateChanged(request.customerId, {
+      orderId,
+      status: 'created',
+      dispatchState: 'queued',
+      dispatchAttempts: 0
     });
+
+    // Emit lifecycle state: broadcasting
     this.emitBroadcastStateChanged(request.customerId, {
       orderId,
       status: 'broadcasting',
@@ -1419,7 +1477,6 @@ class OrderService {
     };
 
     if (FF_ORDER_DISPATCH_OUTBOX) {
-      await this.enqueueOrderDispatchOutbox(orderId);
       const immediateOutcome = await this.processDispatchOutboxImmediately(orderId, dispatchContext);
       if (immediateOutcome) {
         dispatchState = immediateOutcome.dispatchState;
@@ -2325,31 +2382,12 @@ class OrderService {
       logger.info(`   ${unfilled.length} truck requests expired`);
     }
 
-    // Update order status
-    const newStatus = order.trucksFilled > 0 ? 'partially_filled' : 'expired';
-    await db.updateOrder(orderId, { status: newStatus, stateChangedAt: new Date() });
-
-    const expiredAt = new Date().toISOString();
-
-    // Notify customer — payload matches PRD WebSocket event spec
-    emitToUser(order.customerId, 'order_expired', this.withEventMeta({
-      orderId,
-      status: newStatus,
-      expiredAt,
-      totalTrucks: order.totalTrucks,
-      trucksFilled: order.trucksFilled
-    }));
-
     // =========================================================================
-    // CRITICAL FIX: Notify ALL transporters to remove expired broadcast
+    // Derive timeout reason before customer/transporter notifications
     // =========================================================================
-    // Previously only customer was notified. Transporters kept seeing the stale
-    // broadcast overlay until broadcast.service.ts poll caught it (up to 5s gap).
-    // Now we notify transporters immediately via WebSocket + FCM push.
-    //
-    // SCALABILITY: Uses queue for batches >50 transporters
-    // EASY UNDERSTANDING: Same pattern as cancelOrder() transporter notification
-    // MODULARITY: broadcast.service.ts poll checker remains as safety net
+    // Two customer-facing timeout cases:
+    // 1) NO_ONLINE_TRANSPORTERS: no transporter matched in the configured radius waves
+    // 2) NO_TRANSPORTER_ACCEPTANCE: transporters were notified but none accepted in time
     // =========================================================================
     const notifiedTransporters = new Set<string>();
     for (const tr of truckRequests) {
@@ -2359,6 +2397,44 @@ class OrderService {
     }
 
     const transporterIds = Array.from(notifiedTransporters);
+    const notifiedCount = transporterIds.length;
+    const newStatus = order.trucksFilled > 0 ? 'partially_filled' : 'expired';
+    const reasonCode = order.trucksFilled > 0
+      ? 'PARTIAL_FILL_TIMEOUT'
+      : notifiedCount > 0
+        ? 'NO_TRANSPORTER_ACCEPTANCE'
+        : 'NO_ONLINE_TRANSPORTERS';
+    const derivedDispatchState: CreateOrderResponse['dispatchState'] = order.trucksFilled > 0 ? 'dispatched' : 'dispatch_failed';
+    const onlineCandidates = Math.max(order.onlineCandidatesCount || 0, notifiedCount);
+    const expiredAt = new Date().toISOString();
+
+    await db.updateOrder(orderId, {
+      status: newStatus,
+      stateChangedAt: new Date(),
+      dispatchState: derivedDispatchState,
+      dispatchReasonCode: reasonCode,
+      onlineCandidatesCount: onlineCandidates,
+      notifiedCount,
+      lastDispatchAt: new Date()
+    });
+
+    // Notify customer — includes explicit timeout reason for precise UX messaging.
+    emitToUser(order.customerId, 'order_expired', this.withEventMeta({
+      orderId,
+      status: newStatus,
+      expiredAt,
+      totalTrucks: order.totalTrucks,
+      trucksFilled: order.trucksFilled,
+      reasonCode,
+      onlineCandidates,
+      notifiedTransporters: notifiedCount
+    }));
+
+    // =========================================================================
+    // Notify ALL transporters to remove expired broadcast
+    // =========================================================================
+    // Uses queue for large fanout and keeps broadcast_dismissed compatibility.
+    // =========================================================================
 
     if (transporterIds.length > 0) {
       const expiryEventId = uuidv4();
@@ -2528,16 +2604,25 @@ class OrderService {
     // handleOrderExpiry only did WS + transporter FCM, not customer FCM.
     await queueService.queuePushNotificationBatch(
       [order.customerId],
-      {
-        title: 'No trucks found',
-        body: 'Your search timed out. Tap to search again.',
-        data: {
-          type: 'order_expired',
-          orderId,
-          status: newStatus
+        {
+          title: reasonCode === 'NO_ONLINE_TRANSPORTERS'
+            ? 'No transporters available nearby'
+            : reasonCode === 'NO_TRANSPORTER_ACCEPTANCE'
+              ? 'No one accepted your request'
+              : 'Search timed out',
+          body: reasonCode === 'NO_ONLINE_TRANSPORTERS'
+            ? 'No transporters were available in nearby area. Tap to search again.'
+            : reasonCode === 'NO_TRANSPORTER_ACCEPTANCE'
+              ? 'Transporters were notified, but no one accepted in time. Tap to search again.'
+              : 'Your search timed out. Tap to search again.',
+          data: {
+            type: 'order_expired',
+            orderId,
+            status: newStatus,
+            reasonCode
+          }
         }
-      }
-    ).catch((err: unknown) => {
+      ).catch((err: unknown) => {
       const errorMessage = err instanceof Error ? err.message : String(err);
       logger.warn(`FCM: Failed to send expiry push to customer ${order.customerId}`, { error: errorMessage });
     });
@@ -2616,7 +2701,7 @@ class OrderService {
     await this.clearCustomerActiveBroadcast(customerId);
 
     // 3b. Stop any pending/retrying dispatch outbox jobs for this cancelled order.
-    await (prismaClient as any).orderDispatchOutbox.updateMany({
+    await this.orderDispatchOutboxDelegate().updateMany({
       where: {
         orderId,
         status: { in: ['pending', 'retrying', 'processing'] }
