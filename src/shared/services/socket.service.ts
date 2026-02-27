@@ -487,32 +487,47 @@ async function setupRedisAdapter(socketServer: Server): Promise<void> {
     return;
   }
 
-  try {
-    // Redis Streams adapter only needs ONE Redis client (not pub+sub pair).
-    // It reuses the existing redisService connection → no extra connections.
-    // Uses XADD/XREAD (Redis Streams) instead of PSUBSCRIBE:
-    //   - Works with ElastiCache Serverless out of the box
-    //   - Resilient to temporary Redis disconnects (resumes stream)
-    //   - Same sub-ms latency as pub/sub — zero performance impact
-    const client = redisService.getClient();
-    if (!client) {
-      throw new Error('Redis client not available — redisService may not be initialized yet');
+  // Retry with backoff — Redis may not be ready at ECS task startup
+  const MAX_RETRIES = 3;
+  const RETRY_DELAY_MS = 2000;
+
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      // Redis Streams adapter only needs ONE Redis client (not pub+sub pair).
+      // It reuses the existing redisService connection → no extra connections.
+      // Uses XADD/XREAD (Redis Streams) instead of PSUBSCRIBE:
+      //   - Works with ElastiCache Serverless out of the box
+      //   - Resilient to temporary Redis disconnects (resumes stream)
+      //   - Same sub-ms latency as pub/sub — zero performance impact
+      const client = redisService.getClient();
+      if (!client) {
+        throw new Error('Redis client not available — redisService may not be initialized yet');
+      }
+
+      socketServer.adapter(createAdapter(client));
+
+      redisPubSubInitialized = true;
+      redisAdapterMode = 'enabled';
+      redisAdapterLastError = null;
+      logger.info(`[Socket] Redis Streams adapter initialized (Instance: ${SERVER_INSTANCE_ID}) [attempt ${attempt}/${MAX_RETRIES}]`);
+      logger.info('   Cross-instance WebSocket delivery ENABLED (ElastiCache Serverless compatible)');
+      return; // Success — exit retry loop
+    } catch (error: any) {
+      redisAdapterLastError = error?.message || 'unknown';
+      logger.warn(`[Socket] Redis Streams adapter attempt ${attempt}/${MAX_RETRIES} failed: ${error.message}`);
+
+      if (attempt < MAX_RETRIES) {
+        logger.info(`[Socket] Retrying in ${RETRY_DELAY_MS}ms...`);
+        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+      }
     }
-
-    socketServer.adapter(createAdapter(client));
-
-    redisPubSubInitialized = true;
-    redisAdapterMode = 'enabled';
-    redisAdapterLastError = null;
-    logger.info(`[Socket] Redis Streams adapter initialized (Instance: ${SERVER_INSTANCE_ID})`);
-    logger.info('   Cross-instance WebSocket delivery ENABLED (ElastiCache Serverless compatible)');
-  } catch (error: any) {
-    redisPubSubInitialized = false;
-    redisAdapterMode = 'failed';
-    redisAdapterLastError = error?.message || 'unknown';
-    logger.error(`[Socket] Failed to initialize Redis Streams adapter: ${error.message}`);
-    logger.warn('[Socket] Falling back to single-instance mode — cross-task socket delivery disabled');
   }
+
+  // All retries exhausted
+  redisPubSubInitialized = false;
+  redisAdapterMode = 'failed';
+  logger.error(`[Socket] Redis Streams adapter failed after ${MAX_RETRIES} attempts: ${redisAdapterLastError}`);
+  logger.warn('[Socket] Falling back to single-instance mode — cross-task socket delivery disabled');
 }
 
 function withSocketMeta(data: any): any {
