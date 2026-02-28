@@ -62,8 +62,16 @@ const FF_BROADCAST_STRICT_SENT_ACCOUNTING = process.env.FF_BROADCAST_STRICT_SENT
 const FF_DB_STRICT_IDEMPOTENCY = process.env.FF_DB_STRICT_IDEMPOTENCY !== 'false';
 const FF_ORDER_DISPATCH_OUTBOX = process.env.FF_ORDER_DISPATCH_OUTBOX !== 'false';
 const FF_ORDER_DISPATCH_STATUS_EVENTS = process.env.FF_ORDER_DISPATCH_STATUS_EVENTS !== 'false';
+const FF_CANCEL_OUTBOX_ENABLED = process.env.FF_CANCEL_OUTBOX_ENABLED !== 'false';
+const FF_CANCEL_POLICY_TRUCK_V1 = process.env.FF_CANCEL_POLICY_TRUCK_V1 !== 'false';
+const FF_CANCEL_EVENT_VERSION_ENFORCED = process.env.FF_CANCEL_EVENT_VERSION_ENFORCED !== 'false';
+const FF_CANCEL_REBOOK_CHURN_GUARD = process.env.FF_CANCEL_REBOOK_CHURN_GUARD !== 'false';
+const FF_CANCEL_DEFERRED_SETTLEMENT = process.env.FF_CANCEL_DEFERRED_SETTLEMENT !== 'false';
+const FF_CANCEL_IDEMPOTENCY_REQUIRED = process.env.FF_CANCEL_IDEMPOTENCY_REQUIRED !== 'false';
 const ORDER_DISPATCH_OUTBOX_POLL_MS = Math.max(500, parseInt(process.env.ORDER_DISPATCH_OUTBOX_POLL_MS || '1500', 10) || 1500);
 const ORDER_DISPATCH_OUTBOX_BATCH_SIZE = Math.max(1, parseInt(process.env.ORDER_DISPATCH_OUTBOX_BATCH_SIZE || '20', 10) || 20);
+const ORDER_CANCEL_OUTBOX_POLL_MS = Math.max(500, parseInt(process.env.ORDER_CANCEL_OUTBOX_POLL_MS || '1500', 10) || 1500);
+const ORDER_CANCEL_OUTBOX_BATCH_SIZE = Math.max(1, parseInt(process.env.ORDER_CANCEL_OUTBOX_BATCH_SIZE || '20', 10) || 20);
 
 type OrderDispatchOutboxStatus = 'pending' | 'processing' | 'retrying' | 'dispatched' | 'failed';
 
@@ -95,6 +103,88 @@ interface DispatchOutboxRow {
   maxAttempts: number;
   nextRetryAt: Date;
   lockedAt: Date | null;
+}
+
+type OrderLifecycleOutboxStatus = 'pending' | 'processing' | 'retrying' | 'dispatched' | 'failed';
+
+interface OrderLifecycleOutboxPayload {
+  type: 'order_cancelled';
+  orderId: string;
+  customerId: string;
+  transporters: string[];
+  drivers: Array<{
+    driverId: string;
+    tripId?: string;
+    customerName?: string;
+    customerPhone?: string;
+    pickupAddress?: string;
+    dropAddress?: string;
+  }>;
+  reason: string;
+  reasonCode: string;
+  cancelledAt: string;
+  eventId: string;
+  eventVersion: number;
+  serverTimeMs: number;
+}
+
+interface LifecycleOutboxRow {
+  id: string;
+  orderId: string;
+  eventType: string;
+  payload: Prisma.JsonValue;
+  status: OrderLifecycleOutboxStatus;
+  attempts: number;
+  maxAttempts: number;
+  nextRetryAt: Date;
+  lockedAt: Date | null;
+}
+
+type TruckCancelPolicyStage =
+  | 'SEARCHING'
+  | 'DRIVER_ASSIGNED'
+  | 'AT_PICKUP'
+  | 'LOADING_STARTED'
+  | 'IN_TRANSIT'
+  | 'UNLOADING_STARTED';
+
+type TruckCancelDecision = 'allowed' | 'blocked_dispute_only';
+
+interface CancelMoneyBreakdown {
+  baseCancellationFee: number;
+  waitingCharges: number;
+  percentageFareComponent: number;
+  driverMinimumGuarantee: number;
+  finalAmount: number;
+}
+
+interface TruckCancelPolicyEvaluation {
+  stage: TruckCancelPolicyStage;
+  decision: TruckCancelDecision;
+  reasonRequired: boolean;
+  reasonCode: string;
+  penaltyBreakdown: CancelMoneyBreakdown;
+  driverCompensationBreakdown: CancelMoneyBreakdown;
+  settlementState: 'pending' | 'settled' | 'waived';
+  pendingPenaltyAmount: number;
+}
+
+interface CancelOrderResult {
+  success: boolean;
+  message: string;
+  transportersNotified: number;
+  policyStage?: TruckCancelPolicyStage;
+  cancelDecision?: TruckCancelDecision;
+  reasonRequired?: boolean;
+  reasonCode?: string;
+  penaltyBreakdown?: CancelMoneyBreakdown;
+  driverCompensationBreakdown?: CancelMoneyBreakdown;
+  settlementState?: 'pending' | 'settled' | 'waived';
+  pendingPenaltyAmount?: number;
+  eventId?: string;
+  eventVersion?: number;
+  serverTimeMs?: number;
+  disputeId?: string;
 }
 
 // =============================================================================
@@ -340,10 +430,15 @@ class OrderService {
   private readonly ORDER_STEP_TIMER_LOCK_PREFIX = 'lock:order-broadcast-step:';
   private outboxWorkerTimer: NodeJS.Timeout | null = null;
   private outboxWorkerRunning = false;
+  private lifecycleOutboxWorkerTimer: NodeJS.Timeout | null = null;
+  private lifecycleOutboxWorkerRunning = false;
 
   constructor() {
     if (FF_ORDER_DISPATCH_OUTBOX && process.env.NODE_ENV !== 'test') {
       this.startDispatchOutboxWorker();
+    }
+    if (FF_CANCEL_OUTBOX_ENABLED && process.env.NODE_ENV !== 'test') {
+      this.startLifecycleOutboxWorker();
     }
   }
 
@@ -756,6 +851,376 @@ class OrderService {
     return this.processDispatchOutboxRow(row, context);
   }
 
+  private lifecycleOutboxDelegate(tx?: Prisma.TransactionClient) {
+    return tx?.orderLifecycleOutbox ?? prismaClient.orderLifecycleOutbox;
+  }
+
+  private parseLifecycleOutboxPayload(payload: Prisma.JsonValue): OrderLifecycleOutboxPayload | null {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
+    const raw = payload as Record<string, unknown>;
+    const type = typeof raw.type === 'string' ? raw.type : '';
+    if (type !== 'order_cancelled') return null;
+    const orderId = typeof raw.orderId === 'string' ? raw.orderId.trim() : '';
+    const customerId = typeof raw.customerId === 'string' ? raw.customerId.trim() : '';
+    if (!orderId || !customerId) return null;
+    const transporters = Array.isArray(raw.transporters)
+      ? raw.transporters.map((item) => String(item || '').trim()).filter(Boolean)
+      : [];
+    const drivers: OrderLifecycleOutboxPayload['drivers'] = Array.isArray(raw.drivers)
+      ? raw.drivers.reduce<OrderLifecycleOutboxPayload['drivers']>((acc, item) => {
+          if (!item || typeof item !== 'object' || Array.isArray(item)) return acc;
+          const row = item as Record<string, unknown>;
+          const driverId = typeof row.driverId === 'string' ? row.driverId.trim() : '';
+          if (!driverId) return acc;
+          acc.push({
+            driverId,
+            tripId: typeof row.tripId === 'string' ? row.tripId : undefined,
+            customerName: typeof row.customerName === 'string' ? row.customerName : undefined,
+            customerPhone: typeof row.customerPhone === 'string' ? row.customerPhone : undefined,
+            pickupAddress: typeof row.pickupAddress === 'string' ? row.pickupAddress : undefined,
+            dropAddress: typeof row.dropAddress === 'string' ? row.dropAddress : undefined
+          });
+          return acc;
+        }, [])
+      : [];
+    const reason = typeof raw.reason === 'string' && raw.reason.trim().length > 0
+      ? raw.reason.trim()
+      : 'Cancelled by customer';
+    const reasonCode = typeof raw.reasonCode === 'string' && raw.reasonCode.trim().length > 0
+      ? raw.reasonCode.trim()
+      : 'CUSTOMER_CANCELLED';
+    const cancelledAt = typeof raw.cancelledAt === 'string' && raw.cancelledAt.trim().length > 0
+      ? raw.cancelledAt
+      : new Date().toISOString();
+    const eventId = typeof raw.eventId === 'string' && raw.eventId.trim().length > 0
+      ? raw.eventId
+      : uuidv4();
+    const eventVersion = Number(raw.eventVersion || 1);
+    const serverTimeMs = Number(raw.serverTimeMs || Date.now());
+    return {
+      type: 'order_cancelled',
+      orderId,
+      customerId,
+      transporters,
+      drivers,
+      reason,
+      reasonCode,
+      cancelledAt,
+      eventId,
+      eventVersion: Number.isFinite(eventVersion) && eventVersion > 0 ? Math.floor(eventVersion) : 1,
+      serverTimeMs: Number.isFinite(serverTimeMs) && serverTimeMs > 0 ? Math.floor(serverTimeMs) : Date.now()
+    };
+  }
+
+  private calculateLifecycleRetryDelayMs(attempt: number): number {
+    const scheduleMs = [1000, 2000, 4000, 8000, 16000, 30000, 60000];
+    const base = scheduleMs[Math.max(0, Math.min(scheduleMs.length - 1, attempt - 1))];
+    const jitter = Math.floor(Math.random() * 500);
+    return base + jitter;
+  }
+
+  private startLifecycleOutboxWorker(): void {
+    if (this.lifecycleOutboxWorkerTimer) return;
+
+    const poll = async (): Promise<void> => {
+      if (this.lifecycleOutboxWorkerRunning) return;
+      this.lifecycleOutboxWorkerRunning = true;
+      try {
+        await this.processLifecycleOutboxBatch();
+      } catch (error: any) {
+        logger.error('Order lifecycle outbox worker tick failed', {
+          error: error?.message || 'unknown'
+        });
+      } finally {
+        this.lifecycleOutboxWorkerRunning = false;
+      }
+    };
+
+    this.lifecycleOutboxWorkerTimer = setInterval(() => {
+      void poll();
+    }, ORDER_CANCEL_OUTBOX_POLL_MS);
+    this.lifecycleOutboxWorkerTimer.unref?.();
+    void poll();
+
+    logger.info('Order lifecycle outbox worker started', {
+      pollMs: ORDER_CANCEL_OUTBOX_POLL_MS,
+      batchSize: ORDER_CANCEL_OUTBOX_BATCH_SIZE
+    });
+  }
+
+  private async enqueueCancelLifecycleOutbox(
+    payload: OrderLifecycleOutboxPayload,
+    tx?: Prisma.TransactionClient
+  ): Promise<string> {
+    const outboxId = uuidv4();
+    await this.lifecycleOutboxDelegate(tx).create({
+      data: {
+        id: outboxId,
+        orderId: payload.orderId,
+        eventType: payload.type,
+        payload: payload as unknown as Prisma.InputJsonValue,
+        status: 'pending',
+        attempts: 0,
+        maxAttempts: 10,
+        nextRetryAt: new Date()
+      }
+    });
+    return outboxId;
+  }
+
+  private async claimLifecycleOutboxById(outboxId: string): Promise<LifecycleOutboxRow | null> {
+    const now = new Date();
+    const staleLockBefore = new Date(now.getTime() - 120_000);
+    const claimed = await this.lifecycleOutboxDelegate().updateMany({
+      where: {
+        id: outboxId,
+        status: { in: ['pending', 'retrying'] },
+        nextRetryAt: { lte: now },
+        OR: [{ lockedAt: null }, { lockedAt: { lt: staleLockBefore } }]
+      },
+      data: {
+        status: 'processing',
+        lockedAt: now
+      }
+    });
+    if (claimed.count === 0) return null;
+    const row = await this.lifecycleOutboxDelegate().findUnique({ where: { id: outboxId } });
+    return row as LifecycleOutboxRow | null;
+  }
+
+  private async claimReadyLifecycleOutboxRows(limit: number): Promise<LifecycleOutboxRow[]> {
+    const now = new Date();
+    const staleLockBefore = new Date(now.getTime() - 120_000);
+    const candidates = await this.lifecycleOutboxDelegate().findMany({
+      where: {
+        status: { in: ['pending', 'retrying'] },
+        nextRetryAt: { lte: now },
+        OR: [{ lockedAt: null }, { lockedAt: { lt: staleLockBefore } }]
+      },
+      orderBy: [{ nextRetryAt: 'asc' }, { createdAt: 'asc' }],
+      take: limit
+    });
+
+    const claimed: LifecycleOutboxRow[] = [];
+    for (const candidate of candidates) {
+      const claim = await this.lifecycleOutboxDelegate().updateMany({
+        where: {
+          id: candidate.id,
+          status: { in: ['pending', 'retrying'] },
+          nextRetryAt: { lte: now },
+          OR: [{ lockedAt: null }, { lockedAt: { lt: staleLockBefore } }]
+        },
+        data: {
+          status: 'processing',
+          lockedAt: now
+        }
+      });
+      if (claim.count > 0) {
+        claimed.push({
+          id: candidate.id,
+          orderId: candidate.orderId,
+          eventType: candidate.eventType,
+          payload: candidate.payload as Prisma.JsonValue,
+          status: 'processing',
+          attempts: candidate.attempts,
+          maxAttempts: candidate.maxAttempts,
+          nextRetryAt: candidate.nextRetryAt,
+          lockedAt: now
+        });
+      }
+    }
+    return claimed;
+  }
+
+  private async emitCancellationLifecycle(payload: OrderLifecycleOutboxPayload): Promise<void> {
+    const dismissalPayload = {
+      broadcastId: payload.orderId,
+      orderId: payload.orderId,
+      reason: 'customer_cancelled',
+      reasonCode: payload.reasonCode,
+      message: 'Sorry, the customer cancelled this order',
+      cancelledAt: payload.cancelledAt,
+      eventId: payload.eventId,
+      eventVersion: payload.eventVersion,
+      serverTimeMs: payload.serverTimeMs,
+      emittedAt: new Date().toISOString()
+    };
+    const cancellationPayload = {
+      type: 'order_cancelled',
+      orderId: payload.orderId,
+      reason: payload.reason,
+      reasonCode: payload.reasonCode,
+      cancelledAt: payload.cancelledAt,
+      eventId: payload.eventId,
+      eventVersion: payload.eventVersion,
+      serverTimeMs: payload.serverTimeMs,
+      emittedAt: new Date().toISOString(),
+      broadcastId: payload.orderId
+    };
+
+    if (payload.transporters.length > 0) {
+      await this.emitToTransportersWithAdaptiveFanout(
+        payload.transporters,
+        [
+          { event: 'order_cancelled', payload: cancellationPayload },
+          { event: 'broadcast_dismissed', payload: dismissalPayload }
+        ],
+        'order_cancelled_lifecycle'
+      );
+
+      await queueService.queuePushNotificationBatch(payload.transporters, {
+        title: '❌ Order Cancelled',
+        body: `Order #${payload.orderId.slice(-8).toUpperCase()} was cancelled by customer`,
+        data: {
+          type: 'order_cancelled',
+          orderId: payload.orderId,
+          broadcastId: payload.orderId,
+          reasonCode: payload.reasonCode,
+          cancelledAt: payload.cancelledAt,
+          eventId: payload.eventId,
+          eventVersion: String(payload.eventVersion),
+          serverTimeMs: String(payload.serverTimeMs)
+        }
+      });
+    }
+
+    emitToUser(payload.customerId, 'order_cancelled', {
+      orderId: payload.orderId,
+      status: 'cancelled',
+      reason: payload.reason,
+      reasonCode: payload.reasonCode,
+      cancelledAt: payload.cancelledAt,
+      stateChangedAt: payload.cancelledAt,
+      eventId: payload.eventId,
+      eventVersion: payload.eventVersion,
+      serverTimeMs: payload.serverTimeMs,
+      emittedAt: new Date().toISOString()
+    });
+
+    await queueService.queuePushNotificationBatch([payload.customerId], {
+      title: 'Search cancelled',
+      body: 'Your truck search was cancelled.',
+      data: {
+        type: 'order_cancelled',
+        orderId: payload.orderId,
+        broadcastId: payload.orderId,
+        reasonCode: payload.reasonCode,
+        cancelledAt: payload.cancelledAt,
+        eventId: payload.eventId,
+        eventVersion: String(payload.eventVersion),
+        serverTimeMs: String(payload.serverTimeMs)
+      }
+    });
+
+    for (const driver of payload.drivers) {
+      this.emitDriverCancellationEvents(driver.driverId, {
+        orderId: payload.orderId,
+        tripId: driver.tripId,
+        reason: payload.reason,
+        message: 'Trip cancelled by customer',
+        cancelledAt: payload.cancelledAt,
+        customerName: driver.customerName || '',
+        customerPhone: driver.customerPhone || '',
+        pickupAddress: driver.pickupAddress || '',
+        dropAddress: driver.dropAddress || ''
+      });
+    }
+  }
+
+  private async processLifecycleOutboxRow(row: LifecycleOutboxRow): Promise<void> {
+    const payload = this.parseLifecycleOutboxPayload(row.payload);
+    const nextAttempt = Math.max(1, row.attempts + 1);
+    if (!payload) {
+      await this.lifecycleOutboxDelegate().update({
+        where: { id: row.id },
+        data: {
+          status: 'failed',
+          attempts: nextAttempt,
+          processedAt: new Date(),
+          lockedAt: null,
+          lastError: 'INVALID_PAYLOAD',
+          dlqReason: 'INVALID_PAYLOAD'
+        }
+      });
+      return;
+    }
+
+    try {
+      await this.emitCancellationLifecycle(payload);
+      await this.lifecycleOutboxDelegate().update({
+        where: { id: row.id },
+        data: {
+          status: 'dispatched',
+          attempts: nextAttempt,
+          processedAt: new Date(),
+          lockedAt: null,
+          lastError: null,
+          dlqReason: null
+        }
+      });
+    } catch (error: any) {
+      const retryable = nextAttempt < row.maxAttempts;
+      metrics.incrementCounter('cancel_emit_retry_total', {
+        channel: 'lifecycle_outbox',
+        retryable: retryable ? 'true' : 'false'
+      });
+      if (retryable) {
+        await this.lifecycleOutboxDelegate().update({
+          where: { id: row.id },
+          data: {
+            status: 'retrying',
+            attempts: nextAttempt,
+            nextRetryAt: new Date(Date.now() + this.calculateLifecycleRetryDelayMs(nextAttempt)),
+            lockedAt: null,
+            lastError: error?.message || 'CANCEL_LIFECYCLE_EMIT_FAILED'
+          }
+        });
+      } else {
+        await this.lifecycleOutboxDelegate().update({
+          where: { id: row.id },
+          data: {
+            status: 'failed',
+            attempts: nextAttempt,
+            processedAt: new Date(),
+            lockedAt: null,
+            lastError: error?.message || 'CANCEL_LIFECYCLE_EMIT_FAILED',
+            dlqReason: 'RETRY_EXHAUSTED'
+          }
+        });
+        logger.error('[CANCEL OUTBOX] moved to DLQ', {
+          outboxId: row.id,
+          orderId: row.orderId,
+          eventType: row.eventType,
+          attempts: nextAttempt
+        });
+      }
+    }
+  }
+
+  private async processLifecycleOutboxBatch(limit = ORDER_CANCEL_OUTBOX_BATCH_SIZE): Promise<void> {
+    if (!FF_CANCEL_OUTBOX_ENABLED) return;
+    const rows = await this.claimReadyLifecycleOutboxRows(limit);
+    for (const row of rows) {
+      try {
+        await this.processLifecycleOutboxRow(row);
+      } catch (error: any) {
+        logger.error('Order lifecycle outbox row processing failed', {
+          outboxId: row.id,
+          orderId: row.orderId,
+          eventType: row.eventType,
+          error: error?.message || 'unknown'
+        });
+      }
+    }
+  }
+
+  private async processLifecycleOutboxImmediately(outboxId: string): Promise<void> {
+    if (!FF_CANCEL_OUTBOX_ENABLED) return;
+    const row = await this.claimLifecycleOutboxById(outboxId);
+    if (!row) return;
+    await this.processLifecycleOutboxRow(row);
+  }
+
   private orderExpiryTimerKey(orderId: string): string {
     return `${this.ORDER_EXPIRY_TIMER_PREFIX}${orderId}`;
   }
@@ -1028,6 +1493,8 @@ class OrderService {
       throw new AppError(400, 'VALIDATION_ERROR', 'Truck quantity must be greater than zero');
     }
     const requestPayloadHash = this.buildRequestPayloadHash(request);
+
+    await this.enforceCancelRebookCooldown(request.customerId);
 
     // ==========================================================================
     // PER-CUSTOMER ORDER DEBOUNCE (3 second cooldown)
@@ -2655,6 +3122,344 @@ class OrderService {
     await this.clearCustomerActiveBroadcast(order.customerId);
   }
 
+  private deriveTruckCancelStage(
+    order: Pick<OrderRecord, 'status' | 'loadingStartedAt' | 'unloadingStartedAt'>,
+    assignments: Array<{ status: AssignmentStatus }>
+  ): TruckCancelPolicyStage {
+    if (order.unloadingStartedAt) return 'UNLOADING_STARTED';
+
+    const statuses = new Set(assignments.map((assignment) => assignment.status));
+    if (statuses.has(AssignmentStatus.in_transit)) return 'IN_TRANSIT';
+    if (order.loadingStartedAt) return 'LOADING_STARTED';
+    if (statuses.has(AssignmentStatus.at_pickup)) return 'AT_PICKUP';
+    if (
+      statuses.has(AssignmentStatus.pending) ||
+      statuses.has(AssignmentStatus.driver_accepted) ||
+      statuses.has(AssignmentStatus.en_route_pickup)
+    ) {
+      return 'DRIVER_ASSIGNED';
+    }
+    return 'SEARCHING';
+  }
+
+  private calculateWaitingCharges(order: Pick<OrderRecord, 'stopWaitTimers'>): number {
+    const nowMs = Date.now();
+    const timers = Array.isArray(order.stopWaitTimers) ? order.stopWaitTimers : [];
+    let waitingMinutes = 0;
+    for (const timer of timers) {
+      if (timer.departedAt) continue;
+      const arrivedAtRaw = typeof timer.arrivedAt === 'string' ? timer.arrivedAt : '';
+      if (!arrivedAtRaw) continue;
+      const arrivedAtMs = new Date(arrivedAtRaw).getTime();
+      if (!Number.isFinite(arrivedAtMs)) continue;
+      waitingMinutes = Math.max(waitingMinutes, Math.floor((nowMs - arrivedAtMs) / 60_000));
+    }
+    const graceMinutes = 5;
+    return Math.max(0, waitingMinutes - graceMinutes) * 5;
+  }
+
+  private createMoneyBreakdown(
+    baseCancellationFee: number,
+    waitingCharges: number,
+    percentageFareComponent: number,
+    driverMinimumGuarantee: number
+  ): CancelMoneyBreakdown {
+    return {
+      baseCancellationFee,
+      waitingCharges,
+      percentageFareComponent,
+      driverMinimumGuarantee,
+      finalAmount: Math.max(
+        baseCancellationFee,
+        waitingCharges,
+        percentageFareComponent,
+        driverMinimumGuarantee
+      )
+    };
+  }
+
+  private evaluateTruckCancelPolicy(
+    order: Pick<OrderRecord, 'totalAmount' | 'stopWaitTimers' | 'status' | 'loadingStartedAt' | 'unloadingStartedAt'>,
+    assignments: Array<{ status: AssignmentStatus }>,
+    reason?: string
+  ): TruckCancelPolicyEvaluation {
+    if (!FF_CANCEL_POLICY_TRUCK_V1) {
+      return {
+        stage: 'SEARCHING',
+        decision: 'allowed',
+        reasonRequired: false,
+        reasonCode: 'CANCEL_POLICY_DISABLED',
+        penaltyBreakdown: this.createMoneyBreakdown(0, 0, 0, 0),
+        driverCompensationBreakdown: this.createMoneyBreakdown(0, 0, 0, 0),
+        settlementState: 'waived',
+        pendingPenaltyAmount: 0
+      };
+    }
+
+    const stage = this.deriveTruckCancelStage(order, assignments);
+    const waitingCharges = this.calculateWaitingCharges(order);
+    const percentage30 = Math.round((Number(order.totalAmount || 0) * 0.30) * 100) / 100;
+
+    let decision: TruckCancelDecision = 'allowed';
+    let reasonRequired = false;
+    let reasonCode = 'CUSTOMER_CANCELLED';
+    let penaltyBreakdown = this.createMoneyBreakdown(0, 0, 0, 0);
+    let driverCompensationBreakdown = this.createMoneyBreakdown(0, 0, 0, 0);
+
+    switch (stage) {
+      case 'SEARCHING':
+        penaltyBreakdown = this.createMoneyBreakdown(0, 0, 0, 0);
+        driverCompensationBreakdown = this.createMoneyBreakdown(0, 0, 0, 0);
+        reasonCode = 'CANCEL_SEARCHING';
+        break;
+      case 'DRIVER_ASSIGNED':
+        penaltyBreakdown = this.createMoneyBreakdown(50, 0, 0, 0);
+        driverCompensationBreakdown = this.createMoneyBreakdown(50, 0, 0, 50);
+        reasonCode = 'CANCEL_AFTER_ASSIGNMENT';
+        break;
+      case 'AT_PICKUP':
+        reasonRequired = true;
+        penaltyBreakdown = this.createMoneyBreakdown(100, waitingCharges, 0, 100);
+        driverCompensationBreakdown = this.createMoneyBreakdown(100, waitingCharges, 0, 100);
+        reasonCode = 'CANCEL_AT_PICKUP';
+        break;
+      case 'LOADING_STARTED':
+        reasonRequired = true;
+        penaltyBreakdown = this.createMoneyBreakdown(100, waitingCharges, percentage30, 100);
+        driverCompensationBreakdown = this.createMoneyBreakdown(100, waitingCharges, Math.round((percentage30 * 0.5) * 100) / 100, 100);
+        reasonCode = 'CANCEL_LOADING_STARTED';
+        break;
+      case 'IN_TRANSIT':
+        decision = 'blocked_dispute_only';
+        reasonRequired = true;
+        reasonCode = 'CANCEL_BLOCKED_IN_TRANSIT';
+        break;
+      case 'UNLOADING_STARTED':
+        decision = 'blocked_dispute_only';
+        reasonRequired = true;
+        reasonCode = 'CANCEL_BLOCKED_UNLOADING_STARTED';
+        break;
+    }
+
+    if (reasonRequired && (!reason || reason.trim().length === 0)) {
+      reasonCode = `${reasonCode}_REASON_REQUIRED`;
+    }
+
+    const pendingPenaltyAmount = decision === 'allowed' ? penaltyBreakdown.finalAmount : 0;
+    const settlementState: 'pending' | 'settled' | 'waived' = decision !== 'allowed'
+      ? 'waived'
+      : (pendingPenaltyAmount > 0 || driverCompensationBreakdown.finalAmount > 0)
+        ? 'pending'
+        : 'settled';
+
+    return {
+      stage,
+      decision,
+      reasonRequired,
+      reasonCode,
+      penaltyBreakdown,
+      driverCompensationBreakdown,
+      settlementState,
+      pendingPenaltyAmount
+    };
+  }
+
+  private buildCancelPayloadHash(orderId: string, reason?: string): string {
+    const normalizedReason = (reason || '').trim().toLowerCase();
+    return crypto
+      .createHash('sha256')
+      .update(`${orderId}::${normalizedReason}`)
+      .digest('hex');
+  }
+
+  private async getCancelIdempotentResponse(
+    customerId: string,
+    idempotencyKey: string,
+    payloadHash: string
+  ): Promise<CancelOrderResult | null> {
+    const row = await prismaClient.orderCancelIdempotency.findUnique({
+      where: {
+        customerId_operation_idempotencyKey: {
+          customerId,
+          operation: 'cancel',
+          idempotencyKey
+        }
+      }
+    });
+    if (!row) return null;
+    if (row.payloadHash !== payloadHash) {
+      throw new AppError(409, 'IDEMPOTENCY_CONFLICT', 'Idempotency key reused with different cancel payload');
+    }
+    return row.responseJson as unknown as CancelOrderResult;
+  }
+
+  private async persistCancelIdempotentResponse(
+    customerId: string,
+    idempotencyKey: string,
+    payloadHash: string,
+    orderId: string,
+    response: CancelOrderResult,
+    statusCode: number
+  ): Promise<void> {
+    try {
+      await prismaClient.orderCancelIdempotency.create({
+        data: {
+          id: uuidv4(),
+          customerId,
+          operation: 'cancel',
+          idempotencyKey,
+          payloadHash,
+          orderId,
+          statusCode,
+          responseJson: response as unknown as Prisma.InputJsonValue
+        }
+      });
+    } catch (error: any) {
+      if (error?.code !== 'P2002') throw error;
+      const replay = await this.getCancelIdempotentResponse(customerId, idempotencyKey, payloadHash);
+      if (!replay) {
+        throw new AppError(409, 'IDEMPOTENCY_CONFLICT', 'Idempotency key conflict');
+      }
+    }
+  }
+
+  private async registerCancelRebookChurn(customerId: string): Promise<void> {
+    if (!FF_CANCEL_REBOOK_CHURN_GUARD) return;
+    const countKey = `cancel:rebook:count:${customerId}`;
+    const cooldownKey = `cancel:rebook:cooldown:${customerId}`;
+    try {
+      const newCount = await redisService.incr(countKey);
+      if (newCount === 1) {
+        await redisService.expire(countKey, 120).catch(() => false);
+      }
+      if (newCount > 6) {
+        await redisService.set(cooldownKey, '120', 120);
+      } else if (newCount > 3) {
+        const existingTtl = await redisService.ttl(cooldownKey).catch(() => -1);
+        if (existingTtl <= 0) {
+          await redisService.set(cooldownKey, '15', 15);
+        }
+      }
+    } catch (error: any) {
+      logger.warn('Failed to update cancel rebook churn counter', {
+        customerId,
+        error: error?.message || 'unknown'
+      });
+    }
+  }
+
+  private async enforceCancelRebookCooldown(customerId: string): Promise<void> {
+    if (!FF_CANCEL_REBOOK_CHURN_GUARD) return;
+    const cooldownKey = `cancel:rebook:cooldown:${customerId}`;
+    const remaining = await redisService.ttl(cooldownKey).catch(() => -1);
+    if (remaining > 0) {
+      metrics.incrementCounter('cancel_rebook_throttled_total', {
+        bucket: remaining > 60 ? 'hard' : 'soft'
+      });
+      throw new AppError(
+        429,
+        'CANCEL_REBOOK_COOLDOWN',
+        `Please wait ${remaining}s before creating another order.`,
+        { retryAfter: remaining }
+      );
+    }
+  }
+
+  async getCancelPreview(orderId: string, customerId: string, reason?: string): Promise<CancelOrderResult> {
+    const order = await db.getOrderById(orderId);
+    if (!order) {
+      return { success: false, message: 'Order not found', transportersNotified: 0 };
+    }
+    if (order.customerId !== customerId) {
+      return { success: false, message: 'You can only cancel your own orders', transportersNotified: 0 };
+    }
+
+    const assignments = await prismaClient.assignment.findMany({
+      where: {
+        orderId,
+        status: {
+          in: [
+            AssignmentStatus.pending,
+            AssignmentStatus.driver_accepted,
+            AssignmentStatus.en_route_pickup,
+            AssignmentStatus.at_pickup,
+            AssignmentStatus.in_transit
+          ]
+        }
+      },
+      select: { status: true }
+    });
+    const evaluation = this.evaluateTruckCancelPolicy(order, assignments, reason);
+    return {
+      success: true,
+      message: evaluation.decision === 'allowed'
+        ? 'Cancellation allowed under current stage'
+        : 'Cancellation blocked. Please use dispute.',
+      transportersNotified: 0,
+      policyStage: evaluation.stage,
+      cancelDecision: evaluation.decision,
+      reasonRequired: evaluation.reasonRequired,
+      reasonCode: evaluation.reasonCode,
+      penaltyBreakdown: evaluation.penaltyBreakdown,
+      driverCompensationBreakdown: evaluation.driverCompensationBreakdown,
+      settlementState: evaluation.settlementState,
+      pendingPenaltyAmount: evaluation.pendingPenaltyAmount,
+      serverTimeMs: Date.now(),
+      eventVersion: Number(order.lifecycleEventVersion || 0)
+    };
+  }
+
+  async createCancelDispute(
+    orderId: string,
+    customerId: string,
+    reasonCode?: string,
+    notes?: string
+  ): Promise<{ success: boolean; disputeId?: string; message: string; stage?: TruckCancelPolicyStage }> {
+    const order = await db.getOrderById(orderId);
+    if (!order) return { success: false, message: 'Order not found' };
+    if (order.customerId !== customerId) return { success: false, message: 'You can only dispute your own orders' };
+
+    const assignments = await prismaClient.assignment.findMany({
+      where: {
+        orderId,
+        status: {
+          in: [
+            AssignmentStatus.pending,
+            AssignmentStatus.driver_accepted,
+            AssignmentStatus.en_route_pickup,
+            AssignmentStatus.at_pickup,
+            AssignmentStatus.in_transit
+          ]
+        }
+      },
+      select: { status: true }
+    });
+    const stage = this.deriveTruckCancelStage(order, assignments);
+    if (stage !== 'IN_TRANSIT' && stage !== 'UNLOADING_STARTED') {
+      return {
+        success: false,
+        message: 'Dispute can be raised only when cancellation is blocked in transit/unloading stage',
+        stage
+      };
+    }
+
+    const disputeId = uuidv4();
+    await prismaClient.cancelDispute.create({
+      data: {
+        id: disputeId,
+        orderId,
+        customerId,
+        stage,
+        reasonCode: reasonCode || null,
+        notes: notes || null,
+        status: 'open'
+      }
+    });
+
+    metrics.incrementCounter('cancel_dispute_created_total', { stage: stage.toLowerCase() });
+    return { success: true, disputeId, message: 'Dispute created successfully', stage };
+  }
+
   /**
    * Cancel an order — atomic, idempotent, race-safe
    *
@@ -2664,247 +3469,479 @@ class OrderService {
   async cancelOrder(
     orderId: string,
     customerId: string,
-    reason?: string
-  ): Promise<{ success: boolean; message: string; transportersNotified: number }> {
+    reason?: string,
+    idempotencyKey?: string,
+    options: { createDispute?: boolean } = {}
+  ): Promise<CancelOrderResult> {
     logger.info(`CANCEL ORDER: ${orderId} by customer ${customerId}`);
+    const normalizedReason = (reason || '').trim();
+    const effectiveReason = normalizedReason || 'Cancelled by customer';
+    const payloadHash = this.buildCancelPayloadHash(orderId, effectiveReason);
 
-    // ATOMIC cancel: only succeeds if status is still cancellable
-    const updated = await prismaClient.order.updateMany({
-      where: {
-        id: orderId,
-        customerId,
-        status: { in: [OrderStatus.created, OrderStatus.broadcasting, OrderStatus.active, OrderStatus.partially_filled] }
-      },
-      data: {
-        status: OrderStatus.cancelled,
-        stateChangedAt: new Date(),
-        cancelledAt: new Date().toISOString(),
-        cancellationReason: reason || 'Cancelled by customer'
-      }
-    });
-
-    // Fetch current state
-    const order = await db.getOrderById(orderId);
-
-    if (!order) {
-      return { success: false, message: 'Order not found', transportersNotified: 0 };
-    }
-
-    if (order.customerId !== customerId) {
-      return { success: false, message: 'You can only cancel your own orders', transportersNotified: 0 };
-    }
-
-    // IDEMPOTENT: already cancelled is success
-    if (updated.count === 0 && order.status === OrderStatus.cancelled) {
-      return { success: true, message: 'Order already cancelled', transportersNotified: 0 };
-    }
-
-    if (updated.count === 0) {
-      return { success: false, message: `Cannot cancel order in ${order.status} state`, transportersNotified: 0 };
-    }
-
-    // === CANCEL WON: Full cleanup ===
-
-    const closedCancelledHolds = await truckHoldService.closeActiveHoldsForOrder(orderId, 'ORDER_CANCELLED');
-    if (closedCancelledHolds > 0) {
-      logger.info(`[ORDER CANCEL] Closed ${closedCancelledHolds} active hold(s) for order ${orderId}`);
-    }
-
-    // 1. Cancel all associated TruckRequests atomically
-    const truckRequests = await db.getTruckRequestsByOrder(orderId);
-    const requestIds = truckRequests.filter(tr => ['searching', 'held'].includes(tr.status)).map(tr => tr.id);
-    if (requestIds.length > 0) {
-      await db.updateTruckRequestsBatch(requestIds, { status: TruckRequestStatus.cancelled });
-    }
-
-    // 2. Clear timers from Redis
-    await redisService.cancelTimer(this.TIMER_KEYS.ORDER_EXPIRY(orderId));
-    await this.clearProgressiveStepTimers(orderId);
-    logger.info(`   Cleared timers for ${orderId}`);
-
-    // 3. Clear customer active broadcast key + idempotency keys
-    await this.clearCustomerActiveBroadcast(customerId);
-
-    // 3b. Stop any pending/retrying dispatch outbox jobs for this cancelled order.
-    await this.orderDispatchOutboxDelegate().updateMany({
-      where: {
+    if (FF_CANCEL_IDEMPOTENCY_REQUIRED && !idempotencyKey) {
+      logger.warn('[CANCEL] Idempotency key missing while strict flag is enabled', {
         orderId,
-        status: { in: ['pending', 'retrying', 'processing'] }
-      },
-      data: {
-        status: 'failed',
-        processedAt: new Date(),
-        lockedAt: null,
-        lastError: 'ORDER_CANCELLED'
-      }
-    });
-
-    // 4. Collect and notify all notified transporters
-    const notifiedTransporters = new Set<string>();
-    for (const tr of truckRequests) {
-      if (tr.notifiedTransporters) {
-        tr.notifiedTransporters.forEach(t => notifiedTransporters.add(t));
-      }
+        customerId
+      });
     }
 
-    const cancelledAt = new Date().toISOString();
-    const cancellationEventId = uuidv4();
-    const cancellationServerTimeMs = Date.now();
-    const cancellationData = {
-      type: 'order_cancelled',
-      orderId,
-      reason: reason || 'Cancelled by customer',
-      cancelledAt,
-      eventId: cancellationEventId,
-      eventVersion: 1,
-      serverTimeMs: cancellationServerTimeMs,
-      emittedAt: new Date().toISOString()
+    if (idempotencyKey) {
+      const replay = await this.getCancelIdempotentResponse(customerId, idempotencyKey, payloadHash);
+      if (replay) return replay;
+    }
+
+    let lifecycleOutboxId: string | null = null;
+    let lifecyclePayload: OrderLifecycleOutboxPayload | null = null;
+    let closedHoldsCount = 0;
+    let closedHoldIds: string[] = [];
+    let result: CancelOrderResult = {
+      success: false,
+      message: 'Cancel failed',
+      transportersNotified: 0
     };
+    let statusCode = 400;
 
-    const transporterIds = Array.from(notifiedTransporters);
+    const cancellableOrderStatuses: OrderStatus[] = [
+      OrderStatus.created,
+      OrderStatus.broadcasting,
+      OrderStatus.active,
+      OrderStatus.partially_filled
+    ];
+    const activeAssignmentStatuses: AssignmentStatus[] = [
+      AssignmentStatus.pending,
+      AssignmentStatus.driver_accepted,
+      AssignmentStatus.en_route_pickup,
+      AssignmentStatus.at_pickup,
+      AssignmentStatus.in_transit
+    ];
 
-    if (transporterIds.length > 0) {
-      // broadcast_dismissed feeds BroadcastListScreen overlay infrastructure directly
-      const dismissedData = {
-        broadcastId: orderId,
+    await prismaClient.$transaction(async (tx) => {
+      const order = await tx.order.findUnique({ where: { id: orderId } });
+      if (!order) {
+        statusCode = 404;
+        result = { success: false, message: 'Order not found', transportersNotified: 0 };
+        return;
+      }
+      if (order.customerId !== customerId) {
+        statusCode = 403;
+        result = {
+          success: false,
+          message: 'You can only cancel your own orders',
+          transportersNotified: 0
+        };
+        return;
+      }
+
+      const assignmentRows = await tx.assignment.findMany({
+        where: { orderId, status: { in: activeAssignmentStatuses } },
+        select: {
+          id: true,
+          status: true,
+          driverId: true,
+          tripId: true,
+          vehicleId: true
+        }
+      });
+      const stageEvaluation = this.evaluateTruckCancelPolicy(order as unknown as OrderRecord, assignmentRows, normalizedReason);
+      metrics.incrementCounter('cancel_requests_total', {
+        stage: stageEvaluation.stage.toLowerCase(),
+        decision: stageEvaluation.decision
+      });
+
+      if (stageEvaluation.reasonRequired && !normalizedReason) {
+        statusCode = 400;
+        result = {
+          success: false,
+          message: 'Cancellation reason is required at this stage',
+          transportersNotified: 0,
+          policyStage: stageEvaluation.stage,
+          cancelDecision: stageEvaluation.decision,
+          reasonRequired: true,
+          reasonCode: stageEvaluation.reasonCode,
+          penaltyBreakdown: stageEvaluation.penaltyBreakdown,
+          driverCompensationBreakdown: stageEvaluation.driverCompensationBreakdown,
+          settlementState: stageEvaluation.settlementState,
+          pendingPenaltyAmount: stageEvaluation.pendingPenaltyAmount,
+          eventVersion: Number(order.lifecycleEventVersion || 0),
+          serverTimeMs: Date.now()
+        };
+        return;
+      }
+
+      if (stageEvaluation.decision === 'blocked_dispute_only') {
+        let disputeId: string | undefined;
+        if (options.createDispute) {
+          disputeId = uuidv4();
+          await tx.cancelDispute.create({
+            data: {
+              id: disputeId,
+              orderId,
+              customerId,
+              stage: stageEvaluation.stage,
+              reasonCode: normalizedReason || stageEvaluation.reasonCode,
+              notes: normalizedReason || null,
+              status: 'open'
+            }
+          });
+          metrics.incrementCounter('cancel_dispute_created_total', {
+            stage: stageEvaluation.stage.toLowerCase()
+          });
+        }
+
+        statusCode = 409;
+        result = {
+          success: false,
+          message: disputeId
+            ? 'Cancellation blocked. Dispute created.'
+            : 'Cancellation blocked at this stage. Please raise a dispute.',
+          transportersNotified: 0,
+          policyStage: stageEvaluation.stage,
+          cancelDecision: stageEvaluation.decision,
+          reasonRequired: stageEvaluation.reasonRequired,
+          reasonCode: stageEvaluation.reasonCode,
+          penaltyBreakdown: stageEvaluation.penaltyBreakdown,
+          driverCompensationBreakdown: stageEvaluation.driverCompensationBreakdown,
+          settlementState: stageEvaluation.settlementState,
+          pendingPenaltyAmount: stageEvaluation.pendingPenaltyAmount,
+          disputeId,
+          eventVersion: Number(order.lifecycleEventVersion || 0),
+          serverTimeMs: Date.now()
+        };
+        return;
+      }
+
+      const updated = await tx.order.updateMany({
+        where: {
+          id: orderId,
+          customerId,
+          status: { in: cancellableOrderStatuses }
+        },
+        data: {
+          status: OrderStatus.cancelled,
+          stateChangedAt: new Date(),
+          cancelledAt: new Date().toISOString(),
+          cancellationReason: effectiveReason,
+          lifecycleEventVersion: { increment: 1 }
+        }
+      });
+
+      const refreshedOrder = await tx.order.findUnique({ where: { id: orderId } });
+      if (!refreshedOrder) {
+        statusCode = 404;
+        result = { success: false, message: 'Order not found', transportersNotified: 0 };
+        return;
+      }
+
+      if (updated.count === 0) {
+        if (refreshedOrder.status === OrderStatus.cancelled) {
+          statusCode = 200;
+          result = {
+            success: true,
+            message: 'Order already cancelled',
+            transportersNotified: 0,
+            policyStage: stageEvaluation.stage,
+            cancelDecision: 'allowed',
+            reasonRequired: stageEvaluation.reasonRequired,
+            reasonCode: stageEvaluation.reasonCode,
+            penaltyBreakdown: stageEvaluation.penaltyBreakdown,
+            driverCompensationBreakdown: stageEvaluation.driverCompensationBreakdown,
+            settlementState: stageEvaluation.settlementState,
+            pendingPenaltyAmount: stageEvaluation.pendingPenaltyAmount,
+            eventVersion: Number(refreshedOrder.lifecycleEventVersion || 0),
+            serverTimeMs: Date.now()
+          };
+          return;
+        }
+        statusCode = 409;
+        result = {
+          success: false,
+          message: `Cannot cancel order in ${refreshedOrder.status} state`,
+          transportersNotified: 0,
+          policyStage: stageEvaluation.stage,
+          cancelDecision: stageEvaluation.decision,
+          reasonRequired: stageEvaluation.reasonRequired,
+          reasonCode: stageEvaluation.reasonCode,
+          penaltyBreakdown: stageEvaluation.penaltyBreakdown,
+          driverCompensationBreakdown: stageEvaluation.driverCompensationBreakdown,
+          settlementState: stageEvaluation.settlementState,
+          pendingPenaltyAmount: stageEvaluation.pendingPenaltyAmount,
+          eventVersion: Number(refreshedOrder.lifecycleEventVersion || 0),
+          serverTimeMs: Date.now()
+        };
+        return;
+      }
+
+      const truckRequests = await tx.truckRequest.findMany({
+        where: { orderId },
+        select: {
+          id: true,
+          status: true,
+          notifiedTransporters: true
+        }
+      });
+
+      const activeHolds = await tx.truckHoldLedger.findMany({
+        where: { orderId, status: 'active' },
+        select: {
+          holdId: true,
+          transporterId: true,
+          truckRequestIds: true
+        }
+      });
+      closedHoldsCount = activeHolds.length;
+      closedHoldIds = activeHolds.map((hold) => hold.holdId);
+
+      for (const hold of activeHolds) {
+        await tx.truckRequest.updateMany({
+          where: {
+            id: { in: hold.truckRequestIds },
+            orderId,
+            status: TruckRequestStatus.held,
+            heldById: hold.transporterId
+          },
+          data: {
+            status: TruckRequestStatus.cancelled,
+            heldById: null,
+            heldAt: null
+          }
+        });
+        await tx.truckHoldLedger.update({
+          where: { holdId: hold.holdId },
+          data: {
+            status: 'cancelled',
+            terminalReason: 'ORDER_CANCELLED',
+            releasedAt: new Date()
+          }
+        });
+      }
+
+      await tx.truckRequest.updateMany({
+        where: {
+          orderId,
+          status: { in: [TruckRequestStatus.searching, TruckRequestStatus.held] }
+        },
+        data: {
+          status: TruckRequestStatus.cancelled,
+          heldById: null,
+          heldAt: null
+        }
+      });
+
+      if (assignmentRows.length > 0) {
+        await tx.assignment.updateMany({
+          where: {
+            orderId,
+            status: { in: activeAssignmentStatuses }
+          },
+          data: {
+            status: AssignmentStatus.cancelled
+          }
+        });
+      }
+
+      const vehicleIdsToRelease = Array.from(
+        new Set(
+          assignmentRows
+            .map((assignment) => assignment.vehicleId)
+            .filter((id): id is string => Boolean(id))
+        )
+      );
+      if (vehicleIdsToRelease.length > 0) {
+        await tx.vehicle.updateMany({
+          where: { id: { in: vehicleIdsToRelease } },
+          data: {
+            status: VehicleStatus.available,
+            currentTripId: null,
+            assignedDriverId: null
+          }
+        });
+      }
+
+      await tx.orderDispatchOutbox.updateMany({
+        where: {
+          orderId,
+          status: { in: ['pending', 'retrying', 'processing'] }
+        },
+        data: {
+          status: 'failed',
+          processedAt: new Date(),
+          lockedAt: null,
+          lastError: 'ORDER_CANCELLED'
+        }
+      });
+
+      const eventVersion = Number(refreshedOrder.lifecycleEventVersion || 1);
+      const eventId = uuidv4();
+      const serverTimeMs = Date.now();
+      const cancelledAt = refreshedOrder.cancelledAt || new Date().toISOString();
+
+      await tx.cancellationLedger.create({
+        data: {
+          id: uuidv4(),
+          orderId,
+          customerId,
+          driverId: assignmentRows[0]?.driverId || null,
+          policyStage: stageEvaluation.stage,
+          reasonCode: normalizedReason || stageEvaluation.reasonCode,
+          penaltyAmount: stageEvaluation.penaltyBreakdown.finalAmount,
+          compensationAmount: stageEvaluation.driverCompensationBreakdown.finalAmount,
+          settlementState: stageEvaluation.settlementState,
+          cancelDecision: stageEvaluation.decision,
+          eventVersion,
+          idempotencyKey: idempotencyKey || null
+        }
+      });
+
+      if (stageEvaluation.pendingPenaltyAmount > 0 && FF_CANCEL_DEFERRED_SETTLEMENT) {
+        await tx.customerPenaltyDue.create({
+          data: {
+            id: uuidv4(),
+            customerId,
+            orderId,
+            amount: stageEvaluation.pendingPenaltyAmount,
+            state: 'due',
+            nextOrderHint: 'Pending cancellation fee will be adjusted on next booking.'
+          }
+        });
+      }
+
+      const activeDriverIds = Array.from(
+        new Set(
+          assignmentRows
+            .map((assignment) => assignment.driverId)
+            .filter((id): id is string => Boolean(id))
+        )
+      );
+      if (activeDriverIds.length > 0 && stageEvaluation.driverCompensationBreakdown.finalAmount > 0 && FF_CANCEL_DEFERRED_SETTLEMENT) {
+        const perDriverAmount = Math.round((stageEvaluation.driverCompensationBreakdown.finalAmount / activeDriverIds.length) * 100) / 100;
+        await tx.driverCompensationLedger.createMany({
+          data: activeDriverIds.map((driverId) => ({
+            id: uuidv4(),
+            driverId,
+            orderId,
+            amount: perDriverAmount,
+            state: 'pending'
+          }))
+        });
+      }
+
+      const now = new Date();
+      await tx.cancellationAbuseCounter.upsert({
+        where: { customerId },
+        create: {
+          customerId,
+          cancelCount7d: 1,
+          cancelCount30d: 1,
+          cancelAfterLoadingCount: stageEvaluation.stage === 'LOADING_STARTED' ? 1 : 0,
+          cancelRebook2mCount: 1,
+          riskTier: stageEvaluation.stage === 'LOADING_STARTED' ? 'warning' : 'normal',
+          lastCancelAt: now
+        },
+        update: {
+          cancelCount7d: { increment: 1 },
+          cancelCount30d: { increment: 1 },
+          cancelAfterLoadingCount: stageEvaluation.stage === 'LOADING_STARTED'
+            ? { increment: 1 }
+            : undefined,
+          cancelRebook2mCount: { increment: 1 },
+          lastCancelAt: now,
+          riskTier: stageEvaluation.stage === 'LOADING_STARTED' ? 'warning' : undefined
+        }
+      });
+
+      const transporterIds = Array.from(
+        truckRequests.reduce((set, row) => {
+          (row.notifiedTransporters || []).forEach((id) => {
+            if (typeof id === 'string' && id.trim().length > 0) set.add(id.trim());
+          });
+          return set;
+        }, new Set<string>())
+      );
+
+      lifecyclePayload = {
+        type: 'order_cancelled',
         orderId,
-        reason: 'customer_cancelled',
-        message: 'Sorry, the customer cancelled this order',
+        customerId,
+        transporters: transporterIds,
+        drivers: assignmentRows
+          .filter((assignment) => Boolean(assignment.driverId))
+          .map((assignment) => ({
+            driverId: String(assignment.driverId),
+            tripId: assignment.tripId || undefined,
+            customerName: refreshedOrder.customerName,
+            customerPhone: refreshedOrder.customerPhone,
+            pickupAddress: (refreshedOrder.pickup as any)?.address || '',
+            dropAddress: (refreshedOrder.drop as any)?.address || ''
+          })),
+        reason: effectiveReason,
+        reasonCode: stageEvaluation.reasonCode,
         cancelledAt,
-        eventId: cancellationEventId,
-        eventVersion: 1,
-        serverTimeMs: cancellationServerTimeMs,
-        emittedAt: new Date().toISOString()
+        eventId,
+        eventVersion: FF_CANCEL_EVENT_VERSION_ENFORCED ? eventVersion : 1,
+        serverTimeMs
       };
 
-      await this.emitToTransportersWithAdaptiveFanout(
-        transporterIds,
-        [
-          { event: 'order_cancelled', payload: cancellationData },
-          { event: 'broadcast_dismissed', payload: dismissedData }
-        ],
-        'order_cancelled'
-      );
-      logger.info(`   Cancellation broadcast dispatched to ${transporterIds.length} transporters`);
+      if (FF_CANCEL_OUTBOX_ENABLED && lifecyclePayload) {
+        lifecycleOutboxId = await this.enqueueCancelLifecycleOutbox(lifecyclePayload, tx);
+      }
 
-      await queueService.queuePushNotificationBatch(
-        transporterIds,
-        {
-          title: '❌ Order Cancelled',
-          body: `Order #${orderId.slice(-8).toUpperCase()} was cancelled by customer`,
-          data: {
-            type: 'order_cancelled',
+      statusCode = 200;
+      result = {
+        success: true,
+        message: 'Order cancelled successfully',
+        transportersNotified: transporterIds.length,
+        policyStage: stageEvaluation.stage,
+        cancelDecision: stageEvaluation.decision,
+        reasonRequired: stageEvaluation.reasonRequired,
+        reasonCode: stageEvaluation.reasonCode,
+        penaltyBreakdown: stageEvaluation.penaltyBreakdown,
+        driverCompensationBreakdown: stageEvaluation.driverCompensationBreakdown,
+        settlementState: stageEvaluation.settlementState,
+        pendingPenaltyAmount: stageEvaluation.pendingPenaltyAmount,
+        eventId,
+        eventVersion: lifecyclePayload.eventVersion,
+        serverTimeMs
+      };
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+
+    if (result.success) {
+      await redisService.cancelTimer(this.TIMER_KEYS.ORDER_EXPIRY(orderId));
+      await this.clearProgressiveStepTimers(orderId);
+      await this.clearCustomerActiveBroadcast(customerId);
+      await this.registerCancelRebookChurn(customerId);
+      await truckHoldService.clearHoldCacheEntries(closedHoldIds);
+
+      metrics.incrementCounter('holds_released_on_cancel_total', {
+        bucket: closedHoldsCount > 0 ? 'has_holds' : 'none'
+      }, Math.max(1, closedHoldsCount));
+
+      if (FF_CANCEL_OUTBOX_ENABLED && lifecycleOutboxId) {
+        try {
+          await this.processLifecycleOutboxImmediately(lifecycleOutboxId);
+        } catch (error: any) {
+          logger.warn('[CANCEL OUTBOX] immediate dispatch failed; worker will retry', {
             orderId,
-            broadcastId: orderId,
-            cancelledAt,
-            eventId: cancellationEventId,
-            eventVersion: String(1),
-            serverTimeMs: String(cancellationServerTimeMs)
-          }
+            outboxId: lifecycleOutboxId,
+            error: error?.message || 'unknown'
+          });
         }
-      ).catch((err: unknown) => {
-        const errorMessage = err instanceof Error ? err.message : String(err);
-        logger.warn(`FCM: Failed to queue cancellation push for order ${orderId}`, { error: errorMessage });
-      });
+      } else if (lifecyclePayload) {
+        await this.emitCancellationLifecycle(lifecyclePayload);
+      }
     }
 
-    // 5. Notify customer — WebSocket (foreground) + FCM (background/killed app)
-    emitToUser(customerId, 'order_cancelled', {
-      orderId,
-      status: 'cancelled',
-      reason: reason || 'Cancelled by customer',
-      cancelledAt,
-      stateChangedAt: cancelledAt,
-      eventId: cancellationEventId,
-      eventVersion: 1,
-      serverTimeMs: cancellationServerTimeMs,
-      emittedAt: new Date().toISOString()
-    });
-
-    // GAP 7 FIX: FCM fallback for customer when app is backgrounded/killed.
-    // Without this, a customer who backgrounds the app during search never
-    // sees the "Search cancelled" state when they reopen it.
-    await queueService.queuePushNotificationBatch(
-      [customerId],
-      {
-        title: 'Search cancelled',
-        body: 'Your truck search was cancelled.',
-        data: {
-          type: 'order_cancelled',
-          orderId,
-          status: 'cancelled',
-          broadcastId: orderId,
-          cancelledAt,
-          eventId: cancellationEventId,
-          eventVersion: String(1),
-          serverTimeMs: String(cancellationServerTimeMs)
-        }
-      }
-    ).catch((err: unknown) => {
-      const errorMessage = err instanceof Error ? err.message : String(err);
-      logger.warn(`FCM: Failed to send cancellation push to customer ${customerId}`, { error: errorMessage });
-    });
-
-    // 6. Revert active assignments — release vehicles and notify drivers
-    try {
-      const activeAssignments = await prismaClient.assignment.findMany({
-        where: { orderId, status: { in: [AssignmentStatus.pending, AssignmentStatus.driver_accepted, AssignmentStatus.en_route_pickup, AssignmentStatus.at_pickup, AssignmentStatus.in_transit] } }
-      });
-      if (activeAssignments.length > 0) {
-        await prismaClient.assignment.updateMany({
-          where: { orderId, status: { in: [AssignmentStatus.pending, AssignmentStatus.driver_accepted, AssignmentStatus.en_route_pickup, AssignmentStatus.at_pickup, AssignmentStatus.in_transit] } },
-          data: { status: AssignmentStatus.cancelled }
-        });
-
-        const vehicleIdsToRelease = Array.from(
-          new Set(
-            activeAssignments
-              .map((assignment) => assignment.vehicleId)
-              .filter((id): id is string => Boolean(id))
-          )
-        );
-        if (vehicleIdsToRelease.length > 0) {
-          await prismaClient.vehicle.updateMany({
-            where: {
-              id: { in: vehicleIdsToRelease }
-            },
-            data: {
-              status: VehicleStatus.available,
-              currentTripId: null,
-              assignedDriverId: null
-            }
-          }).catch(() => {});
-        }
-
-        for (const assignment of activeAssignments) {
-          if (assignment.driverId) {
-            this.emitDriverCancellationEvents(assignment.driverId, {
-              orderId,
-              tripId: assignment.tripId,
-              reason: reason || 'Cancelled by customer',
-              message: 'Trip cancelled by customer',
-              cancelledAt,
-              customerName: order.customerName,
-              customerPhone: order.customerPhone,
-              pickupAddress: order.pickup?.address || '',
-              dropAddress: order.drop?.address || ''
-            });
-          }
-        }
-        logger.info(`[CANCEL] Reverted ${activeAssignments.length} assignments, released vehicles`);
-      }
-    } catch (err: unknown) {
-      const errorMessage = err instanceof Error ? err.message : String(err);
-      logger.warn(`[CANCEL] Failed to revert assignments (non-critical)`, { error: errorMessage });
+    if (idempotencyKey) {
+      await this.persistCancelIdempotentResponse(
+        customerId,
+        idempotencyKey,
+        payloadHash,
+        orderId,
+        result,
+        statusCode
+      );
     }
 
-    logger.info(`Order ${orderId} cancelled, notified ${transporterIds.length} transporters`);
-
-    return {
-      success: true,
-      message: 'Order cancelled successfully',
-      transportersNotified: transporterIds.length
-    };
+    return result;
   }
 
   /**

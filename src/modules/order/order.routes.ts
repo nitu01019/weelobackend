@@ -511,19 +511,34 @@ router.post(
       const { id: orderId } = req.params;
       const user = (req as any).user;
       const { reason } = req.body;
+      const idempotencyKey = req.header('X-Idempotency-Key') || req.header('x-idempotency-key') || undefined;
       
       logger.info(`📛 Order cancellation requested: ${orderId} by ${user.phone}`);
       
       // Cancel the order and broadcast to transporters
-      const result = await orderService.cancelOrder(orderId, user.userId, reason);
+      const result = await orderService.cancelOrder(orderId, user.userId, reason, idempotencyKey);
       
       if (!result.success) {
-        res.status(400).json({
+        const statusCode = result.cancelDecision === 'blocked_dispute_only' ? 409 : 400;
+        res.status(statusCode).json({
           success: false,
           error: {
-            code: 'CANCEL_FAILED',
-            message: result.message
-          }
+            code: result.cancelDecision === 'blocked_dispute_only' ? 'CANCEL_BLOCKED_DISPUTE_ONLY' : 'CANCEL_FAILED',
+            message: result.message,
+            data: {
+              policyStage: result.policyStage,
+              cancelDecision: result.cancelDecision,
+              reasonRequired: result.reasonRequired,
+              reasonCode: result.reasonCode,
+              penaltyBreakdown: result.penaltyBreakdown,
+              driverCompensationBreakdown: result.driverCompensationBreakdown,
+              settlementState: result.settlementState,
+              pendingPenaltyAmount: result.pendingPenaltyAmount,
+              disputeId: result.disputeId,
+              eventVersion: result.eventVersion,
+              serverTimeMs: result.serverTimeMs
+            }
+          },
         });
         return;
       }
@@ -536,6 +551,17 @@ router.post(
           orderId,
           status: 'cancelled',
           reason: reason || 'Cancelled by customer',
+          policyStage: result.policyStage,
+          cancelDecision: result.cancelDecision,
+          reasonRequired: result.reasonRequired,
+          reasonCode: result.reasonCode,
+          penaltyBreakdown: result.penaltyBreakdown,
+          driverCompensationBreakdown: result.driverCompensationBreakdown,
+          settlementState: result.settlementState,
+          pendingPenaltyAmount: result.pendingPenaltyAmount,
+          eventId: result.eventId,
+          eventVersion: result.eventVersion,
+          serverTimeMs: result.serverTimeMs,
           transportersNotified: result.transportersNotified,
           cancelledAt: new Date().toISOString()
         }
@@ -858,11 +884,12 @@ router.delete(
     try {
       const { orderId } = req.params;
       const user = (req as any).user;
+      const idempotencyKey = req.header('X-Idempotency-Key') || req.header('x-idempotency-key') || undefined;
       
       logger.info(`📛 Cancel request: Order ${orderId} by customer ${user.phone}`);
       
       // SCALABILITY: Use existing cancelOrder service
-      const result = await orderService.cancelOrder(orderId, user.userId, 'Customer cancelled from app');
+      const result = await orderService.cancelOrder(orderId, user.userId, 'Customer cancelled from app', idempotencyKey);
       
       if (result.success) {
         logger.info(`✅ Order ${orderId} cancelled successfully. Transporters notified: ${result.transportersNotified}`);
@@ -870,21 +897,122 @@ router.delete(
           success: true,
           message: result.message,
           data: {
-            transportersNotified: result.transportersNotified
+            transportersNotified: result.transportersNotified,
+            policyStage: result.policyStage,
+            cancelDecision: result.cancelDecision,
+            reasonRequired: result.reasonRequired,
+            reasonCode: result.reasonCode,
+            penaltyBreakdown: result.penaltyBreakdown,
+            driverCompensationBreakdown: result.driverCompensationBreakdown,
+            settlementState: result.settlementState,
+            pendingPenaltyAmount: result.pendingPenaltyAmount,
+            eventId: result.eventId,
+            eventVersion: result.eventVersion,
+            serverTimeMs: result.serverTimeMs
           }
         });
       } else {
         logger.warn(`⚠️ Cancel failed: ${result.message}`);
-        res.status(400).json({
+        const statusCode = result.cancelDecision === 'blocked_dispute_only' ? 409 : 400;
+        res.status(statusCode).json({
           success: false,
           error: {
-            code: 'CANCEL_FAILED',
-            message: result.message
+            code: result.cancelDecision === 'blocked_dispute_only' ? 'CANCEL_BLOCKED_DISPUTE_ONLY' : 'CANCEL_FAILED',
+            message: result.message,
+            data: {
+              policyStage: result.policyStage,
+              cancelDecision: result.cancelDecision,
+              reasonRequired: result.reasonRequired,
+              reasonCode: result.reasonCode,
+              penaltyBreakdown: result.penaltyBreakdown,
+              driverCompensationBreakdown: result.driverCompensationBreakdown,
+              settlementState: result.settlementState,
+              pendingPenaltyAmount: result.pendingPenaltyAmount,
+              disputeId: result.disputeId,
+              eventVersion: result.eventVersion,
+              serverTimeMs: result.serverTimeMs
+            }
           }
         });
       }
     } catch (error: any) {
       logger.error(`Cancel order error: ${error.message}`);
+      next(error);
+    }
+  }
+);
+
+router.get(
+  '/:orderId/cancel-preview',
+  authMiddleware,
+  roleGuard(['customer']),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { orderId } = req.params;
+      const user = (req as any).user;
+      const reason = typeof req.query.reason === 'string' ? req.query.reason : undefined;
+      const preview = await orderService.getCancelPreview(orderId, user.userId, reason);
+      if (!preview.success) {
+        return res.status(404).json({
+          success: false,
+          error: {
+            code: 'CANCEL_PREVIEW_FAILED',
+            message: preview.message
+          }
+        });
+      }
+      return res.json({
+        success: true,
+        data: {
+          orderId,
+          policyStage: preview.policyStage,
+          cancelDecision: preview.cancelDecision,
+          reasonRequired: preview.reasonRequired,
+          reasonCode: preview.reasonCode,
+          penaltyBreakdown: preview.penaltyBreakdown,
+          driverCompensationBreakdown: preview.driverCompensationBreakdown,
+          settlementState: preview.settlementState,
+          pendingPenaltyAmount: preview.pendingPenaltyAmount,
+          eventVersion: preview.eventVersion,
+          serverTimeMs: preview.serverTimeMs
+        }
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+router.post(
+  '/:orderId/cancel/dispute',
+  authMiddleware,
+  roleGuard(['customer']),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { orderId } = req.params;
+      const user = (req as any).user;
+      const reasonCode = typeof req.body?.reasonCode === 'string' ? req.body.reasonCode : undefined;
+      const notes = typeof req.body?.notes === 'string' ? req.body.notes : undefined;
+      const dispute = await orderService.createCancelDispute(orderId, user.userId, reasonCode, notes);
+      if (!dispute.success) {
+        return res.status(400).json({
+          success: false,
+          error: {
+            code: 'DISPUTE_CREATE_FAILED',
+            message: dispute.message,
+            data: { stage: dispute.stage }
+          }
+        });
+      }
+      return res.json({
+        success: true,
+        data: {
+          disputeId: dispute.disputeId,
+          stage: dispute.stage,
+          message: dispute.message
+        }
+      });
+    } catch (error) {
       next(error);
     }
   }

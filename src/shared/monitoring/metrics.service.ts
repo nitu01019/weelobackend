@@ -214,6 +214,36 @@ class MetricsService {
       sum: new Map(),
       count: new Map()
     });
+
+    this.counters.set('cancel_requests_total', {
+      name: 'cancel_requests_total',
+      help: 'Total cancellation requests by policy stage and decision',
+      labels: {}
+    });
+
+    this.counters.set('cancel_emit_retry_total', {
+      name: 'cancel_emit_retry_total',
+      help: 'Total cancellation fanout retries by channel',
+      labels: {}
+    });
+
+    this.counters.set('cancel_rebook_throttled_total', {
+      name: 'cancel_rebook_throttled_total',
+      help: 'Total order create attempts blocked by cancel/rebook churn guard',
+      labels: {}
+    });
+
+    this.counters.set('holds_released_on_cancel_total', {
+      name: 'holds_released_on_cancel_total',
+      help: 'Total held rows released due to customer cancellation',
+      labels: {}
+    });
+
+    this.counters.set('cancel_dispute_created_total', {
+      name: 'cancel_dispute_created_total',
+      help: 'Total blocked-stage cancel disputes created',
+      labels: {}
+    });
     
     // WebSocket connections
     this.gauges.set('websocket_connections', {

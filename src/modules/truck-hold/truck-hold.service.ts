@@ -1787,6 +1787,14 @@ class TruckHoldService {
     return activeHolds.length;
   }
 
+  async clearHoldCacheEntries(holdIds: string[]): Promise<void> {
+    if (!Array.isArray(holdIds) || holdIds.length === 0) return;
+    for (const holdId of holdIds) {
+      if (!holdId) continue;
+      await holdStore.remove(holdId).catch(() => {});
+    }
+  }
+
   // ===========================================================================
   // PRIVATE METHODS
   // ===========================================================================

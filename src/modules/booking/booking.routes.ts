@@ -555,14 +555,29 @@ router.post(
 
       const { orderId } = req.params;
       const { reason } = req.body ?? {};
-      const result = await canonicalOrderService.cancelOrder(orderId, req.user!.userId, reason);
+      const idempotencyKey = req.header('X-Idempotency-Key') || req.header('x-idempotency-key') || undefined;
+      const result = await canonicalOrderService.cancelOrder(orderId, req.user!.userId, reason, idempotencyKey);
 
       if (!result.success) {
-        return res.status(400).json({
+        const statusCode = result.cancelDecision === 'blocked_dispute_only' ? 409 : 400;
+        return res.status(statusCode).json({
           success: false,
           error: {
-            code: 'CANCEL_FAILED',
-            message: result.message
+            code: result.cancelDecision === 'blocked_dispute_only' ? 'CANCEL_BLOCKED_DISPUTE_ONLY' : 'CANCEL_FAILED',
+            message: result.message,
+            data: {
+              policyStage: result.policyStage,
+              cancelDecision: result.cancelDecision,
+              reasonRequired: result.reasonRequired,
+              reasonCode: result.reasonCode,
+              penaltyBreakdown: result.penaltyBreakdown,
+              driverCompensationBreakdown: result.driverCompensationBreakdown,
+              settlementState: result.settlementState,
+              pendingPenaltyAmount: result.pendingPenaltyAmount,
+              disputeId: result.disputeId,
+              eventVersion: result.eventVersion,
+              serverTimeMs: result.serverTimeMs
+            }
           }
         });
       }
@@ -573,8 +588,96 @@ router.post(
           orderId,
           status: 'cancelled',
           reason: reason || 'Cancelled by customer',
+          policyStage: result.policyStage,
+          cancelDecision: result.cancelDecision,
+          reasonRequired: result.reasonRequired,
+          reasonCode: result.reasonCode,
+          penaltyBreakdown: result.penaltyBreakdown,
+          driverCompensationBreakdown: result.driverCompensationBreakdown,
+          settlementState: result.settlementState,
+          pendingPenaltyAmount: result.pendingPenaltyAmount,
+          eventId: result.eventId,
+          eventVersion: result.eventVersion,
+          serverTimeMs: result.serverTimeMs,
           transportersNotified: result.transportersNotified,
           cancelledAt: new Date().toISOString()
+        }
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+router.get(
+  '/orders/:orderId/cancel-preview',
+  authMiddleware,
+  roleGuard(['customer']),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { orderId } = req.params;
+      const reason = typeof req.query.reason === 'string' ? req.query.reason : undefined;
+      const preview = await canonicalOrderService.getCancelPreview(orderId, req.user!.userId, reason);
+      if (!preview.success) {
+        return res.status(404).json({
+          success: false,
+          error: {
+            code: 'CANCEL_PREVIEW_FAILED',
+            message: preview.message
+          }
+        });
+      }
+
+      return res.json({
+        success: true,
+        data: {
+          orderId,
+          policyStage: preview.policyStage,
+          cancelDecision: preview.cancelDecision,
+          reasonRequired: preview.reasonRequired,
+          reasonCode: preview.reasonCode,
+          penaltyBreakdown: preview.penaltyBreakdown,
+          driverCompensationBreakdown: preview.driverCompensationBreakdown,
+          settlementState: preview.settlementState,
+          pendingPenaltyAmount: preview.pendingPenaltyAmount,
+          eventVersion: preview.eventVersion,
+          serverTimeMs: preview.serverTimeMs
+        }
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+router.post(
+  '/orders/:orderId/cancel/dispute',
+  authMiddleware,
+  roleGuard(['customer']),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { orderId } = req.params;
+      const reasonCode = typeof req.body?.reasonCode === 'string' ? req.body.reasonCode : undefined;
+      const notes = typeof req.body?.notes === 'string' ? req.body.notes : undefined;
+      const dispute = await canonicalOrderService.createCancelDispute(orderId, req.user!.userId, reasonCode, notes);
+
+      if (!dispute.success) {
+        return res.status(400).json({
+          success: false,
+          error: {
+            code: 'DISPUTE_CREATE_FAILED',
+            message: dispute.message,
+            data: { stage: dispute.stage }
+          }
+        });
+      }
+
+      return res.json({
+        success: true,
+        data: {
+          disputeId: dispute.disputeId,
+          stage: dispute.stage,
+          message: dispute.message
         }
       });
     } catch (error) {

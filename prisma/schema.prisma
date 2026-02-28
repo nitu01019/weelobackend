@@ -440,6 +440,9 @@ model Order {
   // =========================================
   cancelledAt        String?
   cancellationReason String?
+  loadingStartedAt   DateTime?
+  unloadingStartedAt DateTime?
+  lifecycleEventVersion Int @default(0)
 
   // =========================================
   // TIMING
@@ -507,6 +510,141 @@ model OrderDispatchOutbox {
 
   @@index([status, nextRetryAt, createdAt])
   @@index([orderId, status])
+}
+
+// =============================================================================
+// ORDER LIFECYCLE OUTBOX (durable cancel fanout replay)
+// =============================================================================
+model OrderLifecycleOutbox {
+  id            String   @id @default(uuid())
+  orderId        String
+  eventType      String   // order_cancelled|order_expired|...
+  payload        Json
+  status         String   @default("pending") // pending|processing|retrying|dispatched|failed
+  attempts       Int      @default(0)
+  maxAttempts    Int      @default(10)
+  nextRetryAt    DateTime @default(now())
+  lockedAt       DateTime?
+  processedAt    DateTime?
+  lastError      String?
+  dlqReason      String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([orderId, eventType, status])
+  @@index([status, nextRetryAt, createdAt])
+}
+
+// =============================================================================
+// ORDER CANCEL IDEMPOTENCY (duplicate-safe cancel retries)
+// =============================================================================
+model OrderCancelIdempotency {
+  id             String   @id @default(uuid())
+  customerId     String
+  operation      String   @default("cancel")
+  idempotencyKey String
+  payloadHash    String
+  orderId        String
+  statusCode     Int
+  responseJson   Json
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([customerId, operation, idempotencyKey])
+  @@index([customerId, createdAt])
+  @@index([orderId, createdAt])
+}
+
+// =============================================================================
+// CANCELLATION LEDGER (policy + deferred settlement audit)
+// =============================================================================
+model CancellationLedger {
+  id                    String   @id @default(uuid())
+  orderId               String
+  customerId            String
+  driverId              String?
+  policyStage           String
+  reasonCode            String?
+  penaltyAmount         Float    @default(0)
+  compensationAmount    Float    @default(0)
+  settlementState       String   @default("pending") // pending|settled|waived|disputed
+  cancelDecision        String   @default("allowed") // allowed|blocked_dispute_only
+  eventVersion          Int      @default(1)
+  idempotencyKey        String?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  @@index([orderId, createdAt])
+  @@index([customerId, settlementState, createdAt])
+}
+
+// =============================================================================
+// CUSTOMER PENALTY DUE (deferred charges)
+// =============================================================================
+model CustomerPenaltyDue {
+  id            String   @id @default(uuid())
+  customerId    String
+  orderId       String
+  amount        Float
+  state         String   @default("due") // due|settled|waived|disputed
+  nextOrderHint String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([customerId, state, createdAt])
+  @@index([orderId, state])
+}
+
+// =============================================================================
+// DRIVER COMPENSATION LEDGER (deferred payouts)
+// =============================================================================
+model DriverCompensationLedger {
+  id         String   @id @default(uuid())
+  driverId   String
+  orderId    String
+  amount     Float
+  state      String   @default("pending") // pending|posted|reversed
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([driverId, state, createdAt])
+  @@index([orderId, state])
+}
+
+// =============================================================================
+// CANCELLATION ABUSE COUNTERS
+// =============================================================================
+model CancellationAbuseCounter {
+  customerId                 String   @id
+  cancelCount7d              Int      @default(0)
+  cancelCount30d             Int      @default(0)
+  cancelAfterLoadingCount    Int      @default(0)
+  cancelRebook2mCount        Int      @default(0)
+  cooldownUntil              DateTime?
+  riskTier                   String   @default("normal")
+  lastCancelAt               DateTime?
+  createdAt                  DateTime @default(now())
+  updatedAt                  DateTime @updatedAt
+
+  @@index([customerId, updatedAt])
+}
+
+// =============================================================================
+// CANCEL DISPUTE (blocked-stage cancel escalation)
+// =============================================================================
+model CancelDispute {
+  id           String   @id @default(uuid())
+  orderId       String
+  customerId    String
+  stage         String
+  reasonCode    String?
+  notes         String?
+  status        String   @default("open") // open|under_review|resolved|rejected
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([orderId, createdAt])
+  @@index([customerId, status, createdAt])
 }
 
 // =============================================================================

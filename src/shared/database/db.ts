@@ -227,6 +227,9 @@ export interface OrderRecord {
   onlineCandidatesCount?: number;
   notifiedCount?: number;
   lastDispatchAt?: Date | string | null;
+  loadingStartedAt?: Date | string | null;
+  unloadingStartedAt?: Date | string | null;
+  lifecycleEventVersion?: number;
 
   cancelledAt?: string;
   cancellationReason?: string;
