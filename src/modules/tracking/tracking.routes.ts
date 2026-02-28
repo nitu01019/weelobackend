@@ -552,7 +552,7 @@ router.get(
         where: {
           driverId,
           status: {
-            in: ['pending', 'driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit', 'arrived_at_drop']
+            in: ['pending', 'driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit', 'arrived_at_drop'] as any
           }
         },
         include: {
@@ -582,7 +582,7 @@ router.get(
           }
         },
         orderBy: { assignedAt: 'desc' }
-      });
+      }) as any;
 
       if (!activeAssignment) {
         return res.json({
