@@ -69,12 +69,23 @@ export const coordinatesSchema = z.object({
  * Note: address min length reduced to 1 for testing flexibility
  */
 export const locationSchema = z.object({
-  coordinates: coordinatesSchema,
+  // Nested format: { coordinates: { latitude, longitude } }
+  coordinates: coordinatesSchema.optional(),
+  // Flat format: { latitude, longitude } (used by customer app)
+  latitude: z.number().min(-90).max(90).optional(),
+  longitude: z.number().min(-180).max(180).optional(),
   address: z.string().min(1).max(500),
   city: z.string().max(100).optional(),
   state: z.string().max(100).optional(),
   pincode: z.string().max(10).optional()
-});
+}).refine(
+  (data) => {
+    if (data.coordinates) return true;
+    if (data.latitude !== undefined && data.longitude !== undefined) return true;
+    return false;
+  },
+  { message: 'Either coordinates object OR latitude+longitude fields are required' }
+);
 
 /**
  * Pagination schema
@@ -182,10 +193,10 @@ export function validateRequest<T extends z.ZodSchema>(schema: T) {
     try {
       // Parse and validate
       const validated = schema.parse(req.body);
-      
+
       // Replace body with validated data (includes transforms)
       req.body = validated;
-      
+
       next();
     } catch (error) {
       if (error instanceof z.ZodError) {
@@ -193,14 +204,14 @@ export function validateRequest<T extends z.ZodSchema>(schema: T) {
           field: e.path.join('.'),
           message: e.message
         }));
-        
+
         // Log validation errors for debugging
         console.log('=== VALIDATION ERROR ===');
         console.log('Path:', req.path);
         console.log('Request body:', JSON.stringify(req.body, null, 2));
         console.log('Validation errors:', JSON.stringify(details, null, 2));
         console.log('========================');
-        
+
         next(new AppError(400, 'VALIDATION_ERROR', 'Invalid request data', { fields: details }));
       } else {
         next(error);
@@ -225,7 +236,7 @@ export function validateQuery<T extends z.ZodSchema>(schema: T) {
           field: e.path.join('.'),
           message: e.message
         }));
-        
+
         next(new AppError(400, 'VALIDATION_ERROR', 'Invalid query parameters', { fields: details }));
       } else {
         next(error);
@@ -271,12 +282,12 @@ export function maskPhone(phone: string): string {
 export function maskSensitive(data: Record<string, any>): Record<string, any> {
   const sensitiveKeys = ['password', 'token', 'otp', 'secret', 'key'];
   const masked = { ...data };
-  
+
   for (const key of Object.keys(masked)) {
     if (sensitiveKeys.some(sk => key.toLowerCase().includes(sk))) {
       masked[key] = '***REDACTED***';
     }
   }
-  
+
   return masked;
 }
