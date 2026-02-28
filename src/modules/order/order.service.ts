@@ -40,6 +40,8 @@ import { redisService } from '../../shared/services/redis.service';
 import { pricingService } from '../pricing/pricing.service';
 import { AppError } from '../../shared/types/error.types';
 import { PROGRESSIVE_RADIUS_STEPS, progressiveRadiusMatcher } from './progressive-radius-matcher';
+import { metrics } from '../../shared/monitoring/metrics.service';
+import { truckHoldService } from '../truck-hold/truck-hold.service';
 
 // =============================================================================
 // CACHE KEYS & TTL (Optimized for fast lookups)
@@ -311,6 +313,9 @@ interface BroadcastData {
   // Timing
   expiresAt: string;
   createdAt: string;
+  eventId?: string;
+  eventVersion?: number;
+  serverTimeMs?: number;
 }
 
 // =============================================================================
@@ -1877,6 +1882,8 @@ class OrderService {
       totalStops: routeBreakdownCalc.totalStops,
       estimatedArrival: routeBreakdownCalc.estimatedArrival
     };
+    const broadcastEventId = uuidv4();
+    const broadcastServerTimeMs = Date.now();
 
     const broadcastData: BroadcastData = {
       type: 'new_broadcast',
@@ -1911,7 +1918,10 @@ class OrderService {
       distance: request.distanceKm,
       goodsType: request.goodsType,
       expiresAt,
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      eventId: broadcastEventId,
+      eventVersion: 1,
+      serverTimeMs: broadcastServerTimeMs
     };
 
     const requestedVehicles: any[] = [];
@@ -2116,6 +2126,11 @@ class OrderService {
     }
   ): void {
     if (!FF_ORDER_DISPATCH_STATUS_EVENTS) return;
+    metrics.incrementCounter('broadcast_state_transition_total', {
+      status: (payload.status || 'unknown').toLowerCase(),
+      dispatch_state: (payload.dispatchState || 'unknown').toLowerCase(),
+      reason_code: (payload.reasonCode || 'none').toLowerCase()
+    });
     emitToUser(
       customerId,
       'broadcast_state_changed',
@@ -2418,6 +2433,11 @@ class OrderService {
       lastDispatchAt: new Date()
     });
 
+    const closedExpiryHolds = await truckHoldService.closeActiveHoldsForOrder(orderId, 'ORDER_EXPIRED');
+    if (closedExpiryHolds > 0) {
+      logger.info(`[ORDER EXPIRY] Closed ${closedExpiryHolds} active hold(s) for order ${orderId}`);
+    }
+
     // Notify customer — includes explicit timeout reason for precise UX messaging.
     emitToUser(order.customerId, 'order_expired', this.withEventMeta({
       orderId,
@@ -2684,6 +2704,11 @@ class OrderService {
     }
 
     // === CANCEL WON: Full cleanup ===
+
+    const closedCancelledHolds = await truckHoldService.closeActiveHoldsForOrder(orderId, 'ORDER_CANCELLED');
+    if (closedCancelledHolds > 0) {
+      logger.info(`[ORDER CANCEL] Closed ${closedCancelledHolds} active hold(s) for order ${orderId}`);
+    }
 
     // 1. Cancel all associated TruckRequests atomically
     const truckRequests = await db.getTruckRequestsByOrder(orderId);

@@ -7,9 +7,9 @@
  * 
  * ⭐ GOLDEN RULE (NEVER FORGET):
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- *   LOCK IN REDIS FIRST. DATABASE COMES SECOND.
+ *   DATABASE ATOMIC CLAIM IS THE FINAL TRUTH. REDIS IS OPTIONAL ACCELERATION.
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * This single rule is why big booking apps never double-assign.
+ * Atomic DB claim is the boundary that prevents double-assignment.
  * 
  * THE PROBLEM THIS SOLVES:
  * ────────────────────────
@@ -22,29 +22,27 @@
  * 
  * This is called a RACE CONDITION.
  * 
- * THE SOLUTION (Redis Distributed Lock):
- * ──────────────────────────────────────
- * SET truck:1234 transporter_id NX EX 180
- * 
- *   NX  = SET only if key does NOT exist (atomic)
- *   EX  = Auto-expire after 180 seconds (3 minutes, prevents deadlocks)
- * 
- * First transporter wins. Others get instant rejection. Zero DB load for losers.
+ * THE SOLUTION (Atomic DB Claim + Hold Ledger):
+ * ─────────────────────────────────────────────
+ * - Claim candidate rows with FOR UPDATE SKIP LOCKED inside a transaction
+ * - Transition exactly N rows from searching -> held with owner preconditions
+ * - Persist hold ledger for recovery/idempotent replay
+ * - Use Redis only for optional fast-path caching/cleanup
  * 
  * SCALABILITY:
  * ────────────
- * - 1 million concurrent requests? Redis handles it at memory speed
- * - Multiple backend servers? Redis is the single source of truth
- * - Server crashes? TTL auto-releases locks, system self-heals
- * - No database contention, no deadlocks, no double booking
+ * - Multiple backend servers? DB transaction semantics remain consistent
+ * - Server crashes? Hold ledger + TTL cleanup reconciles stale holds
+ * - Redis interruptions do not break correctness
+ * - No double booking across concurrent hold races
  * 
  * FLOW:
  * ─────
  * 1. Transporter taps "Accept" → holdTrucks()
- *    a. Acquire Redis locks for selected trucks (atomic, instant)
- *    b. If lock fails → Return immediately (someone else got them)
- *    c. If lock acquired → Update database (safe, unique)
- *    d. Trucks held for 180 seconds (3 minutes)
+ *    a. Atomic DB claim of exact requested quantity
+ *    b. If insufficient/changed state → deterministic failure
+ *    c. Persist hold ledger with expiry for recovery
+ *    d. Broadcast availability update
  * 
  * 2. Transporter confirms → confirmHold()
  *    a. Verify hold exists and is valid
@@ -52,21 +50,21 @@
  *    c. Release/let locks expire
  * 
  * 3. Timeout or reject → releaseHold()
- *    a. Release Redis locks
- *    b. Mark trucks as available
+ *    a. Reconcile held rows with order state guards
+ *    b. Update hold ledger terminal status
  *    c. System broadcasts update
  * 
  * WHAT HAPPENS IF:
  * ────────────────
- * - DB write fails after lock? Lock expires, trucks become available again
- * - Server crashes? Lock TTL expires, trucks auto-release
- * - Network drops? Same - TTL handles it
+ * - Response lost after success? Idempotency + my-active reconciliation returns same hold
+ * - Server crashes mid-flow? Ledger cleanup reconciles stale active holds
+ * - Cancel-vs-hold race? Terminal order states win during confirm/release checks
  * 
  * NEVER DO THIS:
  * ──────────────
- * ❌ Write to database first, then lock
- * ❌ Lock without TTL (can cause permanent deadlocks)
- * ❌ Check database for availability without lock
+ * ❌ Read availability and trust app timing without transactional claim
+ * ❌ Return hold success before exact row-state transition commits
+ * ❌ Re-open cancelled/expired rows to searching on release
  * ❌ Process requests without any locking
  * 
  * @author Weelo Team
@@ -75,13 +73,15 @@
  */
 
 import { v4 as uuidv4 } from 'uuid';
+import crypto from 'crypto';
 import { Prisma } from '@prisma/client';
 import { db } from '../../shared/database/db';
-import { prismaClient } from '../../shared/database/prisma.service';
+import { prismaClient, AssignmentStatus, OrderStatus, TruckRequestStatus, VehicleStatus } from '../../shared/database/prisma.service';
 import { logger } from '../../shared/services/logger.service';
 import { socketService } from '../../shared/services/socket.service';
 import { redisService } from '../../shared/services/redis.service';
 import { queueService } from '../../shared/services/queue.service';
+import { metrics } from '../../shared/monitoring/metrics.service';
 
 // =============================================================================
 // TYPES & INTERFACES
@@ -124,6 +124,7 @@ export interface HoldTrucksRequest {
   vehicleType: string;
   vehicleSubtype: string;
   quantity: number;
+  idempotencyKey?: string;
 }
 
 /**
@@ -134,6 +135,10 @@ export interface HoldTrucksResponse {
   holdId?: string;
   expiresAt?: Date;
   heldQuantity?: number;
+  holdState?: 'reserved' | 'released' | 'confirmed';
+  eventId?: string;
+  eventVersion?: number;
+  serverTimeMs?: number;
   message: string;
   error?: string;
 }
@@ -181,6 +186,15 @@ const CONFIG = {
   MAX_HOLD_QUANTITY: 50,           // Max trucks one transporter can hold at once
   MIN_HOLD_QUANTITY: 1,            // Minimum trucks to hold
 };
+
+const ACTIVE_ORDER_STATUSES = new Set(['created', 'broadcasting', 'active', 'partially_filled']);
+const TERMINAL_ORDER_STATUSES = new Set(['cancelled', 'expired', 'completed', 'fully_filled']);
+const HOLD_EVENT_VERSION = 1;
+
+const FF_HOLD_DB_ATOMIC_CLAIM = process.env.FF_HOLD_DB_ATOMIC_CLAIM !== 'false';
+const FF_HOLD_STRICT_IDEMPOTENCY = process.env.FF_HOLD_STRICT_IDEMPOTENCY !== 'false';
+const FF_HOLD_RECONCILE_RECOVERY = process.env.FF_HOLD_RECONCILE_RECOVERY !== 'false';
+const FF_HOLD_SAFE_RELEASE_GUARD = process.env.FF_HOLD_SAFE_RELEASE_GUARD !== 'false';
 
 // =============================================================================
 // REDIS KEYS - Distributed Locking for Truck Holds
@@ -449,6 +463,123 @@ class TruckHoldService {
     this.startCleanupJob();
   }
 
+  private normalizeVehiclePart(value: string | null | undefined): string {
+    return (value || '').trim();
+  }
+
+  private buildOperationPayloadHash(operation: 'hold' | 'release', payload: Record<string, unknown>): string {
+    return crypto
+      .createHash('sha256')
+      .update(`${operation}:${JSON.stringify(payload)}`)
+      .digest('hex');
+  }
+
+  private async getIdempotentOperationResponse(
+    transporterId: string,
+    operation: 'hold' | 'release',
+    idempotencyKey?: string
+  ): Promise<{
+    statusCode: number;
+    response: HoldTrucksResponse | { success: boolean; message: string; error?: string };
+    payloadHash: string;
+  } | null> {
+    if (!FF_HOLD_STRICT_IDEMPOTENCY || !idempotencyKey) return null;
+
+    const existing = await prismaClient.truckHoldIdempotency.findUnique({
+      where: {
+        transporterId_operation_idempotencyKey: {
+          transporterId,
+          operation,
+          idempotencyKey
+        }
+      }
+    });
+
+    if (!existing) return null;
+
+    return {
+      statusCode: existing.statusCode,
+      response: existing.responseJson as unknown as HoldTrucksResponse | { success: boolean; message: string; error?: string },
+      payloadHash: existing.payloadHash
+    };
+  }
+
+  private async saveIdempotentOperationResponse(
+    transporterId: string,
+    operation: 'hold' | 'release',
+    idempotencyKey: string | undefined,
+    payloadHash: string,
+    statusCode: number,
+    response: HoldTrucksResponse | { success: boolean; message: string; error?: string }
+  ): Promise<void> {
+    if (!FF_HOLD_STRICT_IDEMPOTENCY || !idempotencyKey) return;
+
+    await prismaClient.truckHoldIdempotency.upsert({
+      where: {
+        transporterId_operation_idempotencyKey: {
+          transporterId,
+          operation,
+          idempotencyKey
+        }
+      },
+      update: {
+        payloadHash,
+        statusCode,
+        responseJson: response as unknown as Prisma.InputJsonValue
+      },
+      create: {
+        id: uuidv4(),
+        transporterId,
+        operation,
+        idempotencyKey,
+        payloadHash,
+        statusCode,
+        responseJson: response as unknown as Prisma.InputJsonValue
+      }
+    });
+  }
+
+  private async findActiveLedgerHold(
+    transporterId: string,
+    orderId: string,
+    vehicleType: string,
+    vehicleSubtype: string
+  ) {
+    const now = new Date();
+    return prismaClient.truckHoldLedger.findFirst({
+      where: {
+        transporterId,
+        orderId,
+        vehicleType: { equals: vehicleType, mode: 'insensitive' },
+        vehicleSubtype: { equals: vehicleSubtype, mode: 'insensitive' },
+        status: 'active',
+        expiresAt: { gt: now }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+  }
+
+  private recordHoldOutcomeMetrics(result: HoldTrucksResponse, startedAtMs: number, replay: boolean = false): void {
+    const durationMs = Math.max(0, Date.now() - startedAtMs);
+    metrics.observeHistogram('hold.latency_ms', durationMs, {
+      replay: replay ? 'true' : 'false',
+      result: result.success ? 'success' : 'failed'
+    });
+    if (replay) {
+      metrics.incrementCounter('hold.idempotent_replay.total', {
+        result: result.success ? 'success' : 'failed',
+        reason: (result.error || 'none').toLowerCase()
+      });
+      return;
+    }
+    if (result.success) {
+      metrics.incrementCounter('hold.success.total');
+    } else {
+      const reason = (result.error || 'unknown').toLowerCase();
+      metrics.incrementCounter('hold.conflict.total', { reason });
+    }
+  }
+
   // ===========================================================================
   // PUBLIC METHODS
   // ===========================================================================
@@ -468,148 +599,228 @@ class TruckHoldService {
    * @returns HoldTrucksResponse
    */
   async holdTrucks(request: HoldTrucksRequest): Promise<HoldTrucksResponse> {
-    const { orderId, transporterId, vehicleType, vehicleSubtype, quantity } = request;
+    const holdStartedAtMs = Date.now();
+    metrics.incrementCounter('hold.request.total');
+
+    const transporterId = request.transporterId;
+    const orderId = (request.orderId || '').trim();
+    const vehicleType = this.normalizeVehiclePart(request.vehicleType);
+    const vehicleSubtype = this.normalizeVehiclePart(request.vehicleSubtype);
+    const quantity = Number(request.quantity);
+    const idempotencyKey = request.idempotencyKey?.trim() || undefined;
 
     logger.info(`[TruckHold] Hold request: ${quantity}x ${vehicleType} ${vehicleSubtype} for order ${orderId}`);
 
+    const payloadHash = this.buildOperationPayloadHash('hold', {
+      orderId,
+      vehicleType: vehicleType.toLowerCase(),
+      vehicleSubtype: vehicleSubtype.toLowerCase(),
+      quantity
+    });
+
+    const idempotentReplay = await this.getIdempotentOperationResponse(
+      transporterId,
+      'hold',
+      idempotencyKey
+    );
+    if (idempotentReplay) {
+      if (idempotentReplay.payloadHash !== payloadHash) {
+        const conflict = {
+          success: false,
+          message: 'Idempotency key reused with a different hold payload.',
+          error: 'IDEMPOTENCY_CONFLICT'
+        };
+        this.recordHoldOutcomeMetrics(conflict, holdStartedAtMs, true);
+        return conflict;
+      }
+      const replayResponse = idempotentReplay.response as HoldTrucksResponse;
+      this.recordHoldOutcomeMetrics(replayResponse, holdStartedAtMs, true);
+      return replayResponse;
+    }
+
+    const eventId = uuidv4();
+    const serverTimeMs = Date.now();
+    let response: HoldTrucksResponse;
+    let statusCode = 400;
+
     try {
-      // 1. Validate quantity
-      if (quantity < CONFIG.MIN_HOLD_QUANTITY || quantity > CONFIG.MAX_HOLD_QUANTITY) {
-        return {
+      if (!orderId || !vehicleType || !Number.isFinite(quantity)) {
+        response = {
           success: false,
-          message: `Quantity must be between ${CONFIG.MIN_HOLD_QUANTITY} and ${CONFIG.MAX_HOLD_QUANTITY}`,
-          error: 'INVALID_QUANTITY'
+          message: 'orderId, vehicleType and finite quantity are required.',
+          error: 'VALIDATION_ERROR'
         };
+        await this.saveIdempotentOperationResponse(transporterId, 'hold', idempotencyKey, payloadHash, statusCode, response);
+        this.recordHoldOutcomeMetrics(response, holdStartedAtMs);
+        return response;
       }
 
-      // 2. Check if transporter already has a hold for this type
-      const existingHold = await holdStore.getTransporterHold(transporterId, orderId, vehicleType, vehicleSubtype);
-      if (existingHold) {
-        return {
+      if (!Number.isInteger(quantity) || quantity < CONFIG.MIN_HOLD_QUANTITY || quantity > CONFIG.MAX_HOLD_QUANTITY) {
+        response = {
           success: false,
-          message: 'You already have trucks on hold for this type. Confirm or wait for timeout.',
-          error: 'ALREADY_HOLDING'
+          message: `Quantity must be an integer between ${CONFIG.MIN_HOLD_QUANTITY} and ${CONFIG.MAX_HOLD_QUANTITY}.`,
+          error: 'VALIDATION_ERROR'
         };
+        await this.saveIdempotentOperationResponse(transporterId, 'hold', idempotencyKey, payloadHash, statusCode, response);
+        this.recordHoldOutcomeMetrics(response, holdStartedAtMs);
+        return response;
       }
 
-      // 2b. CHECK ORDER STATUS — fail fast if cancelled/expired/completed
-      // This gives the Captain app a clear reason to dismiss the overlay
-      const order = await db.getOrderById(orderId);
-      if (!order) {
-        return {
-          success: false,
-          message: 'This request no longer exists.',
-          error: 'ORDER_NOT_FOUND'
-        };
-      }
-      const inactiveStatuses = ['cancelled', 'expired', 'completed', 'fully_filled'];
-      if (inactiveStatuses.includes(order.status)) {
-        logger.info(`[TruckHold] Order ${orderId} is ${order.status} — rejecting hold request`);
-        return {
-          success: false,
-          message: 'This request was cancelled.',
-          error: 'ORDER_CANCELLED'
-        };
-      }
-
-      // 3. Get available truck requests
-      const availableTrucks = await this.getAvailableTruckRequests(orderId, vehicleType, vehicleSubtype);
-
-      if (availableTrucks.length < quantity) {
-        return {
-          success: false,
-          message: `Only ${availableTrucks.length} trucks available. Someone else may have selected them.`,
-          error: 'NOT_ENOUGH_AVAILABLE'
-        };
+      if (FF_HOLD_RECONCILE_RECOVERY) {
+        const existingHold = await this.findActiveLedgerHold(transporterId, orderId, vehicleType, vehicleSubtype);
+        if (existingHold) {
+          statusCode = 200;
+          response = {
+            success: true,
+            holdId: existingHold.holdId,
+            expiresAt: existingHold.expiresAt,
+            heldQuantity: existingHold.quantity,
+            holdState: 'reserved',
+            eventId,
+            eventVersion: HOLD_EVENT_VERSION,
+            serverTimeMs,
+            message: `${existingHold.quantity} truck(s) already reserved for this request.`
+          };
+          await this.saveIdempotentOperationResponse(transporterId, 'hold', idempotencyKey, payloadHash, statusCode, response);
+          this.recordHoldOutcomeMetrics(response, holdStartedAtMs, true);
+          return response;
+        }
       }
 
-      // 4. Select the requested quantity of trucks
-      const selectedTrucks = availableTrucks.slice(0, quantity);
-      const truckRequestIds = selectedTrucks.map(t => t.id);
-
-      // =================================================================
-      // 🔒 CRITICAL: REDIS LOCK FIRST, DATABASE SECOND
-      // =================================================================
-      // This is the BookMyShow pattern:
-      // 1. Acquire Redis lock (atomic, instant)
-      // 2. If lock acquired → Update database
-      // 3. If lock failed → Return immediately (no DB hit)
-      //
-      // WHY THIS ORDER MATTERS:
-      // - 10 transporters tap "Accept" at same time
-      // - Redis lock ensures ONLY ONE wins (atomic)
-      // - Losers get rejected instantly (no DB load)
-      // - Database only handles 1 write, not 10
-      // =================================================================
-
+      const holdId = `HOLD_${uuidv4().substring(0, 8).toUpperCase()}`;
       const now = new Date();
       const expiresAt = new Date(now.getTime() + CONFIG.HOLD_DURATION_SECONDS * 1000);
+      let heldCount = 0;
 
-      // 5. Create hold record (prepare, don't save yet)
-      const holdId = `HOLD_${uuidv4().substring(0, 8).toUpperCase()}`;
-      const hold: TruckHold = {
-        holdId,
-        orderId,
-        transporterId,
-        vehicleType,
-        vehicleSubtype,
-        quantity,
-        truckRequestIds,
-        createdAt: now,
-        expiresAt,
-        status: 'active'
-      };
-
-      // 6. 🔒 ACQUIRE REDIS LOCKS FIRST (this is the race condition prevention)
-      // This uses SET NX EX - atomic "set if not exists with expiry"
-      // If ANY truck is already locked, the whole operation fails fast
-      const lockSuccess = await holdStore.add(hold);
-
-      if (!lockSuccess) {
-        // ❌ LOCK FAILED - Someone else got these trucks
-        // No DB changes were made, so no cleanup needed!
-        // This is the power of "lock first" - instant rejection, zero DB load
-        logger.info(`[TruckHold] ⚡ Lock failed for ${quantity} trucks - someone else got them`);
-
-        return {
-          success: false,
-          message: 'Trucks are no longer available. Someone else selected them.',
-          error: 'LOCK_FAILED'
-        };
-      }
-
-      // 7. ✅ LOCK ACQUIRED - Now safe to update database
-      // Only ONE transporter reaches here per truck set
-      // Database write is guaranteed to be unique
-      for (const truckId of truckRequestIds) {
-        await db.updateTruckRequest(truckId, {
-          status: 'held',
-          heldBy: transporterId,
-          heldAt: now.toISOString()
+      await prismaClient.$transaction(async (tx) => {
+        const order = await tx.order.findUnique({
+          where: { id: orderId },
+          select: { id: true, status: true }
         });
-      }
 
-      // 7. Broadcast availability update to all connected clients
-      this.broadcastAvailabilityUpdate(orderId);
+        if (!order) throw new Error('ORDER_NOT_FOUND');
+        if (TERMINAL_ORDER_STATUSES.has(order.status)) throw new Error('ORDER_INACTIVE');
 
-      logger.info(`[TruckHold] ✅ Held ${quantity} trucks. Hold ID: ${holdId}, Expires: ${expiresAt.toISOString()}`);
+        const claimedRows = FF_HOLD_DB_ATOMIC_CLAIM
+          ? await tx.$queryRaw<Array<{ id: string }>>`
+              SELECT id
+              FROM "TruckRequest"
+              WHERE "orderId" = ${orderId}
+                AND lower("vehicleType") = lower(${vehicleType})
+                AND lower("vehicleSubtype") = lower(${vehicleSubtype})
+                AND "status" = 'searching'
+              ORDER BY "requestNumber" ASC, "createdAt" ASC
+              FOR UPDATE SKIP LOCKED
+              LIMIT ${quantity}
+            `
+          : await tx.truckRequest.findMany({
+              where: {
+                orderId,
+                vehicleType: { equals: vehicleType, mode: 'insensitive' },
+                vehicleSubtype: { equals: vehicleSubtype, mode: 'insensitive' },
+                status: TruckRequestStatus.searching
+              },
+              orderBy: [{ requestNumber: 'asc' }, { createdAt: 'asc' }],
+              take: quantity,
+              select: { id: true }
+            });
 
-      return {
+        const selectedIds = claimedRows.map((row) => row.id);
+        if (selectedIds.length < quantity) {
+          throw new Error(`NOT_ENOUGH_AVAILABLE:${selectedIds.length}`);
+        }
+
+        const claimUpdate = await tx.truckRequest.updateMany({
+          where: {
+            id: { in: selectedIds },
+            orderId,
+            status: TruckRequestStatus.searching
+          },
+          data: {
+            status: TruckRequestStatus.held,
+            heldById: transporterId,
+            heldAt: now.toISOString()
+          }
+        });
+
+        if (claimUpdate.count !== quantity) {
+          throw new Error('TRUCK_STATE_CHANGED');
+        }
+
+        await tx.truckHoldLedger.create({
+          data: {
+            holdId,
+            orderId,
+            transporterId,
+            vehicleType,
+            vehicleSubtype,
+            quantity,
+            truckRequestIds: selectedIds,
+            status: 'active',
+            expiresAt
+          }
+        });
+
+        heldCount = claimUpdate.count;
+      }, {
+        isolationLevel: Prisma.TransactionIsolationLevel.Serializable
+      });
+
+      response = {
         success: true,
         holdId,
         expiresAt,
-        heldQuantity: quantity,
-        message: `${quantity} truck(s) held for ${CONFIG.HOLD_DURATION_SECONDS} seconds. Please confirm.`
+        heldQuantity: heldCount,
+        holdState: 'reserved',
+        eventId,
+        eventVersion: HOLD_EVENT_VERSION,
+        serverTimeMs,
+        message: `${heldCount} truck(s) reserved for ${CONFIG.HOLD_DURATION_SECONDS} seconds. Assign drivers to finalize.`
       };
+      statusCode = 200;
 
+      this.broadcastAvailabilityUpdate(orderId);
+      logger.info(`[TruckHold] ✅ Held ${heldCount} trucks. Hold ID: ${holdId}, Expires: ${expiresAt.toISOString()}`);
     } catch (error: any) {
-      logger.error(`[TruckHold] Error holding trucks: ${error.message}`, error);
-      return {
-        success: false,
-        message: 'Failed to hold trucks. Please try again.',
-        error: 'INTERNAL_ERROR'
-      };
+      const message = String(error?.message || 'HOLD_FAILED');
+      if (message.startsWith('NOT_ENOUGH_AVAILABLE')) {
+        const available = parseInt(message.split(':')[1] || '0', 10);
+        response = {
+          success: false,
+          message: `Only ${available} trucks available right now.`,
+          error: 'NOT_ENOUGH_AVAILABLE'
+        };
+      } else if (message === 'ORDER_NOT_FOUND') {
+        response = {
+          success: false,
+          message: 'This request no longer exists.',
+          error: 'ORDER_INACTIVE'
+        };
+      } else if (message === 'ORDER_INACTIVE') {
+        response = {
+          success: false,
+          message: 'This request is no longer active.',
+          error: 'ORDER_INACTIVE'
+        };
+      } else if (message === 'TRUCK_STATE_CHANGED') {
+        response = {
+          success: false,
+          message: 'Truck availability changed. Please retry.',
+          error: 'TRUCK_STATE_CHANGED'
+        };
+      } else {
+        logger.error(`[TruckHold] Error holding trucks: ${message}`, error);
+        response = {
+          success: false,
+          message: 'Failed to reserve trucks. Please retry.',
+          error: 'INTERNAL_ERROR'
+        };
+      }
     }
+
+    await this.saveIdempotentOperationResponse(transporterId, 'hold', idempotencyKey, payloadHash, statusCode, response);
+    this.recordHoldOutcomeMetrics(response, holdStartedAtMs);
+    return response;
   }
 
   /**
@@ -629,11 +840,11 @@ class TruckHoldService {
    * @returns Success/failure response
    */
   async confirmHold(holdId: string, transporterId: string): Promise<{ success: boolean; message: string; assignedTrucks?: string[] }> {
+    const confirmStartedAtMs = Date.now();
     logger.info(`[TruckHold] Simple confirm request: ${holdId} by ${transporterId}`);
 
     try {
-      // 1. Get hold record (async - Redis)
-      const hold = await holdStore.get(holdId);
+      const hold = await prismaClient.truckHoldLedger.findUnique({ where: { holdId } });
 
       if (!hold) {
         return { success: false, message: 'Hold not found or expired' };
@@ -653,31 +864,59 @@ class TruckHoldService {
         return { success: false, message: 'Hold expired. Please try again.' };
       }
 
-      // 2. Mark trucks as assigned
-      for (const truckId of hold.truckRequestIds) {
-        await db.updateTruckRequest(truckId, {
-          status: 'assigned',
-          assignedTo: transporterId,
-          assignedTransporterId: transporterId,
-          assignedAt: new Date().toISOString(),
-          heldBy: undefined,
-          heldAt: undefined
+      const now = new Date().toISOString();
+      const confirmed = await prismaClient.$transaction(async (tx) => {
+        const order = await tx.order.findUnique({
+          where: { id: hold.orderId },
+          select: { status: true, id: true }
         });
-      }
+        if (!order || TERMINAL_ORDER_STATUSES.has(order.status)) {
+          throw new Error('ORDER_INACTIVE');
+        }
 
-      // 3. Update order's filled count (atomic increment — prevents race condition)
-      await prismaClient.order.update({
-        where: { id: hold.orderId },
-        data: { trucksFilled: { increment: hold.quantity } }
+        const update = await tx.truckRequest.updateMany({
+          where: {
+            id: { in: hold.truckRequestIds },
+            orderId: hold.orderId,
+            status: TruckRequestStatus.held,
+            heldById: transporterId
+          },
+          data: {
+            status: TruckRequestStatus.assigned,
+            assignedTransporterId: transporterId,
+            assignedAt: now,
+            heldById: null,
+            heldAt: null
+          }
+        });
+
+        if (update.count !== hold.quantity) {
+          throw new Error('TRUCK_STATE_CHANGED');
+        }
+
+        await tx.order.update({
+          where: { id: hold.orderId },
+          data: { trucksFilled: { increment: hold.quantity } }
+        });
+
+        await tx.truckHoldLedger.update({
+          where: { holdId },
+          data: {
+            status: 'confirmed',
+            confirmedAt: new Date(),
+            terminalReason: null
+          }
+        });
+
+        return update.count;
+      }, {
+        isolationLevel: Prisma.TransactionIsolationLevel.Serializable
       });
-
-      // 4. Mark hold as confirmed (async - Redis)
-      await holdStore.updateStatus(holdId, 'confirmed');
 
       // 5. Broadcast update
       this.broadcastAvailabilityUpdate(hold.orderId);
 
-      logger.info(`[TruckHold] ✅ Confirmed hold ${holdId}. ${hold.quantity} trucks assigned to ${transporterId}`);
+      logger.info(`[TruckHold] ✅ Confirmed hold ${holdId}. ${confirmed} trucks assigned to ${transporterId}`);
 
       return {
         success: true,
@@ -686,8 +925,16 @@ class TruckHoldService {
       };
 
     } catch (error: any) {
+      if (String(error?.message || '') === 'ORDER_INACTIVE') {
+        return { success: false, message: 'This request is no longer active.' };
+      }
+      if (String(error?.message || '') === 'TRUCK_STATE_CHANGED') {
+        return { success: false, message: 'Some held trucks changed state. Please retry.' };
+      }
       logger.error(`[TruckHold] Error confirming hold: ${error.message}`, error);
       return { success: false, message: 'Failed to confirm. Please try again.' };
+    } finally {
+      metrics.observeHistogram('confirm.latency_ms', Math.max(0, Date.now() - confirmStartedAtMs));
     }
   }
 
@@ -742,7 +989,7 @@ class TruckHoldService {
       // =========================================================================
       // STEP 1: Validate hold exists and is active
       // =========================================================================
-      const hold = await holdStore.get(holdId);
+      const hold = await prismaClient.truckHoldLedger.findUnique({ where: { holdId } });
 
       if (!hold) {
         return { success: false, message: 'Hold not found or expired' };
@@ -776,7 +1023,13 @@ class TruckHoldService {
       // =========================================================================
       const failedAssignments: Array<{ vehicleId: string; reason: string }> = [];
       const validatedVehicles: Array<{ vehicle: any; driver: any; truckRequestId: string }> = [];
-      const activeDriverStatuses = ['pending', 'driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit'];
+      const activeDriverStatuses: AssignmentStatus[] = [
+        AssignmentStatus.pending,
+        AssignmentStatus.driver_accepted,
+        AssignmentStatus.en_route_pickup,
+        AssignmentStatus.at_pickup,
+        AssignmentStatus.in_transit
+      ];
       const seenVehicleIds = new Set<string>();
       const seenDriverIds = new Set<string>();
       const vehicleIds = assignments.map((assignment) => assignment.vehicleId);
@@ -809,7 +1062,7 @@ class TruckHoldService {
         prismaClient.assignment.findMany({
           where: {
             driverId: { in: uniqueDriverIds },
-            status: { in: activeDriverStatuses as any }
+            status: { in: activeDriverStatuses }
           },
           select: {
             driverId: true,
@@ -950,7 +1203,7 @@ class TruckHoldService {
         const txBusyDrivers = await tx.assignment.findMany({
           where: {
             driverId: { in: uniqueDriverIds },
-            status: { in: activeDriverStatuses as any }
+            status: { in: activeDriverStatuses }
           },
           select: {
             driverId: true,
@@ -978,10 +1231,10 @@ class TruckHoldService {
             where: {
               id: vehicle.id,
               transporterId,
-              status: 'available' as any
+              status: VehicleStatus.available
             },
             data: {
-              status: 'in_transit' as any,
+              status: VehicleStatus.in_transit,
               currentTripId: tripId,
               assignedDriverId: driver.id,
               lastStatusChange: now
@@ -995,11 +1248,11 @@ class TruckHoldService {
             where: {
               id: truckRequestId,
               orderId: hold.orderId,
-              status: 'held' as any,
+              status: TruckRequestStatus.held,
               heldById: transporterId
             },
             data: {
-              status: 'assigned' as any,
+              status: TruckRequestStatus.assigned,
               assignedTransporterId: transporterId,
               assignedTransporterName: transporter?.name || transporter?.businessName || '',
               assignedVehicleId: vehicle.id,
@@ -1033,7 +1286,7 @@ class TruckHoldService {
               driverName: driver.name,
               driverPhone: driver.phone || '',
               tripId,
-              status: 'pending' as any,
+              status: AssignmentStatus.pending,
               assignedAt: now
             }
           });
@@ -1053,11 +1306,13 @@ class TruckHoldService {
           data: { trucksFilled: { increment: txAssignments.length } },
           select: { trucksFilled: true, totalTrucks: true }
         });
-        const newStatus: 'active' | 'partially_filled' | 'fully_filled' =
-          updatedOrder.trucksFilled >= updatedOrder.totalTrucks ? 'fully_filled' : 'partially_filled';
+        const newStatus: OrderStatus =
+          updatedOrder.trucksFilled >= updatedOrder.totalTrucks
+            ? OrderStatus.fully_filled
+            : OrderStatus.partially_filled;
         await tx.order.update({
           where: { id: hold.orderId },
-          data: { status: newStatus as any }
+          data: { status: newStatus }
         });
 
         return {
@@ -1180,7 +1435,14 @@ class TruckHoldService {
       // =========================================================================
       // STEP 7: Mark hold as confirmed and broadcast
       // =========================================================================
-      await holdStore.updateStatus(holdId, 'confirmed');
+      await prismaClient.truckHoldLedger.update({
+        where: { holdId },
+        data: {
+          status: 'confirmed',
+          confirmedAt: new Date(),
+          terminalReason: null
+        }
+      }).catch(() => {});
       this.broadcastAvailabilityUpdate(hold.orderId);
 
       logger.info(`╔══════════════════════════════════════════════════════════════╗`);
@@ -1215,47 +1477,136 @@ class TruckHoldService {
    * @param holdId - The hold ID to release
    * @param transporterId - The transporter releasing (optional, for validation)
    */
-  async releaseHold(holdId: string, transporterId?: string): Promise<{ success: boolean; message: string }> {
+  async releaseHold(
+    holdId: string,
+    transporterId?: string,
+    idempotencyKey?: string
+  ): Promise<{ success: boolean; message: string; error?: string }> {
     logger.info(`[TruckHold] Release request: ${holdId}`);
 
+    const normalizedHoldId = (holdId || '').trim();
+    const payloadHash = this.buildOperationPayloadHash('release', { holdId: normalizedHoldId });
+    if (transporterId && idempotencyKey) {
+      const replay = await this.getIdempotentOperationResponse(transporterId, 'release', idempotencyKey);
+      if (replay) {
+        if (replay.payloadHash !== payloadHash) {
+          return {
+            success: false,
+            message: 'Idempotency key reused with a different release payload.',
+            error: 'IDEMPOTENCY_CONFLICT'
+          };
+        }
+        return replay.response as { success: boolean; message: string; error?: string };
+      }
+    }
+
+    let response: { success: boolean; message: string; error?: string } = { success: false, message: 'Failed to release hold', error: 'INTERNAL_ERROR' };
+    let statusCode = 400;
+
     try {
-      const hold = await holdStore.get(holdId);
+      if (!normalizedHoldId) {
+        response = { success: false, message: 'holdId is required', error: 'VALIDATION_ERROR' };
+        return response;
+      }
+
+      const hold = await prismaClient.truckHoldLedger.findUnique({ where: { holdId: normalizedHoldId } });
 
       if (!hold) {
-        return { success: false, message: 'Hold not found' };
+        response = { success: false, message: 'Hold not found', error: 'HOLD_NOT_FOUND' };
+        return response;
       }
 
       if (transporterId && hold.transporterId !== transporterId) {
-        return { success: false, message: 'This hold belongs to another transporter' };
+        response = { success: false, message: 'This hold belongs to another transporter', error: 'FORBIDDEN' };
+        return response;
       }
 
       if (hold.status !== 'active') {
-        return { success: true, message: 'Hold already released' };
+        response = { success: true, message: 'Hold already released' };
+        statusCode = 200;
+        return response;
       }
 
-      // 1. Mark trucks as searching (available) again
-      for (const truckId of hold.truckRequestIds) {
-        await db.updateTruckRequest(truckId, {
-          status: 'searching',
-          heldBy: undefined,
-          heldAt: undefined
+      const resolvedTransporterId = hold.transporterId;
+      await prismaClient.$transaction(async (tx) => {
+        const order = await tx.order.findUnique({
+          where: { id: hold.orderId },
+          select: { status: true }
         });
-      }
 
-      // 2. Mark hold as released (async - Redis)
-      await holdStore.updateStatus(holdId, 'released');
-      await holdStore.remove(holdId);
+        const orderStatus = (order?.status || '').toString();
+        const isActiveOrder = ACTIVE_ORDER_STATUSES.has(orderStatus);
+        const nextTruckStatus: TruckRequestStatus = isActiveOrder
+          ? TruckRequestStatus.searching
+          : orderStatus === 'cancelled'
+            ? TruckRequestStatus.cancelled
+            : orderStatus === 'expired'
+              ? TruckRequestStatus.expired
+              : TruckRequestStatus.expired;
+
+        const where: Prisma.TruckRequestWhereInput = {
+          id: { in: hold.truckRequestIds },
+          orderId: hold.orderId,
+          status: TruckRequestStatus.held
+        };
+
+        if (FF_HOLD_SAFE_RELEASE_GUARD) {
+          where.heldById = resolvedTransporterId;
+        }
+
+        await tx.truckRequest.updateMany({
+          where,
+          data: {
+            status: nextTruckStatus,
+            heldById: null,
+            heldAt: null
+          }
+        });
+
+        await tx.truckHoldLedger.update({
+          where: { holdId: normalizedHoldId },
+          data: {
+            status: isActiveOrder
+              ? 'released'
+              : orderStatus === 'cancelled'
+                ? 'cancelled'
+                : 'expired',
+            terminalReason: isActiveOrder ? 'RELEASED_BY_TRANSPORTER' : `ORDER_${orderStatus.toUpperCase() || 'INACTIVE'}`,
+            releasedAt: new Date()
+          }
+        });
+      }, {
+        isolationLevel: Prisma.TransactionIsolationLevel.Serializable
+      });
+
+      // best-effort Redis cleanup for stale lock/index keys
+      await holdStore.remove(normalizedHoldId).catch(() => {});
 
       // 3. Broadcast update
       this.broadcastAvailabilityUpdate(hold.orderId);
 
-      logger.info(`[TruckHold] ✅ Released hold ${holdId}. ${hold.quantity} trucks available again.`);
+      logger.info(`[TruckHold] ✅ Released hold ${normalizedHoldId}. ${hold.quantity} trucks reconciled.`);
+      metrics.incrementCounter('hold.cleanup.released_total');
 
-      return { success: true, message: 'Hold released. Trucks are available again.' };
+      response = { success: true, message: 'Hold released successfully.' };
+      statusCode = 200;
+      return response;
 
     } catch (error: any) {
       logger.error(`[TruckHold] Error releasing hold: ${error.message}`, error);
-      return { success: false, message: 'Failed to release hold' };
+      response = { success: false, message: 'Failed to release hold', error: 'INTERNAL_ERROR' };
+      return response;
+    } finally {
+      if (transporterId && idempotencyKey) {
+        await this.saveIdempotentOperationResponse(
+          transporterId,
+          'release',
+          idempotencyKey,
+          payloadHash,
+          statusCode,
+          response
+        ).catch(() => {});
+      }
     }
   }
 
@@ -1338,6 +1689,93 @@ class TruckHoldService {
       logger.error(`[TruckHold] Error getting availability: ${error.message}`, error);
       return null;
     }
+  }
+
+  async getMyActiveHold(
+    transporterId: string,
+    orderId: string,
+    vehicleType: string,
+    vehicleSubtype: string
+  ): Promise<{
+    holdId: string;
+    orderId: string;
+    vehicleType: string;
+    vehicleSubtype: string;
+    quantity: number;
+    expiresAt: string;
+    status: string;
+  } | null> {
+    const hold = await this.findActiveLedgerHold(
+      transporterId,
+      orderId,
+      this.normalizeVehiclePart(vehicleType),
+      this.normalizeVehiclePart(vehicleSubtype)
+    );
+    if (!hold) return null;
+    return {
+      holdId: hold.holdId,
+      orderId: hold.orderId,
+      vehicleType: hold.vehicleType,
+      vehicleSubtype: hold.vehicleSubtype,
+      quantity: hold.quantity,
+      expiresAt: hold.expiresAt.toISOString(),
+      status: hold.status
+    };
+  }
+
+  async closeActiveHoldsForOrder(
+    orderId: string,
+    terminalReason: 'ORDER_CANCELLED' | 'ORDER_EXPIRED'
+  ): Promise<number> {
+    const activeHolds = await prismaClient.truckHoldLedger.findMany({
+      where: {
+        orderId,
+        status: 'active'
+      },
+      select: {
+        holdId: true,
+        transporterId: true,
+        truckRequestIds: true
+      }
+    });
+
+    if (activeHolds.length === 0) return 0;
+
+    const terminalTruckStatus: TruckRequestStatus = terminalReason === 'ORDER_CANCELLED'
+      ? TruckRequestStatus.cancelled
+      : TruckRequestStatus.expired;
+    for (const hold of activeHolds) {
+      await prismaClient.$transaction(async (tx) => {
+        await tx.truckRequest.updateMany({
+          where: {
+            id: { in: hold.truckRequestIds },
+            orderId,
+            status: TruckRequestStatus.held,
+            heldById: hold.transporterId
+          },
+          data: {
+            status: terminalTruckStatus,
+            heldById: null,
+            heldAt: null
+          }
+        });
+
+        await tx.truckHoldLedger.update({
+          where: { holdId: hold.holdId },
+          data: {
+            status: terminalReason === 'ORDER_CANCELLED' ? 'cancelled' : 'expired',
+            terminalReason,
+            releasedAt: new Date()
+          }
+        });
+      }).catch((error) => {
+        logger.warn(`[TruckHold] Failed to close hold ${hold.holdId} for order ${orderId}: ${String((error as Error)?.message || error)}`);
+      });
+
+      await holdStore.remove(hold.holdId).catch(() => {});
+    }
+
+    return activeHolds.length;
   }
 
   // ===========================================================================
@@ -1526,15 +1964,32 @@ class TruckHoldService {
   private startCleanupJob(): void {
     this.cleanupInterval = setInterval(async () => {
       try {
-        const expiredHolds = await holdStore.getExpiredHolds();
+        const now = new Date();
+        const expiredHolds = await prismaClient.truckHoldLedger.findMany({
+          where: {
+            status: 'active',
+            expiresAt: { lte: now }
+          },
+          take: 200,
+          orderBy: { expiresAt: 'asc' },
+          select: { holdId: true, orderId: true }
+        });
 
         for (const hold of expiredHolds) {
           logger.info(`[TruckHold] Auto-releasing expired hold: ${hold.holdId}`);
           await this.releaseHold(hold.holdId);
+          await prismaClient.truckHoldLedger.update({
+            where: { holdId: hold.holdId },
+            data: {
+              status: 'expired',
+              terminalReason: 'HOLD_TTL_EXPIRED',
+              releasedAt: new Date()
+            }
+          }).catch(() => {});
         }
 
         if (expiredHolds.length > 0) {
-          logger.info(`[TruckHold] Cleanup: Released ${expiredHolds.length} expired holds`);
+          logger.info(`[TruckHold] Cleanup: Reconciled ${expiredHolds.length} expired holds`);
         }
       } catch (error: any) {
         logger.error(`[TruckHold] Cleanup job error: ${error.message}`);

@@ -510,6 +510,47 @@ model OrderDispatchOutbox {
 }
 
 // =============================================================================
+// TRUCK HOLD LEDGER (durable hold state for recovery and reconciliation)
+// =============================================================================
+model TruckHoldLedger {
+  holdId         String   @id
+  orderId        String
+  transporterId  String
+  vehicleType    String
+  vehicleSubtype String
+  quantity       Int
+  truckRequestIds String[] @default([])
+  status         String   @default("active") // active|confirmed|released|expired|cancelled
+  expiresAt      DateTime
+  terminalReason String?
+  releasedAt     DateTime?
+  confirmedAt    DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([orderId, status, expiresAt])
+  @@index([transporterId, status, expiresAt])
+}
+
+// =============================================================================
+// TRUCK HOLD IDEMPOTENCY (duplicate-safe hold/release retries)
+// =============================================================================
+model TruckHoldIdempotency {
+  id             String   @id @default(uuid())
+  transporterId  String
+  operation      String   // hold|release
+  idempotencyKey String
+  payloadHash    String
+  statusCode     Int
+  responseJson   Json
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([transporterId, operation, idempotencyKey])
+  @@index([transporterId, operation, createdAt])
+}
+
+// =============================================================================
 // TRUCK REQUEST MODEL
 // =============================================================================
 // 
@@ -592,6 +633,8 @@ model TruckRequest {
   @@index([assignedTransporterId])         // Assigned to transporter
   @@index([status, vehicleType])           // Active requests by type
   @@index([notifiedTransporters], type: Gin) // Fast membership lookup for transporter feed
+  @@index([orderId, vehicleType, vehicleSubtype, status, requestNumber])
+  @@index([status, heldAt])
 }
 
 // =============================================================================
