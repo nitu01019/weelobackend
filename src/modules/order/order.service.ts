@@ -794,19 +794,19 @@ class OrderService {
       const reasonCode = retryable ? 'DISPATCH_RETRYING' : 'DISPATCH_FAILED';
       const updateData: any = retryable
         ? {
-            status: 'retrying',
-            attempts: attemptNumber,
-            nextRetryAt: new Date(Date.now() + this.calculateDispatchRetryDelayMs(attemptNumber)),
-            lastError: error?.message || 'DISPATCH_FAILED',
-            lockedAt: null
-          }
+          status: 'retrying',
+          attempts: attemptNumber,
+          nextRetryAt: new Date(Date.now() + this.calculateDispatchRetryDelayMs(attemptNumber)),
+          lastError: error?.message || 'DISPATCH_FAILED',
+          lockedAt: null
+        }
         : {
-            status: 'failed',
-            attempts: attemptNumber,
-            processedAt: new Date(),
-            lastError: error?.message || 'DISPATCH_FAILED',
-            lockedAt: null
-          };
+          status: 'failed',
+          attempts: attemptNumber,
+          processedAt: new Date(),
+          lastError: error?.message || 'DISPATCH_FAILED',
+          lockedAt: null
+        };
 
       await this.orderDispatchOutboxDelegate().update({
         where: { id: row.id },
@@ -868,20 +868,20 @@ class OrderService {
       : [];
     const drivers: OrderLifecycleOutboxPayload['drivers'] = Array.isArray(raw.drivers)
       ? raw.drivers.reduce<OrderLifecycleOutboxPayload['drivers']>((acc, item) => {
-          if (!item || typeof item !== 'object' || Array.isArray(item)) return acc;
-          const row = item as Record<string, unknown>;
-          const driverId = typeof row.driverId === 'string' ? row.driverId.trim() : '';
-          if (!driverId) return acc;
-          acc.push({
-            driverId,
-            tripId: typeof row.tripId === 'string' ? row.tripId : undefined,
-            customerName: typeof row.customerName === 'string' ? row.customerName : undefined,
-            customerPhone: typeof row.customerPhone === 'string' ? row.customerPhone : undefined,
-            pickupAddress: typeof row.pickupAddress === 'string' ? row.pickupAddress : undefined,
-            dropAddress: typeof row.dropAddress === 'string' ? row.dropAddress : undefined
-          });
-          return acc;
-        }, [])
+        if (!item || typeof item !== 'object' || Array.isArray(item)) return acc;
+        const row = item as Record<string, unknown>;
+        const driverId = typeof row.driverId === 'string' ? row.driverId.trim() : '';
+        if (!driverId) return acc;
+        acc.push({
+          driverId,
+          tripId: typeof row.tripId === 'string' ? row.tripId : undefined,
+          customerName: typeof row.customerName === 'string' ? row.customerName : undefined,
+          customerPhone: typeof row.customerPhone === 'string' ? row.customerPhone : undefined,
+          pickupAddress: typeof row.pickupAddress === 'string' ? row.pickupAddress : undefined,
+          dropAddress: typeof row.dropAddress === 'string' ? row.dropAddress : undefined
+        });
+        return acc;
+      }, [])
       : [];
     const reason = typeof raw.reason === 'string' && raw.reason.trim().length > 0
       ? raw.reason.trim()
@@ -1580,494 +1580,494 @@ class OrderService {
     }
 
     try {
-    // DB authoritative check (covers Redis failure edge case)
-    const existingBooking = await prismaClient.booking.findFirst({
-      where: { customerId: request.customerId, status: { in: [BookingStatus.created, BookingStatus.broadcasting, BookingStatus.active, BookingStatus.partially_filled] } }
-    });
-    const existingOrder = await prismaClient.order.findFirst({
-      where: { customerId: request.customerId, status: { in: [OrderStatus.created, OrderStatus.broadcasting, OrderStatus.active, OrderStatus.partially_filled] } }
-    });
-    if (existingBooking || existingOrder) {
-      throw new Error('Request already in progress. Cancel it first.');
-    }
-
-    // ========================================
-    // SERVER-GENERATED IDEMPOTENCY (double-tap / retry protection)
-    // ========================================
-    const roundCoord = (n: number) => Math.round(n * 1000) / 1000;
-    // Extract pickup/drop coords from routePoints or legacy fields
-    const idemPickup = request.routePoints?.[0] || request.pickup;
-    const idemDrop = request.routePoints?.[request.routePoints?.length ? request.routePoints.length - 1 : 0] || request.drop;
-    const truckTypesSorted = request.vehicleRequirements
-      .map(t => `${t.vehicleType}:${t.vehicleSubtype || ''}:${t.quantity}`)
-      .sort()
-      .join('|');
-    const idempotencyFingerprint = [
-      request.customerId,
-      truckTypesSorted,
-      roundCoord(idemPickup?.latitude || 0),
-      roundCoord(idemPickup?.longitude || 0),
-      roundCoord(idemDrop?.latitude || 0),
-      roundCoord(idemDrop?.longitude || 0)
-    ].join(':');
-    const idempotencyHash = crypto.createHash('sha256').update(idempotencyFingerprint).digest('hex').substring(0, 32);
-    const dedupeKey = `idem:broadcast:create:${request.customerId}:${idempotencyHash}`;
-
-    const existingDedupeId = await redisService.get(dedupeKey);
-    if (existingDedupeId) {
-      const existingDedupeOrder = await db.getOrderById(existingDedupeId);
-      if (existingDedupeOrder && !['cancelled', 'expired'].includes(existingDedupeOrder.status)) {
-        logger.info('Idempotent replay: returning existing order', { orderId: existingDedupeId, idempotencyHash });
-        const totalTrucks = request.vehicleRequirements.reduce((sum, req) => sum + req.quantity, 0);
-        const totalAmount = request.vehicleRequirements.reduce((sum, req) => sum + (req.quantity * req.pricePerTruck), 0);
-        return {
-          orderId: existingDedupeId,
-          totalTrucks,
-          totalAmount,
-          dispatchState: 'dispatched',
-          dispatchAttempts: 1,
-          onlineCandidates: existingDedupeOrder.onlineCandidatesCount || 0,
-          notifiedTransporters: existingDedupeOrder.notifiedCount || 0,
-          reasonCode: existingDedupeOrder.dispatchReasonCode || undefined,
-          serverTimeMs: Date.now(),
-          truckRequests: [],
-          expiresAt: existingDedupeOrder.expiresAt,
-          expiresIn: 0
-        };
-      }
-    }
-
-    const orderId = uuidv4();
-    const now = new Date();
-    const expiresAt = new Date(now.getTime() + this.BROADCAST_TIMEOUT_MS).toISOString();
-
-    // Calculate totals
-    const totalTrucks = request.vehicleRequirements.reduce((sum, req) => sum + req.quantity, 0);
-    if (totalTrucks <= 0) {
-      throw new AppError(400, 'VALIDATION_ERROR', 'Total trucks must be greater than zero');
-    }
-
-    // ==========================================================================
-    // SECURITY: Server-side price validation
-    // ==========================================================================
-    // Recalculate prices server-side to prevent client-side price tampering.
-    // The client-submitted pricePerTruck is compared against the server-calculated
-    // price. If the client price is lower (manipulated), we use the server price.
-    // A tolerance of 5% is allowed for rounding/timing differences (e.g., surge).
-    // ==========================================================================
-    const PRICE_TOLERANCE = 0.05; // 5% tolerance for rounding/surge timing
-
-    for (const req of request.vehicleRequirements) {
-      try {
-        const serverEstimate = pricingService.calculateEstimate({
-          vehicleType: req.vehicleType,
-          vehicleSubtype: req.vehicleSubtype,
-          distanceKm: request.distanceKm,
-          trucksNeeded: req.quantity,
-          cargoWeightKg: request.cargoWeightKg
-        });
-
-        const serverPrice = serverEstimate.pricePerTruck;
-        const clientPrice = req.pricePerTruck;
-        const priceDiff = (clientPrice - serverPrice) / serverPrice;
-
-        if (priceDiff < -PRICE_TOLERANCE) {
-          // Client price is suspiciously low - use server price
-          logger.warn(`⚠️ PRICE TAMPER DETECTED: ${req.vehicleType}/${req.vehicleSubtype} ` +
-            `client=₹${clientPrice} vs server=₹${serverPrice} (diff=${(priceDiff * 100).toFixed(1)}%). ` +
-            `Using server price.`);
-          req.pricePerTruck = serverPrice;
-        } else if (Math.abs(priceDiff) > PRICE_TOLERANCE) {
-          // Price differs significantly but client paid more - log but allow
-          logger.info(`ℹ️ Price variance: ${req.vehicleType}/${req.vehicleSubtype} ` +
-            `client=₹${clientPrice} vs server=₹${serverPrice} (diff=${(priceDiff * 100).toFixed(1)}%)`);
-        }
-      } catch (error: any) {
-        logger.warn(`⚠️ Price validation failed for ${req.vehicleType}: ${error.message}. Using client price.`);
-        // If pricing service fails, allow client price to avoid blocking orders
-      }
-    }
-
-    const totalAmount = request.vehicleRequirements.reduce(
-      (sum, req) => sum + (req.quantity * req.pricePerTruck),
-      0
-    );
-
-    // ==========================================================================
-    // BUILD ROUTE POINTS (with intermediate stops support)
-    // ==========================================================================
-    // 
-    // INPUT OPTIONS:
-    // 1. routePoints array (NEW) - directly use these
-    // 2. pickup + drop (LEGACY) - build routePoints from them
-    //
-    // OUTPUT: routePoints array with auto-assigned stopIndex
-    // ==========================================================================
-
-    let routePoints: { type: 'PICKUP' | 'STOP' | 'DROP'; latitude: number; longitude: number; address: string; city?: string; state?: string; stopIndex: number }[];
-    let pickup: { latitude: number; longitude: number; address: string; city?: string; state?: string };
-    let drop: { latitude: number; longitude: number; address: string; city?: string; state?: string };
-
-    if (request.routePoints && request.routePoints.length >= 2) {
-      // NEW: Use provided routePoints
-      routePoints = request.routePoints.map((point, index) => ({
-        ...point,
-        stopIndex: index
-      }));
-
-      // Extract pickup (first) and drop (last) for backward compatibility
-      const firstPoint = request.routePoints[0];
-      const lastPoint = request.routePoints[request.routePoints.length - 1];
-
-      pickup = {
-        latitude: firstPoint.latitude,
-        longitude: firstPoint.longitude,
-        address: firstPoint.address,
-        city: firstPoint.city,
-        state: firstPoint.state
-      };
-
-      drop = {
-        latitude: lastPoint.latitude,
-        longitude: lastPoint.longitude,
-        address: lastPoint.address,
-        city: lastPoint.city,
-        state: lastPoint.state
-      };
-
-      logger.info(`📍 Route has ${routePoints.length} points (${routePoints.filter(p => p.type === 'STOP').length} intermediate stops)`);
-    } else if (request.pickup && request.drop) {
-      // LEGACY: Build routePoints from pickup + drop
-      pickup = request.pickup;
-      drop = request.drop;
-
-      routePoints = [
-        { type: 'PICKUP', ...pickup, stopIndex: 0 },
-        { type: 'DROP', ...drop, stopIndex: 1 }
-      ];
-
-      logger.info(`📍 Route has 2 points (no intermediate stops)`);
-    } else {
-      // SCALABILITY: Use structured error code for monitoring
-      // EASY UNDERSTANDING: Clear validation error message
-      // MODULARITY: Consistent with other validation errors
-      // CODING STANDARDS: REST API error response pattern
-      throw new Error('Either routePoints OR both pickup and drop must be provided'); // TODO: Replace with ValidationError when imported
-    }
-
-    const stopsCount = routePoints.filter(p => p.type === 'STOP').length;
-
-    logger.info(`╔══════════════════════════════════════════════════════════════╗`);
-    logger.info(`║  🚛 NEW MULTI-VEHICLE ORDER                                   ║`);
-    logger.info(`╠══════════════════════════════════════════════════════════════╣`);
-    logger.info(`║  Order ID: ${orderId.substring(0, 8)}...`);
-    logger.info(`║  Customer: ${request.customerName}`);
-    logger.info(`║  Total Trucks: ${totalTrucks}`);
-    logger.info(`║  Total Amount: ₹${totalAmount}`);
-    logger.info(`║  Vehicle Types: ${request.vehicleRequirements.length}`);
-    request.vehicleRequirements.forEach((req, i) => {
-      logger.info(`║    ${i + 1}. ${req.quantity}x ${req.vehicleType} (${req.vehicleSubtype}) @ ₹${req.pricePerTruck}`);
-    });
-    logger.info(`║  Route Points: ${routePoints.length} (${stopsCount} stops)`);
-    routePoints.forEach((point, i) => {
-      logger.info(`║    ${i}. [${point.type}] ${point.address.substring(0, 40)}...`);
-    });
-    logger.info(`╚══════════════════════════════════════════════════════════════╝`);
-
-    // 1. Create the parent Order
-    const order: Omit<OrderRecord, 'createdAt' | 'updatedAt'> = {
-      id: orderId,
-      customerId: request.customerId,
-      customerName: request.customerName,
-      customerPhone: request.customerPhone,
-
-      // Route points (NEW - with intermediate stops)
-      routePoints,
-      currentRouteIndex: 0,        // Start at pickup
-      stopWaitTimers: [],          // Empty until driver reaches stops
-
-      // Legacy pickup/drop (for backward compatibility)
-      pickup,
-      drop,
-
-      distanceKm: request.distanceKm,
-      totalTrucks,
-      trucksFilled: 0,
-      totalAmount,
-      goodsType: request.goodsType,
-      cargoWeightKg: request.cargoWeightKg,
-      status: 'created',
-      stateChangedAt: new Date(),
-      dispatchState: 'queued',
-      dispatchAttempts: 0,
-      dispatchReasonCode: null,
-      onlineCandidatesCount: 0,
-      notifiedCount: 0,
-      lastDispatchAt: null,
-      scheduledAt: request.scheduledAt,
-      expiresAt
-    };
-
-    // 2. Prepare TruckRequests for each vehicle type
-    const truckRequests: TruckRequestRecord[] = [];
-    const responseRequests: CreateOrderResponse['truckRequests'] = [];
-    let requestNumber = 1;
-
-    for (const vehicleReq of request.vehicleRequirements) {
-      // Create one TruckRequest per truck (not per type)
-      // This allows each truck to be assigned independently
-      for (let i = 0; i < vehicleReq.quantity; i++) {
-        const truckRequestId = uuidv4();
-
-        const truckRequest: Omit<TruckRequestRecord, 'createdAt' | 'updatedAt'> = {
-          id: truckRequestId,
-          orderId,
-          requestNumber,
-          vehicleType: vehicleReq.vehicleType,
-          vehicleSubtype: vehicleReq.vehicleSubtype,
-          pricePerTruck: vehicleReq.pricePerTruck,
-          status: 'searching',
-          notifiedTransporters: []
-        };
-
-        truckRequests.push(truckRequest as TruckRequestRecord);
-        requestNumber++;
-      }
-
-      // Find matching transporters for this vehicle type
-      const matchingTransporters = await db.getTransportersWithVehicleType(
-        vehicleReq.vehicleType,
-        vehicleReq.vehicleSubtype
-      );
-
-      responseRequests.push({
-        id: truckRequests[truckRequests.length - 1].id,
-        vehicleType: vehicleReq.vehicleType,
-        vehicleSubtype: vehicleReq.vehicleSubtype,
-        quantity: vehicleReq.quantity,
-        pricePerTruck: vehicleReq.pricePerTruck,
-        matchingTransporters: matchingTransporters.length
-      });
-    }
-
-    let dispatchState: CreateOrderResponse['dispatchState'] = 'dispatching';
-    let dispatchReasonCode: string | undefined;
-    let dispatchAttempts = 1;
-    let onlineCandidates = 0;
-    let notifiedTransporters = 0;
-
-    // Narrow serializable transaction: duplicate-check + order + truckRequests + dispatch outbox bootstrap.
-    // This removes the crash window where order exists but outbox row does not.
-    await prismaClient.$transaction(async (tx) => {
-      const dupBooking = await tx.booking.findFirst({
+      // DB authoritative check (covers Redis failure edge case)
+      const existingBooking = await prismaClient.booking.findFirst({
         where: { customerId: request.customerId, status: { in: [BookingStatus.created, BookingStatus.broadcasting, BookingStatus.active, BookingStatus.partially_filled] } }
       });
-      const dupOrder = await tx.order.findFirst({
+      const existingOrder = await prismaClient.order.findFirst({
         where: { customerId: request.customerId, status: { in: [OrderStatus.created, OrderStatus.broadcasting, OrderStatus.active, OrderStatus.partially_filled] } }
       });
-      if (dupBooking || dupOrder) {
+      if (existingBooking || existingOrder) {
         throw new Error('Request already in progress. Cancel it first.');
       }
 
-      await tx.order.create({
-        data: {
-          ...order,
-          routePoints: order.routePoints as any,
-          stopWaitTimers: order.stopWaitTimers as any,
-          pickup: order.pickup as any,
-          drop: order.drop as any,
-          status: order.status as OrderStatus
-        }
-      });
+      // ========================================
+      // SERVER-GENERATED IDEMPOTENCY (double-tap / retry protection)
+      // ========================================
+      const roundCoord = (n: number) => Math.round(n * 1000) / 1000;
+      // Extract pickup/drop coords from routePoints or legacy fields
+      const idemPickup = request.routePoints?.[0] || request.pickup;
+      const idemDrop = request.routePoints?.[request.routePoints?.length ? request.routePoints.length - 1 : 0] || request.drop;
+      const truckTypesSorted = request.vehicleRequirements
+        .map(t => `${t.vehicleType}:${t.vehicleSubtype || ''}:${t.quantity}`)
+        .sort()
+        .join('|');
+      const idempotencyFingerprint = [
+        request.customerId,
+        truckTypesSorted,
+        roundCoord(idemPickup?.latitude || 0),
+        roundCoord(idemPickup?.longitude || 0),
+        roundCoord(idemDrop?.latitude || 0),
+        roundCoord(idemDrop?.longitude || 0)
+      ].join(':');
+      const idempotencyHash = crypto.createHash('sha256').update(idempotencyFingerprint).digest('hex').substring(0, 32);
+      const dedupeKey = `idem:broadcast:create:${request.customerId}:${idempotencyHash}`;
 
-      if (truckRequests.length > 0) {
-        await tx.truckRequest.createMany({
-          data: truckRequests.map((truckRequest) => ({
-            id: truckRequest.id,
-            orderId: truckRequest.orderId,
-            requestNumber: truckRequest.requestNumber,
-            vehicleType: truckRequest.vehicleType,
-            vehicleSubtype: truckRequest.vehicleSubtype,
-            pricePerTruck: truckRequest.pricePerTruck,
-            status: truckRequest.status as TruckRequestStatus,
-            heldById: truckRequest.heldBy || null,
-            heldAt: truckRequest.heldAt || null,
-            assignedTransporterId: truckRequest.assignedTransporterId || truckRequest.assignedTo || null,
-            assignedTransporterName: truckRequest.assignedTransporterName || null,
-            assignedVehicleId: truckRequest.assignedVehicleId || null,
-            assignedVehicleNumber: truckRequest.assignedVehicleNumber || null,
-            assignedDriverId: truckRequest.assignedDriverId || null,
-            assignedDriverName: truckRequest.assignedDriverName || null,
-            assignedDriverPhone: truckRequest.assignedDriverPhone || null,
-            tripId: truckRequest.tripId || null,
-            notifiedTransporters: truckRequest.notifiedTransporters || [],
-            assignedAt: truckRequest.assignedAt || null
-          })),
-          skipDuplicates: true
+      const existingDedupeId = await redisService.get(dedupeKey);
+      if (existingDedupeId) {
+        const existingDedupeOrder = await db.getOrderById(existingDedupeId);
+        if (existingDedupeOrder && !['cancelled', 'expired'].includes(existingDedupeOrder.status)) {
+          logger.info('Idempotent replay: returning existing order', { orderId: existingDedupeId, idempotencyHash });
+          const totalTrucks = request.vehicleRequirements.reduce((sum, req) => sum + req.quantity, 0);
+          const totalAmount = request.vehicleRequirements.reduce((sum, req) => sum + (req.quantity * req.pricePerTruck), 0);
+          return {
+            orderId: existingDedupeId,
+            totalTrucks,
+            totalAmount,
+            dispatchState: 'dispatched',
+            dispatchAttempts: 1,
+            onlineCandidates: existingDedupeOrder.onlineCandidatesCount || 0,
+            notifiedTransporters: existingDedupeOrder.notifiedCount || 0,
+            reasonCode: existingDedupeOrder.dispatchReasonCode || undefined,
+            serverTimeMs: Date.now(),
+            truckRequests: [],
+            expiresAt: existingDedupeOrder.expiresAt,
+            expiresIn: 0
+          };
+        }
+      }
+
+      const orderId = uuidv4();
+      const now = new Date();
+      const expiresAt = new Date(now.getTime() + this.BROADCAST_TIMEOUT_MS).toISOString();
+
+      // Calculate totals
+      const totalTrucks = request.vehicleRequirements.reduce((sum, req) => sum + req.quantity, 0);
+      if (totalTrucks <= 0) {
+        throw new AppError(400, 'VALIDATION_ERROR', 'Total trucks must be greater than zero');
+      }
+
+      // ==========================================================================
+      // SECURITY: Server-side price validation
+      // ==========================================================================
+      // Recalculate prices server-side to prevent client-side price tampering.
+      // The client-submitted pricePerTruck is compared against the server-calculated
+      // price. If the client price is lower (manipulated), we use the server price.
+      // A tolerance of 5% is allowed for rounding/timing differences (e.g., surge).
+      // ==========================================================================
+      const PRICE_TOLERANCE = 0.05; // 5% tolerance for rounding/surge timing
+
+      for (const req of request.vehicleRequirements) {
+        try {
+          const serverEstimate = pricingService.calculateEstimate({
+            vehicleType: req.vehicleType,
+            vehicleSubtype: req.vehicleSubtype,
+            distanceKm: request.distanceKm,
+            trucksNeeded: req.quantity,
+            cargoWeightKg: request.cargoWeightKg
+          });
+
+          const serverPrice = serverEstimate.pricePerTruck;
+          const clientPrice = req.pricePerTruck;
+          const priceDiff = (clientPrice - serverPrice) / serverPrice;
+
+          if (priceDiff < -PRICE_TOLERANCE) {
+            // Client price is suspiciously low - use server price
+            logger.warn(`⚠️ PRICE TAMPER DETECTED: ${req.vehicleType}/${req.vehicleSubtype} ` +
+              `client=₹${clientPrice} vs server=₹${serverPrice} (diff=${(priceDiff * 100).toFixed(1)}%). ` +
+              `Using server price.`);
+            req.pricePerTruck = serverPrice;
+          } else if (Math.abs(priceDiff) > PRICE_TOLERANCE) {
+            // Price differs significantly but client paid more - log but allow
+            logger.info(`ℹ️ Price variance: ${req.vehicleType}/${req.vehicleSubtype} ` +
+              `client=₹${clientPrice} vs server=₹${serverPrice} (diff=${(priceDiff * 100).toFixed(1)}%)`);
+          }
+        } catch (error: any) {
+          logger.warn(`⚠️ Price validation failed for ${req.vehicleType}: ${error.message}. Using client price.`);
+          // If pricing service fails, allow client price to avoid blocking orders
+        }
+      }
+
+      const totalAmount = request.vehicleRequirements.reduce(
+        (sum, req) => sum + (req.quantity * req.pricePerTruck),
+        0
+      );
+
+      // ==========================================================================
+      // BUILD ROUTE POINTS (with intermediate stops support)
+      // ==========================================================================
+      // 
+      // INPUT OPTIONS:
+      // 1. routePoints array (NEW) - directly use these
+      // 2. pickup + drop (LEGACY) - build routePoints from them
+      //
+      // OUTPUT: routePoints array with auto-assigned stopIndex
+      // ==========================================================================
+
+      let routePoints: { type: 'PICKUP' | 'STOP' | 'DROP'; latitude: number; longitude: number; address: string; city?: string; state?: string; stopIndex: number }[];
+      let pickup: { latitude: number; longitude: number; address: string; city?: string; state?: string };
+      let drop: { latitude: number; longitude: number; address: string; city?: string; state?: string };
+
+      if (request.routePoints && request.routePoints.length >= 2) {
+        // NEW: Use provided routePoints
+        routePoints = request.routePoints.map((point, index) => ({
+          ...point,
+          stopIndex: index
+        }));
+
+        // Extract pickup (first) and drop (last) for backward compatibility
+        const firstPoint = request.routePoints[0];
+        const lastPoint = request.routePoints[request.routePoints.length - 1];
+
+        pickup = {
+          latitude: firstPoint.latitude,
+          longitude: firstPoint.longitude,
+          address: firstPoint.address,
+          city: firstPoint.city,
+          state: firstPoint.state
+        };
+
+        drop = {
+          latitude: lastPoint.latitude,
+          longitude: lastPoint.longitude,
+          address: lastPoint.address,
+          city: lastPoint.city,
+          state: lastPoint.state
+        };
+
+        logger.info(`📍 Route has ${routePoints.length} points (${routePoints.filter(p => p.type === 'STOP').length} intermediate stops)`);
+      } else if (request.pickup && request.drop) {
+        // LEGACY: Build routePoints from pickup + drop
+        pickup = request.pickup;
+        drop = request.drop;
+
+        routePoints = [
+          { type: 'PICKUP', ...pickup, stopIndex: 0 },
+          { type: 'DROP', ...drop, stopIndex: 1 }
+        ];
+
+        logger.info(`📍 Route has 2 points (no intermediate stops)`);
+      } else {
+        // SCALABILITY: Use structured error code for monitoring
+        // EASY UNDERSTANDING: Clear validation error message
+        // MODULARITY: Consistent with other validation errors
+        // CODING STANDARDS: REST API error response pattern
+        throw new Error('Either routePoints OR both pickup and drop must be provided'); // TODO: Replace with ValidationError when imported
+      }
+
+      const stopsCount = routePoints.filter(p => p.type === 'STOP').length;
+
+      logger.info(`╔══════════════════════════════════════════════════════════════╗`);
+      logger.info(`║  🚛 NEW MULTI-VEHICLE ORDER                                   ║`);
+      logger.info(`╠══════════════════════════════════════════════════════════════╣`);
+      logger.info(`║  Order ID: ${orderId.substring(0, 8)}...`);
+      logger.info(`║  Customer: ${request.customerName}`);
+      logger.info(`║  Total Trucks: ${totalTrucks}`);
+      logger.info(`║  Total Amount: ₹${totalAmount}`);
+      logger.info(`║  Vehicle Types: ${request.vehicleRequirements.length}`);
+      request.vehicleRequirements.forEach((req, i) => {
+        logger.info(`║    ${i + 1}. ${req.quantity}x ${req.vehicleType} (${req.vehicleSubtype}) @ ₹${req.pricePerTruck}`);
+      });
+      logger.info(`║  Route Points: ${routePoints.length} (${stopsCount} stops)`);
+      routePoints.forEach((point, i) => {
+        logger.info(`║    ${i}. [${point.type}] ${point.address.substring(0, 40)}...`);
+      });
+      logger.info(`╚══════════════════════════════════════════════════════════════╝`);
+
+      // 1. Create the parent Order
+      const order: Omit<OrderRecord, 'createdAt' | 'updatedAt'> = {
+        id: orderId,
+        customerId: request.customerId,
+        customerName: request.customerName,
+        customerPhone: request.customerPhone,
+
+        // Route points (NEW - with intermediate stops)
+        routePoints,
+        currentRouteIndex: 0,        // Start at pickup
+        stopWaitTimers: [],          // Empty until driver reaches stops
+
+        // Legacy pickup/drop (for backward compatibility)
+        pickup,
+        drop,
+
+        distanceKm: request.distanceKm,
+        totalTrucks,
+        trucksFilled: 0,
+        totalAmount,
+        goodsType: request.goodsType,
+        cargoWeightKg: request.cargoWeightKg,
+        status: 'created',
+        stateChangedAt: new Date(),
+        dispatchState: 'queued',
+        dispatchAttempts: 0,
+        dispatchReasonCode: null,
+        onlineCandidatesCount: 0,
+        notifiedCount: 0,
+        lastDispatchAt: null,
+        scheduledAt: request.scheduledAt,
+        expiresAt
+      };
+
+      // 2. Prepare TruckRequests for each vehicle type
+      const truckRequests: TruckRequestRecord[] = [];
+      const responseRequests: CreateOrderResponse['truckRequests'] = [];
+      let requestNumber = 1;
+
+      for (const vehicleReq of request.vehicleRequirements) {
+        // Create one TruckRequest per truck (not per type)
+        // This allows each truck to be assigned independently
+        for (let i = 0; i < vehicleReq.quantity; i++) {
+          const truckRequestId = uuidv4();
+
+          const truckRequest: Omit<TruckRequestRecord, 'createdAt' | 'updatedAt'> = {
+            id: truckRequestId,
+            orderId,
+            requestNumber,
+            vehicleType: vehicleReq.vehicleType,
+            vehicleSubtype: vehicleReq.vehicleSubtype,
+            pricePerTruck: vehicleReq.pricePerTruck,
+            status: 'searching',
+            notifiedTransporters: []
+          };
+
+          truckRequests.push(truckRequest as TruckRequestRecord);
+          requestNumber++;
+        }
+
+        // Find matching transporters for this vehicle type
+        const matchingTransporters = await db.getTransportersWithVehicleType(
+          vehicleReq.vehicleType,
+          vehicleReq.vehicleSubtype
+        );
+
+        responseRequests.push({
+          id: truckRequests[truckRequests.length - 1].id,
+          vehicleType: vehicleReq.vehicleType,
+          vehicleSubtype: vehicleReq.vehicleSubtype,
+          quantity: vehicleReq.quantity,
+          pricePerTruck: vehicleReq.pricePerTruck,
+          matchingTransporters: matchingTransporters.length
         });
       }
 
-      await tx.order.update({
-        where: { id: orderId },
-        data: {
-          status: OrderStatus.broadcasting,
-          stateChangedAt: new Date(),
-          dispatchState: 'dispatching',
-          dispatchAttempts,
-          dispatchReasonCode: null,
-          lastDispatchAt: new Date()
+      let dispatchState: CreateOrderResponse['dispatchState'] = 'dispatching';
+      let dispatchReasonCode: string | undefined;
+      let dispatchAttempts = 1;
+      let onlineCandidates = 0;
+      let notifiedTransporters = 0;
+
+      // Narrow serializable transaction: duplicate-check + order + truckRequests + dispatch outbox bootstrap.
+      // This removes the crash window where order exists but outbox row does not.
+      await prismaClient.$transaction(async (tx) => {
+        const dupBooking = await tx.booking.findFirst({
+          where: { customerId: request.customerId, status: { in: [BookingStatus.created, BookingStatus.broadcasting, BookingStatus.active, BookingStatus.partially_filled] } }
+        });
+        const dupOrder = await tx.order.findFirst({
+          where: { customerId: request.customerId, status: { in: [OrderStatus.created, OrderStatus.broadcasting, OrderStatus.active, OrderStatus.partially_filled] } }
+        });
+        if (dupBooking || dupOrder) {
+          throw new Error('Request already in progress. Cancel it first.');
         }
+
+        await tx.order.create({
+          data: {
+            ...order,
+            routePoints: order.routePoints as any,
+            stopWaitTimers: order.stopWaitTimers as any,
+            pickup: order.pickup as any,
+            drop: order.drop as any,
+            status: order.status as OrderStatus
+          }
+        });
+
+        if (truckRequests.length > 0) {
+          await tx.truckRequest.createMany({
+            data: truckRequests.map((truckRequest) => ({
+              id: truckRequest.id,
+              orderId: truckRequest.orderId,
+              requestNumber: truckRequest.requestNumber,
+              vehicleType: truckRequest.vehicleType,
+              vehicleSubtype: truckRequest.vehicleSubtype,
+              pricePerTruck: truckRequest.pricePerTruck,
+              status: truckRequest.status as TruckRequestStatus,
+              heldById: truckRequest.heldBy || null,
+              heldAt: truckRequest.heldAt || null,
+              assignedTransporterId: truckRequest.assignedTransporterId || truckRequest.assignedTo || null,
+              assignedTransporterName: truckRequest.assignedTransporterName || null,
+              assignedVehicleId: truckRequest.assignedVehicleId || null,
+              assignedVehicleNumber: truckRequest.assignedVehicleNumber || null,
+              assignedDriverId: truckRequest.assignedDriverId || null,
+              assignedDriverName: truckRequest.assignedDriverName || null,
+              assignedDriverPhone: truckRequest.assignedDriverPhone || null,
+              tripId: truckRequest.tripId || null,
+              notifiedTransporters: truckRequest.notifiedTransporters || [],
+              assignedAt: truckRequest.assignedAt || null
+            })),
+            skipDuplicates: true
+          });
+        }
+
+        await tx.order.update({
+          where: { id: orderId },
+          data: {
+            status: OrderStatus.broadcasting,
+            stateChangedAt: new Date(),
+            dispatchState: 'dispatching',
+            dispatchAttempts,
+            dispatchReasonCode: null,
+            lastDispatchAt: new Date()
+          }
+        });
+
+        if (FF_ORDER_DISPATCH_OUTBOX) {
+          await this.enqueueOrderDispatchOutbox(orderId, tx);
+        }
+      }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+
+      // Emit lifecycle state: created
+      this.emitBroadcastStateChanged(request.customerId, {
+        orderId,
+        status: 'created',
+        dispatchState: 'queued',
+        dispatchAttempts: 0
       });
 
+      // Emit lifecycle state: broadcasting
+      this.emitBroadcastStateChanged(request.customerId, {
+        orderId,
+        status: 'broadcasting',
+        dispatchState: 'dispatching',
+        dispatchAttempts
+      });
+
+      // 3. Dispatch through durable outbox (or fallback direct dispatch when flag disabled)
+      const dispatchContext: DispatchAttemptContext = {
+        request,
+        truckRequests,
+        expiresAt,
+        pickup
+      };
+
       if (FF_ORDER_DISPATCH_OUTBOX) {
-        await this.enqueueOrderDispatchOutbox(orderId, tx);
-      }
-    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
-
-    // Emit lifecycle state: created
-    this.emitBroadcastStateChanged(request.customerId, {
-      orderId,
-      status: 'created',
-      dispatchState: 'queued',
-      dispatchAttempts: 0
-    });
-
-    // Emit lifecycle state: broadcasting
-    this.emitBroadcastStateChanged(request.customerId, {
-      orderId,
-      status: 'broadcasting',
-      dispatchState: 'dispatching',
-      dispatchAttempts
-    });
-
-    // 3. Dispatch through durable outbox (or fallback direct dispatch when flag disabled)
-    const dispatchContext: DispatchAttemptContext = {
-      request,
-      truckRequests,
-      expiresAt,
-      pickup
-    };
-
-    if (FF_ORDER_DISPATCH_OUTBOX) {
-      const immediateOutcome = await this.processDispatchOutboxImmediately(orderId, dispatchContext);
-      if (immediateOutcome) {
-        dispatchState = immediateOutcome.dispatchState;
-        dispatchReasonCode = immediateOutcome.reasonCode;
-        onlineCandidates = immediateOutcome.onlineCandidates;
-        notifiedTransporters = immediateOutcome.notifiedTransporters;
-        dispatchAttempts = immediateOutcome.dispatchAttempts;
-      } else {
-        dispatchState = 'dispatching';
-        dispatchReasonCode = 'DISPATCH_RETRYING';
-        dispatchAttempts = 1;
-      }
-    } else {
-      // IMPORTANT: Wrapped in try-catch - dispatch errors should NEVER fail order creation
-      try {
-        const dispatchStats = await this.broadcastToTransporters(orderId, request, truckRequests, expiresAt, pickup);
-        onlineCandidates = dispatchStats.onlineCandidates;
-        notifiedTransporters = dispatchStats.notifiedTransporters;
-
-        if (notifiedTransporters > 0) {
-          dispatchState = 'dispatched';
+        const immediateOutcome = await this.processDispatchOutboxImmediately(orderId, dispatchContext);
+        if (immediateOutcome) {
+          dispatchState = immediateOutcome.dispatchState;
+          dispatchReasonCode = immediateOutcome.reasonCode;
+          onlineCandidates = immediateOutcome.onlineCandidates;
+          notifiedTransporters = immediateOutcome.notifiedTransporters;
+          dispatchAttempts = immediateOutcome.dispatchAttempts;
         } else {
-          dispatchState = 'dispatch_failed';
-          dispatchReasonCode = dispatchStats.onlineCandidates === 0
-            ? 'NO_ONLINE_TRANSPORTERS'
-            : 'DISPATCH_RETRYING';
+          dispatchState = 'dispatching';
+          dispatchReasonCode = 'DISPATCH_RETRYING';
+          dispatchAttempts = 1;
         }
-      } catch (broadcastError: any) {
-        dispatchState = 'dispatch_failed';
-        dispatchReasonCode = 'DISPATCH_RETRYING';
-        logger.error(`⚠️ Broadcast error (order still created): ${broadcastError.message}`);
-        logger.error(broadcastError.stack);
+      } else {
+        // IMPORTANT: Wrapped in try-catch - dispatch errors should NEVER fail order creation
+        try {
+          const dispatchStats = await this.broadcastToTransporters(orderId, request, truckRequests, expiresAt, pickup);
+          onlineCandidates = dispatchStats.onlineCandidates;
+          notifiedTransporters = dispatchStats.notifiedTransporters;
+
+          if (notifiedTransporters > 0) {
+            dispatchState = 'dispatched';
+          } else {
+            dispatchState = 'dispatch_failed';
+            dispatchReasonCode = dispatchStats.onlineCandidates === 0
+              ? 'NO_ONLINE_TRANSPORTERS'
+              : 'DISPATCH_RETRYING';
+          }
+        } catch (broadcastError: any) {
+          dispatchState = 'dispatch_failed';
+          dispatchReasonCode = 'DISPATCH_RETRYING';
+          logger.error(`⚠️ Broadcast error (order still created): ${broadcastError.message}`);
+          logger.error(broadcastError.stack);
+        }
       }
-    }
 
-    // 4. Set expiry timer
-    this.setOrderExpiryTimer(orderId, this.BROADCAST_TIMEOUT_MS);
+      // 4. Set expiry timer
+      this.setOrderExpiryTimer(orderId, this.BROADCAST_TIMEOUT_MS);
 
-    // Transition: broadcasting -> active (timer started, awaiting responses)
-    await db.updateOrder(orderId, {
-      status: 'active',
-      stateChangedAt: new Date(),
-      dispatchState,
-      dispatchAttempts,
-      dispatchReasonCode: dispatchReasonCode || null,
-      onlineCandidatesCount: onlineCandidates,
-      notifiedCount: notifiedTransporters,
-      lastDispatchAt: new Date()
-    });
-    this.emitBroadcastStateChanged(request.customerId, {
-      orderId,
-      status: 'active',
-      dispatchState,
-      dispatchAttempts,
-      reasonCode: dispatchReasonCode,
-      onlineCandidates,
-      notifiedTransporters
-    });
+      // Transition: broadcasting -> active (timer started, awaiting responses)
+      await db.updateOrder(orderId, {
+        status: 'active',
+        stateChangedAt: new Date(),
+        dispatchState,
+        dispatchAttempts,
+        dispatchReasonCode: dispatchReasonCode || null,
+        onlineCandidatesCount: onlineCandidates,
+        notifiedCount: notifiedTransporters,
+        lastDispatchAt: new Date()
+      });
+      this.emitBroadcastStateChanged(request.customerId, {
+        orderId,
+        status: 'active',
+        dispatchState,
+        dispatchAttempts,
+        reasonCode: dispatchReasonCode,
+        onlineCandidates,
+        notifiedTransporters
+      });
 
-    // SCALABILITY: Calculate expiresIn for UI countdown timer
-    // EASY UNDERSTANDING: UI always matches backend TTL
-    const expiresIn = Math.floor(this.BROADCAST_TIMEOUT_MS / 1000); // 60 seconds
+      // SCALABILITY: Calculate expiresIn for UI countdown timer
+      // EASY UNDERSTANDING: UI always matches backend TTL
+      const expiresIn = Math.floor(this.BROADCAST_TIMEOUT_MS / 1000); // 60 seconds
 
-    // Build response
-    const orderResponse: CreateOrderResponse = {
-      orderId,
-      totalTrucks,
-      totalAmount,
-      dispatchState,
-      dispatchAttempts,
-      onlineCandidates,
-      notifiedTransporters,
-      reasonCode: dispatchReasonCode,
-      serverTimeMs: Date.now(),
-      truckRequests: responseRequests,
-      expiresAt,
-      expiresIn  // NEW: UI uses this for countdown (backend-driven)
-    };
+      // Build response
+      const orderResponse: CreateOrderResponse = {
+        orderId,
+        totalTrucks,
+        totalAmount,
+        dispatchState,
+        dispatchAttempts,
+        onlineCandidates,
+        notifiedTransporters,
+        reasonCode: dispatchReasonCode,
+        serverTimeMs: Date.now(),
+        truckRequests: responseRequests,
+        expiresAt,
+        expiresIn  // NEW: UI uses this for countdown (backend-driven)
+      };
 
-    // ==========================================================================
-    // IDEMPOTENCY CACHE - Store response for future retries
-    // ==========================================================================
-    // SCALABILITY: 5 minute TTL prevents duplicate processing
-    // EASY UNDERSTANDING: Client can safely retry failed requests
-    // MODULARITY: Automatic cleanup via Redis TTL
-    // ==========================================================================
-    if (request.idempotencyKey) {
-      const cacheKey = `idempotency:${request.customerId}:${request.idempotencyKey}`;
-      const ttl = 300; // 5 minutes
+      // ==========================================================================
+      // IDEMPOTENCY CACHE - Store response for future retries
+      // ==========================================================================
+      // SCALABILITY: 5 minute TTL prevents duplicate processing
+      // EASY UNDERSTANDING: Client can safely retry failed requests
+      // MODULARITY: Automatic cleanup via Redis TTL
+      // ==========================================================================
+      if (request.idempotencyKey) {
+        const cacheKey = `idempotency:${request.customerId}:${request.idempotencyKey}`;
+        const ttl = 300; // 5 minutes
 
-      try {
-        await redisService.set(cacheKey, JSON.stringify(orderResponse), ttl);
-        // Store pointer for cleanup on cancel/expiry
-        await redisService.set(`idempotency:order:${request.customerId}:latest`, request.idempotencyKey, ttl);
-        await this.persistDbIdempotentResponse(
-          request.customerId,
-          request.idempotencyKey,
-          requestPayloadHash,
-          orderId,
-          orderResponse
-        );
-        logger.info(`Idempotency cached: ${cacheKey.substring(0, 50)}... (TTL: ${ttl}s)`);
-      } catch (error: unknown) {
-        const message = error instanceof Error ? error.message : String(error);
-        logger.warn(`⚠️ Failed to cache idempotency response: ${message}`);
-        // Non-critical error, continue
+        try {
+          await redisService.set(cacheKey, JSON.stringify(orderResponse), ttl);
+          // Store pointer for cleanup on cancel/expiry
+          await redisService.set(`idempotency:order:${request.customerId}:latest`, request.idempotencyKey, ttl);
+          await this.persistDbIdempotentResponse(
+            request.customerId,
+            request.idempotencyKey,
+            requestPayloadHash,
+            orderId,
+            orderResponse
+          );
+          logger.info(`Idempotency cached: ${cacheKey.substring(0, 50)}... (TTL: ${ttl}s)`);
+        } catch (error: unknown) {
+          const message = error instanceof Error ? error.message : String(error);
+          logger.warn(`⚠️ Failed to cache idempotency response: ${message}`);
+          // Non-critical error, continue
+        }
       }
-    }
 
-    // Store server-generated idempotency key
-    const orderTimeoutSeconds = Math.ceil(this.BROADCAST_TIMEOUT_MS / 1000);
-    await redisService.set(dedupeKey, orderId, orderTimeoutSeconds + 30);
-    await redisService.set(`idem:broadcast:latest:${request.customerId}`, dedupeKey, orderTimeoutSeconds + 30);
+      // Store server-generated idempotency key
+      const orderTimeoutSeconds = Math.ceil(this.BROADCAST_TIMEOUT_MS / 1000);
+      await redisService.set(dedupeKey, orderId, orderTimeoutSeconds + 30);
+      await redisService.set(`idem:broadcast:latest:${request.customerId}`, dedupeKey, orderTimeoutSeconds + 30);
 
-    // Set customer active broadcast key (one-per-customer enforcement)
-    await redisService.set(activeKey, orderId, orderTimeoutSeconds + 60);
+      // Set customer active broadcast key (one-per-customer enforcement)
+      await redisService.set(activeKey, orderId, orderTimeoutSeconds + 60);
 
-    // Return response
-    return orderResponse;
+      // Return response
+      return orderResponse;
     } finally {
       await redisService.releaseLock(lockKey, request.customerId).catch((err: unknown) => {
         const errorMessage = err instanceof Error ? err.message : String(err);
@@ -2277,9 +2277,9 @@ class OrderService {
   ): Promise<void> {
     if (transporterIds.length === 0) return;
     const key = this.notifiedTransportersKey(orderId, vehicleType, vehicleSubtype);
-    await redisService.sAdd(key, ...transporterIds).catch(() => {});
+    await redisService.sAdd(key, ...transporterIds).catch(() => { });
     const ttlSeconds = Math.ceil(this.BROADCAST_TIMEOUT_MS / 1000) + 120;
-    await redisService.expire(key, ttlSeconds).catch(() => {});
+    await redisService.expire(key, ttlSeconds).catch(() => { });
   }
 
   private async broadcastVehicleTypePayload(
@@ -2557,14 +2557,14 @@ class OrderService {
     // Clean up server-generated idempotency key
     const latestIdemKey = await redisService.get(`idem:broadcast:latest:${customerId}`).catch(() => null);
     if (latestIdemKey) {
-      await redisService.del(latestIdemKey).catch(() => {});
-      await redisService.del(`idem:broadcast:latest:${customerId}`).catch(() => {});
+      await redisService.del(latestIdemKey).catch(() => { });
+      await redisService.del(`idem:broadcast:latest:${customerId}`).catch(() => { });
     }
     // Clean up client-supplied idempotency key
     const latestClientIdemKey = await redisService.get(`idempotency:order:${customerId}:latest`).catch(() => null);
     if (latestClientIdemKey) {
-      await redisService.del(`idempotency:${customerId}:${latestClientIdemKey}`).catch(() => {});
-      await redisService.del(`idempotency:order:${customerId}:latest`).catch(() => {});
+      await redisService.del(`idempotency:${customerId}:${latestClientIdemKey}`).catch(() => { });
+      await redisService.del(`idempotency:order:${customerId}:latest`).catch(() => { });
     }
   }
 
@@ -2734,7 +2734,7 @@ class OrderService {
         await this.handleOrderExpiry(orderId);
       } finally {
         await redisService.cancelTimer(timer.key).catch(() => false);
-        await redisService.releaseLock(lockKey, 'order-expiry-checker').catch(() => {});
+        await redisService.releaseLock(lockKey, 'order-expiry-checker').catch(() => { });
       }
     }
   }
@@ -2791,7 +2791,7 @@ class OrderService {
         });
       } finally {
         await redisService.cancelTimer(timer.key).catch(() => false);
-        await redisService.releaseLock(lockKey, 'order-step-checker').catch(() => {});
+        await redisService.releaseLock(lockKey, 'order-step-checker').catch(() => { });
       }
     }
   }
@@ -3045,7 +3045,7 @@ class OrderService {
                 currentTripId: null,
                 assignedDriverId: null
               }
-            }).catch(() => {});
+            }).catch(() => { });
           }
 
           for (const assignment of cancelledAssignments) {
@@ -3091,25 +3091,25 @@ class OrderService {
     // handleOrderExpiry only did WS + transporter FCM, not customer FCM.
     await queueService.queuePushNotificationBatch(
       [order.customerId],
-        {
-          title: reasonCode === 'NO_ONLINE_TRANSPORTERS'
-            ? 'No transporters available nearby'
-            : reasonCode === 'NO_TRANSPORTER_ACCEPTANCE'
-              ? 'No one accepted your request'
-              : 'Search timed out',
-          body: reasonCode === 'NO_ONLINE_TRANSPORTERS'
-            ? 'No transporters were available in nearby area. Tap to search again.'
-            : reasonCode === 'NO_TRANSPORTER_ACCEPTANCE'
-              ? 'Transporters were notified, but no one accepted in time. Tap to search again.'
-              : 'Your search timed out. Tap to search again.',
-          data: {
-            type: 'order_expired',
-            orderId,
-            status: newStatus,
-            reasonCode
-          }
+      {
+        title: reasonCode === 'NO_ONLINE_TRANSPORTERS'
+          ? 'No transporters available nearby'
+          : reasonCode === 'NO_TRANSPORTER_ACCEPTANCE'
+            ? 'No one accepted your request'
+            : 'Search timed out',
+        body: reasonCode === 'NO_ONLINE_TRANSPORTERS'
+          ? 'No transporters were available in nearby area. Tap to search again.'
+          : reasonCode === 'NO_TRANSPORTER_ACCEPTANCE'
+            ? 'Transporters were notified, but no one accepted in time. Tap to search again.'
+            : 'Your search timed out. Tap to search again.',
+        data: {
+          type: 'order_expired',
+          orderId,
+          status: newStatus,
+          reasonCode
         }
-      ).catch((err: unknown) => {
+      }
+    ).catch((err: unknown) => {
       const errorMessage = err instanceof Error ? err.message : String(err);
       logger.warn(`FCM: Failed to send expiry push to customer ${order.customerId}`, { error: errorMessage });
     });
@@ -3483,6 +3483,11 @@ class OrderService {
         orderId,
         customerId
       });
+      throw new AppError(
+        400,
+        'IDEMPOTENCY_KEY_REQUIRED',
+        'X-Idempotency-Key header is required for cancellation.'
+      );
     }
 
     if (idempotencyKey) {
@@ -4019,6 +4024,20 @@ class OrderService {
             throw new Error('EARLY_RETURN:Vehicle not found');
           }
 
+          // Phase 6 guard: Vehicle must be available (not already on a trip)
+          if (vehicle.status !== 'available') {
+            metrics.incrementCounter('assignment_blocked_total', { reason: 'vehicle_busy' });
+            throw new Error(
+              `EARLY_RETURN:Vehicle ${vehicle.vehicleNumber} is currently ${vehicle.status}`
+            );
+          }
+          if (vehicle.currentTripId) {
+            metrics.incrementCounter('assignment_blocked_total', { reason: 'vehicle_on_trip' });
+            throw new Error(
+              `EARLY_RETURN:Vehicle ${vehicle.vehicleNumber} is already on trip ${vehicle.currentTripId}`
+            );
+          }
+
           const driver = await tx.user.findUnique({
             where: { id: driverId }
           });
@@ -4026,10 +4045,32 @@ class OrderService {
             throw new Error('EARLY_RETURN:Driver not found');
           }
 
+          // Phase 6 guard: Driver must NOT have an active assignment already
+          const existingDriverAssignment = await tx.assignment.findFirst({
+            where: {
+              driverId,
+              status: { in: ['pending', 'driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit'] }
+            },
+            select: { id: true, tripId: true, orderId: true }
+          });
+          if (existingDriverAssignment) {
+            metrics.incrementCounter('assignment_blocked_total', { reason: 'driver_busy' });
+            throw new Error(
+              `EARLY_RETURN:Driver ${driver.name} is already assigned to an active trip`
+            );
+          }
+
           // Verify vehicle type matches
           if (vehicle.vehicleType !== truckRequest.vehicleType) {
             throw new Error(
               `EARLY_RETURN:Vehicle type mismatch. Request requires ${truckRequest.vehicleType}, vehicle is ${vehicle.vehicleType}`
+            );
+          }
+
+          // Phase 6 guard: Verify vehicle SUBTYPE matches
+          if (vehicle.vehicleSubtype !== truckRequest.vehicleSubtype) {
+            throw new Error(
+              `EARLY_RETURN:Vehicle subtype mismatch. Request requires ${truckRequest.vehicleSubtype}, vehicle is ${vehicle.vehicleSubtype}`
             );
           }
 
@@ -4224,6 +4265,7 @@ class OrderService {
       now
     } = txResult;
 
+    metrics.incrementCounter('assignment_success_total');
     logger.info(`Truck request ${truckRequestId} accepted`);
     logger.info(`   Vehicle: ${vehicleNumber} (${vehicleType})`);
     logger.info(`   Driver: ${driverName} (${driverPhone})`);
@@ -4360,8 +4402,8 @@ class OrderService {
 
     // If fully filled, cancel expiry timer and clear active key
     if (newStatus === 'fully_filled') {
-      await redisService.cancelTimer(this.TIMER_KEYS.ORDER_EXPIRY(orderId)).catch(() => {});
-      await this.clearProgressiveStepTimers(orderId).catch(() => {});
+      await redisService.cancelTimer(this.TIMER_KEYS.ORDER_EXPIRY(orderId)).catch(() => { });
+      await this.clearProgressiveStepTimers(orderId).catch(() => { });
       await this.clearCustomerActiveBroadcast(customerId);
       logger.info(`Order ${orderId} fully filled! All ${orderTotalTrucks} trucks assigned.`);
     }

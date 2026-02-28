@@ -28,16 +28,16 @@ import { paginationSchema } from '../../shared/utils/validation.utils';
 export const TRACKING_CONFIG = {
   /** Max points in a batch upload (prevents server overload) */
   MAX_BATCH_SIZE: 100,
-  
+
   /** Points older than this (seconds) go to history only, not live location */
   STALE_THRESHOLD_SECONDS: 60,
-  
+
   /** Max realistic speed in m/s (200 km/h = 55 m/s for trucks) */
   MAX_REALISTIC_SPEED_MS: 55,
-  
+
   /** If gap > this between points, mark driver as UNKNOWN */
   OFFLINE_THRESHOLD_SECONDS: 120,
-  
+
   /** Minimum time between points to accept (prevents spam) */
   MIN_INTERVAL_MS: 1000,
 };
@@ -194,6 +194,7 @@ export const tripStatusUpdateSchema = z.object({
     'at_pickup',
     'loading_complete',
     'in_transit',
+    'arrived_at_drop',
     'completed'
   ])
 });

@@ -105,7 +105,7 @@ router.get(
     try {
       const user = (req as any).user;
       const activeOrder = await db.getActiveOrderByCustomer(user.userId);
-      
+
       res.json({
         success: true,
         data: {
@@ -144,7 +144,7 @@ router.post(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const user = (req as any).user;
-      
+
       // =================================================================
       // DISTRIBUTED LOCK - Prevent concurrent order creation
       // =================================================================
@@ -160,7 +160,7 @@ router.post(
         route_alias_used: true,
         customerId: user.userId
       });
-      
+
       if (!lockAcquired.acquired) {
         logger.warn(`🔒 Concurrent order request blocked for customer ${user.phone}`);
         res.status(409).json({
@@ -175,7 +175,7 @@ router.post(
         });
         return;
       }
-      
+
       logger.debug(`🔓 Lock acquired for customer ${user.phone}, processing order...`);
 
       // Extract idempotency key early so route-level active-order guard does not
@@ -184,7 +184,7 @@ router.post(
       if (idempotencyKey) {
         logger.debug(`🔑 Idempotency key received: ${idempotencyKey.substring(0, 8)}...`);
       }
-      
+
       // =================================================================
       // RULE 1: ONE ACTIVE ORDER PER CUSTOMER
       // Customer must cancel their current order before creating a new one
@@ -211,7 +211,7 @@ router.post(
           return;
         }
       }
-      
+
       // =================================================================
       // RULE 2: RATE LIMITING - Max 5 orders per minute per customer
       // Prevents abuse and ensures fair usage
@@ -238,12 +238,12 @@ router.post(
         });
         return;
       }
-      
+
       try {
         // Debug: Log raw request body
         logger.info(`[Orders] POST / - Customer: ${user.phone}`);
         logger.info(`[Orders] POST / - Body: ${JSON.stringify(req.body, null, 2)}`);
-        
+
         // Validate request body
         const validationResult = createOrderSchema.safeParse(req.body);
         if (!validationResult.success) {
@@ -257,10 +257,10 @@ router.post(
           });
           return;
         }
-        
+
         const data = validationResult.data;
         const normalizedInput = normalizeCreateOrderInput(data);
-        
+
         const orderRequest = toCreateOrderServiceRequest(
           normalizedInput,
           {
@@ -270,27 +270,27 @@ router.post(
           },
           idempotencyKey
         );
-      
-      // Create order and broadcast
-      const result = await orderService.createOrder(orderRequest);
-      
-      logger.info(`Order created by ${user.phone}: ${result.orderId}`);
-      
-      const responseData = buildCreateOrderResponseData(
-        result,
-        normalizedInput,
-        {
-          id: user.userId,
-          name: user.name || 'Customer',
-          phone: user.phone
-        }
-      );
-      
-      res.status(201).json({
-        success: true,
-        data: responseData
-      });
-      
+
+        // Create order and broadcast
+        const result = await orderService.createOrder(orderRequest);
+
+        logger.info(`Order created by ${user.phone}: ${result.orderId}`);
+
+        const responseData = buildCreateOrderResponseData(
+          result,
+          normalizedInput,
+          {
+            id: user.userId,
+            name: user.name || 'Customer',
+            phone: user.phone
+          }
+        );
+
+        res.status(201).json({
+          success: true,
+          data: responseData
+        });
+
       } catch (error: any) {
         logger.error(`Create order error: ${error.message}`);
         next(error);
@@ -325,9 +325,9 @@ router.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const user = (req as any).user;
-      
+
       const orders = await orderService.getOrdersByCustomer(user.userId);
-      
+
       res.json({
         success: true,
         data: {
@@ -335,7 +335,7 @@ router.get(
           total: orders.length
         }
       });
-      
+
     } catch (error: any) {
       logger.error(`Get orders error: ${error.message}`);
       next(error);
@@ -357,9 +357,9 @@ router.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const user = (req as any).user;
-      
+
       const requests = await orderService.getActiveRequestsForTransporter(user.userId);
-      
+
       // Group by order for better display
       const byOrder = new Map<string, any>();
       for (const req of requests) {
@@ -371,7 +371,7 @@ router.get(
         }
         byOrder.get(req.orderId).requests.push(req);
       }
-      
+
       res.json({
         success: true,
         data: {
@@ -380,7 +380,7 @@ router.get(
           byOrder: Array.from(byOrder.values())
         }
       });
-      
+
     } catch (error: any) {
       logger.error(`Get active requests error: ${error.message}`);
       next(error);
@@ -400,9 +400,9 @@ router.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { id } = req.params;
-      
+
       const order = await orderService.getOrderDetails(id);
-      
+
       if (!order) {
         res.status(404).json({
           success: false,
@@ -413,12 +413,12 @@ router.get(
         });
         return;
       }
-      
+
       res.json({
         success: true,
         data: order
       });
-      
+
     } catch (error: any) {
       logger.error(`Get order details error: ${error.message}`);
       next(error);
@@ -452,10 +452,10 @@ router.post(
         });
         return;
       }
-      
+
       const { truckRequestId, vehicleId, driverId } = validationResult.data;
       const user = (req as any).user;
-      
+
       // Accept the request
       const result = await orderService.acceptTruckRequest(
         truckRequestId,
@@ -463,7 +463,7 @@ router.post(
         vehicleId,
         driverId
       );
-      
+
       if (!result.success) {
         res.status(400).json({
           success: false,
@@ -474,12 +474,12 @@ router.post(
         });
         return;
       }
-      
+
       res.json({
         success: true,
         data: result
       });
-      
+
     } catch (error: any) {
       logger.error(`Accept request error: ${error.message}`);
       next(error);
@@ -512,12 +512,12 @@ router.post(
       const user = (req as any).user;
       const { reason } = req.body;
       const idempotencyKey = req.header('X-Idempotency-Key') || req.header('x-idempotency-key') || undefined;
-      
+
       logger.info(`📛 Order cancellation requested: ${orderId} by ${user.phone}`);
-      
+
       // Cancel the order and broadcast to transporters
       const result = await orderService.cancelOrder(orderId, user.userId, reason, idempotencyKey);
-      
+
       if (!result.success) {
         const statusCode = result.cancelDecision === 'blocked_dispute_only' ? 409 : 400;
         res.status(statusCode).json({
@@ -542,9 +542,9 @@ router.post(
         });
         return;
       }
-      
+
       logger.info(`✅ Order cancelled: ${orderId}, notified ${result.transportersNotified} transporters`);
-      
+
       res.json({
         success: true,
         data: {
@@ -566,7 +566,7 @@ router.post(
           cancelledAt: new Date().toISOString()
         }
       });
-      
+
     } catch (error: any) {
       logger.error(`Cancel order error: ${error.message}`);
       next(error);
@@ -606,30 +606,30 @@ router.post(
     try {
       const { orderId } = req.params;
       const driverId = req.user!.userId;
-      
+
       const order = await db.getOrderById(orderId);
-      
+
       if (!order) {
         return res.status(404).json({
           success: false,
           error: { code: 'ORDER_NOT_FOUND', message: 'Order not found' }
         });
       }
-      
+
       // Verify driver is assigned to this order
       const assignments = await db.getAssignmentsByOrder(orderId);
       const driverAssignment = assignments.find(a => a.driverId === driverId);
-      
+
       if (!driverAssignment) {
         return res.status(403).json({
           success: false,
           error: { code: 'NOT_ASSIGNED', message: 'You are not assigned to this order' }
         });
       }
-      
+
       const currentIndex = order.currentRouteIndex || 0;
       const totalPoints = order.routePoints?.length || 2;
-      
+
       // Check if already at final stop
       if (currentIndex >= totalPoints - 1) {
         return res.json({
@@ -643,17 +643,51 @@ router.post(
           }
         });
       }
-      
+
       // Increment index
       const newIndex = currentIndex + 1;
       const currentPoint = order.routePoints?.[newIndex];
       const nextPoint = order.routePoints?.[newIndex + 1] || null;
       const isCompleted = newIndex >= totalPoints - 1;
-      
+
+      // Phase 7 (7D): Geofence check — driver must be within 200m of target stop (road distance)
+      // Uses Google Directions API for accurate distance. Falls back gracefully.
+      if (currentPoint?.latitude && currentPoint?.longitude) {
+        const driverLoc = await redisService.getJSON<any>(`driver:location:${driverId}`).catch(() => null);
+        if (driverLoc?.latitude && driverLoc?.longitude) {
+          const MAX_STOP_DISTANCE_M = parseInt(
+            process.env.MAX_STOP_DISTANCE_METERS || '200', 10
+          );
+          try {
+            const { googleMapsService } = await import('../../shared/services/google-maps.service');
+            const eta = await googleMapsService.getETA(
+              { lat: driverLoc.latitude, lng: driverLoc.longitude },
+              { lat: Number(currentPoint.latitude), lng: Number(currentPoint.longitude) }
+            );
+            if (eta) {
+              const roadDistanceM = eta.distanceKm * 1000;
+              if (roadDistanceM > MAX_STOP_DISTANCE_M) {
+                return res.status(400).json({
+                  success: false,
+                  error: {
+                    code: 'TOO_FAR_FROM_STOP',
+                    message: `You are ${Math.round(roadDistanceM)}m away by road. Please move within ${MAX_STOP_DISTANCE_M}m.`
+                  }
+                });
+              }
+            }
+            // If eta is null (Google API failed), allow through
+          } catch (geoErr: any) {
+            // Google API failure — allow through, don't block legitimate stops
+            logger.warn(`[STOP] Google Directions geofence failed, allowing through: ${geoErr?.message}`);
+          }
+        }
+      }
+
       // Record arrival time for wait timer
       const now = new Date().toISOString();
       const stopWaitTimers = order.stopWaitTimers || [];
-      
+
       // Add wait timer for this stop (if it's a STOP, not pickup/drop)
       if (currentPoint?.type === 'STOP') {
         stopWaitTimers.push({
@@ -662,16 +696,16 @@ router.post(
           waitTimeSeconds: 0
         });
       }
-      
+
       // Update order
       await db.updateOrder(orderId, {
         currentRouteIndex: newIndex,
         stopWaitTimers
       });
-      
+
       logger.info(`📍 Driver ${driverId} reached stop ${newIndex} of ${totalPoints - 1}`);
       logger.info(`   [${currentPoint?.type}] ${currentPoint?.address}`);
-      
+
       // Notify customer via WebSocket
       const progressUpdate = {
         type: 'route_progress_updated',
@@ -684,22 +718,22 @@ router.post(
         isCompleted,
         arrivedAt: now
       };
-      
+
       emitToUser(order.customerId, 'route_progress_updated', progressUpdate);
-      
+
       // If completed (reached drop), update order status
       if (isCompleted && currentPoint?.type === 'DROP') {
         await db.updateOrder(orderId, { status: 'completed' });
-        
+
         // Notify customer
         emitToUser(order.customerId, 'order_completed', {
           orderId,
           completedAt: now
         });
-        
+
         logger.info(`🎉 Order ${orderId} completed!`);
       }
-      
+
       res.json({
         success: true,
         message: `Reached ${currentPoint?.type || 'stop'}`,
@@ -712,7 +746,7 @@ router.post(
           arrivedAt: now
         }
       });
-      
+
     } catch (error) {
       next(error);
     }
@@ -740,37 +774,37 @@ router.get(
     try {
       const { orderId } = req.params;
       const userId = req.user!.userId;
-      
+
       const order = await db.getOrderById(orderId);
-      
+
       if (!order) {
         return res.status(404).json({
           success: false,
           error: { code: 'ORDER_NOT_FOUND', message: 'Order not found' }
         });
       }
-      
+
       // Verify user is involved (customer, driver, or transporter)
       const isCustomer = order.customerId === userId;
       const assignments = await db.getAssignmentsByOrder(orderId);
       const isDriverOrTransporter = assignments.some(
         a => a.driverId === userId || a.transporterId === userId
       );
-      
+
       if (!isCustomer && !isDriverOrTransporter) {
         return res.status(403).json({
           success: false,
           error: { code: 'FORBIDDEN', message: 'You are not involved in this order' }
         });
       }
-      
+
       const currentIndex = order.currentRouteIndex || 0;
       const routePoints = order.routePoints || [];
       const totalPoints = routePoints.length;
       const currentPoint = routePoints[currentIndex] || null;
       const nextPoint = routePoints[currentIndex + 1] || null;
       const isCompleted = currentIndex >= totalPoints - 1;
-      
+
       res.json({
         success: true,
         data: {
@@ -785,7 +819,7 @@ router.get(
           stopWaitTimers: order.stopWaitTimers || []
         }
       });
-      
+
     } catch (error) {
       next(error);
     }
@@ -807,50 +841,50 @@ router.post(
     try {
       const { orderId } = req.params;
       const driverId = req.user!.userId;
-      
+
       const order = await db.getOrderById(orderId);
-      
+
       if (!order) {
         return res.status(404).json({
           success: false,
           error: { code: 'ORDER_NOT_FOUND', message: 'Order not found' }
         });
       }
-      
+
       // Verify driver is assigned
       const assignments = await db.getAssignmentsByOrder(orderId);
       const driverAssignment = assignments.find(a => a.driverId === driverId);
-      
+
       if (!driverAssignment) {
         return res.status(403).json({
           success: false,
           error: { code: 'NOT_ASSIGNED', message: 'You are not assigned to this order' }
         });
       }
-      
+
       const currentIndex = order.currentRouteIndex || 0;
       const stopWaitTimers = order.stopWaitTimers || [];
       const now = new Date().toISOString();
-      
+
       // Find the current stop timer and update departure
       const timerIndex = stopWaitTimers.findIndex(t => t.stopIndex === currentIndex && !t.departedAt);
-      
+
       if (timerIndex >= 0) {
         const arrivedAt = new Date(stopWaitTimers[timerIndex].arrivedAt).getTime();
         const departedAt = new Date(now).getTime();
         const waitTimeSeconds = Math.floor((departedAt - arrivedAt) / 1000);
-        
+
         stopWaitTimers[timerIndex] = {
           ...stopWaitTimers[timerIndex],
           departedAt: now,
           waitTimeSeconds
         };
-        
+
         await db.updateOrder(orderId, { stopWaitTimers });
-        
+
         logger.info(`📍 Driver ${driverId} departed stop ${currentIndex}, wait time: ${waitTimeSeconds}s`);
       }
-      
+
       res.json({
         success: true,
         message: 'Departure recorded',
@@ -859,7 +893,7 @@ router.post(
           stopWaitTimers
         }
       });
-      
+
     } catch (error) {
       next(error);
     }
@@ -885,12 +919,12 @@ router.delete(
       const { orderId } = req.params;
       const user = (req as any).user;
       const idempotencyKey = req.header('X-Idempotency-Key') || req.header('x-idempotency-key') || undefined;
-      
+
       logger.info(`📛 Cancel request: Order ${orderId} by customer ${user.phone}`);
-      
+
       // SCALABILITY: Use existing cancelOrder service
       const result = await orderService.cancelOrder(orderId, user.userId, 'Customer cancelled from app', idempotencyKey);
-      
+
       if (result.success) {
         logger.info(`✅ Order ${orderId} cancelled successfully. Transporters notified: ${result.transportersNotified}`);
         res.json({
@@ -1035,33 +1069,33 @@ router.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { orderId } = req.params;
-      
+
       logger.debug(`📊 Status check: Order ${orderId}`);
-      
-      const order = await db.orders.findUnique({ 
+
+      const order = await db.orders.findUnique({
         where: { id: orderId }
       });
-      
+
       if (!order) {
-        return res.status(404).json({ 
-          success: false, 
+        return res.status(404).json({
+          success: false,
           error: {
             code: 'ORDER_NOT_FOUND',
             message: 'Order not found'
           }
         });
       }
-      
+
       // SCALABILITY: Calculate remaining time from database timestamp
       // EASY UNDERSTANDING: Backend calculates, UI just displays
       const now = Date.now();
       const expiresAt = new Date(order.expiresAt).getTime();
       const remainingMs = Math.max(0, expiresAt - now);
       const remainingSeconds = Math.floor(remainingMs / 1000);
-      
+
       const normalizedStatus = normalizeOrderStatus(order.status);
       const isActive = ACTIVE_ORDER_STATUSES.has(normalizedStatus) && remainingSeconds > 0;
-      
+
       res.json({
         success: true,
         data: {

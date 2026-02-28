@@ -32,7 +32,7 @@ import { CreateAssignmentInput, UpdateStatusInput, GetAssignmentsQuery } from '.
 const ASSIGNMENT_CONFIG = {
   /** How long driver has to respond (60 seconds) */
   TIMEOUT_MS: 60 * 1000,
-  
+
   /** How often to check for expired assignments (every 5 seconds) */
   EXPIRY_CHECK_INTERVAL_MS: 5 * 1000,
 };
@@ -73,7 +73,7 @@ let assignmentExpiryCheckerInterval: NodeJS.Timeout | null = null;
  */
 function startAssignmentExpiryChecker(): void {
   if (assignmentExpiryCheckerInterval) return;
-  
+
   assignmentExpiryCheckerInterval = setInterval(async () => {
     try {
       await processExpiredAssignments();
@@ -81,7 +81,7 @@ function startAssignmentExpiryChecker(): void {
       logger.error('Assignment expiry checker error', { error: error.message });
     }
   }, ASSIGNMENT_CONFIG.EXPIRY_CHECK_INTERVAL_MS);
-  
+
   logger.info('📅 Assignment expiry checker started (Redis-based, cluster-safe)');
 }
 
@@ -102,14 +102,14 @@ export function stopAssignmentExpiryChecker(): void {
  */
 async function processExpiredAssignments(): Promise<void> {
   const expiredTimers = await redisService.getExpiredTimers<AssignmentTimerData>('timer:assignment:');
-  
+
   for (const timer of expiredTimers) {
     // Acquire distributed lock (prevents duplicate processing)
     const lockKey = `lock:assignment-expiry:${timer.data.assignmentId}`;
     const lock = await redisService.acquireLock(lockKey, 'expiry-checker', 30);
-    
+
     if (!lock.acquired) continue; // Another instance is handling this
-    
+
     try {
       await assignmentService.handleAssignmentTimeout(timer.data);
       await redisService.cancelTimer(timer.key);
@@ -132,7 +132,7 @@ startAssignmentExpiryChecker();
 // =============================================================================
 
 class AssignmentService {
-  
+
   // ==========================================================================
   // CREATE ASSIGNMENT (Transporter assigns truck to booking)
   // ==========================================================================
@@ -162,7 +162,7 @@ class AssignmentService {
 
     // Verify vehicle type matches booking
     if (vehicle.vehicleType !== booking.vehicleType) {
-      throw new AppError(400, 'VEHICLE_MISMATCH', 
+      throw new AppError(400, 'VEHICLE_MISMATCH',
         `Booking requires ${booking.vehicleType}, but vehicle is ${vehicle.vehicleType}`);
     }
 
@@ -205,7 +205,7 @@ class AssignmentService {
 
     await prismaClient.$transaction(async (tx) => {
       // Re-check inside transaction with Serializable isolation
-      const activeStatuses = ['pending', 'driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit'];
+      const activeStatuses = ['pending', 'driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit', 'arrived_at_drop'];
       const activeAssignment = await tx.assignment.findFirst({
         where: { driverId: data.driverId, status: { in: activeStatuses as any } }
       });
@@ -238,7 +238,7 @@ class AssignmentService {
       tripId,
       createdAt: new Date().toISOString()
     };
-    
+
     await redisService.setTimer(
       TIMER_KEYS.ASSIGNMENT_EXPIRY(assignment.id),
       timerData,
@@ -392,7 +392,7 @@ class AssignmentService {
     const activeAssignment = await db.getActiveAssignmentByDriver(driverId);
     if (activeAssignment && activeAssignment.id !== assignmentId) {
       logger.warn(`⚠️ Driver ${driverId} tried to accept ${assignmentId} but already has active trip: ${activeAssignment.tripId}`);
-      throw new AppError(400, 'DRIVER_BUSY', 
+      throw new AppError(400, 'DRIVER_BUSY',
         'You already have an active trip. Complete or cancel it before accepting a new one.');
     }
 
@@ -472,14 +472,15 @@ class AssignmentService {
 
   // Valid assignment status transitions (prevents backward/invalid moves)
   private static readonly VALID_TRANSITIONS: Record<string, string[]> = {
-    pending:          ['driver_accepted', 'driver_declined', 'cancelled'],
-    driver_accepted:  ['en_route_pickup', 'cancelled'],
-    en_route_pickup:  ['at_pickup', 'cancelled'],
-    at_pickup:        ['in_transit', 'cancelled'],
-    in_transit:       ['completed', 'cancelled'],
-    completed:        [],
-    driver_declined:  [],
-    cancelled:        [],
+    pending: ['driver_accepted', 'driver_declined', 'cancelled'],
+    driver_accepted: ['en_route_pickup', 'cancelled'],
+    en_route_pickup: ['at_pickup', 'cancelled'],
+    at_pickup: ['in_transit', 'cancelled'],
+    in_transit: ['arrived_at_drop', 'completed', 'cancelled'],
+    arrived_at_drop: ['completed', 'cancelled'],
+    completed: [],
+    driver_declined: [],
+    cancelled: [],
   };
 
   async updateStatus(

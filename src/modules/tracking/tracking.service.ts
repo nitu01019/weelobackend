@@ -39,6 +39,7 @@ import { redisService } from '../../shared/services/redis.service';
 import { queueService } from '../../shared/services/queue.service';
 import { haversineDistanceMeters } from '../../shared/utils/geospatial.utils';
 import { prismaClient } from '../../shared/database/prisma.service';
+import { googleMapsService } from '../../shared/services/google-maps.service';
 import {
   UpdateLocationInput,
   GetTrackingQuery,
@@ -224,6 +225,12 @@ class TrackingService {
       }
 
       // 5. Broadcast via WebSocket - THE KEY FOR REAL-TIME
+      // Phase 7 (7B): Include staleness info so customer app can show
+      // "GPS unavailable" instead of a silently frozen marker.
+      // Use the device's GPS timestamp (if sent) to detect truly stale points.
+      // Falls back to 0 (fresh) if no client timestamp was provided.
+      const clientTs = data.timestamp ? new Date(data.timestamp).getTime() : Date.now();
+      const locationAgeMs = Math.max(0, Date.now() - clientTs);
       const broadcastPayload = {
         tripId: data.tripId,
         driverId,
@@ -231,7 +238,9 @@ class TrackingService {
         longitude: data.longitude,
         speed: data.speed,
         bearing: data.bearing,
-        timestamp: now
+        timestamp: now,
+        isStale: locationAgeMs > 60_000,
+        locationAgeMs
       };
 
       // Broadcast to booking room (customer watches this)
@@ -261,6 +270,31 @@ class TrackingService {
       });
 
       logger.debug('📍 Location updated', { tripId: data.tripId, driverId, lat: data.latitude, lng: data.longitude });
+
+      // ==================================================================
+      // Phase 7: 2km Proximity Notification — "Your driver is about to arrive"
+      // ==================================================================
+      // Only when driver is heading to pickup (en_route_pickup / heading_to_pickup)
+      // Uses Redis flag to send only ONCE per trip (no spam)
+      // Uses Google Directions API for road distance (async, non-blocking)
+      // ==================================================================
+      if (
+        existing &&
+        (existing.status === 'en_route_pickup' || existing.status === 'heading_to_pickup') &&
+        (existing.orderId || existing.bookingId)
+      ) {
+        this.checkAndSendProximityNotification(
+          data.tripId,
+          driverId,
+          data.latitude,
+          data.longitude,
+          existing
+        ).catch(err => {
+          logger.debug('[TRACKING] Proximity check failed (non-fatal)', {
+            tripId: data.tripId, error: err?.message
+          });
+        });
+      }
 
     } catch (error: any) {
       logger.error(`Failed to update location: ${error.message}`, { tripId: data.tripId, driverId });
@@ -701,7 +735,10 @@ class TrackingService {
       // ------------------------------------------------------------------
       const assignment = await prismaClient.assignment.findUnique({
         where: { tripId },
-        include: { booking: { select: { customerId: true, customerName: true, id: true } } }
+        include: {
+          booking: { select: { customerId: true, customerName: true, id: true, pickup: true } },
+          order: { select: { id: true, customerId: true, pickup: true } }
+        }
       });
 
       if (!assignment) {
@@ -725,7 +762,8 @@ class TrackingService {
         'at_pickup': 3,
         'loading_complete': 4,
         'in_transit': 5,
-        'completed': 6,
+        'arrived_at_drop': 6,
+        'completed': 7,
         'cancelled': -1,
         'driver_declined': -1
       };
@@ -752,6 +790,60 @@ class TrackingService {
       }
 
       // ------------------------------------------------------------------
+      // Phase 7 (7A): Geofence check — driver must be within 200m of pickup
+      //               before marking 'at_pickup'. Prevents fake arrivals.
+      //               Uses Google Directions API for road distance.
+      //               If Google API or GPS unavailable, allow (don't block).
+      // ------------------------------------------------------------------
+      if (status === 'at_pickup') {
+        const driverLocation = await redisService.getJSON<LocationData>(
+          REDIS_KEYS.DRIVER_LOCATION(driverId)
+        );
+        if (driverLocation?.latitude && driverLocation?.longitude) {
+          const pickupSource = assignment.order?.pickup || assignment.booking?.pickup;
+          const pickupData = typeof pickupSource === 'string'
+            ? JSON.parse(pickupSource as string)
+            : pickupSource;
+          const pickupLat = pickupData?.latitude || pickupData?.lat;
+          const pickupLng = pickupData?.longitude || pickupData?.lng;
+          if (pickupLat && pickupLng) {
+            const MAX_ARRIVAL_DISTANCE_M = parseInt(
+              process.env.MAX_ARRIVAL_DISTANCE_METERS || '200', 10
+            );
+            try {
+              // Use Google Directions API for accurate road distance
+              const eta = await googleMapsService.getETA(
+                { lat: driverLocation.latitude, lng: driverLocation.longitude },
+                { lat: Number(pickupLat), lng: Number(pickupLng) }
+              );
+              if (eta) {
+                const roadDistanceMeters = eta.distanceKm * 1000;
+                if (roadDistanceMeters > MAX_ARRIVAL_DISTANCE_M) {
+                  logger.warn('[TRACKING] Arrival rejected — too far from pickup (road distance)', {
+                    tripId, driverId,
+                    roadDistanceMeters: Math.round(roadDistanceMeters),
+                    maxAllowed: MAX_ARRIVAL_DISTANCE_M
+                  });
+                  throw new AppError(400, 'TOO_FAR_FROM_PICKUP',
+                    `You are ${Math.round(roadDistanceMeters)}m away by road. Please move within ${MAX_ARRIVAL_DISTANCE_M}m of pickup.`
+                  );
+                }
+              }
+              // If eta is null (Google API failed), allow through
+            } catch (geoErr: any) {
+              // If it's our own AppError (TOO_FAR), re-throw it
+              if (geoErr instanceof AppError) throw geoErr;
+              // Otherwise Google API failed — allow through (don't block legitimate arrivals)
+              logger.warn('[TRACKING] Google Directions geofence check failed, allowing through', {
+                tripId, error: geoErr?.message
+              });
+            }
+          }
+        }
+        // If no GPS data in Redis, allow — don't block legitimate arrivals
+      }
+
+      // ------------------------------------------------------------------
       // 2. Map Captain app status → Prisma enum (where applicable)
       //    'loading_complete' is Redis-only (not in Prisma enum)
       // ------------------------------------------------------------------
@@ -760,6 +852,7 @@ class TrackingService {
         'at_pickup': 'at_pickup',
         'loading_complete': null,  // Redis-only, skip Prisma update
         'in_transit': 'in_transit',
+        'arrived_at_drop': 'arrived_at_drop',
         'completed': 'completed'
       };
 
@@ -782,6 +875,31 @@ class TrackingService {
           where: { tripId },
           data: updates
         });
+
+        // Phase 7 (7E): Populate Order timestamps for cancel policy stage detection
+        const targetOrderId = assignment.orderId || assignment.order?.id;
+        if (targetOrderId) {
+          if (status === 'at_pickup') {
+            await prismaClient.order.update({
+              where: { id: targetOrderId },
+              data: { loadingStartedAt: new Date() }
+            }).catch(err => {
+              logger.warn('[TRACKING] Failed to set loadingStartedAt (non-fatal)', {
+                orderId: targetOrderId, error: err.message
+              });
+            });
+          }
+          if (status === 'arrived_at_drop') {
+            await prismaClient.order.update({
+              where: { id: targetOrderId },
+              data: { unloadingStartedAt: new Date() }
+            }).catch(err => {
+              logger.warn('[TRACKING] Failed to set unloadingStartedAt (non-fatal)', {
+                orderId: targetOrderId, error: err.message
+              });
+            });
+          }
+        }
       }
 
       // ------------------------------------------------------------------
@@ -804,23 +922,38 @@ class TrackingService {
       //    so we skip the duplicate broadcast below for 'completed'
       // ------------------------------------------------------------------
       if (status === 'completed') {
-        try {
-          await this.completeTracking(tripId);
-        } catch (completeErr: any) {
-          logger.warn('[TRACKING] completeTracking cleanup failed (non-fatal)', {
-            tripId, error: completeErr.message
-          });
+        // Phase 9A: Double-tap guard — Redis lock prevents race condition
+        // Scenario: Two rapid "Complete" taps → both pass Postgres idempotent check
+        //           before first one commits → duplicate completion events.
+        // Solution: SETNX lock with 10s TTL. Second tap gets lock-failed → returns silently.
+        const tripCompleteLock = `lock:trip-complete:${tripId}`;
+        const completeLock = await redisService.acquireLock(tripCompleteLock, 'trip-completion', 10);
+        if (!completeLock.acquired) {
+          logger.info('[TRACKING] Trip completion already in progress (double-tap guard)', { tripId });
+          return; // Idempotent — first request will handle everything
         }
 
-        // Phase 5: Check if ALL trucks for this booking are now completed
-        // If yes → update booking status + notify customer
-        const completedBookingId = assignment.booking?.id || assignment.bookingId;
-        if (completedBookingId) {
-          this.checkBookingCompletion(completedBookingId).catch(err => {
-            logger.warn('[TRACKING] Booking completion check failed (non-fatal)', {
-              bookingId: completedBookingId, error: err.message
+        try {
+          try {
+            await this.completeTracking(tripId);
+          } catch (completeErr: any) {
+            logger.warn('[TRACKING] completeTracking cleanup failed (non-fatal)', {
+              tripId, error: completeErr.message
             });
-          });
+          }
+
+          // Phase 5: Check if ALL trucks for this booking are now completed
+          // If yes → update booking status + notify customer
+          const completedBookingId = assignment.booking?.id || assignment.bookingId;
+          if (completedBookingId) {
+            this.checkBookingCompletion(completedBookingId).catch(err => {
+              logger.warn('[TRACKING] Booking completion check failed (non-fatal)', {
+                bookingId: completedBookingId, error: err.message
+              });
+            });
+          }
+        } finally {
+          await redisService.releaseLock(tripCompleteLock, 'trip-completion').catch(() => { });
         }
       }
 
@@ -848,6 +981,10 @@ class TrackingService {
           'in_transit': {
             title: '🚀 Trip started!',
             body: `Your truck (${assignment.vehicleNumber}) is on the way to the destination`
+          },
+          'arrived_at_drop': {
+            title: '📍 Driver arrived at drop-off',
+            body: `Driver ${assignment.driverName} has arrived at the drop-off location`
           },
           'completed': {
             title: '✅ Delivery complete!',
@@ -1144,6 +1281,144 @@ class TrackingService {
     this.historyPersistStateByTrip.delete(tripId);
 
     logger.info('✅ Tracking completed', { tripId });
+  }
+
+  /**
+   * ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+   * ┃  PROXIMITY NOTIFICATION — Driver within 2km of pickup                   ┃
+   * ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+   * 
+   * Called on every location update when driver is heading to pickup.
+   * Sends FCM push to customer: "Your driver is about to arrive!"
+   * 
+   * PERFORMANCE (critical for 2+ lakh concurrent users):
+   *   - Step 1: Quick Redis flag check — O(1), ~0.2ms
+   *     If already notified → return immediately (no further work)
+   *   - Step 2: Quick haversine check — O(1), pure math, ~0.01ms
+   *     If driver > 3km straight-line → skip Google API call entirely
+   *   - Step 3: Google Directions API — only called when driver is ~3km away
+   *     This means per trip, Google API is called maybe 5-10 times total
+   *     (from 3km to pickup), NOT on every GPS update
+   *   - Step 4: Set Redis flag — O(1), prevents duplicate notifications
+   * 
+   * RESULT: 99%+ of location updates hit only Step 1 (Redis flag) or
+   *         Step 2 (haversine) — no Google API call needed.
+   * 
+   * SENT ONCE per trip per driver (Redis flag with 30min TTL).
+   * Fire-and-forget from updateLocation — never blocks the GPS response.
+   */
+  private async checkAndSendProximityNotification(
+    tripId: string,
+    driverId: string,
+    driverLat: number,
+    driverLng: number,
+    existing: LocationData
+  ): Promise<void> {
+    const PROXIMITY_KEY = `proximity_notified:${tripId}`;
+
+    // Step 1: Redis flag check — already notified? Skip immediately.
+    const alreadyNotified = await redisService.get(PROXIMITY_KEY);
+    if (alreadyNotified) return;
+
+    // Step 2: Rough haversine check — if driver is > 3km straight-line, skip Google API
+    // This prevents calling Google API on 99%+ of location updates
+    const entityId = existing.orderId || existing.bookingId;
+    if (!entityId) return;
+
+    // Get pickup location
+    let pickupLat: number | null = null;
+    let pickupLng: number | null = null;
+    let customerId: string | null = null;
+    let vehicleNumber = existing.vehicleNumber || '';
+    let driverName = '';
+
+    // Try order first, then booking
+    const assignment = await prismaClient.assignment.findFirst({
+      where: { tripId },
+      select: {
+        driverName: true,
+        vehicleNumber: true,
+        vehicleType: true,
+        order: { select: { pickup: true, customerId: true } },
+        booking: { select: { pickup: true, customerId: true } }
+      }
+    });
+
+    if (!assignment) return;
+
+    driverName = assignment.driverName || '';
+    vehicleNumber = assignment.vehicleNumber || vehicleNumber;
+
+    const pickupSource = assignment.order?.pickup || assignment.booking?.pickup;
+    const pickupData = typeof pickupSource === 'string'
+      ? JSON.parse(pickupSource as string)
+      : pickupSource as any;
+
+    pickupLat = Number(pickupData?.latitude || pickupData?.lat);
+    pickupLng = Number(pickupData?.longitude || pickupData?.lng);
+    customerId = assignment.order?.customerId || assignment.booking?.customerId || null;
+
+    if (!pickupLat || !pickupLng || !customerId) return;
+
+    // Quick straight-line check — skip Google API if clearly > 3km away
+    const straightLineMeters = haversineDistanceMeters(
+      driverLat, driverLng, pickupLat, pickupLng
+    );
+    if (straightLineMeters > 3000) return; // Too far, skip Google API call
+
+    // Step 3: Google Directions API — accurate road distance
+    const PROXIMITY_THRESHOLD_KM = parseFloat(
+      process.env.DRIVER_PROXIMITY_NOTIFICATION_KM || '2'
+    );
+
+    const eta = await googleMapsService.getETA(
+      { lat: driverLat, lng: driverLng },
+      { lat: pickupLat, lng: pickupLng }
+    );
+
+    if (!eta || eta.distanceKm > PROXIMITY_THRESHOLD_KM) return;
+
+    // Step 4: Driver is within 2km by road — send notification!
+    // Set Redis flag FIRST (prevent race condition with concurrent GPS updates)
+    await redisService.set(PROXIMITY_KEY, '1', 1800); // 30 min TTL
+
+    // Send FCM push to customer
+    queueService.queuePushNotification(customerId, {
+      title: '🚛 Your driver is almost here!',
+      body: `${driverName} (${vehicleNumber}) is about ${eta.durationText} away`,
+      data: {
+        type: 'driver_approaching',
+        tripId,
+        driverId,
+        vehicleNumber,
+        driverName,
+        distanceKm: String(eta.distanceKm.toFixed(1)),
+        durationMinutes: String(eta.durationMinutes),
+        durationText: eta.durationText
+      }
+    }).catch(err => {
+      logger.warn('[TRACKING] Proximity FCM push failed (non-fatal)', {
+        tripId, customerId, error: err?.message
+      });
+    });
+
+    // Also emit via WebSocket for instant UI update
+    emitToUser(customerId, 'driver_approaching', {
+      tripId,
+      driverId,
+      vehicleNumber,
+      driverName,
+      distanceKm: eta.distanceKm,
+      durationMinutes: eta.durationMinutes,
+      durationText: eta.durationText,
+      timestamp: new Date().toISOString()
+    });
+
+    logger.info('[TRACKING] 🔔 Proximity notification sent — driver within 2km', {
+      tripId, driverId, vehicleNumber,
+      roadDistanceKm: eta.distanceKm.toFixed(1),
+      durationText: eta.durationText
+    });
   }
 
   private shouldPersistHistoryPoint(tripId: string, entry: LocationHistoryEntry, status: string): boolean {

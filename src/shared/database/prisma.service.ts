@@ -248,7 +248,9 @@ export interface TrackingRecord {
 
 const DB_POOL_CONFIG = {
   connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT || '20', 10),
-  poolTimeout: parseInt(process.env.DB_POOL_TIMEOUT || '10', 10),
+  // Phase 10: Reduced from 10s to 5s — fail fast for user-facing APIs
+  // 10s wait = user already abandoned. 5s returns meaningful 503 quickly.
+  poolTimeout: parseInt(process.env.DB_POOL_TIMEOUT || '5', 10),
 };
 
 // Prisma client singleton

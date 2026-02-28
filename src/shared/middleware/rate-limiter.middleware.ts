@@ -41,29 +41,48 @@ import { logger } from '../services/logger.service';
 /**
  * Redis-backed store for express-rate-limit
  * 
- * SCALABILITY:
- * - Shared counter across ALL server instances (ECS tasks)
- * - Uses atomic Redis INCR — no race conditions even at millions of req/sec
- * - Automatic TTL cleanup — no memory leaks
+ * Phase 10: Netflix/Uber-style dual-counter pattern:
  * 
- * EASY UNDERSTANDING:
- * - Implements express-rate-limit's Store interface
- * - increment() → Redis INCR + EXPIRE (atomic counter with TTL)
- * - decrement() → Redis INCRBY -1 (for successful requests that shouldn't count)
- * - resetKey() → Redis DEL (clear a specific key)
+ * PRIMARY: Redis (distributed, shared across ECS instances)
+ * FALLBACK: In-memory Map (per-instance, still enforces limits)
  * 
- * MODULARITY:
- * - Uses existing redisService singleton (no new connections)
- * - Prefix isolates rate limit keys from other Redis data
- * - Can be reused for any rate limiter configuration
+ * FAIL-SAFE BEHAVIOR:
+ * - Redis UP → uses Redis (distributed counting, consistent across instances)
+ * - Redis DOWN → uses in-memory backup counter (per-instance, still blocks abuse)
+ * - Redis RECOVERS → next request auto-uses Redis again (seamless recovery)
+ * 
+ * WHY NOT throw error: express-rate-limit calls next(error) → 500 for ALL users
+ * WHY NOT return totalHits:0: fail-open → unlimited requests → security vulnerability
+ * WHY this works: in-memory counter is cheap (Map), self-cleans via TTL, and
+ *   provides per-instance rate limiting which is better than no rate limiting
+ * 
+ * COST: ~50 bytes per active rate limit key in memory. At 2.3M users
+ *   with 1-minute windows, worst case = ~115MB (well within ECS limits)
  */
 class RedisRateLimitStore {
   private prefix: string;
   private windowMs: number;
+  // Phase 10: In-memory backup counter for Redis failures
+  private memoryCounters = new Map<string, { hits: number; resetAt: number }>();
+  private memoryCleanupInterval: ReturnType<typeof setInterval>;
 
   constructor(windowMs: number, prefix: string = 'rl:') {
     this.prefix = prefix;
     this.windowMs = windowMs;
+
+    // Self-clean expired entries every 60s to prevent memory leaks
+    this.memoryCleanupInterval = setInterval(() => {
+      const now = Date.now();
+      for (const [key, entry] of this.memoryCounters) {
+        if (now > entry.resetAt) {
+          this.memoryCounters.delete(key);
+        }
+      }
+    }, 60_000);
+    // Don't prevent process exit
+    if (this.memoryCleanupInterval.unref) {
+      this.memoryCleanupInterval.unref();
+    }
   }
 
   /**
@@ -74,14 +93,31 @@ class RedisRateLimitStore {
   }
 
   /**
-   * Increment the rate limit counter for a key
+   * In-memory fallback counter
+   * Used when Redis is unreachable — still enforces per-instance limits
+   */
+  private incrementMemory(key: string): { totalHits: number; resetTime: Date } {
+    const now = Date.now();
+    let entry = this.memoryCounters.get(key);
+
+    if (!entry || now > entry.resetAt) {
+      // New window
+      entry = { hits: 1, resetAt: now + this.windowMs };
+      this.memoryCounters.set(key, entry);
+    } else {
+      entry.hits++;
+    }
+
+    return { totalHits: entry.hits, resetTime: new Date(entry.resetAt) };
+  }
+
+  /**
+   * Increment rate limit counter
    * 
-   * SCALABILITY: Uses Redis INCR (atomic) + EXPIRE (auto-cleanup)
-   * - First request: INCR creates key with value 1, EXPIRE sets TTL
-   * - Subsequent requests: INCR atomically increments, TTL already set
-   * - After window expires: Redis auto-deletes the key
+   * TRIES Redis first. On failure, falls back to in-memory counter.
+   * When Redis recovers, automatically switches back to Redis on next call.
    * 
-   * @returns { totalHits, resetTime } — current count and when the window resets
+   * @returns { totalHits, resetTime } — current count and when window resets
    */
   async increment(key: string): Promise<{ totalHits: number; resetTime: Date }> {
     const redisKey = this.getKey(key);
@@ -94,10 +130,13 @@ class RedisRateLimitStore {
 
       return { totalHits, resetTime };
     } catch (error: any) {
-      // GRACEFUL DEGRADATION: If Redis fails, return a permissive response
-      // The in-memory fallback in express-rate-limit will handle it
-      logger.warn(`[RateLimit] Redis increment failed for ${key}: ${error.message}`);
-      return { totalHits: 0, resetTime: new Date(Date.now() + this.windowMs) };
+      // Phase 10: FAIL-CLOSED with in-memory backup (Netflix pattern)
+      // - NOT throw (causes 500 errors for ALL users)
+      // - NOT totalHits:0 (fail-open, security vulnerability)
+      // - YES in-memory counter (per-instance, still enforces limits)
+      // When Redis comes back → next call auto-uses Redis (seamless recovery)
+      logger.warn(`[RateLimit] Redis failed for ${key}: ${error.message} — using in-memory counter`);
+      return this.incrementMemory(key);
     }
   }
 

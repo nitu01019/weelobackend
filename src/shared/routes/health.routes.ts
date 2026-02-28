@@ -35,11 +35,33 @@ const router = Router();
 // Track server start time
 const startTime = Date.now();
 
+// Phase 10: Startup grace period — during first 15s, /health/ready returns 200
+// even if Redis isn't connected yet (ECS tasks need time to initialize)
+const STARTUP_GRACE_MS = 15_000;
+
+// Phase 10: Import shutdown flag from server.ts
+// Uses lazy require to avoid circular dependency
+function getIsShuttingDown(): boolean {
+  try {
+    return require('../../server').isShuttingDown === true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Basic health check - for load balancers
  * Returns 200 if server is running, nothing else
  */
 router.get('/health', (_req: Request, res: Response) => {
+  // Phase 10 Issue 3: Return 503 during shutdown so ALB stops routing
+  if (getIsShuttingDown()) {
+    return res.status(503).json({
+      status: 'shutting_down',
+      timestamp: new Date().toISOString()
+    });
+  }
+
   res.status(200).json({
     status: 'healthy',
     timestamp: new Date().toISOString()
@@ -65,7 +87,7 @@ router.get('/health/live', (_req: Request, res: Response) => {
 router.get('/health/ready', async (_req: Request, res: Response) => {
   try {
     const checks: Record<string, boolean> = {};
-    
+
     // Check cache/Redis
     try {
       // Test cache by setting and getting a test value
@@ -94,7 +116,7 @@ router.get('/health/ready', async (_req: Request, res: Response) => {
     } catch {
       checks.redis = false;
     }
-    
+
     // Check circuit breakers
     const circuitBreakers = circuitBreakerRegistry.getAllStats();
     const openCircuits = circuitBreakers.filter(cb => cb.state === 'OPEN');
@@ -109,13 +131,20 @@ router.get('/health/ready', async (_req: Request, res: Response) => {
     } else {
       checks.socketPubSub = true;
     }
-    
+
     // Determine overall status
     const isReady = Object.values(checks).every(v => v);
-    
-    res.status(isReady ? 200 : 503).json({
-      status: isReady ? 'ready' : 'not_ready',
+
+    // Phase 10: Startup grace period — first 15s always ready
+    // ECS tasks need time to connect to Redis/Prisma after boot.
+    // Without this, ALB marks brand-new tasks as unhealthy immediately.
+    const isInGracePeriod = (Date.now() - startTime) < STARTUP_GRACE_MS;
+    const finalReady = isReady || isInGracePeriod;
+
+    res.status(finalReady ? 200 : 503).json({
+      status: finalReady ? 'ready' : 'not_ready',
       checks,
+      ...(isInGracePeriod && !isReady ? { note: 'startup_grace_period' } : {}),
       timestamp: new Date().toISOString()
     });
   } catch (error) {
@@ -161,11 +190,11 @@ router.get('/health/slo', (req: Request, res: Response) => {
 router.get('/health/detailed', async (_req: Request, res: Response) => {
   const memUsage = process.memoryUsage();
   const cpuUsage = process.cpuUsage();
-  
+
   // Calculate uptime
   const uptimeSeconds = Math.floor((Date.now() - startTime) / 1000);
   const uptimeFormatted = formatUptime(uptimeSeconds);
-  
+
   // Get queue stats
   const queueStats = {
     default: defaultQueue.getStats(),
@@ -173,17 +202,17 @@ router.get('/health/detailed', async (_req: Request, res: Response) => {
     tracking: trackingQueue.getStats(),
     auth: authQueue.getStats()
   };
-  
+
   // Get circuit breaker stats
   const circuitBreakers = circuitBreakerRegistry.getAllStats();
-  
+
   // Build response
   const healthStatus = {
     status: 'healthy',
     version: process.env.npm_package_version || '2.0.0',
     environment: process.env.NODE_ENV || 'development',
     timestamp: new Date().toISOString(),
-    
+
     server: {
       pid: process.pid,
       uptime: uptimeFormatted,
@@ -192,7 +221,7 @@ router.get('/health/detailed', async (_req: Request, res: Response) => {
       platform: process.platform,
       arch: process.arch
     },
-    
+
     system: {
       hostname: os.hostname(),
       cpuCores: os.cpus().length,
@@ -200,7 +229,7 @@ router.get('/health/detailed', async (_req: Request, res: Response) => {
       freeMemory: formatBytes(os.freemem()),
       loadAverage: os.loadavg()
     },
-    
+
     process: {
       memory: {
         heapUsed: formatBytes(memUsage.heapUsed),
@@ -213,9 +242,9 @@ router.get('/health/detailed', async (_req: Request, res: Response) => {
         system: cpuUsage.system
       }
     },
-    
+
     queues: queueStats,
-    
+
     circuitBreakers: circuitBreakers.reduce((acc, cb) => {
       acc[cb.name] = {
         state: cb.state,
@@ -224,13 +253,13 @@ router.get('/health/detailed', async (_req: Request, res: Response) => {
       };
       return acc;
     }, {} as Record<string, unknown>),
-    
+
     metrics: metrics.getMetricsJSON(),
-    
+
     // SCALABILITY: SMS delivery metrics for production monitoring
     sms: smsService.getMetrics()
   };
-  
+
   res.json(healthStatus);
 });
 
@@ -261,7 +290,7 @@ router.get('/health/websocket', (_req: Request, res: Response) => {
   const io = getIO();
   const stats = getConnectionStats();
   const adapterStatus = getRedisAdapterStatus();
-  
+
   // Get detailed socket info
   const connectedSockets: any[] = [];
   if (io) {
@@ -276,15 +305,15 @@ router.get('/health/websocket', (_req: Request, res: Response) => {
       });
     });
   }
-  
+
   res.json({
     status: io ? 'initialized' : 'NOT INITIALIZED',
     stats,
     adapter: adapterStatus,
     connectedSockets,
     socketCount: connectedSockets.length,
-    message: connectedSockets.length === 0 
-      ? '⚠️ NO SOCKETS CONNECTED! Broadcasts will not be received in real-time.' 
+    message: connectedSockets.length === 0
+      ? '⚠️ NO SOCKETS CONNECTED! Broadcasts will not be received in real-time.'
       : `✅ ${connectedSockets.length} socket(s) connected`
   });
 });
@@ -297,12 +326,12 @@ function formatBytes(bytes: number): string {
   const units = ['B', 'KB', 'MB', 'GB'];
   let value = bytes;
   let unitIndex = 0;
-  
+
   while (value >= 1024 && unitIndex < units.length - 1) {
     value /= 1024;
     unitIndex++;
   }
-  
+
   return `${value.toFixed(2)} ${units[unitIndex]}`;
 }
 
@@ -311,13 +340,13 @@ function formatUptime(seconds: number): string {
   const hours = Math.floor((seconds % 86400) / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
   const secs = seconds % 60;
-  
+
   const parts: string[] = [];
   if (days > 0) parts.push(`${days}d`);
   if (hours > 0) parts.push(`${hours}h`);
   if (minutes > 0) parts.push(`${minutes}m`);
   parts.push(`${secs}s`);
-  
+
   return parts.join(' ');
 }
 

@@ -720,16 +720,16 @@ class TruckHoldService {
               LIMIT ${quantity}
             `
           : await tx.truckRequest.findMany({
-              where: {
-                orderId,
-                vehicleType: { equals: vehicleType, mode: 'insensitive' },
-                vehicleSubtype: { equals: vehicleSubtype, mode: 'insensitive' },
-                status: TruckRequestStatus.searching
-              },
-              orderBy: [{ requestNumber: 'asc' }, { createdAt: 'asc' }],
-              take: quantity,
-              select: { id: true }
-            });
+            where: {
+              orderId,
+              vehicleType: { equals: vehicleType, mode: 'insensitive' },
+              vehicleSubtype: { equals: vehicleSubtype, mode: 'insensitive' },
+              status: TruckRequestStatus.searching
+            },
+            orderBy: [{ requestNumber: 'asc' }, { createdAt: 'asc' }],
+            take: quantity,
+            select: { id: true }
+          });
 
         const selectedIds = claimedRows.map((row) => row.id);
         if (selectedIds.length < quantity) {
@@ -1124,6 +1124,16 @@ class TruckHoldService {
           continue;
         }
 
+        // Subtype enforcement: prevent e.g. 10-wheel assigned to 6-wheel slot
+        if (hold.vehicleSubtype && vehicle.vehicleSubtype &&
+          vehicle.vehicleSubtype.toLowerCase() !== hold.vehicleSubtype.toLowerCase()) {
+          failedAssignments.push({
+            vehicleId,
+            reason: `Vehicle subtype mismatch. Expected ${hold.vehicleSubtype}, got ${vehicle.vehicleSubtype}`
+          });
+          continue;
+        }
+
         const driver = driverMap.get(driverId);
         if (!driver) {
           failedAssignments.push({ vehicleId, reason: 'Driver not found' });
@@ -1448,7 +1458,7 @@ class TruckHoldService {
           confirmedAt: new Date(),
           terminalReason: null
         }
-      }).catch(() => {});
+      }).catch(() => { });
       this.broadcastAvailabilityUpdate(hold.orderId);
 
       logger.info(`╔══════════════════════════════════════════════════════════════╗`);
@@ -1587,7 +1597,7 @@ class TruckHoldService {
       });
 
       // best-effort Redis cleanup for stale lock/index keys
-      await holdStore.remove(normalizedHoldId).catch(() => {});
+      await holdStore.remove(normalizedHoldId).catch(() => { });
 
       // 3. Broadcast update
       this.broadcastAvailabilityUpdate(hold.orderId);
@@ -1614,7 +1624,7 @@ class TruckHoldService {
           payloadHash,
           statusCode,
           response
-        ).catch(() => {});
+        ).catch(() => { });
       }
     }
   }
@@ -1781,7 +1791,7 @@ class TruckHoldService {
         logger.warn(`[TruckHold] Failed to close hold ${hold.holdId} for order ${orderId}: ${String((error as Error)?.message || error)}`);
       });
 
-      await holdStore.remove(hold.holdId).catch(() => {});
+      await holdStore.remove(hold.holdId).catch(() => { });
     }
 
     return activeHolds.length;
@@ -1791,7 +1801,7 @@ class TruckHoldService {
     if (!Array.isArray(holdIds) || holdIds.length === 0) return;
     for (const holdId of holdIds) {
       if (!holdId) continue;
-      await holdStore.remove(holdId).catch(() => {});
+      await holdStore.remove(holdId).catch(() => { });
     }
   }
 
@@ -2006,7 +2016,7 @@ class TruckHoldService {
               terminalReason: 'HOLD_TTL_EXPIRED',
               releasedAt: new Date()
             }
-          }).catch(() => {});
+          }).catch(() => { });
         }
 
         if (expiredHolds.length > 0) {

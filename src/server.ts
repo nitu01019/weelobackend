@@ -92,6 +92,11 @@ import { fcmService } from './shared/services/fcm.service';
 import { redisService } from './shared/services/redis.service';
 
 // =============================================================================
+// Phase 10: SHUTDOWN STATE (shared with health.routes.ts)
+// =============================================================================
+export let isShuttingDown = false;
+
+// =============================================================================
 // ENVIRONMENT VALIDATION (Fail fast if config is invalid)
 // =============================================================================
 validateAndLogEnvironment();
@@ -541,6 +546,9 @@ process.on('unhandledRejection', (reason) => {
 const gracefulShutdown = async (signal: string) => {
   logger.info(`${signal} received. Starting graceful shutdown...`);
 
+  // Phase 10: Set shutdown flag — middleware returns 503, health returns 503
+  isShuttingDown = true;
+
   // Stop all background intervals first (prevents new work during shutdown)
   try {
     const { stopBookingExpiryChecker } = require('./modules/booking/booking.service');
@@ -560,6 +568,26 @@ const gracefulShutdown = async (signal: string) => {
     logger.info('All background intervals stopped');
   } catch (err) {
     logger.error('Error stopping background intervals', err);
+  }
+
+  // Phase 10 Issue 2: Graceful Socket.IO disconnect
+  // Tell all connected clients "reconnect NOW" instead of silently dropping.
+  // Clients already have reconnect logic — this triggers it immediately.
+  try {
+    const { getIO } = require('./shared/services/socket.service');
+    const io = getIO();
+    if (io) {
+      const socketCount = io.sockets.sockets.size;
+      logger.info(`[Shutdown] Disconnecting ${socketCount} WebSocket client(s) with reason 'server_shutting_down'`);
+      io.sockets.sockets.forEach((socket: any) => {
+        socket.disconnect(true); // true = force close (sends 'disconnect' event with reason)
+      });
+      // Brief pause to let disconnect frames flush to clients
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      logger.info('[Shutdown] All WebSocket clients disconnected');
+    }
+  } catch (err) {
+    logger.error('Error disconnecting WebSocket clients', err);
   }
 
   server.close(async () => {

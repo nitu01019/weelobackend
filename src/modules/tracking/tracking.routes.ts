@@ -19,12 +19,12 @@ import { prismaClient } from '../../shared/database/prisma.service';
 
 // Redis key builders (matching tracking.service.ts)
 const DRIVER_LOCATION_KEY = (driverId: string) => `driver:location:${driverId}`;
-import { 
-  updateLocationSchema, 
-  getTrackingQuerySchema, 
+import {
+  updateLocationSchema,
+  getTrackingQuerySchema,
   batchLocationSchema,
   tripStatusUpdateSchema,
-  DriverOnlineStatus 
+  DriverOnlineStatus
 } from './tracking.schema';
 import { z } from 'zod';
 import { assertBookingTrackingAccess } from './tracking-access.policy';
@@ -47,7 +47,7 @@ router.post(
         req.user!.userId,
         req.body
       );
-      
+
       res.json({
         success: true,
         message: 'Location updated'
@@ -73,7 +73,7 @@ router.get(
         req.user!.userId,
         req.user!.role
       );
-      
+
       res.json({
         success: true,
         data: tracking
@@ -228,7 +228,7 @@ router.get(
         req.user!.userId,
         req.user!.role
       );
-      
+
       res.json({
         success: true,
         data: tracking
@@ -256,7 +256,7 @@ router.get(
         req.user!.role,
         query
       );
-      
+
       res.json({
         success: true,
         data: history
@@ -293,7 +293,7 @@ router.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const fleet = await trackingService.getFleetTracking(req.user!.userId);
-      
+
       res.json({
         success: true,
         data: fleet
@@ -409,7 +409,7 @@ router.post(
         req.user!.userId,
         req.body
       );
-      
+
       res.json({
         success: true,
         message: `Processed ${result.processed} points`,
@@ -443,7 +443,7 @@ router.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const status = await trackingService.getDriverStatus(req.user!.userId);
-      
+
       res.json({
         success: true,
         data: { status }
@@ -476,11 +476,11 @@ router.put(
       const schema = z.object({
         status: z.enum(['ONLINE', 'OFFLINE'])
       });
-      
+
       const { status } = schema.parse(req.body);
-      
+
       await trackingService.setDriverStatus(req.user!.userId, status as DriverOnlineStatus);
-      
+
       res.json({
         success: true,
         message: `Status set to ${status}`
@@ -507,12 +507,123 @@ router.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const status = await trackingService.getDriverStatus(req.params.driverId);
-      
+
       res.json({
         success: true,
-        data: { 
+        data: {
           driverId: req.params.driverId,
-          status 
+          status
+        }
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// =============================================================================
+// ACTIVE TRIP RECOVERY (Phase 7 — 7C)
+// =============================================================================
+
+/**
+ * @route   GET /tracking/active-trip
+ * @desc    Get driver's current active trip (crash recovery)
+ * @access  Driver only
+ *
+ * USE CASE:
+ * - Captain app crashes mid-trip
+ * - On relaunch, driver calls this to restore trip state
+ * - Returns full trip details: pickup, drop, status, vehicle info
+ * - Returns null if no active trip
+ *
+ * SCALABILITY:
+ *   - Indexed query on driverId + status enum
+ *   - Single DB round-trip
+ */
+router.get(
+  '/active-trip',
+  authMiddleware,
+  roleGuard(['driver']),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const driverId = req.user!.userId;
+
+      const activeAssignment = await prismaClient.assignment.findFirst({
+        where: {
+          driverId,
+          status: {
+            in: ['pending', 'driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit', 'arrived_at_drop']
+          }
+        },
+        include: {
+          order: {
+            select: {
+              id: true,
+              pickup: true,
+              drop: true,
+              routePoints: true,
+              currentRouteIndex: true,
+              distanceKm: true,
+              totalTrucks: true,
+              customerName: true,
+              customerPhone: true
+            }
+          },
+          booking: {
+            select: {
+              id: true,
+              pickup: true,
+              drop: true,
+              distanceKm: true,
+              trucksNeeded: true,
+              customerName: true,
+              customerPhone: true
+            }
+          }
+        },
+        orderBy: { assignedAt: 'desc' }
+      });
+
+      if (!activeAssignment) {
+        return res.json({
+          success: true,
+          data: null,
+          message: 'No active trip'
+        });
+      }
+
+      // Get live location from Redis if available
+      const locationData = await redisService.getJSON<any>(
+        `driver:location:${driverId}`
+      ).catch(() => null);
+
+      res.json({
+        success: true,
+        data: {
+          assignmentId: activeAssignment.id,
+          tripId: activeAssignment.tripId,
+          status: activeAssignment.status,
+          orderId: activeAssignment.orderId,
+          bookingId: activeAssignment.bookingId,
+          vehicleNumber: activeAssignment.vehicleNumber,
+          vehicleType: activeAssignment.vehicleType,
+          vehicleSubtype: activeAssignment.vehicleSubtype,
+          driverName: activeAssignment.driverName,
+          pickup: activeAssignment.order?.pickup || activeAssignment.booking?.pickup,
+          drop: activeAssignment.order?.drop || activeAssignment.booking?.drop,
+          routePoints: activeAssignment.order?.routePoints,
+          currentRouteIndex: activeAssignment.order?.currentRouteIndex || 0,
+          distanceKm: activeAssignment.order?.distanceKm || activeAssignment.booking?.distanceKm,
+          customerName: activeAssignment.order?.customerName || activeAssignment.booking?.customerName,
+          customerPhone: activeAssignment.order?.customerPhone || activeAssignment.booking?.customerPhone,
+          assignedAt: activeAssignment.assignedAt,
+          lastLocation: locationData ? {
+            latitude: locationData.latitude,
+            longitude: locationData.longitude,
+            speed: locationData.speed,
+            bearing: locationData.bearing,
+            lastUpdated: locationData.lastUpdated
+          } : null
         }
       });
     } catch (error) {

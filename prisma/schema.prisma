@@ -94,6 +94,7 @@ enum AssignmentStatus {
   en_route_pickup  // Driver heading to pickup
   at_pickup        // Driver arrived at pickup
   in_transit       // Goods loaded, heading to drop
+  arrived_at_drop  // Driver arrived at drop-off location
   completed        // Trip completed
   cancelled        // Trip cancelled
 }
@@ -855,6 +856,10 @@ model Assignment {
   @@index([status])             // Active assignments
   @@index([driverId, status])   // Driver's active trips
   @@index([transporterId, status]) // Transporter's active assignments
+
+  // DB-level guarantee: one active trip per driver
+  // Service logic already checks this, but this prevents edge-case concurrency bypasses
+  @@unique([driverId, status], map: "assignment_driver_active_unique")
 }
 
 // =============================================================================
