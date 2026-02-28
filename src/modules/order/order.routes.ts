@@ -563,6 +563,8 @@ router.post(
           eventVersion: result.eventVersion,
           serverTimeMs: result.serverTimeMs,
           transportersNotified: result.transportersNotified,
+          driversNotified: result.driversNotified || 0,
+          assignmentsCancelled: result.assignmentsCancelled || 0,
           cancelledAt: new Date().toISOString()
         }
       });
@@ -932,14 +934,8 @@ router.delete(
           message: result.message,
           data: {
             transportersNotified: result.transportersNotified,
-            policyStage: result.policyStage,
-            cancelDecision: result.cancelDecision,
-            reasonRequired: result.reasonRequired,
-            reasonCode: result.reasonCode,
-            penaltyBreakdown: result.penaltyBreakdown,
-            driverCompensationBreakdown: result.driverCompensationBreakdown,
-            settlementState: result.settlementState,
-            pendingPenaltyAmount: result.pendingPenaltyAmount,
+            driversNotified: result.driversNotified || 0,
+            assignmentsCancelled: result.assignmentsCancelled || 0,
             eventId: result.eventId,
             eventVersion: result.eventVersion,
             serverTimeMs: result.serverTimeMs
@@ -1160,7 +1156,7 @@ router.get(
           status: normalizeOrderStatus(order.status),
           dispatchState: (order as any).dispatchState || 'queued',
           reasonCode: (order as any).dispatchReasonCode || null,
-          eventVersion: 1,
+          eventVersion: Math.floor(new Date((order as any).updatedAt ?? Date.now()).getTime() / 1000),
           serverTimeMs: nowMs,
           expiresAtMs,
           syncCursor,
@@ -1198,6 +1194,48 @@ router.get(
       });
     } catch (error: any) {
       logger.error(`Get broadcast snapshot error: ${error.message}`);
+      next(error);
+    }
+  }
+);
+
+// =============================================================================
+// GET /pending-settlements — customer-facing pending penalty/settlement dues
+// =============================================================================
+router.get('/pending-settlements',
+  authMiddleware,
+  roleGuard(['customer']),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const user = (req as any).user;
+      const dues = await (orderService as any).prisma.customerPenaltyDue.findMany({
+        where: {
+          customerId: user.userId,
+          state: 'due'
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 20
+      });
+
+      const totalPending = dues.reduce((sum: number, d: any) => sum + (Number(d.amount) || 0), 0);
+
+      res.json({
+        success: true,
+        data: {
+          totalPending,
+          count: dues.length,
+          items: dues.map((d: any) => ({
+            id: d.id,
+            orderId: d.orderId,
+            amount: Number(d.amount) || 0,
+            state: d.state,
+            nextOrderHint: d.nextOrderHint || 'Will be adjusted on next booking.',
+            createdAt: d.createdAt
+          }))
+        }
+      });
+    } catch (error: any) {
+      logger.error(`Get pending settlements error: ${error.message}`);
       next(error);
     }
   }

@@ -126,6 +126,8 @@ interface OrderLifecycleOutboxPayload {
   eventId: string;
   eventVersion: number;
   serverTimeMs: number;
+  compensationAmount?: number;
+  settlementState?: string;
 }
 
 interface LifecycleOutboxRow {
@@ -173,6 +175,8 @@ interface CancelOrderResult {
   success: boolean;
   message: string;
   transportersNotified: number;
+  driversNotified?: number;
+  assignmentsCancelled?: number;
   policyStage?: TruckCancelPolicyStage;
   cancelDecision?: TruckCancelDecision;
   reasonRequired?: boolean;
@@ -1122,7 +1126,9 @@ class OrderService {
         customerName: driver.customerName || '',
         customerPhone: driver.customerPhone || '',
         pickupAddress: driver.pickupAddress || '',
-        dropAddress: driver.dropAddress || ''
+        dropAddress: driver.dropAddress || '',
+        compensationAmount: payload.compensationAmount,
+        settlementState: payload.settlementState
       });
     }
   }
@@ -2815,6 +2821,8 @@ class OrderService {
       customerPhone?: string;
       pickupAddress?: string;
       dropAddress?: string;
+      compensationAmount?: number;
+      settlementState?: string;
     }
   ): void {
     const correlationEventId = uuidv4();
@@ -2829,6 +2837,8 @@ class OrderService {
       customerPhone: payload.customerPhone ?? '',
       pickupAddress: payload.pickupAddress ?? '',
       dropAddress: payload.dropAddress ?? '',
+      compensationAmount: payload.compensationAmount ?? 0,
+      settlementState: payload.settlementState ?? 'none',
       eventId: correlationEventId,
       emittedAt
     };
@@ -3883,7 +3893,9 @@ class OrderService {
         cancelledAt,
         eventId,
         eventVersion: FF_CANCEL_EVENT_VERSION_ENFORCED ? eventVersion : 1,
-        serverTimeMs
+        serverTimeMs,
+        compensationAmount: stageEvaluation.driverCompensationBreakdown?.finalAmount || 0,
+        settlementState: stageEvaluation.settlementState || 'none'
       };
 
       if (FF_CANCEL_OUTBOX_ENABLED && lifecyclePayload) {
@@ -3895,6 +3907,8 @@ class OrderService {
         success: true,
         message: 'Order cancelled successfully',
         transportersNotified: transporterIds.length,
+        driversNotified: lifecyclePayload.drivers?.length || 0,
+        assignmentsCancelled: assignmentRows.length,
         policyStage: stageEvaluation.stage,
         cancelDecision: stageEvaluation.decision,
         reasonRequired: stageEvaluation.reasonRequired,

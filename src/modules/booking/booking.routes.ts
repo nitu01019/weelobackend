@@ -178,7 +178,7 @@ router.post(
         req.user!.phone,
         req.body
       );
-      
+
       res.status(201).json({
         success: true,
         data: { booking }
@@ -254,7 +254,7 @@ router.get(
         isRated: b.status === 'completed' ? (ratingStatusMap[b.id] ?? false) : undefined,
         hasUnratedTrips: b.status === 'completed' ? !(ratingStatusMap[b.id] ?? false) : undefined
       }));
-      
+
       res.json({
         success: true,
         data: {
@@ -281,7 +281,7 @@ router.get(
     try {
       const query = getBookingsQuerySchema.parse(req.query);
       const result = await bookingService.getActiveBroadcasts(req.user!.userId, query);
-      
+
       res.json({
         success: true,
         data: result
@@ -307,7 +307,7 @@ router.get(
         req.user!.userId,
         req.user!.role
       );
-      
+
       res.json({
         success: true,
         data: { booking }
@@ -333,7 +333,7 @@ router.get(
         req.user!.userId,
         req.user!.role
       );
-      
+
       res.json({
         success: true,
         data: { trucks }
@@ -359,7 +359,7 @@ router.patch(
         req.params.id,
         req.user!.userId
       );
-      
+
       res.json({
         success: true,
         data: { booking }
@@ -462,7 +462,7 @@ router.post(
         idempotencyKey
       );
       const result = await canonicalOrderService.createOrder(serviceRequest);
-      
+
       res.status(201).json({
         success: true,
         data: buildCreateOrderResponseData(
@@ -478,7 +478,7 @@ router.post(
     } catch (error) {
       next(error);
     } finally {
-      await redisService.releaseLock(lockKey, customerId).catch(() => {});
+      await redisService.releaseLock(lockKey, customerId).catch(() => { });
     }
   }
 );
@@ -496,9 +496,9 @@ router.get(
     try {
       const page = parseInt(req.query.page as string) || 1;
       const limit = parseInt(req.query.limit as string) || 20;
-      
+
       const result = await canonicalOrderService.getCustomerOrders(req.user!.userId, page, limit);
-      
+
       res.json({
         success: true,
         data: result
@@ -524,7 +524,7 @@ router.get(
         req.user!.userId,
         req.user!.role
       );
-      
+
       res.json({
         success: true,
         data: result
@@ -786,7 +786,7 @@ router.get(
           status: details.status,
           dispatchState: (details as any).dispatchState || 'queued',
           reasonCode: (details as any).dispatchReasonCode || null,
-          eventVersion: 1,
+          eventVersion: Math.floor(new Date((details as any).updatedAt ?? Date.now()).getTime() / 1000),
           serverTimeMs: nowMs,
           expiresAtMs,
           syncCursor,
@@ -848,10 +848,10 @@ router.get(
       const latestChangeMs = Date.parse(syncCursor);
       const snapshotUnchanged = requestedCursorMs !== null && Number.isFinite(latestChangeMs) && latestChangeMs <= requestedCursorMs;
       const responseOrders = snapshotUnchanged ? [] : result;
-      
+
       res.json({
         success: true,
-        data: { 
+        data: {
           orders: responseOrders,
           count: result.length,
           syncCursor,
@@ -881,21 +881,21 @@ router.post(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { vehicleId, driverId } = req.body;
-      
+
       if (!vehicleId) {
         return res.status(400).json({
           success: false,
           error: { code: 'VEHICLE_REQUIRED', message: 'vehicleId is required' }
         });
       }
-      
+
       const request = await canonicalOrderService.acceptTruckRequest(
         req.params.id,
         req.user!.userId,
         vehicleId,
         driverId
       );
-      
+
       res.json({
         success: true,
         data: { request }
