@@ -195,6 +195,11 @@ const FF_HOLD_DB_ATOMIC_CLAIM = process.env.FF_HOLD_DB_ATOMIC_CLAIM !== 'false';
 const FF_HOLD_STRICT_IDEMPOTENCY = process.env.FF_HOLD_STRICT_IDEMPOTENCY !== 'false';
 const FF_HOLD_RECONCILE_RECOVERY = process.env.FF_HOLD_RECONCILE_RECOVERY !== 'false';
 const FF_HOLD_SAFE_RELEASE_GUARD = process.env.FF_HOLD_SAFE_RELEASE_GUARD !== 'false';
+const HOLD_IDEMPOTENCY_RETENTION_HOURS = Math.max(24, parseInt(process.env.HOLD_IDEMPOTENCY_RETENTION_HOURS || '168', 10) || 168);
+const HOLD_IDEMPOTENCY_PURGE_INTERVAL_MS = Math.max(
+  60_000,
+  parseInt(process.env.HOLD_IDEMPOTENCY_PURGE_INTERVAL_MS || String(30 * 60 * 1000), 10) || (30 * 60 * 1000)
+);
 
 // =============================================================================
 // REDIS KEYS - Distributed Locking for Truck Holds
@@ -458,6 +463,7 @@ const holdStore = new HoldStore();
 
 class TruckHoldService {
   private cleanupInterval: NodeJS.Timeout | null = null;
+  private lastIdempotencyPurgeAtMs = 0;
 
   constructor() {
     this.startCleanupJob();
@@ -1480,7 +1486,8 @@ class TruckHoldService {
   async releaseHold(
     holdId: string,
     transporterId?: string,
-    idempotencyKey?: string
+    idempotencyKey?: string,
+    releaseSource: 'manual' | 'cleanup' | 'system' = 'manual'
   ): Promise<{ success: boolean; message: string; error?: string }> {
     logger.info(`[TruckHold] Release request: ${holdId}`);
 
@@ -1586,7 +1593,9 @@ class TruckHoldService {
       this.broadcastAvailabilityUpdate(hold.orderId);
 
       logger.info(`[TruckHold] ✅ Released hold ${normalizedHoldId}. ${hold.quantity} trucks reconciled.`);
-      metrics.incrementCounter('hold.cleanup.released_total');
+      if (releaseSource !== 'cleanup') {
+        metrics.incrementCounter('hold.release.total', { source: releaseSource });
+      }
 
       response = { success: true, message: 'Hold released successfully.' };
       statusCode = 200;
@@ -1965,6 +1974,7 @@ class TruckHoldService {
     this.cleanupInterval = setInterval(async () => {
       try {
         const now = new Date();
+        let cleanupReleasedCount = 0;
         const expiredHolds = await prismaClient.truckHoldLedger.findMany({
           where: {
             status: 'active',
@@ -1977,7 +1987,10 @@ class TruckHoldService {
 
         for (const hold of expiredHolds) {
           logger.info(`[TruckHold] Auto-releasing expired hold: ${hold.holdId}`);
-          await this.releaseHold(hold.holdId);
+          const releaseResult = await this.releaseHold(hold.holdId, undefined, undefined, 'cleanup');
+          if (releaseResult.success) {
+            cleanupReleasedCount++;
+          }
           await prismaClient.truckHoldLedger.update({
             where: { holdId: hold.holdId },
             data: {
@@ -1990,6 +2003,23 @@ class TruckHoldService {
 
         if (expiredHolds.length > 0) {
           logger.info(`[TruckHold] Cleanup: Reconciled ${expiredHolds.length} expired holds`);
+          // Emit explicit cleanup metric at job level for release-gate visibility.
+          metrics.incrementCounter('hold.cleanup.released_total', { source: 'cleanup_job' }, cleanupReleasedCount);
+        }
+
+        const nowMs = Date.now();
+        if (nowMs - this.lastIdempotencyPurgeAtMs >= HOLD_IDEMPOTENCY_PURGE_INTERVAL_MS) {
+          this.lastIdempotencyPurgeAtMs = nowMs;
+          const cutoff = new Date(nowMs - (HOLD_IDEMPOTENCY_RETENTION_HOURS * 60 * 60 * 1000));
+          const purged = await prismaClient.truckHoldIdempotency.deleteMany({
+            where: {
+              createdAt: { lt: cutoff }
+            }
+          });
+          if (purged.count > 0) {
+            logger.info(`[TruckHold] Purged ${purged.count} old hold idempotency row(s)`);
+            metrics.incrementCounter('hold.idempotency.purged_total', {}, purged.count);
+          }
         }
       } catch (error: any) {
         logger.error(`[TruckHold] Cleanup job error: ${error.message}`);
