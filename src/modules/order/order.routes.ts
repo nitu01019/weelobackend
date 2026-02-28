@@ -36,6 +36,14 @@ function normalizeOrderStatus(status: unknown): string {
   return typeof status === 'string' ? status.toLowerCase() : '';
 }
 
+function normalizeOrderLifecycleState(status: unknown): 'active' | 'cancelled' | 'expired' | 'accepted' {
+  const normalized = normalizeOrderStatus(status);
+  if (normalized === 'cancelled' || normalized === 'canceled') return 'cancelled';
+  if (normalized === 'expired') return 'expired';
+  if (normalized === 'fully_filled' || normalized === 'completed' || normalized === 'closed') return 'accepted';
+  return 'active';
+}
+
 // =============================================================================
 // VALIDATION SCHEMAS
 // =============================================================================
@@ -944,6 +952,90 @@ router.get(
       });
     } catch (error: any) {
       logger.error(`Get order status error: ${error.message}`);
+      next(error);
+    }
+  }
+);
+
+/**
+ * GET /api/v1/orders/:orderId/broadcast-snapshot
+ * Canonical snapshot for reconnect/stale payload reconciliation.
+ */
+router.get(
+  '/:orderId/broadcast-snapshot',
+  authMiddleware,
+  roleGuard(['customer']),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { orderId } = req.params;
+      const order = await db.orders.findUnique({ where: { id: orderId } });
+      if (!order) {
+        return res.status(404).json({
+          success: false,
+          error: {
+            code: 'ORDER_NOT_FOUND',
+            message: 'Order not found'
+          }
+        });
+      }
+
+      const requests = await db.getTruckRequestsByOrder(orderId);
+      const nowMs = Date.now();
+      const expiresAtMs = new Date(order.expiresAt).getTime();
+      const syncCursor = new Date(
+        Math.max(
+          nowMs,
+          new Date((order as any).updatedAt ?? nowMs).getTime(),
+          new Date((order as any).stateChangedAt ?? nowMs).getTime()
+        )
+      ).toISOString();
+
+      res.json({
+        success: true,
+        data: {
+          orderId: order.id,
+          state: normalizeOrderLifecycleState(order.status),
+          status: normalizeOrderStatus(order.status),
+          dispatchState: (order as any).dispatchState || 'queued',
+          reasonCode: (order as any).dispatchReasonCode || null,
+          eventVersion: 1,
+          serverTimeMs: nowMs,
+          expiresAtMs,
+          syncCursor,
+          order: {
+            id: order.id,
+            customerId: order.customerId,
+            customerName: order.customerName,
+            customerPhone: order.customerPhone,
+            pickup: order.pickup,
+            drop: order.drop,
+            distanceKm: order.distanceKm,
+            totalTrucks: order.totalTrucks,
+            trucksFilled: order.trucksFilled,
+            totalAmount: order.totalAmount,
+            goodsType: order.goodsType,
+            weight: order.weight,
+            status: normalizeOrderStatus(order.status),
+            expiresAt: order.expiresAt,
+            createdAt: order.createdAt
+          },
+          requests: requests.map((request) => ({
+            id: request.id,
+            orderId: request.orderId,
+            requestNumber: request.requestNumber,
+            vehicleType: request.vehicleType,
+            vehicleSubtype: request.vehicleSubtype,
+            pricePerTruck: request.pricePerTruck,
+            status: request.status,
+            assignedTransporterId: request.assignedTransporterId,
+            assignedVehicleNumber: request.assignedVehicleNumber,
+            assignedDriverName: request.assignedDriverName,
+            createdAt: request.createdAt
+          }))
+        }
+      });
+    } catch (error: any) {
+      logger.error(`Get broadcast snapshot error: ${error.message}`);
       next(error);
     }
   }

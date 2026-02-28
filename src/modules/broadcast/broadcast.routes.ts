@@ -64,11 +64,13 @@ router.get(
         vehicleType: vehicleType as string,
         maxDistance: maxDistance ? parseFloat(maxDistance as string) : undefined
       });
+      const syncCursor = new Date().toISOString();
       
       res.json({
         success: true,
         broadcasts,
-        count: broadcasts.length
+        count: broadcasts.length,
+        syncCursor
       });
     } catch (error) {
       next(error);

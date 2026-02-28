@@ -32,6 +32,34 @@ import {
 const router = Router();
 const FF_LEGACY_BOOKING_PROXY_TO_ORDER = process.env.FF_LEGACY_BOOKING_PROXY_TO_ORDER !== 'false';
 
+function normalizeOrderLifecycleState(status: string): 'active' | 'cancelled' | 'expired' | 'accepted' {
+  const normalized = status.toLowerCase();
+  if (normalized === 'cancelled' || normalized === 'canceled') return 'cancelled';
+  if (normalized === 'expired') return 'expired';
+  if (normalized === 'fully_filled' || normalized === 'completed' || normalized === 'closed') return 'accepted';
+  return 'active';
+}
+
+function buildSyncCursorFromOrders(
+  orders: Array<{ order: { updatedAt?: Date | string; stateChangedAt?: Date | string; createdAt?: Date | string } }>
+): string {
+  const latestMs = orders.reduce((acc, item) => {
+    const order = item.order;
+    const updatedMs = order.updatedAt ? new Date(order.updatedAt).getTime() : 0;
+    const stateChangedMs = order.stateChangedAt ? new Date(order.stateChangedAt).getTime() : 0;
+    const createdMs = order.createdAt ? new Date(order.createdAt).getTime() : 0;
+    return Math.max(acc, updatedMs, stateChangedMs, createdMs);
+  }, 0);
+  return new Date(latestMs || Date.now()).toISOString();
+}
+
+function parseSyncCursorMs(syncCursor: unknown): number | null {
+  if (typeof syncCursor !== 'string' || syncCursor.trim().length === 0) return null;
+  const parsed = Date.parse(syncCursor);
+  if (!Number.isFinite(parsed)) return null;
+  return parsed;
+}
+
 /**
  * @route   POST /bookings
  * @desc    Create new booking (broadcasts to transporters)
@@ -615,6 +643,89 @@ router.get(
 );
 
 /**
+ * @route   GET /bookings/orders/:orderId/broadcast-snapshot
+ * @desc    Canonical snapshot for transporter/captain reconcile after socket gaps
+ * @access  Customer only
+ */
+router.get(
+  '/orders/:orderId/broadcast-snapshot',
+  authMiddleware,
+  roleGuard(['customer', 'transporter', 'driver']),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { orderId } = req.params;
+      const scopedOrder = await canonicalOrderService.getOrderWithRequests(
+        orderId,
+        req.user!.userId,
+        req.user!.role
+      );
+      const details = {
+        ...scopedOrder.order,
+        truckRequests: scopedOrder.requests
+      };
+
+      const nowMs = Date.now();
+      const expiresAtMs = new Date(details.expiresAt).getTime();
+      const lifecycleState = normalizeOrderLifecycleState(details.status);
+      const syncCursor = new Date(
+        Math.max(
+          nowMs,
+          new Date((details as any).updatedAt ?? nowMs).getTime(),
+          new Date((details as any).stateChangedAt ?? nowMs).getTime()
+        )
+      ).toISOString();
+
+      res.json({
+        success: true,
+        data: {
+          orderId: details.id,
+          state: lifecycleState,
+          status: details.status,
+          dispatchState: (details as any).dispatchState || 'queued',
+          reasonCode: (details as any).dispatchReasonCode || null,
+          eventVersion: 1,
+          serverTimeMs: nowMs,
+          expiresAtMs,
+          syncCursor,
+          order: {
+            id: details.id,
+            customerId: details.customerId,
+            customerName: details.customerName,
+            customerPhone: details.customerPhone,
+            pickup: details.pickup,
+            drop: details.drop,
+            distanceKm: details.distanceKm,
+            totalTrucks: details.totalTrucks,
+            trucksFilled: details.trucksFilled,
+            totalAmount: details.totalAmount,
+            goodsType: details.goodsType,
+            weight: details.weight,
+            status: details.status,
+            expiresAt: details.expiresAt,
+            createdAt: details.createdAt
+          },
+          requests: details.truckRequests.map((request) => ({
+            id: request.id,
+            orderId: request.orderId,
+            requestNumber: request.requestNumber,
+            vehicleType: request.vehicleType,
+            vehicleSubtype: request.vehicleSubtype,
+            pricePerTruck: request.pricePerTruck,
+            status: request.status,
+            assignedTransporterId: request.assignedTransporterId,
+            assignedVehicleNumber: request.assignedVehicleNumber,
+            assignedDriverName: request.assignedDriverName,
+            createdAt: request.createdAt
+          }))
+        }
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
  * @route   GET /bookings/requests/active
  * @desc    Get active truck requests for transporter (only matching vehicle types)
  * @access  Transporter only
@@ -629,12 +740,19 @@ router.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const result = await canonicalOrderService.getActiveTruckRequestsForTransporter(req.user!.userId);
+      const syncCursor = buildSyncCursorFromOrders(result as any);
+      const requestedCursorMs = parseSyncCursorMs(req.query.syncCursor);
+      const latestChangeMs = Date.parse(syncCursor);
+      const snapshotUnchanged = requestedCursorMs !== null && Number.isFinite(latestChangeMs) && latestChangeMs <= requestedCursorMs;
+      const responseOrders = snapshotUnchanged ? [] : result;
       
       res.json({
         success: true,
         data: { 
-          orders: result,
-          count: result.length
+          orders: responseOrders,
+          count: result.length,
+          syncCursor,
+          snapshotUnchanged
         }
       });
     } catch (error) {
