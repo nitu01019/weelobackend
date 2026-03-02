@@ -2503,8 +2503,33 @@ class OrderService {
       }
     }
 
+    // === PHASE 4: ADAPTIVE FANOUT CHUNKING (configurable) ===
+    // Split enqueue jobs into chunks to prevent Redis CPU spike on large fanout.
+    // Closest transporters (sorted by ETA) are in the first chunk.
+    // Default chunk size = 500 (effectively no chunking for normal orders).
+    const FANOUT_CHUNK_SIZE = Math.max(
+      10,
+      parseInt(process.env.FF_ADAPTIVE_FANOUT_CHUNK_SIZE || '500', 10) || 500
+    );
+    const FANOUT_CHUNK_DELAY_MS = Math.max(
+      0,
+      parseInt(process.env.FF_ADAPTIVE_FANOUT_DELAY_MS || '0', 10) || 0
+    );
+
     if (socketQueueJobs.length > 0) {
-      await Promise.allSettled(socketQueueJobs);
+      if (socketQueueJobs.length <= FANOUT_CHUNK_SIZE || FANOUT_CHUNK_DELAY_MS === 0) {
+        // No chunking needed — fire all at once (original behavior)
+        await Promise.allSettled(socketQueueJobs);
+      } else {
+        // Chunked fanout with inter-chunk delay
+        for (let i = 0; i < socketQueueJobs.length; i += FANOUT_CHUNK_SIZE) {
+          const chunk = socketQueueJobs.slice(i, i + FANOUT_CHUNK_SIZE);
+          await Promise.allSettled(chunk);
+          if (i + FANOUT_CHUNK_SIZE < socketQueueJobs.length && FANOUT_CHUNK_DELAY_MS > 0) {
+            await new Promise(resolve => setTimeout(resolve, FANOUT_CHUNK_DELAY_MS));
+          }
+        }
+      }
     }
 
     if (FF_BROADCAST_STRICT_SENT_ACCOUNTING) {

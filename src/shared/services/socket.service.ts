@@ -127,7 +127,8 @@ export const SocketEvent = {
   LEAVE_BOOKING: 'leave_booking',
   JOIN_ORDER: 'join_order',                     // Join order room for updates
   LEAVE_ORDER: 'leave_order',
-  UPDATE_LOCATION: 'update_location'
+  UPDATE_LOCATION: 'update_location',
+  BROADCAST_ACK: 'broadcast_ack'            // Phase 4: client ACKs sequence-numbered message
 };
 
 /**
@@ -447,6 +448,66 @@ export function initializeSocket(server: HttpServer): Server {
       socket.leave(`order:${orderId}`);
       logger.debug(`User ${userId} left order room: ${orderId}`);
     });
+
+    // ================================================================
+    // PHASE 4: SEQUENCE REPLAY ON RECONNECT (flag-gated)
+    // ================================================================
+    // If FF_SEQUENCE_DELIVERY_ENABLED and client sends lastSeq in auth,
+    // replay all unacked messages with seq > lastSeq.
+    // This ensures no message is ever lost, even on 2G reconnect.
+    // ================================================================
+    const FF_SEQ = process.env.FF_SEQUENCE_DELIVERY_ENABLED === 'true';
+    if (FF_SEQ) {
+      const lastSeq = Number(socket.handshake.auth?.lastSeq || 0);
+      if (lastSeq > 0) {
+        (async () => {
+          try {
+            const unackedKey = `socket:unacked:${userId}`;
+            const messages = await redisService.zRangeByScore(
+              unackedKey,
+              lastSeq + 1,  // min: messages after lastSeq
+              '+inf'        // max: all newer messages
+            );
+            if (messages.length > 0) {
+              logger.info(`[Phase4] Replaying ${messages.length} unacked messages for ${userId} (lastSeq=${lastSeq})`);
+              for (const msgStr of messages) {
+                try {
+                  const envelope = JSON.parse(msgStr);
+                  socket.emit(envelope.event || 'replay', {
+                    ...envelope.payload,
+                    _seq: envelope.seq,
+                    _replayed: true
+                  });
+                } catch {
+                  // Skip malformed messages
+                }
+              }
+            }
+          } catch (replayErr: any) {
+            // Replay is best-effort — never block connection
+            logger.warn(`[Phase4] Sequence replay failed for ${userId}`, {
+              error: replayErr?.message
+            });
+          }
+        })();
+      }
+
+      // ACK handler — client sends { seq: N } after processing message
+      socket.on(SocketEvent.BROADCAST_ACK, (ackData: { seq?: number }) => {
+        const ackSeq = Number(ackData?.seq || 0);
+        if (ackSeq <= 0) return;
+        // Remove all messages with seq <= ackSeq (cumulative ACK)
+        redisService.zRemRangeByScore(
+          `socket:unacked:${userId}`,
+          0,
+          ackSeq
+        ).catch((err: any) => {
+          logger.warn(`[Phase4] Failed to clear acked messages`, {
+            userId, ackSeq, error: err?.message
+          });
+        });
+      });
+    }
   });
 
   logger.info('Socket.IO initialized with optimized settings');

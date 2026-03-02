@@ -117,6 +117,11 @@ interface IRedisClient {
   sCard(key: string): Promise<number>;
   sUnion(...keys: string[]): Promise<string[]>;
 
+  // Sorted Sets (for Phase 4 sequence delivery)
+  zAdd(key: string, score: number, member: string): Promise<number>;
+  zRangeByScore(key: string, min: number | string, max: number | string): Promise<string[]>;
+  zRemRangeByScore(key: string, min: number | string, max: number | string): Promise<number>;
+
   // Hashes
   hSet(key: string, field: string, value: string): Promise<void>;
   hGet(key: string, field: string): Promise<string | null>;
@@ -496,6 +501,51 @@ class InMemoryRedisClient implements IRedisClient {
       for (const m of members) result.add(m);
     }
     return Array.from(result);
+  }
+
+  // Sorted Sets (in-memory simulation for Phase 4)
+  async zAdd(key: string, score: number, member: string): Promise<number> {
+    if (this.isExpired(key)) this.store.delete(key);
+    let entry = this.store.get(key);
+    if (!entry) {
+      entry = { type: 'zset' as any, value: new Map<string, number>(), expiresAt: null };
+      this.store.set(key, entry);
+    }
+    const isNew = !entry.value.has(member);
+    entry.value.set(member, score);
+    return isNew ? 1 : 0;
+  }
+
+  async zRangeByScore(key: string, min: number | string, max: number | string): Promise<string[]> {
+    if (this.isExpired(key)) return [];
+    const entry = this.store.get(key);
+    if (!entry || !entry.value || !(entry.value instanceof Map)) return [];
+    const minVal = min === '-inf' ? -Infinity : Number(min);
+    const maxVal = max === '+inf' ? Infinity : Number(max);
+    const results: Array<{ member: string; score: number }> = [];
+    for (const [member, score] of entry.value) {
+      if (score >= minVal && score <= maxVal) {
+        results.push({ member, score });
+      }
+    }
+    results.sort((a, b) => a.score - b.score);
+    return results.map(r => r.member);
+  }
+
+  async zRemRangeByScore(key: string, min: number | string, max: number | string): Promise<number> {
+    if (this.isExpired(key)) return 0;
+    const entry = this.store.get(key);
+    if (!entry || !entry.value || !(entry.value instanceof Map)) return 0;
+    const minVal = min === '-inf' ? -Infinity : Number(min);
+    const maxVal = max === '+inf' ? Infinity : Number(max);
+    let removed = 0;
+    for (const [member, score] of entry.value) {
+      if (score >= minVal && score <= maxVal) {
+        entry.value.delete(member);
+        removed++;
+      }
+    }
+    return removed;
   }
 
   // =========== Hashes ===========
@@ -1009,6 +1059,19 @@ class RealRedisClient implements IRedisClient {
   async sUnion(...keys: string[]): Promise<string[]> {
     if (keys.length === 0) return [];
     return this.client.sunion(...keys);
+  }
+
+  // Sorted Sets (for Phase 4 sequence delivery)
+  async zAdd(key: string, score: number, member: string): Promise<number> {
+    return this.client.zadd(key, score, member);
+  }
+
+  async zRangeByScore(key: string, min: number | string, max: number | string): Promise<string[]> {
+    return this.client.zrangebyscore(key, min, max);
+  }
+
+  async zRemRangeByScore(key: string, min: number | string, max: number | string): Promise<number> {
+    return this.client.zremrangebyscore(key, min, max);
   }
 
   // =========== Hashes ===========
@@ -1707,6 +1770,19 @@ class RedisService {
 
   async sUnion(...keys: string[]): Promise<string[]> {
     return this.client.sUnion(...keys);
+  }
+
+  // Sorted Sets (Phase 4 — delegates to underlying client)
+  async zAdd(key: string, score: number, member: string): Promise<number> {
+    return this.client.zAdd(key, score, member);
+  }
+
+  async zRangeByScore(key: string, min: number | string, max: number | string): Promise<string[]> {
+    return this.client.zRangeByScore(key, min, max);
+  }
+
+  async zRemRangeByScore(key: string, min: number | string, max: number | string): Promise<number> {
+    return this.client.zRemRangeByScore(key, min, max);
   }
 
   // ===========================================================================

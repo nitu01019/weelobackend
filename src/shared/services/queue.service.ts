@@ -70,6 +70,63 @@ const CANCELLED_ORDER_QUEUE_GUARD_CACHE_TTL_MS = Math.max(
 );
 
 // =============================================================================
+// PHASE 4 — GUARANTEED DELIVERY FLAGS & CONFIG
+// =============================================================================
+
+/** Sequence-numbered delivery + unacked queue + replay on reconnect */
+const FF_SEQUENCE_DELIVERY_ENABLED = process.env.FF_SEQUENCE_DELIVERY_ENABLED === 'true';
+
+/** Parallel Socket.IO + FCM delivery for every broadcast */
+const FF_DUAL_CHANNEL_DELIVERY = process.env.FF_DUAL_CHANNEL_DELIVERY === 'true';
+
+/** Message TTL enforcement — drop stale messages before emitting */
+const FF_MESSAGE_TTL_ENABLED = process.env.FF_MESSAGE_TTL_ENABLED === 'true';
+
+/** Priority drain order — CRITICAL(1) → HIGH(2) → NORMAL(3) → LOW(4) */
+const FF_MESSAGE_PRIORITY_ENABLED = process.env.FF_MESSAGE_PRIORITY_ENABLED === 'true';
+
+/** Unacked queue TTL in seconds (10 minutes — covers reconnect window) */
+const UNACKED_QUEUE_TTL_SECONDS = 600;
+
+/** Message TTL per event type (milliseconds) */
+const MESSAGE_TTL_MS: Record<string, number> = {
+  'new_broadcast': 90_000,          // 90s — order expires at 5 min but show only recent
+  'new_truck_request': 90_000,      // 90s — same as new_broadcast
+  'accept_confirmation': 60_000,    // 60s — must be instant; stale = confusing
+  'order_cancelled': 300_000,       // 300s — must always arrive even on slow network
+  'order_expired': 300_000,         // 300s — critical lifecycle event
+  'trip_assigned': 120_000,         // 120s — driver must see this
+  'booking_updated': 120_000,       // 120s — important update
+  'trucks_remaining_update': 30_000 // 30s — informational only
+};
+
+/** Default TTL for events not in the map above */
+const DEFAULT_MESSAGE_TTL_MS = 120_000;
+
+/** Priority levels for message ordering */
+export const MessagePriority = {
+  CRITICAL: 1, // order_cancelled, trip_cancelled, driver_timeout
+  HIGH: 2,     // accept_confirmation, trip_assigned, booking_updated
+  NORMAL: 3,   // new_broadcast, new_truck_request
+  LOW: 4       // trucks_remaining_update, telemetry, driver_status_changed
+} as const;
+
+/** Map event types to priority levels */
+const EVENT_PRIORITY: Record<string, number> = {
+  'order_cancelled': MessagePriority.CRITICAL,
+  'order_expired': MessagePriority.CRITICAL,
+  'trip_cancelled': MessagePriority.CRITICAL,
+  'driver_timeout': MessagePriority.CRITICAL,
+  'accept_confirmation': MessagePriority.HIGH,
+  'trip_assigned': MessagePriority.HIGH,
+  'booking_updated': MessagePriority.HIGH,
+  'new_broadcast': MessagePriority.NORMAL,
+  'new_truck_request': MessagePriority.NORMAL,
+  'trucks_remaining_update': MessagePriority.LOW,
+  'driver_status_changed': MessagePriority.LOW
+};
+
+// =============================================================================
 // IN-MEMORY QUEUE (Development / Single Server)
 // =============================================================================
 
@@ -827,7 +884,80 @@ class QueueService {
         }
       }
 
-      emitToUser(transporterId, event, data);
+      // === PHASE 4: MESSAGE TTL ENFORCEMENT (flag-gated) ===
+      if (FF_MESSAGE_TTL_ENABLED) {
+        const ttlMs = MESSAGE_TTL_MS[event] ?? DEFAULT_MESSAGE_TTL_MS;
+        const ageMs = Date.now() - job.createdAt;
+        if (ageMs > ttlMs) {
+          metrics.incrementCounter('broadcast_delivery_stale_dropped', { event });
+          logger.info('[Phase4] Stale message dropped', {
+            transporterId, event, ageMs, ttlMs
+          });
+          return; // Drop silently
+        }
+      }
+
+      // === PHASE 4: SEQUENCE NUMBERING (flag-gated) ===
+      let seq: number | undefined;
+      if (FF_SEQUENCE_DELIVERY_ENABLED) {
+        try {
+          seq = await redisService.incr(`socket:seq:${transporterId}`);
+          const envelope = JSON.stringify({
+            seq, event, payload: data, createdAt: job.createdAt
+          });
+          await redisService.zAdd(
+            `socket:unacked:${transporterId}`,
+            seq,
+            envelope
+          );
+          await redisService.expire(
+            `socket:unacked:${transporterId}`,
+            UNACKED_QUEUE_TTL_SECONDS
+          );
+          // Attach seq to outgoing payload for client-side dedup
+          if (data && typeof data === 'object') {
+            data._seq = seq;
+          }
+        } catch (seqError: any) {
+          // Sequence numbering is best-effort — never block delivery
+          logger.warn('[Phase4] Sequence numbering failed, delivering without seq', {
+            transporterId, error: seqError?.message
+          });
+        }
+      }
+
+      // === PHASE 4: DUAL-CHANNEL DELIVERY (flag-gated) ===
+      if (FF_DUAL_CHANNEL_DELIVERY) {
+        const { sendPushNotification } = require('./fcm.service');
+        // Fire both channels in parallel — neither blocks the other
+        await Promise.allSettled([
+          // Channel A: Socket.IO (primary, foreground)
+          Promise.resolve().then(() => emitToUser(transporterId, event, data)),
+          // Channel B: FCM Push (fallback, background/offline)
+          sendPushNotification(transporterId, {
+            title: data?.pickupCity
+              ? `🚛 ${data.trucksNeeded || ''}x Truck Required`
+              : 'New Broadcast',
+            body: data?.pickupCity && data?.dropCity
+              ? `${data.pickupCity} → ${data.dropCity} • ₹${data.farePerTruck || ''}/truck`
+              : 'You have a new broadcast request',
+            data: {
+              type: event,
+              orderId: data?.orderId || data?.broadcastId || '',
+              broadcastId: data?.broadcastId || data?.orderId || '',
+              seq: seq?.toString() || ''
+            }
+          }).catch((fcmErr: any) => {
+            // FCM failure must never block delivery
+            logger.warn('[Phase4] FCM delivery failed', {
+              transporterId, error: fcmErr?.message
+            });
+          })
+        ]);
+      } else {
+        // Original path — Socket.IO only
+        emitToUser(transporterId, event, data);
+      }
     });
 
     // Push notification processor
@@ -889,11 +1019,16 @@ class QueueService {
     data: any,
     priority: number = 0
   ): Promise<string> {
+    // Phase 4: auto-assign priority from event type if flag enabled
+    const effectivePriority = FF_MESSAGE_PRIORITY_ENABLED
+      ? (EVENT_PRIORITY[event] ?? MessagePriority.NORMAL)
+      : priority;
+
     return this.queue.add(
       QueueService.QUEUES.BROADCAST,
       'broadcast',
       { transporterId, event, data },
-      { priority }
+      { priority: effectivePriority }
     );
   }
 
