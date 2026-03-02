@@ -1,9 +1,13 @@
 import { availabilityService } from '../../shared/services/availability.service';
 import { generateVehicleKey } from '../../shared/services/vehicle-key.service';
+import { h3GeoIndexService, FF_H3_INDEX_ENABLED } from '../../shared/services/h3-geo-index.service';
+import { logger } from '../../shared/services/logger.service';
 
 export interface RadiusStep {
   radiusKm: number;
   windowMs: number;
+  /** H3 ring count for this step (used when FF_H3_INDEX_ENABLED=true) */
+  h3RingK?: number;
 }
 
 export interface ProgressiveMatchState {
@@ -20,11 +24,38 @@ export interface CandidateTransporter {
   longitude: number;
 }
 
+// ============================================================================
+// PROGRESSIVE RADIUS STEPS
+// ============================================================================
+
+/** Original 3-step progression (default) */
 export const PROGRESSIVE_RADIUS_STEPS: RadiusStep[] = [
   { radiusKm: 10, windowMs: 20_000 },
   { radiusKm: 25, windowMs: 20_000 },
   { radiusKm: 30, windowMs: 20_000 }
 ];
+
+/**
+ * Extended 7-step progression with H3 ring mappings.
+ * Feature-flagged: FF_H3_RADIUS_STEPS_7=true
+ *
+ * Ring K → approximate radius: ringK × 0.461km (H3 res 8 edge length)
+ */
+const FF_H3_RADIUS_STEPS_7 = process.env.FF_H3_RADIUS_STEPS_7 === 'true';
+
+export const PROGRESSIVE_RADIUS_STEPS_7: RadiusStep[] = [
+  { radiusKm: 1.5, windowMs: 0, h3RingK: 2 },    // ~1.4 km, immediate
+  { radiusKm: 3.5, windowMs: 15_000, h3RingK: 5 },    // ~3.5 km
+  { radiusKm: 7, windowMs: 20_000, h3RingK: 10 },   // ~7 km
+  { radiusKm: 15, windowMs: 25_000, h3RingK: 22 },   // ~15 km
+  { radiusKm: 30, windowMs: 30_000, h3RingK: 44 },   // ~30 km
+  { radiusKm: 60, windowMs: 40_000, h3RingK: 88 },   // ~60 km
+  { radiusKm: 100, windowMs: 50_000, h3RingK: 150 }   // ~100 km
+];
+
+function getActiveSteps(): RadiusStep[] {
+  return FF_H3_RADIUS_STEPS_7 ? PROGRESSIVE_RADIUS_STEPS_7 : PROGRESSIVE_RADIUS_STEPS;
+}
 
 function toRadians(value: number): number {
   return value * (Math.PI / 180);
@@ -43,8 +74,13 @@ function haversineDistanceKm(lat1: number, lon1: number, lat2: number, lon2: num
 
 class ProgressiveRadiusMatcher {
   getStep(stepIndex: number): RadiusStep | undefined {
-    if (stepIndex < 0 || stepIndex >= PROGRESSIVE_RADIUS_STEPS.length) return undefined;
-    return PROGRESSIVE_RADIUS_STEPS[stepIndex];
+    const steps = getActiveSteps();
+    if (stepIndex < 0 || stepIndex >= steps.length) return undefined;
+    return steps[stepIndex];
+  }
+
+  getStepCount(): number {
+    return getActiveSteps().length;
   }
 
   async findCandidates(params: {
@@ -69,6 +105,27 @@ class ProgressiveRadiusMatcher {
     if (!step) return [];
 
     const vehicleKey = generateVehicleKey(vehicleType, vehicleSubtype);
+
+    // ========================================================================
+    // H3 PATH (Feature-flagged — default OFF)
+    // When enabled, uses H3 hex-cell lookup instead of GEORADIUS.
+    // Existing GEORADIUS path is untouched below.
+    // ========================================================================
+    if (FF_H3_INDEX_ENABLED && step.h3RingK !== undefined) {
+      return this.findCandidatesH3({
+        pickupLat,
+        pickupLng,
+        vehicleKey,
+        ringK: step.h3RingK,
+        radiusKm: step.radiusKm,
+        alreadyNotified,
+        limit
+      });
+    }
+
+    // ========================================================================
+    // ORIGINAL GEORADIUS PATH (always available, untouched)
+    // ========================================================================
     const nearby = await availabilityService.getAvailableTransportersWithDetails(
       vehicleKey,
       pickupLat,
@@ -99,6 +156,84 @@ class ProgressiveRadiusMatcher {
       .sort((left, right) => left.distanceKm - right.distanceKm)
       .slice(0, limit);
   }
+
+  // ==========================================================================
+  // H3 CANDIDATE FINDER (Private — only called when FF_H3_INDEX_ENABLED=true)
+  // ==========================================================================
+
+  private async findCandidatesH3(params: {
+    pickupLat: number;
+    pickupLng: number;
+    vehicleKey: string;
+    ringK: number;
+    radiusKm: number;
+    alreadyNotified: Set<string>;
+    limit: number;
+  }): Promise<CandidateTransporter[]> {
+    const { pickupLat, pickupLng, vehicleKey, ringK, radiusKm, alreadyNotified, limit } = params;
+
+    try {
+      // H3 candidate lookup — O(k) Redis SUNION
+      const candidateIds = await h3GeoIndexService.getCandidates(
+        pickupLat, pickupLng, vehicleKey, ringK, alreadyNotified
+      );
+
+      if (candidateIds.length === 0) return [];
+
+      // Load driver details to get lat/lng for distance calculation
+      const nearby = await availabilityService.getAvailableTransportersWithDetails(
+        vehicleKey,
+        pickupLat,
+        pickupLng,
+        Math.max(limit * 3, 200),
+        radiusKm
+      );
+
+      // Create a fast lookup set of H3 candidates
+      const h3CandidateSet = new Set(candidateIds);
+
+      // Filter to only H3 candidates, compute strict distance
+      const results = nearby
+        .filter(driver => h3CandidateSet.has(driver.transporterId))
+        .map(driver => ({
+          transporterId: driver.transporterId,
+          distanceKm: haversineDistanceKm(pickupLat, pickupLng, driver.latitude, driver.longitude),
+          latitude: driver.latitude,
+          longitude: driver.longitude
+        }))
+        .filter(c => c.distanceKm <= radiusKm && !alreadyNotified.has(c.transporterId))
+        .sort((a, b) => a.distanceKm - b.distanceKm)
+        .slice(0, limit);
+
+      logger.info('[RadiusMatcher] H3 candidate lookup', {
+        matchingSource: 'h3_index',
+        vehicleKey,
+        ringK,
+        radiusKm,
+        h3Candidates: candidateIds.length,
+        matched: results.length
+      });
+
+      return results;
+    } catch (error: any) {
+      // Fallback to GEORADIUS on H3 failure — zero latency regression
+      logger.warn(`[RadiusMatcher] H3 lookup failed, falling back to GEORADIUS: ${error.message}`);
+      const nearby = await availabilityService.getAvailableTransportersWithDetails(
+        vehicleKey, pickupLat, pickupLng, Math.max(limit * 2, 100), radiusKm
+      );
+      return nearby
+        .map(driver => ({
+          transporterId: driver.transporterId,
+          distanceKm: haversineDistanceKm(pickupLat, pickupLng, driver.latitude, driver.longitude),
+          latitude: driver.latitude,
+          longitude: driver.longitude
+        }))
+        .filter(c => c.distanceKm <= radiusKm && !alreadyNotified.has(c.transporterId))
+        .sort((a, b) => a.distanceKm - b.distanceKm)
+        .slice(0, limit);
+    }
+  }
 }
 
 export const progressiveRadiusMatcher = new ProgressiveRadiusMatcher();
+

@@ -115,6 +115,7 @@ interface IRedisClient {
   sScan(key: string, cursor: string, count?: number): Promise<[string, string[]]>;
   sIsMember(key: string, member: string): Promise<boolean>;
   sCard(key: string): Promise<number>;
+  sUnion(...keys: string[]): Promise<string[]>;
 
   // Hashes
   hSet(key: string, field: string, value: string): Promise<void>;
@@ -486,6 +487,15 @@ class InMemoryRedisClient implements IRedisClient {
     const entry = this.store.get(key);
     if (!entry || entry.type !== 'set') return 0;
     return entry.value.size;
+  }
+
+  async sUnion(...keys: string[]): Promise<string[]> {
+    const result = new Set<string>();
+    for (const key of keys) {
+      const members = await this.sMembers(key);
+      for (const m of members) result.add(m);
+    }
+    return Array.from(result);
   }
 
   // =========== Hashes ===========
@@ -994,6 +1004,11 @@ class RealRedisClient implements IRedisClient {
 
   async sCard(key: string): Promise<number> {
     return this.client.scard(key);
+  }
+
+  async sUnion(...keys: string[]): Promise<string[]> {
+    if (keys.length === 0) return [];
+    return this.client.sunion(...keys);
   }
 
   // =========== Hashes ===========
@@ -1688,6 +1703,10 @@ class RedisService {
 
   async sCard(key: string): Promise<number> {
     return this.client.sCard(key);
+  }
+
+  async sUnion(...keys: string[]): Promise<string[]> {
+    return this.client.sUnion(...keys);
   }
 
   // ===========================================================================

@@ -47,6 +47,7 @@ import { logger } from './logger.service';
 import { redisService, GeoMember } from './redis.service';
 import { db } from '../database/db';
 import { haversineDistanceKm } from '../utils/geospatial.utils';
+import { h3GeoIndexService } from './h3-geo-index.service';
 
 // =============================================================================
 // GEOHASH IMPLEMENTATION (Simple version - no external dependency)
@@ -343,6 +344,13 @@ class AvailabilityService {
         logger.debug(`[Availability] ${transporterId} on trip - removed from geo index`);
       }
 
+      // Shadow-build H3 index (fire-and-forget, zero latency impact)
+      if (!isOnTrip) {
+        h3GeoIndexService.updateLocation(transporterId, latitude, longitude, [vehicleKey]).catch(() => { });
+      } else {
+        h3GeoIndexService.removeTransporter(transporterId).catch(() => { });
+      }
+
     } catch (error: any) {
       logger.error(`[Availability] updateAvailabilityAsync failed: ${error.message}`);
       throw error;
@@ -439,6 +447,13 @@ class AvailabilityService {
     }
 
     logger.debug(`[Availability] Updated multi-vehicle index: ${transporterId} keys=${currentVehicleKeys.length}`);
+
+    // Shadow-build H3 index for all vehicle keys (fire-and-forget)
+    if (!isOnTrip) {
+      h3GeoIndexService.updateLocation(transporterId, latitude, longitude, currentVehicleKeys).catch(() => { });
+    } else {
+      h3GeoIndexService.removeTransporter(transporterId).catch(() => { });
+    }
   }
 
   /**
@@ -493,6 +508,9 @@ class AvailabilityService {
       await redisService.del(REDIS_KEYS.DRIVER_VEHICLE_KEYS(transporterId));
 
       logger.info(`[Availability] Offline: ${transporterId}`);
+
+      // Remove from H3 index (fire-and-forget)
+      h3GeoIndexService.removeTransporter(transporterId).catch(() => { });
 
     } catch (error: any) {
       logger.error(`[Availability] setOfflineAsync failed: ${error.message}`);

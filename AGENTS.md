@@ -235,10 +235,33 @@ curl -s http://weelo-alb-380596483.ap-south-1.elb.amazonaws.com/health | python3
 - ✅ `deliverMissedBroadcasts` — 30-minute time window + cap at 20 bookings
 - ✅ tsc — 0 errors, Tests — 54/54 passed, pushed `6b72d5e`
 
+### 2026-03-03 — Broadcast Dispatch System Upgrade (6-Phase PRD)
+
+**PRD Document:** See conversation artifact `weelo_dispatch_prd_v2.md`
+
+**CRITICAL RULES (NON-NEGOTIABLE):**
+- ⚠️ **ZERO latency regression** — do not touch anything that increases latency
+- ⚠️ **Broadcasts go to TRANSPORTERS ONLY** — never to drivers
+- ⚠️ **HTTP is intentional** — do not change transport layer
+- ⚠️ **All new algorithms behind feature flags, default OFF**
+- ⚠️ **Complete one phase at a time** — do not combine phases
+
+**6 Phases (in order):**
+1. **Phase 1 — Edge Layer & Request Hardening** — 24h idempotency, rate limits, one-active-order
+2. **Phase 2 — H3 Geo-Index** — hexagonal grid candidate lookup (`h3-js`), 7 progressive steps 
+3. **Phase 3 — Google Directions API ETA Scoring** — road-time ETA for top-20 candidates, cached 3 min
+4. **Phase 4 — Guaranteed Delivery (2G/3G safe)** — seq-numbered messages, priority buckets, TTLs, FCM parallel
+5. **Phase 5 — Resilience** — circuit breakers, adaptive fanout, backpressure controls
+6. **Phase 6 — Observability** — metrics, SLO dashboards, pre-deploy latency gates
+
+**Current Status:** Phase 1 in progress.
+
 ### What to do next session
 
-1. Run the "fetch CodeRabbit comments" command above to get the latest verdict
-2. Fix remaining issues in priority order: CRITICAL → MAJOR → MINOR → NITPICK
-3. Push + trigger re-review
-4. Repeat until CodeRabbit approves / no actionable comments remain
-5. Merge `review/coderabbit-full-pass` → `main` and deploy to AWS
+1. Check which phase is current (see Phase status above)
+2. Read the PRD v2 artifact for full technical details of each phase
+3. Complete the current phase fully before moving to next
+4. Run `tsc --noEmit` — ZERO errors before any commit
+5. Run tests — all must pass
+6. Push + trigger CodeRabbit re-review
+7. Update this session log with what was done

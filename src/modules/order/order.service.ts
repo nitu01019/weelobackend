@@ -40,6 +40,7 @@ import { redisService } from '../../shared/services/redis.service';
 import { pricingService } from '../pricing/pricing.service';
 import { AppError } from '../../shared/types/error.types';
 import { PROGRESSIVE_RADIUS_STEPS, progressiveRadiusMatcher } from './progressive-radius-matcher';
+import { candidateScorerService } from '../../shared/services/candidate-scorer.service';
 import { metrics } from '../../shared/monitoring/metrics.service';
 import { truckHoldService } from '../truck-hold/truck-hold.service';
 
@@ -2037,13 +2038,13 @@ class OrderService {
       // ==========================================================================
       // IDEMPOTENCY CACHE - Store response for future retries
       // ==========================================================================
-      // SCALABILITY: 5 minute TTL prevents duplicate processing
-      // EASY UNDERSTANDING: Client can safely retry failed requests
-      // MODULARITY: Automatic cleanup via Redis TTL
+      // SCALABILITY: 24-hour TTL prevents duplicate processing across network retries
+      // EASY UNDERSTANDING: Client can safely retry failed requests, even hours later
+      // MODULARITY: Automatic cleanup via Redis TTL; DB backup is permanent
       // ==========================================================================
       if (request.idempotencyKey) {
         const cacheKey = `idempotency:${request.customerId}:${request.idempotencyKey}`;
-        const ttl = 300; // 5 minutes
+        const ttl = 86_400; // 24 hours — covers all realistic mobile retry windows
 
         try {
           await redisService.set(cacheKey, JSON.stringify(orderResponse), ttl);
@@ -2113,7 +2114,14 @@ class OrderService {
         stepIndex: 0,
         alreadyNotified
       });
-      const targetTransporters = stepCandidates.map((candidate) => candidate.transporterId);
+
+      // Phase 3: Score candidates by ETA (feature-flagged, default OFF → no-op sort)
+      const scoredCandidates = await candidateScorerService.scoreAndRank(
+        stepCandidates,
+        resolvedPickup.latitude,
+        resolvedPickup.longitude
+      );
+      const targetTransporters = scoredCandidates.map((c) => c.transporterId);
       onlineCandidates += targetTransporters.length;
 
       if (targetTransporters.length > 0) {
@@ -2148,7 +2156,7 @@ class OrderService {
     vehicleSubtype: string;
     stepIndex: number;
   }): Promise<void> {
-    const step = PROGRESSIVE_RADIUS_STEPS[timerData.stepIndex];
+    const step = progressiveRadiusMatcher.getStep(timerData.stepIndex);
     if (!step) return;
 
     const order = await db.getOrderById(timerData.orderId);
@@ -2178,7 +2186,14 @@ class OrderService {
       stepIndex: timerData.stepIndex,
       alreadyNotified
     });
-    const targetTransporters = stepCandidates.map((candidate) => candidate.transporterId);
+
+    // Phase 3: Score candidates by ETA (feature-flagged)
+    const scoredCandidates = await candidateScorerService.scoreAndRank(
+      stepCandidates,
+      order.pickup.latitude,
+      order.pickup.longitude
+    );
+    const targetTransporters = scoredCandidates.map((c) => c.transporterId);
 
     if (targetTransporters.length === 0) {
       await this.scheduleNextProgressiveStep(
