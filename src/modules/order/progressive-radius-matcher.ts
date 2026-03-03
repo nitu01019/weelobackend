@@ -112,15 +112,23 @@ class ProgressiveRadiusMatcher {
     // Existing GEORADIUS path is untouched below.
     // ========================================================================
     if (FF_H3_INDEX_ENABLED && step.h3RingK !== undefined) {
-      return this.findCandidatesH3({
-        pickupLat,
-        pickupLng,
-        vehicleKey,
-        ringK: step.h3RingK,
-        radiusKm: step.radiusKm,
-        alreadyNotified,
-        limit
-      });
+      // Phase 5: Circuit breaker wraps H3 lookup. When circuit OPEN,
+      // falls through to GEORADIUS path below (returns undefined → skips early return).
+      const { h3Circuit } = require('../../shared/services/circuit-breaker.service');
+      const h3Result = await h3Circuit.tryWithFallback(
+        () => this.findCandidatesH3({
+          pickupLat,
+          pickupLng,
+          vehicleKey,
+          ringK: step.h3RingK!,
+          radiusKm: step.radiusKm,
+          alreadyNotified,
+          limit
+        }),
+        async () => undefined as any // fallback = fall through to GEORADIUS below
+      );
+      if (h3Result !== undefined) return h3Result;
+      // Circuit is OPEN — fall through to GEORADIUS path
     }
 
     // ========================================================================

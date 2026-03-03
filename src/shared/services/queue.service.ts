@@ -126,6 +126,12 @@ const EVENT_PRIORITY: Record<string, number> = {
   'driver_status_changed': MessagePriority.LOW
 };
 
+/** Phase 5: Queue depth cap for broadcast backpressure */
+const FF_QUEUE_DEPTH_CAP = Math.max(
+  100,
+  parseInt(process.env.FF_QUEUE_DEPTH_CAP || '10000', 10) || 10000
+);
+
 // =============================================================================
 // IN-MEMORY QUEUE (Development / Single Server)
 // =============================================================================
@@ -705,6 +711,8 @@ class QueueService {
   private readonly trackingStreamSink = createTrackingStreamSink();
   private trackingDepthSnapshot: { depth: number; sampledAtMs: number } = { depth: 0, sampledAtMs: 0 };
   private trackingDepthSampleInFlight: Promise<void> | null = null;
+  private broadcastDepthSnapshot: { depth: number; sampledAtMs: number } = { depth: 0, sampledAtMs: 0 };
+  private broadcastDepthSampleInFlight: Promise<void> | null = null;
   private readonly cancelledOrderQueueGuardEnabled = FF_CANCELLED_ORDER_QUEUE_GUARD;
   private readonly cancelledOrderQueueGuardFailOpen = FF_CANCELLED_ORDER_QUEUE_GUARD_FAIL_OPEN;
   private readonly inactiveOrderStatuses = new Set(['cancelled', 'expired', 'completed', 'fully_filled']);
@@ -931,37 +939,65 @@ class QueueService {
       }
 
       // === PHASE 4: DUAL-CHANNEL DELIVERY (flag-gated) ===
+      // Phase 6: Measure delivery latency from enqueue to completion
+      const deliveryStart = Date.now();
       if (FF_DUAL_CHANNEL_DELIVERY) {
         const { sendPushNotification } = require('./fcm.service');
         // Fire both channels in parallel — neither blocks the other
-        await Promise.allSettled([
+        const results = await Promise.allSettled([
           // Channel A: Socket.IO (primary, foreground)
-          Promise.resolve().then(() => emitToUser(transporterId, event, data)),
+          Promise.resolve().then(() => {
+            emitToUser(transporterId, event, data);
+            metrics.incrementCounter('broadcast_delivery_delivered', { channel: 'socket' });
+          }),
           // Channel B: FCM Push (fallback, background/offline)
-          sendPushNotification(transporterId, {
-            title: data?.pickupCity
-              ? `🚛 ${data.trucksNeeded || ''}x Truck Required`
-              : 'New Broadcast',
-            body: data?.pickupCity && data?.dropCity
-              ? `${data.pickupCity} → ${data.dropCity} • ₹${data.farePerTruck || ''}/truck`
-              : 'You have a new broadcast request',
-            data: {
-              type: event,
-              orderId: data?.orderId || data?.broadcastId || '',
-              broadcastId: data?.broadcastId || data?.orderId || '',
-              seq: seq?.toString() || ''
-            }
-          }).catch((fcmErr: any) => {
-            // FCM failure must never block delivery
-            logger.warn('[Phase4] FCM delivery failed', {
-              transporterId, error: fcmErr?.message
-            });
-          })
+          // Phase 5: fcmCircuit wraps FCM — when open, skips FCM entirely
+          (async () => {
+            const { fcmCircuit } = require('./circuit-breaker.service');
+            return fcmCircuit.tryWithFallback(
+              async () => {
+                await sendPushNotification(transporterId, {
+                  title: data?.pickupCity
+                    ? `🚛 ${data.trucksNeeded || ''}x Truck Required`
+                    : 'New Broadcast',
+                  body: data?.pickupCity && data?.dropCity
+                    ? `${data.pickupCity} → ${data.dropCity} • ₹${data.farePerTruck || ''}/truck`
+                    : 'You have a new broadcast request',
+                  data: {
+                    type: event,
+                    orderId: data?.orderId || data?.broadcastId || '',
+                    broadcastId: data?.broadcastId || data?.orderId || '',
+                    seq: seq?.toString() || ''
+                  }
+                });
+                metrics.incrementCounter('broadcast_delivery_delivered', { channel: 'fcm' });
+              },
+              async () => {
+                // Fallback: skip FCM (Socket.IO is primary anyway)
+                logger.info('[Phase5] FCM circuit open, skipping FCM delivery', {
+                  transporterId, event
+                });
+              }
+            );
+          })()
         ]);
+        // Phase 6: Record failures
+        for (const r of results) {
+          if (r.status === 'rejected') {
+            metrics.incrementCounter('broadcast_delivery_failed', {
+              channel: 'unknown', reason: r.reason?.message || 'unknown'
+            });
+          }
+        }
       } else {
         // Original path — Socket.IO only
         emitToUser(transporterId, event, data);
+        metrics.incrementCounter('broadcast_delivery_delivered', { channel: 'socket' });
       }
+      // Phase 6: Delivery latency (enqueue → emit completion)
+      metrics.observeHistogram('broadcast_delivery_latency_ms', Date.now() - deliveryStart, {
+        channel: FF_DUAL_CHANNEL_DELIVERY ? 'dual' : 'socket'
+      });
     });
 
     // Push notification processor
@@ -1023,10 +1059,26 @@ class QueueService {
     data: any,
     priority: number = 0
   ): Promise<string> {
+    // Phase 5: Queue depth backpressure — sampled check (every 2s, not per-call)
+    await this.refreshBroadcastQueueDepth();
+    if (this.broadcastDepthSnapshot.depth >= FF_QUEUE_DEPTH_CAP) {
+      metrics.incrementCounter('broadcast_queue_backpressure_rejected', { event });
+      logger.warn('[Phase5] Broadcast queue depth exceeded cap', {
+        transporterId, event, depth: this.broadcastDepthSnapshot.depth, cap: FF_QUEUE_DEPTH_CAP
+      });
+      throw new Error(`Broadcast queue depth ${this.broadcastDepthSnapshot.depth} exceeds cap ${FF_QUEUE_DEPTH_CAP}`);
+    }
+
     // Phase 4: auto-assign priority from event type if flag enabled
     const effectivePriority = FF_MESSAGE_PRIORITY_ENABLED
       ? (EVENT_PRIORITY[event] ?? MessagePriority.NORMAL)
       : priority;
+
+    // Phase 6: Track enqueue count by channel and priority
+    metrics.incrementCounter('broadcast_delivery_enqueued', {
+      channel: FF_DUAL_CHANNEL_DELIVERY ? 'dual' : 'socket',
+      priority: String(effectivePriority)
+    });
 
     return this.queue.add(
       QueueService.QUEUES.BROADCAST,
@@ -1145,6 +1197,37 @@ class QueueService {
 
     await this.trackingDepthSampleInFlight;
     this.trackingDepthSampleInFlight = null;
+  }
+
+  private async refreshBroadcastQueueDepth(): Promise<void> {
+    const nowMs = Date.now();
+    // Sample every 2 seconds — avoids per-call Redis overhead
+    if (nowMs - this.broadcastDepthSnapshot.sampledAtMs < 2000) return;
+
+    if (this.broadcastDepthSampleInFlight) {
+      await this.broadcastDepthSampleInFlight;
+      return;
+    }
+
+    this.broadcastDepthSampleInFlight = (async () => {
+      try {
+        const depth = await this.queue.getQueueDepth(QueueService.QUEUES.BROADCAST);
+        this.broadcastDepthSnapshot = { depth, sampledAtMs: Date.now() };
+        metrics.setGauge('broadcast_queue_depth', depth);
+        if (depth >= Math.floor(FF_QUEUE_DEPTH_CAP * 0.8)) {
+          logger.warn('[Phase5] Broadcast queue depth nearing cap', {
+            depth, cap: FF_QUEUE_DEPTH_CAP
+          });
+        }
+      } catch (error: any) {
+        logger.warn('[Phase5] Failed to sample broadcast queue depth', {
+          message: error?.message || 'unknown'
+        });
+      }
+    })();
+
+    await this.broadcastDepthSampleInFlight;
+    this.broadcastDepthSampleInFlight = null;
   }
 
   /**
