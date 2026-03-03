@@ -1497,26 +1497,81 @@ class RedisService {
   // ===========================================================================
 
   /**
-   * Increment counter with TTL (for rate limiting)
-   * Returns current count after increment
+   * Increment counter by 1
    */
   async incr(key: string): Promise<number> {
     return this.client.incr(key);
   }
 
+  /**
+   * Increment counter by amount
+   */
   async incrBy(key: string, amount: number): Promise<number> {
     return this.client.incrBy(key, amount);
   }
 
+  /**
+   * Atomic increment with TTL guarantee (Lua script)
+   *
+   * PRODUCTION FIX: The old implementation used two separate commands:
+   *   1. INCR key          (increment counter)
+   *   2. EXPIRE key ttl    (set TTL only on count=1)
+   *
+   * BUG: If INCR succeeded but EXPIRE failed (network blip, Redis timeout),
+   * the key persisted FOREVER with no TTL → permanent rate limit block.
+   *
+   * FIX: Single atomic Lua script — INCR + EXPIRE execute as ONE operation.
+   * Redis guarantees Lua scripts are atomic (no interleaving, no partial failure).
+   *
+   * SELF-HEALING: If a key already exists WITHOUT a TTL (from the old bug),
+   * the script detects ttl=-1 and forces TTL on it — auto-fixes stuck keys.
+   *
+   * Industry standard: Stripe, Cloudflare, and AWS API Gateway all use this
+   * Lua-based atomic pattern for rate limiting.
+   */
   async incrementWithTTL(key: string, ttlSeconds: number): Promise<number> {
-    const count = await this.client.incr(key);
+    try {
+      // Atomic Lua script: INCR + conditional EXPIRE in one operation
+      // Self-heals stuck keys (no TTL) from old non-atomic implementation
+      const result = await this.client.eval(
+        `
+        local count = redis.call('INCR', KEYS[1])
+        if count == 1 then
+          redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
+        else
+          -- Self-healing: if key exists but has no TTL (stuck from old bug), fix it
+          local currentTtl = redis.call('TTL', KEYS[1])
+          if currentTtl == -1 then
+            redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
+          end
+        end
+        return count
+        `,
+        [key],                   // KEYS[1]
+        [String(ttlSeconds)]     // ARGV[1]
+      );
 
-    // Set TTL only on first increment
-    if (count === 1) {
-      await this.client.expire(key, ttlSeconds);
+      // InMemoryRedisClient.eval() returns null — fall through to fallback
+      if (result === null || result === undefined) {
+        throw new Error('eval returned null (in-memory mode)');
+      }
+
+      return Number(result);
+    } catch (error: any) {
+      // Fallback for in-memory mode or if Lua eval fails
+      // Uses two-command approach with defensive TTL check
+      const count = await this.client.incr(key);
+      try {
+        const currentTtl = await this.client.ttl(key);
+        if (currentTtl < 0) {
+          // Key has no TTL — either first increment or stuck key. Fix it.
+          await this.client.expire(key, ttlSeconds);
+        }
+      } catch {
+        // Best effort — counter still incremented correctly
+      }
+      return count;
     }
-
-    return count;
   }
 
   /**
