@@ -901,19 +901,23 @@ class QueueService {
       let seq: number | undefined;
       if (FF_SEQUENCE_DELIVERY_ENABLED) {
         try {
+          // Step 1: increment seq counter (must be sequential — need value)
           seq = await redisService.incr(`socket:seq:${transporterId}`);
           const envelope = JSON.stringify({
             seq, event, payload: data, createdAt: job.createdAt
           });
-          await redisService.zAdd(
-            `socket:unacked:${transporterId}`,
-            seq,
-            envelope
-          );
-          await redisService.expire(
-            `socket:unacked:${transporterId}`,
-            UNACKED_QUEUE_TTL_SECONDS
-          );
+          // Step 2: store in unacked set + refresh TTL (parallel — independent ops)
+          await Promise.all([
+            redisService.zAdd(
+              `socket:unacked:${transporterId}`,
+              seq,
+              envelope
+            ),
+            redisService.expire(
+              `socket:unacked:${transporterId}`,
+              UNACKED_QUEUE_TTL_SECONDS
+            )
+          ]);
           // Attach seq to outgoing payload for client-side dedup
           if (data && typeof data === 'object') {
             data._seq = seq;
