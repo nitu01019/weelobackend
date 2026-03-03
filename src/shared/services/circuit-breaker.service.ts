@@ -80,6 +80,21 @@ export class CircuitBreaker {
     private readonly openKey: string;
     private readonly probeLockKey: string;
 
+    // ==========================================================================
+    // IN-MEMORY FALLBACK — When Redis Is Down
+    // ==========================================================================
+    // Without this: Redis down → recordFailure() silently fails → failures never
+    // counted → circuit never opens → cascading failures to downstream services.
+    //
+    // With this: Each ECS instance tracks failures locally. Not shared across
+    // instances, but still protects THIS instance from cascading failures.
+    //
+    // Industry standard (Uber): In-memory circuit breaker state with Redis
+    // sharing. If Redis is down, each instance maintains its own local state.
+    // ==========================================================================
+    private localFailureTimestamps: number[] = [];
+    private localOpenUntil: number = 0;
+
     constructor(name: string, options: CircuitBreakerOptions = {}) {
         this.name = name;
         this.threshold = options.threshold ?? DEFAULT_THRESHOLD;
@@ -160,9 +175,20 @@ export class CircuitBreaker {
             const isOpen = await redisService.get(this.openKey);
             return isOpen === '1' ? CircuitState.OPEN : CircuitState.CLOSED;
         } catch {
-            // Redis down → assume CLOSED (optimistic — try primary)
-            return CircuitState.CLOSED;
+            // Redis down → check local in-memory state instead of blindly assuming CLOSED
+            return this.getLocalState();
         }
+    }
+
+    /**
+     * Get circuit state from in-memory fallback.
+     * Used when Redis is unreachable.
+     */
+    private getLocalState(): CircuitState {
+        if (Date.now() < this.localOpenUntil) {
+            return CircuitState.OPEN;
+        }
+        return CircuitState.CLOSED;
     }
 
     /**
@@ -189,6 +215,9 @@ export class CircuitBreaker {
      * Record a failure. If threshold exceeded → open circuit.
      */
     private async recordFailure(): Promise<void> {
+        // Always record locally (zero-cost, in-memory) — serves as Redis fallback
+        this.recordLocalFailure();
+
         try {
             const count = await redisService.incr(this.failureKey);
             await redisService.expire(this.failureKey, this.windowSeconds);
@@ -201,8 +230,31 @@ export class CircuitBreaker {
                 metrics.incrementCounter('circuit_breaker_open', { service: this.name });
             }
         } catch {
-            // Recording failure failed — don't crash the caller
-            logger.warn(`[CircuitBreaker] Failed to record failure for ${this.name}`);
+            // Redis down — local fallback already recorded above
+            logger.warn(`[CircuitBreaker] Redis unavailable, using local fallback for ${this.name}`);
+        }
+    }
+
+    /**
+     * Record failure in local in-memory counter.
+     * Prunes timestamps outside the sliding window.
+     * Opens circuit locally if threshold exceeded.
+     */
+    private recordLocalFailure(): void {
+        const now = Date.now();
+        const windowStart = now - (this.windowSeconds * 1000);
+
+        // Prune old entries outside the sliding window
+        this.localFailureTimestamps = this.localFailureTimestamps.filter(ts => ts > windowStart);
+
+        // Add current failure
+        this.localFailureTimestamps.push(now);
+
+        // Check threshold
+        if (this.localFailureTimestamps.length >= this.threshold) {
+            this.localOpenUntil = now + (this.openDurationSeconds * 1000);
+            logger.error(`[CircuitBreaker] OPEN (local): ${this.name} (${this.localFailureTimestamps.length} failures in ${this.windowSeconds}s window)`);
+            metrics.incrementCounter('circuit_breaker_open', { service: this.name, source: 'local' });
         }
     }
 
@@ -210,8 +262,12 @@ export class CircuitBreaker {
      * Record success. Close circuit — remove open flag, failure counter, probe lock.
      */
     private async recordSuccess(): Promise<void> {
+        // Always reset local state
+        this.localFailureTimestamps = [];
+        this.localOpenUntil = 0;
+
         try {
-            // Reset all circuit state
+            // Reset all Redis circuit state
             await Promise.all([
                 redisService.del(this.failureKey),
                 redisService.del(this.openKey),
@@ -221,8 +277,8 @@ export class CircuitBreaker {
             logger.info(`[CircuitBreaker] CLOSED: ${this.name} (probe success)`);
             metrics.incrementCounter('circuit_breaker_closed', { service: this.name });
         } catch {
-            // Best-effort
-            logger.warn(`[CircuitBreaker] Failed to record success for ${this.name}`);
+            // Redis down — local state already reset above
+            logger.warn(`[CircuitBreaker] Redis unavailable, local state reset for ${this.name}`);
         }
     }
 }
