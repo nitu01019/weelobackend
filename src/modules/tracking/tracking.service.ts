@@ -1652,6 +1652,44 @@ class TrackingService {
             message: `Driver (${location.vehicleNumber}) hasn't sent GPS for ${Math.round(ageSeconds / 60)} minutes`
           });
 
+          // === CASE 5.2 FIX: Also notify the CUSTOMER if this driver has an active trip ===
+          if (location.tripId) {
+            try {
+              const assignment = await prismaClient.assignment.findFirst({
+                where: { tripId: location.tripId, status: { in: ['pending', 'driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit'] } },
+                select: {
+                  driverName: true,
+                  vehicleNumber: true,
+                  booking: { select: { customerId: true } },
+                  order: { select: { customerId: true } }
+                }
+              });
+              const customerId = assignment?.booking?.customerId || assignment?.order?.customerId;
+              if (customerId) {
+                emitToUser(customerId, 'driver_connectivity_issue', {
+                  tripId: location.tripId,
+                  driverName: assignment?.driverName || location.vehicleNumber,
+                  vehicleNumber: assignment?.vehicleNumber || location.vehicleNumber,
+                  lastSeenSeconds: Math.round(ageSeconds),
+                  message: `Your driver may have poor connectivity. We're monitoring the situation.`,
+                  timestamp: new Date().toISOString()
+                });
+                queueService.queuePushNotification(customerId, {
+                  title: '⚠️ Driver connectivity issue',
+                  body: `${assignment?.driverName || location.vehicleNumber} may have poor network. Your trip is still active.`,
+                  data: {
+                    type: 'driver_connectivity_issue',
+                    tripId: location.tripId,
+                    vehicleNumber: assignment?.vehicleNumber || location.vehicleNumber
+                  }
+                }).catch(() => { }); // Fire-and-forget
+              }
+            } catch (lookupError: any) {
+              // Non-critical — transporter notification already sent
+              logger.warn('[OFFLINE CHECKER] Customer lookup failed (non-fatal)', { tripId: location.tripId, error: lookupError?.message });
+            }
+          }
+
           queueService.queuePushNotification(transporterId, {
             title: '⚠️ Driver May Be Offline',
             body: `${location.vehicleNumber} hasn't sent GPS for ${Math.round(ageSeconds / 60)} min`,
