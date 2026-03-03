@@ -9,7 +9,7 @@
  * =============================================================================
  */
 
-import { PrismaClient, UserRole, VehicleStatus, BookingStatus, OrderStatus, TruckRequestStatus, AssignmentStatus } from '@prisma/client';
+import { PrismaClient, Prisma, UserRole, VehicleStatus, BookingStatus, OrderStatus, TruckRequestStatus, AssignmentStatus } from '@prisma/client';
 import { logger } from '../services/logger.service';
 import { generateVehicleKey, generateVehicleKeyCandidates } from '../services/vehicle-key.service';
 
@@ -313,6 +313,53 @@ function getPrismaClient(): PrismaClient {
   }
   return prisma;
 }
+
+// =============================================================================
+// withDbTimeout — Enforces statement_timeout on critical transactions
+// =============================================================================
+//
+// WHY: The TIMEOUTS.DB_QUERY constant (10s) is defined but was never enforced
+// at the PostgreSQL level. pool_timeout only controls how long to WAIT for a
+// free connection — not how long a query runs. A slow query (lock wait, table
+// scan, deadlock resolution) can hold a connection for minutes, exhausting
+// the pool and causing cascading 503s across all users.
+//
+// HOW: SET LOCAL statement_timeout applies within this transaction only (no
+// global side-effects). If the query exceeds timeoutMs, PostgreSQL aborts it
+// with a QueryCanceledError, which propagates to the caller as a 500/503.
+//
+// USAGE: Replace prismaClient.$transaction(...) with withDbTimeout(fn, opts)
+// for all user-facing critical paths.
+// =============================================================================
+
+const DB_STATEMENT_TIMEOUT_MS = parseInt(
+  process.env.DB_STATEMENT_TIMEOUT_MS || '8000',
+  10
+);
+
+export async function withDbTimeout<T>(
+  fn: (tx: Prisma.TransactionClient) => Promise<T>,
+  options: {
+    isolationLevel?: Prisma.TransactionIsolationLevel;
+    timeoutMs?: number;
+  } = {}
+): Promise<T> {
+  const timeoutMs = options.timeoutMs ?? DB_STATEMENT_TIMEOUT_MS;
+
+  return prismaClient.$transaction(
+    async (tx) => {
+      // SET LOCAL — applies only within this transaction, zero global impact
+      await tx.$executeRawUnsafe(`SET LOCAL statement_timeout = ${timeoutMs}`);
+      return fn(tx);
+    },
+    {
+      isolationLevel: options.isolationLevel,
+      // Prisma-level timeout is 2s above statement_timeout as safety buffer
+      timeout: timeoutMs + 2000
+    }
+  );
+}
+
 
 // =============================================================================
 // PRISMA DATABASE SERVICE CLASS

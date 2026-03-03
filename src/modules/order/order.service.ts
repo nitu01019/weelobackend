@@ -26,7 +26,7 @@ import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { Prisma } from '@prisma/client';
 import { db, OrderRecord, TruckRequestRecord } from '../../shared/database/db';
-import { prismaClient, OrderStatus, AssignmentStatus, VehicleStatus, BookingStatus, TruckRequestStatus } from '../../shared/database/prisma.service';
+import { prismaClient, withDbTimeout, OrderStatus, AssignmentStatus, VehicleStatus, BookingStatus, TruckRequestStatus } from '../../shared/database/prisma.service';
 import { logger } from '../../shared/services/logger.service';
 import { emitToUser, emitToUsers } from '../../shared/services/socket.service';
 import { sendPushNotification } from '../../shared/services/fcm.service';
@@ -1865,7 +1865,8 @@ class OrderService {
 
       // Narrow serializable transaction: duplicate-check + order + truckRequests + dispatch outbox bootstrap.
       // This removes the crash window where order exists but outbox row does not.
-      await prismaClient.$transaction(async (tx) => {
+      // withDbTimeout enforces statement_timeout=8s inside the TX — prevents pool exhaustion on DB slowness.
+      await withDbTimeout(async (tx) => {
         const dupBooking = await tx.booking.findFirst({
           where: { customerId: request.customerId, status: { in: [BookingStatus.created, BookingStatus.broadcasting, BookingStatus.active, BookingStatus.partially_filled] } }
         });
@@ -1929,7 +1930,7 @@ class OrderService {
         if (FF_ORDER_DISPATCH_OUTBOX) {
           await this.enqueueOrderDispatchOutbox(orderId, tx);
         }
-      }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+      }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable, timeoutMs: 8000 });
 
       // Emit lifecycle state: created
       this.emitBroadcastStateChanged(request.customerId, {
@@ -3598,7 +3599,8 @@ class OrderService {
       AssignmentStatus.in_transit
     ];
 
-    await prismaClient.$transaction(async (tx) => {
+    // withDbTimeout enforces statement_timeout=8s inside the TX — prevents pool exhaustion on DB slowness.
+    await withDbTimeout(async (tx) => {
       const order = await tx.order.findUnique({ where: { id: orderId } });
       if (!order) {
         statusCode = 404;
@@ -3989,7 +3991,7 @@ class OrderService {
         eventVersion: lifecyclePayload.eventVersion,
         serverTimeMs
       };
-    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable, timeoutMs: 8000 });
 
     if (result.success) {
       await redisService.cancelTimer(this.TIMER_KEYS.ORDER_EXPIRY(orderId));
@@ -4074,7 +4076,8 @@ class OrderService {
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
-        txResult = await prismaClient.$transaction(async (tx) => {
+        // withDbTimeout enforces statement_timeout=6s inside the TX — tighter budget for accept flow.
+        txResult = await withDbTimeout(async (tx) => {
           // ----- Read all data inside the transaction -----
           const truckRequest = await tx.truckRequest.findUnique({
             where: { id: truckRequestId }
@@ -4271,7 +4274,7 @@ class OrderService {
             transporterPhone: transporter?.phone || '',
             now
           };
-        }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+        }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable, timeoutMs: 6000 });
 
         // Transaction succeeded, break out of retry loop
         break;
