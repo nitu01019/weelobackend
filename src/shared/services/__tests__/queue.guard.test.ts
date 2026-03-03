@@ -45,6 +45,12 @@ describe('Queue broadcast inactive-order guard', () => {
     jest.clearAllMocks();
   });
 
+  afterAll(() => {
+    jest.restoreAllMocks();
+    // Clear any lingering timers from queue depth samplers
+    jest.useRealTimers();
+  });
+
   it('drops stale new_broadcast when order is inactive (fail-closed)', async () => {
     const service = await loadQueueService({
       failOpen: false,
