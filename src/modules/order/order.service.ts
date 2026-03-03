@@ -2224,6 +2224,22 @@ class OrderService {
 
     if (targetTransporters.length === 0) {
       metrics.incrementCounter('broadcast_skipped_no_available', { vehicleType: timerData.vehicleType });
+
+      // Check if this is the LAST step — if so, and no transporters were ever
+      // notified, tell the customer immediately instead of waiting for full timeout.
+      const nextStep = progressiveRadiusMatcher.getStep(timerData.stepIndex + 1);
+      if (!nextStep && alreadyNotified.size === 0) {
+        logger.info(`📭 No transporters found for ${timerData.vehicleType} after all radius steps — notifying customer`);
+        emitToUser(order.customerId, 'no_transporters_available', {
+          orderId: timerData.orderId,
+          vehicleType: timerData.vehicleType,
+          vehicleSubtype: timerData.vehicleSubtype,
+          reason: 'no_transporters_in_area',
+          message: 'No transporters available in your area right now. Your request will remain active until timeout.',
+          timestamp: new Date().toISOString()
+        });
+      }
+
       await this.scheduleNextProgressiveStep(
         timerData.orderId,
         timerData.vehicleType,
