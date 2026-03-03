@@ -71,17 +71,17 @@ class MetricsService {
   private gauges: Map<string, GaugeMetric> = new Map();
   private histograms: Map<string, HistogramMetric> = new Map();
   private httpRequestSamples: HttpRequestSample[] = [];
-  
+
   // Pre-defined histogram buckets (in milliseconds for latency)
   private readonly latencyBuckets = [5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
   private readonly maxHttpRequestSamples = 40000;
   private readonly maxHttpSampleWindowMs = 15 * 60 * 1000;
-  
+
   constructor() {
     this.initializeDefaultMetrics();
     this.startSystemMetricsCollection();
   }
-  
+
   /**
    * Initialize default metrics
    */
@@ -92,7 +92,7 @@ class MetricsService {
       help: 'Total number of HTTP requests',
       labels: {}
     });
-    
+
     // HTTP request duration histogram
     this.histograms.set('http_request_duration_ms', {
       name: 'http_request_duration_ms',
@@ -103,14 +103,14 @@ class MetricsService {
       sum: new Map(),
       count: new Map()
     });
-    
+
     // Database query counter
     this.counters.set('db_queries_total', {
       name: 'db_queries_total',
       help: 'Total number of database queries',
       labels: {}
     });
-    
+
     // Database query duration
     this.histograms.set('db_query_duration_ms', {
       name: 'db_query_duration_ms',
@@ -121,14 +121,14 @@ class MetricsService {
       sum: new Map(),
       count: new Map()
     });
-    
+
     // Cache metrics
     this.counters.set('cache_hits_total', {
       name: 'cache_hits_total',
       help: 'Total number of cache hits',
       labels: {}
     });
-    
+
     this.counters.set('cache_misses_total', {
       name: 'cache_misses_total',
       help: 'Total number of cache misses',
@@ -244,34 +244,124 @@ class MetricsService {
       help: 'Total blocked-stage cancel disputes created',
       labels: {}
     });
-    
+
+    // =========================================================================
+    // Phase 6: Dispatch Pipeline Metrics
+    // =========================================================================
+
+    this.histograms.set('broadcast_candidate_lookup_ms', {
+      name: 'broadcast_candidate_lookup_ms',
+      help: 'Candidate lookup latency (H3 or GEORADIUS) per progressive step',
+      buckets: [1, 2, 5, 10, 20, 50, 100, 250, 500],
+      values: new Map(),
+      bucketCounts: new Map(),
+      sum: new Map(),
+      count: new Map()
+    });
+
+    this.histograms.set('broadcast_scoring_ms', {
+      name: 'broadcast_scoring_ms',
+      help: 'ETA scoring latency per source (directions_api, haversine_fallback, cache)',
+      buckets: [5, 10, 25, 50, 100, 250, 500, 1000, 2500],
+      values: new Map(),
+      bucketCounts: new Map(),
+      sum: new Map(),
+      count: new Map()
+    });
+
+    this.counters.set('broadcast_candidates_found', {
+      name: 'broadcast_candidates_found',
+      help: 'Number of candidate transporters found per vehicle type and step',
+      labels: {}
+    });
+
+    this.counters.set('broadcast_fanout_total', {
+      name: 'broadcast_fanout_total',
+      help: 'Total transporters fanned out per broadcast by vehicle type',
+      labels: {}
+    });
+
+    this.counters.set('broadcast_skipped_no_available', {
+      name: 'broadcast_skipped_no_available',
+      help: 'Broadcasts skipped because no transporters were available',
+      labels: {}
+    });
+
+    this.histograms.set('broadcast_end_to_end_ms', {
+      name: 'broadcast_end_to_end_ms',
+      help: 'End-to-end broadcast pipeline latency (order creation to last fanout enqueue)',
+      buckets: [50, 100, 250, 500, 1000, 2500, 5000, 10000],
+      values: new Map(),
+      bucketCounts: new Map(),
+      sum: new Map(),
+      count: new Map()
+    });
+
+    // =========================================================================
+    // Phase 6: Delivery Channel Metrics
+    // =========================================================================
+
+    this.counters.set('broadcast_delivery_enqueued', {
+      name: 'broadcast_delivery_enqueued',
+      help: 'Broadcast delivery jobs enqueued by channel (socket, fcm) and priority',
+      labels: {}
+    });
+
+    this.counters.set('broadcast_delivery_delivered', {
+      name: 'broadcast_delivery_delivered',
+      help: 'Broadcast messages successfully delivered by channel',
+      labels: {}
+    });
+
+    this.counters.set('broadcast_delivery_failed', {
+      name: 'broadcast_delivery_failed',
+      help: 'Broadcast delivery failures by channel and reason',
+      labels: {}
+    });
+
+    this.histograms.set('broadcast_delivery_latency_ms', {
+      name: 'broadcast_delivery_latency_ms',
+      help: 'Broadcast delivery latency from enqueue to emit/push completion',
+      buckets: [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000],
+      values: new Map(),
+      bucketCounts: new Map(),
+      sum: new Map(),
+      count: new Map()
+    });
+
+    this.gauges.set('broadcast_queue_depth', {
+      name: 'broadcast_queue_depth',
+      help: 'Current broadcast queue depth',
+      value: 0
+    });
+
     // WebSocket connections
     this.gauges.set('websocket_connections', {
       name: 'websocket_connections',
       help: 'Current number of WebSocket connections',
       value: 0
     });
-    
+
     // Memory usage
     this.gauges.set('nodejs_memory_heap_used_bytes', {
       name: 'nodejs_memory_heap_used_bytes',
       help: 'Node.js heap memory used',
       value: 0
     });
-    
+
     this.gauges.set('nodejs_memory_heap_total_bytes', {
       name: 'nodejs_memory_heap_total_bytes',
       help: 'Node.js total heap memory',
       value: 0
     });
-    
+
     // Event loop lag
     this.gauges.set('nodejs_eventloop_lag_ms', {
       name: 'nodejs_eventloop_lag_ms',
       help: 'Node.js event loop lag in milliseconds',
       value: 0
     });
-    
+
     // Active requests
     this.gauges.set('http_active_requests', {
       name: 'http_active_requests',
@@ -297,7 +387,7 @@ class MetricsService {
       value: 0
     });
   }
-  
+
   /**
    * Start collecting system metrics periodically
    */
@@ -307,7 +397,7 @@ class MetricsService {
       const memUsage = process.memoryUsage();
       this.setGauge('nodejs_memory_heap_used_bytes', memUsage.heapUsed);
       this.setGauge('nodejs_memory_heap_total_bytes', memUsage.heapTotal);
-      
+
       // Measure event loop lag
       const start = process.hrtime.bigint();
       setImmediate(() => {
@@ -318,11 +408,11 @@ class MetricsService {
     // Prevent this timer from blocking Jest process exit.
     timer.unref();
   }
-  
+
   // ===========================================================================
   // COUNTER METHODS
   // ===========================================================================
-  
+
   /**
    * Increment a counter
    */
@@ -332,15 +422,15 @@ class MetricsService {
       logger.warn(`Counter ${name} not found`);
       return;
     }
-    
+
     const labelKey = this.labelsToKey(labels);
     counter.labels[labelKey] = (counter.labels[labelKey] || 0) + value;
   }
-  
+
   // ===========================================================================
   // GAUGE METHODS
   // ===========================================================================
-  
+
   /**
    * Set a gauge value
    */
@@ -350,7 +440,7 @@ class MetricsService {
       gauge.value = value;
     }
   }
-  
+
   /**
    * Increment a gauge
    */
@@ -360,7 +450,7 @@ class MetricsService {
       gauge.value += value;
     }
   }
-  
+
   /**
    * Decrement a gauge
    */
@@ -370,11 +460,11 @@ class MetricsService {
       gauge.value = Math.max(0, gauge.value - value);
     }
   }
-  
+
   // ===========================================================================
   // HISTOGRAM METHODS
   // ===========================================================================
-  
+
   /**
    * Observe a value in a histogram
    */
@@ -384,9 +474,9 @@ class MetricsService {
       logger.warn(`Histogram ${name} not found`);
       return;
     }
-    
+
     const labelKey = this.labelsToKey(labels);
-    
+
     // Initialize if needed
     if (!histogram.values.has(labelKey)) {
       histogram.values.set(labelKey, []);
@@ -394,7 +484,7 @@ class MetricsService {
       histogram.sum.set(labelKey, 0);
       histogram.count.set(labelKey, 0);
     }
-    
+
     // Add value (keep last 1000 for percentile calculation)
     const values = histogram.values.get(labelKey)!;
     values.push(value);
@@ -410,11 +500,11 @@ class MetricsService {
     }
     // +Inf bucket is always incremented.
     cumulativeBuckets[histogram.buckets.length] += 1;
-    
+
     histogram.sum.set(labelKey, histogram.sum.get(labelKey)! + value);
     histogram.count.set(labelKey, histogram.count.get(labelKey)! + 1);
   }
-  
+
   /**
    * Create a timer for measuring duration
    */
@@ -425,22 +515,22 @@ class MetricsService {
       this.observeHistogram(histogramName, duration, labels);
     };
   }
-  
+
   // ===========================================================================
   // PROMETHEUS FORMAT EXPORT
   // ===========================================================================
-  
+
   /**
    * Export all metrics in Prometheus format
    */
   getPrometheusMetrics(): string {
     const lines: string[] = [];
-    
+
     // Export counters
     for (const [, counter] of this.counters) {
       lines.push(`# HELP ${counter.name} ${counter.help}`);
       lines.push(`# TYPE ${counter.name} counter`);
-      
+
       for (const [labelKey, value] of Object.entries(counter.labels)) {
         if (labelKey === '') {
           lines.push(`${counter.name} ${value}`);
@@ -449,31 +539,31 @@ class MetricsService {
         }
       }
     }
-    
+
     // Export gauges
     for (const [, gauge] of this.gauges) {
       lines.push(`# HELP ${gauge.name} ${gauge.help}`);
       lines.push(`# TYPE ${gauge.name} gauge`);
       lines.push(`${gauge.name} ${gauge.value}`);
     }
-    
+
     // Export histograms
     for (const [, histogram] of this.histograms) {
       lines.push(`# HELP ${histogram.name} ${histogram.help}`);
       lines.push(`# TYPE ${histogram.name} histogram`);
-      
+
       for (const [labelKey] of histogram.values) {
         const cumulativeBuckets = histogram.bucketCounts.get(labelKey) || [];
         const count = histogram.count.get(labelKey) || 0;
         const sum = histogram.sum.get(labelKey) || 0;
-        
+
         for (let i = 0; i < histogram.buckets.length; i++) {
           const bucket = histogram.buckets[i];
           const cumulative = cumulativeBuckets[i] || 0;
           const labelPart = labelKey ? `${labelKey},` : '';
           lines.push(`${histogram.name}_bucket{${labelPart}le="${bucket}"} ${cumulative}`);
         }
-        
+
         // +Inf bucket
         const labelPart = labelKey ? `${labelKey},` : '';
         const infCount = cumulativeBuckets[histogram.buckets.length] || count;
@@ -487,10 +577,10 @@ class MetricsService {
         }
       }
     }
-    
+
     return lines.join('\n');
   }
-  
+
   /**
    * Get metrics as JSON (for health endpoint)
    */
@@ -570,11 +660,11 @@ class MetricsService {
       ...(loadTestRunId && { loadTestRunId })
     };
   }
-  
+
   // ===========================================================================
   // HELPERS
   // ===========================================================================
-  
+
   private pruneHttpRequestSamples(nowMs: number): void {
     const minTimestamp = nowMs - this.maxHttpSampleWindowMs;
     while (this.httpRequestSamples.length > 0 && this.httpRequestSamples[0].timestampMs < minTimestamp) {
@@ -611,10 +701,10 @@ export function metricsMiddleware(req: Request, res: Response, next: NextFunctio
   const startTime = process.hrtime.bigint();
   const routePath = getRoutePath(req);
   const loadTestRunId = normalizeRunId(req.headers['x-load-test-run-id']);
-  
+
   // Increment active requests
   metrics.incrementGauge('http_active_requests');
-  
+
   // Capture response
   res.on('finish', () => {
     const duration = Number(process.hrtime.bigint() - startTime) / 1e6;
@@ -623,7 +713,7 @@ export function metricsMiddleware(req: Request, res: Response, next: NextFunctio
       path: routePath,
       status: String(res.statusCode)
     };
-    
+
     // Record metrics
     metrics.incrementCounter('http_requests_total', labels);
     metrics.observeHistogram('http_request_duration_ms', duration, labels);
@@ -647,7 +737,7 @@ export function metricsMiddleware(req: Request, res: Response, next: NextFunctio
 
     metrics.decrementGauge('http_active_requests');
   });
-  
+
   next();
 }
 
@@ -659,7 +749,7 @@ function getRoutePath(req: Request): string {
   if (req.route?.path) {
     return req.baseUrl + req.route.path;
   }
-  
+
   // Normalize dynamic segments
   return req.path
     .replace(/\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '/:id')

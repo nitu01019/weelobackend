@@ -2106,6 +2106,8 @@ class OrderService {
     for (const [typeKey, requests] of requestsByType) {
       const { vehicleType, vehicleSubtype } = this.parseVehicleGroupKey(typeKey);
       const alreadyNotified = await this.getNotifiedTransporters(orderId, vehicleType, vehicleSubtype);
+      // Phase 6: Measure candidate lookup latency
+      const lookupStart = Date.now();
       const stepCandidates = await progressiveRadiusMatcher.findCandidates({
         pickupLat: resolvedPickup.latitude,
         pickupLng: resolvedPickup.longitude,
@@ -2114,17 +2116,27 @@ class OrderService {
         stepIndex: 0,
         alreadyNotified
       });
+      metrics.observeHistogram('broadcast_candidate_lookup_ms', Date.now() - lookupStart, {
+        algorithm: process.env.FF_H3_INDEX_ENABLED === 'true' ? 'h3' : 'georadius',
+        step: '0'
+      });
+      metrics.incrementCounter('broadcast_candidates_found', { vehicleType, step: '0' }, stepCandidates.length);
 
       // Phase 3: Score candidates by ETA (feature-flagged, default OFF → no-op sort)
+      const scoringStart = Date.now();
       const scoredCandidates = await candidateScorerService.scoreAndRank(
         stepCandidates,
         resolvedPickup.latitude,
         resolvedPickup.longitude
       );
+      metrics.observeHistogram('broadcast_scoring_ms', Date.now() - scoringStart, {
+        source: process.env.FF_DIRECTIONS_API_SCORING_ENABLED === 'true' ? 'directions_api' : 'h3_approx'
+      });
       const targetTransporters = scoredCandidates.map((c) => c.transporterId);
       onlineCandidates += targetTransporters.length;
 
       if (targetTransporters.length > 0) {
+        metrics.incrementCounter('broadcast_fanout_total', { vehicleType }, targetTransporters.length);
         const sendResult = await this.broadcastVehicleTypePayload(
           orderId,
           request,
@@ -2139,6 +2151,7 @@ class OrderService {
         await this.markTransportersNotified(orderId, vehicleType, vehicleSubtype, sendResult.sentTransporters);
         notifiedTransporters += sendResult.sentTransporters.length;
       } else {
+        metrics.incrementCounter('broadcast_skipped_no_available', { vehicleType });
         logger.warn(`⚠️ No transporters found for ${vehicleType} (${vehicleSubtype}) in step 10km`);
       }
 
@@ -2178,6 +2191,8 @@ class OrderService {
       timerData.vehicleType,
       timerData.vehicleSubtype
     );
+    // Phase 6: Measure progressive step candidate lookup latency
+    const stepLookupStart = Date.now();
     const stepCandidates = await progressiveRadiusMatcher.findCandidates({
       pickupLat: order.pickup.latitude,
       pickupLng: order.pickup.longitude,
@@ -2186,16 +2201,28 @@ class OrderService {
       stepIndex: timerData.stepIndex,
       alreadyNotified
     });
+    metrics.observeHistogram('broadcast_candidate_lookup_ms', Date.now() - stepLookupStart, {
+      algorithm: process.env.FF_H3_INDEX_ENABLED === 'true' ? 'h3' : 'georadius',
+      step: String(timerData.stepIndex)
+    });
+    metrics.incrementCounter('broadcast_candidates_found', {
+      vehicleType: timerData.vehicleType, step: String(timerData.stepIndex)
+    }, stepCandidates.length);
 
     // Phase 3: Score candidates by ETA (feature-flagged)
+    const stepScoringStart = Date.now();
     const scoredCandidates = await candidateScorerService.scoreAndRank(
       stepCandidates,
       order.pickup.latitude,
       order.pickup.longitude
     );
+    metrics.observeHistogram('broadcast_scoring_ms', Date.now() - stepScoringStart, {
+      source: process.env.FF_DIRECTIONS_API_SCORING_ENABLED === 'true' ? 'directions_api' : 'h3_approx'
+    });
     const targetTransporters = scoredCandidates.map((c) => c.transporterId);
 
     if (targetTransporters.length === 0) {
+      metrics.incrementCounter('broadcast_skipped_no_available', { vehicleType: timerData.vehicleType });
       await this.scheduleNextProgressiveStep(
         timerData.orderId,
         timerData.vehicleType,
@@ -2204,6 +2231,7 @@ class OrderService {
       );
       return;
     }
+    metrics.incrementCounter('broadcast_fanout_total', { vehicleType: timerData.vehicleType }, targetTransporters.length);
 
     const requestFromOrder: CreateOrderRequest = {
       customerId: order.customerId,

@@ -8,6 +8,7 @@
  * using Google Directions API. Results are cached in Redis for 3 minutes
  * to minimize API calls and latency.
  *
+ * PHASE 5: Circuit breaker wraps Google API call. When circuit opens after\n * repeated failures, skips the API entirely (saves 300ms timeout) and goes\n * straight to haversine fallback.\n *
  * WHY GOOGLE DIRECTIONS OVER HAVERSINE:
  * - Haversine gives straight-line distance — useless in cities with one-way
  *   roads, bridges, flyovers, and no-entry zones
@@ -50,9 +51,9 @@ import { config } from '../../config/environment';
 // CONSTANTS
 // =============================================================================
 
-/** Feature flag — controls whether Google Directions API is used for scoring */
+/** Feature flag — Google Directions API scoring (default: ON in production) */
 export const FF_DIRECTIONS_API_SCORING_ENABLED =
-    process.env.FF_DIRECTIONS_API_SCORING_ENABLED === 'true';
+    process.env.FF_DIRECTIONS_API_SCORING_ENABLED !== 'false';
 
 /** Cache TTL — 3 minutes (traffic changes slowly at geohash6 granularity) */
 const CACHE_TTL_SECONDS = 180;
@@ -60,14 +61,65 @@ const CACHE_TTL_SECONDS = 180;
 /** Cache key prefix */
 const CACHE_PREFIX = 'directions';
 
-/** Max concurrent API calls (respect Google QPS limits) */
+/** Max concurrent API calls per batch (in-flight parallelism) */
 const MAX_CONCURRENT_API_CALLS = 10;
 
-/** API timeout per request (ms) */
-const API_TIMEOUT_MS = 3000;
+/** API timeout per request (ms) — 2s: fast fail on slow network */
+const API_TIMEOUT_MS = 2000;
 
 /** Geohash precision for cache key (6 = ~1.2km) */
 const GEOHASH_PRECISION = 6;
+
+/**
+ * Google Directions API QPS limit (configurable via env).
+ * Standard: 50 QPS, Premium: 500 QPS. Default: 450 (leaves 10% headroom).
+ * When rate limit is exceeded, falls back to haversine immediately.
+ */
+const DIRECTIONS_API_MAX_QPS = Math.max(
+    10,
+    parseInt(process.env.DIRECTIONS_API_MAX_QPS || '450', 10) || 450
+);
+
+// =============================================================================
+// TOKEN-BUCKET RATE LIMITER
+// Industry standard QPS guard — Uber/Google internal services use this pattern.
+// When bucket is empty we fall back to haversine (zero wait, zero latency spike).
+// =============================================================================
+
+class TokenBucket {
+    private tokens: number;
+    private lastRefill: number;
+    private readonly maxTokens: number;
+    private readonly refillRatePerMs: number;
+
+    constructor(ratePerSecond: number) {
+        this.maxTokens = ratePerSecond;
+        this.tokens = ratePerSecond;
+        this.lastRefill = Date.now();
+        this.refillRatePerMs = ratePerSecond / 1000;
+    }
+
+    /** Try to consume one token. Returns true if allowed, false if rate limited. */
+    tryConsume(): boolean {
+        const now = Date.now();
+        const elapsed = now - this.lastRefill;
+        // Refill tokens proportional to elapsed time
+        this.tokens = Math.min(
+            this.maxTokens,
+            this.tokens + elapsed * this.refillRatePerMs
+        );
+        this.lastRefill = now;
+
+        if (this.tokens >= 1) {
+            this.tokens -= 1;
+            return true;
+        }
+        return false; // Rate limited — caller falls back to haversine
+    }
+}
+
+/** Single shared rate limiter for the entire process */
+const directionsRateLimiter = new TokenBucket(DIRECTIONS_API_MAX_QPS);
 
 // =============================================================================
 // TYPES
@@ -119,22 +171,36 @@ class DirectionsApiService {
             // Cache miss or error — continue to API
         }
 
-        // 2. Call Google Directions API (if enabled and key available)
+        // 2. Check rate limit BEFORE calling Google API
+        // Phase 6 production hardening: token bucket prevents QPS overrun.
+        // When depleted → instant haversine fallback (no queuing, no latency spike)
         if (FF_DIRECTIONS_API_SCORING_ENABLED && config.googleMaps.apiKey) {
+            if (!directionsRateLimiter.tryConsume()) {
+                // Rate limited — haversine fallback is instant
+                logger.debug('[DirectionsAPI] Rate limit hit, using haversine fallback');
+                return this.haversineFallback(originLat, originLng, destLat, destLng);
+            }
+            const { directionsCircuit } = require('./circuit-breaker.service');
             try {
-                const result = await this.callGoogleDirections(
-                    originLat, originLng, destLat, destLng
+                const result = await directionsCircuit.tryWithFallback(
+                    async () => {
+                        const apiResult = await this.callGoogleDirections(
+                            originLat, originLng, destLat, destLng
+                        );
+                        // Cache the result
+                        await redisService.set(cacheKey, JSON.stringify({
+                            durationSeconds: apiResult.durationSeconds,
+                            distanceMeters: apiResult.distanceMeters
+                        }), CACHE_TTL_SECONDS).catch(() => { });
+                        return apiResult;
+                    },
+                    async () => {
+                        return this.haversineFallback(originLat, originLng, destLat, destLng);
+                    }
                 );
-
-                // Cache the result
-                await redisService.set(cacheKey, JSON.stringify({
-                    durationSeconds: result.durationSeconds,
-                    distanceMeters: result.distanceMeters
-                }), CACHE_TTL_SECONDS).catch(() => { });
-
                 return result;
             } catch (error: any) {
-                logger.warn(`[DirectionsAPI] Google API failed, falling back to Haversine: ${error.message}`);
+                logger.warn(`[DirectionsAPI] Circuit breaker error, falling back to Haversine: ${error.message}`);
             }
         }
 

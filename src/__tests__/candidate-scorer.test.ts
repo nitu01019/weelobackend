@@ -4,7 +4,7 @@
  * =============================================================================
  *
  * Tests the two-tier ETA-based scoring used for dispatch candidate ranking.
- * Tier 1 (Haversine) is always ON. Tier 2 (Google Directions) is feature-flagged.
+ * Tier 1 (Haversine) is the fallback. Tier 2 (Google Directions) is default ON.
  *
  * Run: npx jest --testPathPattern="candidate-scorer" --forceExit
  * =============================================================================
@@ -29,7 +29,7 @@ const testCandidates: CandidateInput[] = [
 
 describe('CandidateScorerService', () => {
 
-    describe('scoreAndRank (Tier 1 — Haversine only)', () => {
+    describe('scoreAndRank (ETA-based scoring)', () => {
 
         it('should return empty array for empty candidates', async () => {
             const result = await candidateScorerService.scoreAndRank([], PICKUP_LAT, PICKUP_LNG);
@@ -44,7 +44,7 @@ describe('CandidateScorerService', () => {
             expect(result).toHaveLength(4);
             for (const candidate of result) {
                 expect(candidate.etaSeconds).toBeGreaterThan(0);
-                expect(candidate.etaSource).toBe('haversine');
+                expect(candidate.etaSource).toMatch(/^(haversine|haversine_fallback|google_api|cache)$/);
                 expect(candidate.transporterId).toBeTruthy();
             }
         });
@@ -90,7 +90,7 @@ describe('CandidateScorerService', () => {
 
             expect(result).toHaveLength(1);
             expect(result[0].transporterId).toBe('t-far');
-            expect(result[0].etaSource).toBe('haversine');
+            expect(result[0].etaSource).toMatch(/^(haversine|google_api|cache)$/);
         });
 
         it('should produce reasonable ETA values (not absurd)', async () => {
