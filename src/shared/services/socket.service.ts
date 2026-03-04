@@ -430,6 +430,43 @@ export function initializeSocket(server: HttpServer): Server {
           logger.warn(`[Socket] Failed to restore transporter presence: ${e.message}`);
         }
       })();
+
+      // ================================================================
+      // MID-ORDER BROADCAST DELIVERY ON CONNECT
+      // ================================================================
+      // When a transporter connects (new session or reconnect), push any
+      // currently-active broadcasts directly on their socket so they see
+      // live orders immediately without waiting for the next broadcast cycle.
+      //
+      // Safety design:
+      //   - Runs in its own async IIFE, never blocks connection handshake
+      //   - try/catch: failure here is silent — client has API reconcile fallback
+      //   - _reconnectDelivery: true flag lets client BroadcastFlowCoordinator
+      //     deduplicate with any Socket.IO or FCM delivery already in flight
+      //   - Capped at 20 broadcasts to avoid flooding slow connections
+      // ================================================================
+      (async () => {
+        try {
+          const { bookingService } = await import('../../modules/booking/booking.service');
+          const result = await bookingService.getActiveBroadcasts(userId, { limit: 20 } as any);
+          // bookingService returns { bookings, total, hasMore }
+          const broadcasts = (result as any)?.bookings ?? (result as any)?.broadcasts ?? [];
+
+          if (Array.isArray(broadcasts) && broadcasts.length > 0) {
+            logger.info(`[Socket] 📡 Pushing ${broadcasts.length} active broadcast(s) to transporter ${userId} on connect`);
+            for (const broadcast of broadcasts) {
+              socket.emit('new_broadcast', {
+                ...(broadcast as object),
+                _reconnectDelivery: true,   // dedup flag for client coordinator
+                _seq: undefined             // skip sequence numbering for reconcile push
+              });
+            }
+          }
+        } catch (e: any) {
+          // Non-critical — client BroadcastFlowCoordinator.requestReconcile() is the fallback
+          logger.warn(`[Socket] Failed to push active broadcasts on connect for ${userId}: ${e.message}`);
+        }
+      })();
     }
 
     // Handle ping from client (for connection quality)
