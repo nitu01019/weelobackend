@@ -647,11 +647,12 @@ function withSocketMeta(data: any): any {
  * Emit to a specific user (by userId)
  * Used to send notifications to specific transporters
  * 
- * MULTI-SERVER: Socket.IO Redis adapter handles cross-instance delivery
+ * MULTI-SERVER: Socket.IO Redis adapter handles cross-instance delivery.
+ * io.to(room).emit() publishes to Redis streams → all instances deliver.
  * 
- * DELIVERY GUARD: If user has zero sockets in room, logs warning and
- * returns early. Message is still in unacked ZSET (if FF_SEQ enabled)
- * and will be replayed on reconnect. FCM fires separately in dual-channel.
+ * NOTE: rooms.get() only returns LOCAL sockets. With multi-server (ECS 2+ tasks),
+ * the transporter may be connected to another instance. NEVER return early based
+ * on local room count — always let io.to().emit() fire through the adapter.
  */
 export function emitToUser(userId: string, event: string, data: any): void {
   if (!io) {
@@ -659,24 +660,17 @@ export function emitToUser(userId: string, event: string, data: any): void {
     return;
   }
 
-  // Delivery guard — check for connected sockets before emitting
-  const room = io.sockets.adapter.rooms.get(`user:${userId}`);
-  const socketCount = room?.size || 0;
+  // Observability: log local socket count (may be 0 in multi-server — that's OK)
+  const localSocketCount = userSockets.get(userId)?.size || 0;
 
-  if (socketCount === 0) {
-    logger.warn(`[emitToUser] ⚠️ No connected sockets for user:${userId} — ${event} deferred to replay/FCM`, {
-      userId, event, metric: 'broadcast.emit.no_sockets'
-    });
-    // Message is still in unacked ZSET (FF_SEQ) → replayed on reconnect
-    // FCM fallback fires separately in dual-channel path
-    return;
+  if (localSocketCount === 0) {
+    logger.debug(`[emitToUser] No LOCAL sockets for user:${userId} — ${event} will route via Redis adapter to other instances`);
   }
 
-  // With @socket.io/redis-adapter, this automatically reaches all instances
+  // ALWAYS emit — Redis adapter handles cross-instance delivery
   io.to(`user:${userId}`).emit(event, withSocketMeta(data));
 
-  const localSocketCount = userSockets.get(userId)?.size || 0;
-  logger.debug(`[Socket] Emitted ${event} to user:${userId} (${socketCount} room, ${localSocketCount} local)`);
+  logger.debug(`[Socket] Emitted ${event} to user:${userId} (${localSocketCount} local sockets)`);
 }
 
 /**
