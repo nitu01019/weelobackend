@@ -368,7 +368,7 @@ describe('Gap 3 Fix: Heartbeat Presence Refresh', () => {
 
     // Verify TTL was refreshed (close to PRESENCE_TTL_SECONDS)
     const ttl = await redisService.ttl(TRANSPORTER_PRESENCE_KEY(TRANSPORTER_ID_1));
-    expect(ttl).toBeGreaterThan(55);
+    expect(ttl).toBeGreaterThan(PRESENCE_TTL_SECONDS - 10);
   });
 
   it('should NOT create presence key when transporter is OFFLINE and heartbeat arrives (guard)', async () => {

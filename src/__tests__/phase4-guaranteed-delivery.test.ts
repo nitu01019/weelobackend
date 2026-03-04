@@ -132,6 +132,35 @@ describe('Message priority mapping', () => {
 // ============================================================================
 
 describe('Phase 4 feature flags default OFF', () => {
+    const savedEnv: Record<string, string | undefined> = {};
+    const flagKeys = [
+        'FF_SEQUENCE_DELIVERY_ENABLED',
+        'FF_DUAL_CHANNEL_DELIVERY',
+        'FF_MESSAGE_TTL_ENABLED',
+        'FF_MESSAGE_PRIORITY_ENABLED',
+        'FF_ADAPTIVE_FANOUT_CHUNK_SIZE',
+        'FF_ADAPTIVE_FANOUT_DELAY_MS',
+    ];
+
+    beforeEach(() => {
+        // Save and clear flags so test verifies true defaults
+        for (const key of flagKeys) {
+            savedEnv[key] = process.env[key];
+            delete process.env[key];
+        }
+    });
+
+    afterEach(() => {
+        // Restore original env
+        for (const key of flagKeys) {
+            if (savedEnv[key] !== undefined) {
+                process.env[key] = savedEnv[key];
+            } else {
+                delete process.env[key];
+            }
+        }
+    });
+
     it('all Phase 4 flags default to false/disabled', () => {
         // These flags are read from process.env at module load time
         // When not set, they should all be falsy
