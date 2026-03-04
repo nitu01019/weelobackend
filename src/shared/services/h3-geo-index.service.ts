@@ -42,17 +42,20 @@ import { logger } from './logger.service';
 // CONSTANTS
 // =============================================================================
 
-/** H3 resolution 8: ~461m edge length, ~2km² per cell area */
-const H3_RESOLUTION = 8;
+/** H3 resolution — configurable via H3_RESOLUTION env var (default 8: ~461m edge).
+ *  Use 9 for dense urban (Mumbai/Delhi), 7 for suburban/rural. */
+const H3_RESOLUTION = Math.min(15, Math.max(0,
+    parseInt(process.env.H3_RESOLUTION || '8', 10) || 8
+));
 
-/** Redis key prefix for H3 cell sets */
-const H3_CELL_KEY_PREFIX = 'h3:8';
+/** Redis key prefix for H3 cell sets (includes resolution for safety) */
+const H3_CELL_KEY_PREFIX = `h3:${H3_RESOLUTION}`;
 
 /** Redis key prefix for transporter's current cell (reverse lookup) */
 const H3_POS_PREFIX = 'h3:pos';
 
-/** TTL for position keys (matches driver details TTL) */
-const H3_POS_TTL_SECONDS = 120;
+/** TTL for position keys (matches presence TTL — 3× heartbeat interval) */
+const H3_POS_TTL_SECONDS = 45;
 
 /** Feature flag — when false, index is shadow-built but not used for dispatch */
 export const FF_H3_INDEX_ENABLED = process.env.FF_H3_INDEX_ENABLED === 'true';

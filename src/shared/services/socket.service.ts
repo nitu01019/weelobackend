@@ -157,8 +157,8 @@ export function initializeSocket(server: HttpServer): Server {
     },
 
     // Performance optimizations
-    pingTimeout: 20000,           // 20s - How long to wait for pong
-    pingInterval: 25000,          // 25s - How often to send ping
+    pingTimeout: 10000,           // 10s - Detect dead sockets faster (was 20s)
+    pingInterval: 12000,          // 12s - Probe more frequently (was 25s)
     upgradeTimeout: 10000,        // 10s - Timeout for upgrade
 
     // Transports - WebSocket preferred
@@ -648,6 +648,10 @@ function withSocketMeta(data: any): any {
  * Used to send notifications to specific transporters
  * 
  * MULTI-SERVER: Socket.IO Redis adapter handles cross-instance delivery
+ * 
+ * DELIVERY GUARD: If user has zero sockets in room, logs warning and
+ * returns early. Message is still in unacked ZSET (if FF_SEQ enabled)
+ * and will be replayed on reconnect. FCM fires separately in dual-channel.
  */
 export function emitToUser(userId: string, event: string, data: any): void {
   if (!io) {
@@ -655,11 +659,24 @@ export function emitToUser(userId: string, event: string, data: any): void {
     return;
   }
 
+  // Delivery guard — check for connected sockets before emitting
+  const room = io.sockets.adapter.rooms.get(`user:${userId}`);
+  const socketCount = room?.size || 0;
+
+  if (socketCount === 0) {
+    logger.warn(`[emitToUser] ⚠️ No connected sockets for user:${userId} — ${event} deferred to replay/FCM`, {
+      userId, event, metric: 'broadcast.emit.no_sockets'
+    });
+    // Message is still in unacked ZSET (FF_SEQ) → replayed on reconnect
+    // FCM fallback fires separately in dual-channel path
+    return;
+  }
+
   // With @socket.io/redis-adapter, this automatically reaches all instances
   io.to(`user:${userId}`).emit(event, withSocketMeta(data));
 
   const localSocketCount = userSockets.get(userId)?.size || 0;
-  logger.debug(`[Socket] Emitted ${event} to user:${userId} (${localSocketCount} local sockets)`);
+  logger.debug(`[Socket] Emitted ${event} to user:${userId} (${socketCount} room, ${localSocketCount} local)`);
 }
 
 /**

@@ -57,7 +57,7 @@ export const ONLINE_TRANSPORTERS_SET = 'online:transporters';
 export const TRANSPORTER_PRESENCE_KEY = (id: string) => `transporter:presence:${id}`;
 
 /** Presence key TTL in seconds (must match transporter.routes.ts) */
-export const PRESENCE_TTL_SECONDS = 120;
+export const PRESENCE_TTL_SECONDS = 45;
 
 // =============================================================================
 // SERVICE CLASS

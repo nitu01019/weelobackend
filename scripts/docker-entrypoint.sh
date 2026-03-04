@@ -13,6 +13,23 @@ set -e
 
 echo "🚀 Starting Weelo Backend..."
 
+# =============================================================================
+# FIREBASE SERVICE ACCOUNT (for FCM push notifications)
+# =============================================================================
+# Downloads Firebase service account JSON from S3 if FIREBASE_SA_S3_URI is set.
+# This enables dual-channel delivery (Socket.IO + FCM push).
+# Example: FIREBASE_SA_S3_URI=s3://weelo-uploads/config/firebase-service-account.json
+# =============================================================================
+if [ -n "$FIREBASE_SA_S3_URI" ]; then
+    echo "📥 Downloading Firebase service account from S3..."
+    aws s3 cp "$FIREBASE_SA_S3_URI" /app/firebase-service-account.json --quiet 2>&1 && {
+        export FIREBASE_SERVICE_ACCOUNT_PATH=/app/firebase-service-account.json
+        echo "✅ Firebase service account ready (FCM enabled)"
+    } || {
+        echo "⚠️ Firebase service account download failed — FCM push disabled"
+    }
+fi
+
 # Check if DATABASE_URL is set and starts with postgres
 if [ -n "$DATABASE_URL" ] && echo "$DATABASE_URL" | grep -q "^postgres"; then
     echo "📦 PostgreSQL DATABASE_URL detected"
