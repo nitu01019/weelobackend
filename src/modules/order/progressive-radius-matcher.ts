@@ -44,13 +44,12 @@ export const PROGRESSIVE_RADIUS_STEPS: RadiusStep[] = [
 const FF_H3_RADIUS_STEPS_7 = process.env.FF_H3_RADIUS_STEPS_7 === 'true';
 
 export const PROGRESSIVE_RADIUS_STEPS_7: RadiusStep[] = [
-  { radiusKm: 1.5, windowMs: 0, h3RingK: 2 },    // ~1.4 km, immediate
-  { radiusKm: 3.5, windowMs: 15_000, h3RingK: 5 },    // ~3.5 km
-  { radiusKm: 7, windowMs: 20_000, h3RingK: 10 },   // ~7 km
-  { radiusKm: 15, windowMs: 25_000, h3RingK: 22 },   // ~15 km
-  { radiusKm: 30, windowMs: 30_000, h3RingK: 44 },   // ~30 km
-  { radiusKm: 60, windowMs: 40_000, h3RingK: 88 },   // ~60 km
-  { radiusKm: 100, windowMs: 50_000, h3RingK: 150 }   // ~100 km
+  { radiusKm: 5, windowMs: 0, h3RingK: 8 },          // ~5 km, immediate
+  { radiusKm: 10, windowMs: 10_000, h3RingK: 15 },    // ~10 km at +10s
+  { radiusKm: 15, windowMs: 20_000, h3RingK: 22 },    // ~15 km
+  { radiusKm: 30, windowMs: 25_000, h3RingK: 44 },    // ~30 km
+  { radiusKm: 60, windowMs: 30_000, h3RingK: 88 },    // ~60 km
+  { radiusKm: 100, windowMs: 40_000, h3RingK: 150 }   // ~100 km
 ];
 
 function getActiveSteps(): RadiusStep[] {
@@ -177,7 +176,7 @@ class ProgressiveRadiusMatcher {
     radiusKm: number;
     alreadyNotified: Set<string>;
     limit: number;
-  }): Promise<CandidateTransporter[]> {
+  }): Promise<CandidateTransporter[] | undefined> {
     const { pickupLat, pickupLng, vehicleKey, ringK, radiusKm, alreadyNotified, limit } = params;
 
     try {
@@ -186,9 +185,15 @@ class ProgressiveRadiusMatcher {
         pickupLat, pickupLng, vehicleKey, ringK, alreadyNotified
       );
 
-      if (candidateIds.length === 0) return [];
+      if (candidateIds.length === 0) {
+        // H3 cells empty (expired TTL / cold start) — fall through to GEORADIUS
+        logger.info('[RadiusMatcher] H3 returned 0 candidates, falling back to GEORADIUS', {
+          vehicleKey, ringK, radiusKm
+        });
+        return undefined; // triggers GEORADIUS fallback in findCandidates()
+      }
 
-      // Load driver details to get lat/lng for distance calculation
+      // H3 found candidates — load details from GEORADIUS for lat/lng + distance
       const nearby = await availabilityService.getAvailableTransportersWithDetails(
         vehicleKey,
         pickupLat,
@@ -197,12 +202,9 @@ class ProgressiveRadiusMatcher {
         radiusKm
       );
 
-      // Create a fast lookup set of H3 candidates
-      const h3CandidateSet = new Set(candidateIds);
-
-      // Filter to only H3 candidates, compute strict distance
+      // UNION approach: include ALL transporters within radius (not just H3 matches)
+      // H3 is a fast hint for WHO might be nearby, GEORADIUS provides ground truth.
       const results = nearby
-        .filter(driver => h3CandidateSet.has(driver.transporterId))
         .map(driver => ({
           transporterId: driver.transporterId,
           distanceKm: haversineDistanceKm(pickupLat, pickupLng, driver.latitude, driver.longitude),
@@ -219,6 +221,7 @@ class ProgressiveRadiusMatcher {
         ringK,
         radiusKm,
         h3Candidates: candidateIds.length,
+        geoNearby: nearby.length,
         matched: results.length
       });
 
@@ -226,19 +229,7 @@ class ProgressiveRadiusMatcher {
     } catch (error: any) {
       // Fallback to GEORADIUS on H3 failure — zero latency regression
       logger.warn(`[RadiusMatcher] H3 lookup failed, falling back to GEORADIUS: ${error.message}`);
-      const nearby = await availabilityService.getAvailableTransportersWithDetails(
-        vehicleKey, pickupLat, pickupLng, Math.max(limit * 2, 100), radiusKm
-      );
-      return nearby
-        .map(driver => ({
-          transporterId: driver.transporterId,
-          distanceKm: haversineDistanceKm(pickupLat, pickupLng, driver.latitude, driver.longitude),
-          latitude: driver.latitude,
-          longitude: driver.longitude
-        }))
-        .filter(c => c.distanceKm <= radiusKm && !alreadyNotified.has(c.transporterId))
-        .sort((a, b) => a.distanceKm - b.distanceKm)
-        .slice(0, limit);
+      return undefined; // triggers GEORADIUS fallback in findCandidates()
     }
   }
 }

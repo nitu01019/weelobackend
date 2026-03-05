@@ -54,8 +54,9 @@ const H3_CELL_KEY_PREFIX = `h3:${H3_RESOLUTION}`;
 /** Redis key prefix for transporter's current cell (reverse lookup) */
 const H3_POS_PREFIX = 'h3:pos';
 
-/** TTL for position keys (matches presence TTL — 3× heartbeat interval) */
-const H3_POS_TTL_SECONDS = 45;
+/** TTL for position keys — generous buffer for low-network transporters.
+ *  90s = 36× REST heartbeat interval (2.5s), survives 2G network delays. */
+const H3_POS_TTL_SECONDS = 90;
 
 /** Feature flag — when false, index is shadow-built but not used for dispatch */
 export const FF_H3_INDEX_ENABLED = process.env.FF_H3_INDEX_ENABLED === 'true';
@@ -245,8 +246,16 @@ class H3GeoIndexService {
             if (posValue) {
                 const oldCell = posValue.split(':')[0];
                 if (oldCell === newCell) {
-                    // Same cell — just refresh TTL
-                    await redisService.expire(posKey(transporterId), H3_POS_TTL_SECONDS).catch(() => { });
+                    // Same cell — sliding window: refresh BOTH pos AND cell TTLs
+                    const refreshOps: Promise<any>[] = [
+                        redisService.expire(posKey(transporterId), H3_POS_TTL_SECONDS).catch(() => { })
+                    ];
+                    for (const vk of vehicleKeys) {
+                        refreshOps.push(
+                            redisService.expire(cellKey(newCell, vk), H3_POS_TTL_SECONDS * 2).catch(() => { })
+                        );
+                    }
+                    await Promise.all(refreshOps);
                     return;
                 }
 
