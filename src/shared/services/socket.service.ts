@@ -161,9 +161,11 @@ export function initializeSocket(server: HttpServer): Server {
     pingInterval: 12000,          // 12s - Probe more frequently (was 25s)
     upgradeTimeout: 10000,        // 10s - Timeout for upgrade
 
-    // Transports - WebSocket preferred
-    transports: ['websocket', 'polling'],
-    allowUpgrades: true,
+    // Transports - WebSocket ONLY (no polling handshake)
+    // Polling→upgrade fails across ALB instances even with stickiness.
+    // Direct WS connection is a single HTTP upgrade request.
+    transports: ['websocket'],
+    allowUpgrades: false,
 
     // Buffer and payload limits
     maxHttpBufferSize: 10 * 1024 * 1024,  // 10MB max message size
