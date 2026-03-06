@@ -409,15 +409,15 @@ class H3GeoIndexService {
      */
     async rebuildFromGeoIndex(
         vehicleKeys: string[],
-        getDriverDetails: (id: string) => Promise<{ latitude: number; longitude: number; vehicleKeys?: string } | null>
+        getTransporterDetails: (id: string) => Promise<{ latitude: number; longitude: number; vehicleKeys?: string } | null>
     ): Promise<number> {
         let indexed = 0;
         try {
-            const onlineIds = await redisService.sMembers('online:drivers').catch(() => []);
+            const onlineIds = await redisService.sMembers('online:transporters').catch(() => []);
             logger.info(`[H3Index] Rebuilding index for ${onlineIds.length} online transporters`);
 
             for (const transporterId of onlineIds) {
-                const details = await getDriverDetails(transporterId);
+                const details = await getTransporterDetails(transporterId);
                 if (!details || !Number.isFinite(details.latitude) || !Number.isFinite(details.longitude)) continue;
 
                 const keys = details.vehicleKeys

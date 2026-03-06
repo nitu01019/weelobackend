@@ -14,7 +14,7 @@ import { Prisma } from '@prisma/client';
 import { db, BookingRecord, AssignmentRecord } from '../../shared/database/db';
 import { AppError } from '../../shared/types/error.types';
 import { logger } from '../../shared/services/logger.service';
-import { emitToUser, emitToRoom, emitToAllTransporters, emitToAll } from '../../shared/services/socket.service';
+import { emitToUser, emitToUsers, emitToRoom, emitToAllTransporters, emitToAll } from '../../shared/services/socket.service';
 import { sendPushNotification } from '../../shared/services/fcm.service';
 import { redisService } from '../../shared/services/redis.service';
 import { prismaClient } from '../../shared/database/prisma.service';
@@ -45,7 +45,7 @@ export const BroadcastEvents = {
 };
 
 interface GetActiveBroadcastsParams {
-  driverId: string;
+  actorId: string;
   vehicleType?: string;
   maxDistance?: number;
 }
@@ -62,13 +62,13 @@ interface AcceptBroadcastParams {
 }
 
 interface DeclineBroadcastParams {
-  driverId: string;
+  actorId: string;
   reason: string;
   notes?: string;
 }
 
 interface GetHistoryParams {
-  driverId: string;
+  actorId: string;
   page: number;
   limit: number;
   status?: string;
@@ -145,15 +145,29 @@ class BroadcastService {
    * This compatibility service remains for fallback and older clients.
    */
   async getActiveBroadcasts(params: GetActiveBroadcastsParams) {
-    const { driverId, vehicleType } = params;
+    const { actorId, vehicleType } = params;
     logger.info('[BroadcastCompat] Resolving active feed via legacy broadcast service', {
       route_alias_used: true,
-      actorId: driverId
+      actorId
     });
 
-    // Get user to find their transporter
-    const user = await db.getUserById(driverId);
-    const transporterId = user?.transporterId || driverId;
+    // Resolve transporter — actorId could be a driver or transporter
+    const user = await db.getUserById(actorId);
+    const transporterId = user?.transporterId || actorId;
+
+    // ============== FIX 4: REDIS CACHE (5s TTL) ==============
+    // Protects DB from polling storms: 50 transporters × refresh/10s = 300 reads/min
+    // Cache reduces to ~60 reads/min with 5s TTL
+    const cacheKey = `cache:broadcasts:${transporterId}`;
+    try {
+      const cached = await redisService.get(cacheKey) as string | null;
+      if (cached) {
+        logger.debug(`[BroadcastCompat] Cache HIT for transporter ${transporterId}`);
+        return JSON.parse(cached);
+      }
+    } catch {
+      // Redis down — fall through to DB query (graceful degradation)
+    }
 
     // Get transporter's vehicle types for filtering
     const transporterVehicles = await db.getVehiclesByTransporter(transporterId);
@@ -198,25 +212,37 @@ class BroadcastService {
 
     logger.info(`[Broadcasts] Found ${orders.length} active orders`);
 
-    for (const order of orders) {
-      logger.info(`[Broadcasts] Processing order ${order.id}, status: ${order.status}, trucks: ${order.trucksFilled}/${order.totalTrucks}`);
-      // Check if not expired
-      if (new Date(order.expiresAt) < new Date()) {
-        continue;
-      }
+    // ============== FIX 3: BATCH QUERY (N+1 → 2 queries) ==============
+    // Before: N orders × 1 getTruckRequestsByOrder() each = N+1 DB calls
+    // After:  1 getActiveOrders() + 1 batch findMany() = 2 DB calls total
+    const validOrders = orders.filter(order => {
+      if (new Date(order.expiresAt) < new Date()) return false;
+      if (order.trucksFilled >= order.totalTrucks) return false;
+      return true;
+    });
+    const orderIds = validOrders.map(o => o.id);
+    const allTruckRequests = orderIds.length > 0
+      ? await prismaClient.truckRequest.findMany({ where: { orderId: { in: orderIds } } })
+      : [];
 
-      // Check if still needs trucks
-      if (order.trucksFilled >= order.totalTrucks) {
-        continue;
-      }
+    // Index by orderId for O(1) lookup in loop
+    const truckRequestsByOrderId = new Map<string, typeof allTruckRequests>();
+    for (const tr of allTruckRequests) {
+      const list = truckRequestsByOrderId.get(tr.orderId) || [];
+      list.push(tr);
+      truckRequestsByOrderId.set(tr.orderId, list);
+    }
 
-      // Get truck requests for this order
-      const truckRequests = db.getTruckRequestsByOrder ? await db.getTruckRequestsByOrder(order.id) : [];
+    logger.info(`[Broadcasts] Batch-loaded ${allTruckRequests.length} truck requests for ${validOrders.length} orders (2 queries)`);
 
-      logger.info(`[Broadcasts] Order ${order.id} has ${truckRequests.length} truck requests`);
-      truckRequests.forEach(tr => {
-        logger.info(`[Broadcasts]   - ${tr.vehicleType}/${tr.vehicleSubtype}, status: ${tr.status}`);
-      });
+    for (const order of validOrders) {
+      // Lookup from pre-fetched map (O(1), no DB call)
+      const truckRequests = (truckRequestsByOrderId.get(order.id) || []).map(tr => ({
+        ...tr,
+        vehicleType: tr.vehicleType || '',
+        vehicleSubtype: tr.vehicleSubtype || '',
+        status: tr.status || 'searching'
+      }));
 
       // Filter to only vehicle types the transporter has
       const relevantRequests = truckRequests.filter(tr => {
@@ -310,6 +336,13 @@ class BroadcastService {
 
     logger.info(`Found ${activeBroadcasts.length} active broadcasts for transporter ${transporterId}`);
 
+    // ============== FIX 4: Store in Redis cache (5s TTL) ==============
+    try {
+      await redisService.set(cacheKey, JSON.stringify(activeBroadcasts), 5);
+    } catch {
+      // Non-critical — next request will just re-query DB
+    }
+
     return activeBroadcasts;
   }
 
@@ -389,7 +422,8 @@ class BroadcastService {
     }
 
     try {
-      const lock = await redisService.acquireLock(lockKey, lockHolder, 8);
+      // FIX 1: Lock TTL 8s → 20s — serializable tx + 3 retries can take >8s under load
+      const lock = await redisService.acquireLock(lockKey, lockHolder, 20);
       lockAcquired = lock.acquired;
       if (!lockAcquired) {
         this.incrementAcceptMetric('lockContention');
@@ -786,22 +820,22 @@ class BroadcastService {
    * Decline a broadcast
    */
   async declineBroadcast(broadcastId: string, params: DeclineBroadcastParams) {
-    const { driverId, reason, notes } = params;
+    const { actorId, reason, notes } = params;
 
     // Just log the decline - no need to store for now
-    logger.info(`Broadcast ${broadcastId} declined by ${driverId}. Reason: ${reason}`, { notes });
+    logger.info(`Broadcast ${broadcastId} declined by ${actorId}. Reason: ${reason}`, { notes });
 
     return { success: true };
   }
 
   /**
-   * Get broadcast history for a driver
+   * Get broadcast history for a transporter/driver
    */
   async getBroadcastHistory(params: GetHistoryParams) {
-    const { driverId, page, limit, status } = params;
+    const { actorId, page, limit, status } = params;
 
-    // Get bookings for this driver
-    let bookings = await db.getBookingsByDriver(driverId);
+    // Get bookings for this actor (transporter or driver)
+    let bookings = await db.getBookingsByDriver(actorId);
 
     // Filter by status if provided
     if (status) {
@@ -927,8 +961,8 @@ class BroadcastService {
             // Mark as expired in database
             await db.updateBooking(booking.id, { status: 'expired' });
 
-            // CRITICAL: Notify ALL transporters to remove this broadcast
-            this.emitBroadcastExpired(booking.id, 'timeout');
+            // CRITICAL: Notify notified transporters to remove this broadcast
+            await this.emitBroadcastExpired(booking.id, 'timeout');
 
             // Notify customer that their request expired
             this.notifyCustomerBroadcastExpired(booking);
@@ -977,8 +1011,8 @@ class BroadcastService {
               await db.updateOrder(order.id, { status: 'expired' });
             }
 
-            // Notify ALL transporters
-            this.emitBroadcastExpired(order.id, 'timeout');
+            // Notify notified transporters
+            await this.emitBroadcastExpired(order.id, 'timeout');
 
             expiredCount++;
             logger.info(`⏰ Order ${order.id} expired - notified all transporters`);
@@ -1002,13 +1036,17 @@ class BroadcastService {
   }
 
   /**
-   * Emit broadcast expired event to ALL transporters
+   * Emit broadcast expired event to NOTIFIED transporters only
    * This instantly removes the broadcast from their overlay/list
+   * 
+   * FIX 2: Changed from emitToAllTransporters → targeted emitToUsers.
+   * Only transporters who were originally notified receive the expiry event.
+   * Prevents 980 wasted socket messages when 1000 are online but only 20 were notified.
    * 
    * @param broadcastId - The broadcast/order ID that expired
    * @param reason - Why it expired ('timeout', 'cancelled', 'fully_filled')
    */
-  emitBroadcastExpired(broadcastId: string, reason: string = 'timeout'): void {
+  async emitBroadcastExpired(broadcastId: string, reason: string = 'timeout'): Promise<void> {
     const payload = {
       broadcastId,
       orderId: broadcastId, // Alias for compatibility
@@ -1021,19 +1059,35 @@ class BroadcastService {
           : 'All trucks have been assigned'
     };
 
-    logger.info(`📢 Broadcasting expiry event: ${broadcastId} (${reason})`);
+    // Lookup notified transporters from booking record
+    let targets: string[] = [];
+    try {
+      const booking = await db.getBookingById(broadcastId);
+      targets = booking?.notifiedTransporters ?? [];
+    } catch {
+      // DB lookup failed — fallback to all transporters (safety net)
+    }
 
-    // Emit to ALL connected transporters
-    emitToAllTransporters(BroadcastEvents.BROADCAST_EXPIRED, payload);
+    if (targets.length > 0) {
+      logger.info(`📢 Targeted expiry event: ${broadcastId} (${reason}) → ${targets.length} transporters`);
+      emitToUsers(targets, BroadcastEvents.BROADCAST_EXPIRED, payload);
+    } else {
+      // Fallback: no targets found (order record missing) → broadcast to all
+      logger.warn(`📢 Fallback expiry event: ${broadcastId} (${reason}) → ALL transporters (no notified list found)`);
+      emitToAllTransporters(BroadcastEvents.BROADCAST_EXPIRED, payload);
+    }
 
-    // Also emit to the specific booking room (for any listeners)
+    // Also emit to the specific booking/order room (for any listeners)
     emitToRoom(`booking:${broadcastId}`, BroadcastEvents.BROADCAST_EXPIRED, payload);
     emitToRoom(`order:${broadcastId}`, BroadcastEvents.BROADCAST_EXPIRED, payload);
   }
 
   /**
-   * Emit trucks remaining update to ALL transporters
+   * Emit trucks remaining update to NOTIFIED transporters only
    * Called when a transporter accepts trucks - others see reduced availability
+   * 
+   * FIX 2: Changed from emitToAllTransporters → targeted emitToUsers.
+   * Only transporters who received this broadcast see the truck count update.
    * 
    * @param broadcastId - The broadcast/order ID
    * @param vehicleType - Which vehicle type was accepted
@@ -1041,13 +1095,13 @@ class BroadcastService {
    * @param remaining - How many trucks still needed
    * @param total - Total trucks needed
    */
-  emitTrucksRemainingUpdate(
+  async emitTrucksRemainingUpdate(
     broadcastId: string,
     vehicleType: string,
     vehicleSubtype: string,
     remaining: number,
     total: number
-  ): void {
+  ): Promise<void> {
     const payload = {
       broadcastId,
       orderId: broadcastId,
@@ -1060,10 +1114,22 @@ class BroadcastService {
       timestamp: new Date().toISOString()
     };
 
-    logger.info(`📢 Trucks remaining update: ${broadcastId} - ${remaining}/${total} (${vehicleType})`);
+    // Lookup notified transporters from booking record
+    let targets: string[] = [];
+    try {
+      const booking = await db.getBookingById(broadcastId);
+      targets = booking?.notifiedTransporters ?? [];
+    } catch {
+      // DB lookup failed — fallback to all transporters
+    }
 
-    // Emit to ALL transporters so they see updated availability
-    emitToAllTransporters(BroadcastEvents.TRUCKS_REMAINING_UPDATE, payload);
+    if (targets.length > 0) {
+      logger.info(`📢 Targeted trucks update: ${broadcastId} - ${remaining}/${total} (${vehicleType}) → ${targets.length} transporters`);
+      emitToUsers(targets, BroadcastEvents.TRUCKS_REMAINING_UPDATE, payload);
+    } else {
+      logger.warn(`📢 Fallback trucks update: ${broadcastId} - ${remaining}/${total} → ALL transporters`);
+      emitToAllTransporters(BroadcastEvents.TRUCKS_REMAINING_UPDATE, payload);
+    }
 
     // Also emit to booking/order room
     emitToRoom(`booking:${broadcastId}`, BroadcastEvents.TRUCKS_REMAINING_UPDATE, payload);
@@ -1071,7 +1137,7 @@ class BroadcastService {
 
     // If fully filled, emit that event too
     if (remaining === 0) {
-      this.emitBroadcastExpired(broadcastId, 'fully_filled');
+      await this.emitBroadcastExpired(broadcastId, 'fully_filled');
     }
   }
 

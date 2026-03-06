@@ -1,6 +1,30 @@
+/**
+ * =============================================================================
+ * PROGRESSIVE RADIUS MATCHER — H3 Primary + GEORADIUS Fallback + ETA Ranking
+ * =============================================================================
+ *
+ * DISPATCH CASCADE:
+ * ─────────────────────────────────────────────────────────────────────────────
+ * 1. H3 SUNION (primary)           → O(k) Redis ops, ~2-5ms
+ *    ↓ if fails / 0 results
+ * 2. GEORADIUS (automatic fallback) → O(N log N), ~10-50ms
+ *    ↓ after candidates found
+ * 3. Google Directions API (ETA)    → Real road ETA ranking, ~200-400ms
+ *    ↓ if fails
+ * 4. Haversine (final fallback)     → Pure math, ~0.1ms
+ *
+ * FEATURE FLAGS:
+ * - FF_H3_INDEX_ENABLED=true  → H3 primary, GEORADIUS fallback
+ * - FF_H3_INDEX_ENABLED=false → GEORADIUS only (current production behavior)
+ * - FF_H3_RADIUS_STEPS_7=true → 7-step expansion (5→10→15→30→60→100km)
+ *
+ * =============================================================================
+ */
+
 import { availabilityService } from '../../shared/services/availability.service';
 import { generateVehicleKey } from '../../shared/services/vehicle-key.service';
 import { h3GeoIndexService, FF_H3_INDEX_ENABLED } from '../../shared/services/h3-geo-index.service';
+import { googleDirectionsService } from '../../shared/services/google-directions.service';
 import { logger } from '../../shared/services/logger.service';
 
 export interface RadiusStep {
@@ -22,6 +46,10 @@ export interface CandidateTransporter {
   distanceKm: number;
   latitude: number;
   longitude: number;
+  /** ETA in seconds from pickup (Google API or haversine estimate) */
+  etaSeconds?: number;
+  /** Source of ETA: 'google' | 'haversine' */
+  etaSource?: 'google' | 'haversine';
 }
 
 // ============================================================================
@@ -82,6 +110,15 @@ class ProgressiveRadiusMatcher {
     return getActiveSteps().length;
   }
 
+  /**
+   * Find candidate transporters for broadcast dispatch.
+   *
+   * CASCADE:
+   * 1. H3 SUNION (if enabled) → load transporter:details hash → filter
+   * 2. GEORADIUS fallback (if H3 fails or disabled)
+   * 3. Google Directions API → real ETA ranking
+   * 4. Haversine → fallback ETA ranking
+   */
   async findCandidates(params: {
     pickupLat: number;
     pickupLng: number;
@@ -106,15 +143,14 @@ class ProgressiveRadiusMatcher {
     const vehicleKey = generateVehicleKey(vehicleType, vehicleSubtype);
 
     // ========================================================================
-    // H3 PATH (Feature-flagged — default OFF)
-    // When enabled, uses H3 hex-cell lookup instead of GEORADIUS.
-    // Existing GEORADIUS path is untouched below.
+    // LAYER 1: H3 PRIMARY PATH (Feature-flagged)
+    // H3 → transporter:details hash → filter. NO GEORADIUS.
     // ========================================================================
+    let candidates: CandidateTransporter[] | undefined;
+
     if (FF_H3_INDEX_ENABLED && step.h3RingK !== undefined) {
-      // Phase 5: Circuit breaker wraps H3 lookup. When circuit OPEN,
-      // falls through to GEORADIUS path below (returns undefined → skips early return).
       const { h3Circuit } = require('../../shared/services/circuit-breaker.service');
-      const h3Result = await h3Circuit.tryWithFallback(
+      candidates = await h3Circuit.tryWithFallback(
         () => this.findCandidatesH3({
           pickupLat,
           pickupLng,
@@ -124,48 +160,75 @@ class ProgressiveRadiusMatcher {
           alreadyNotified,
           limit
         }),
-        async () => undefined as any // fallback = fall through to GEORADIUS below
+        async () => undefined as any // fallback = fall through to GEORADIUS
       );
-      if (h3Result !== undefined) return h3Result;
-      // Circuit is OPEN — fall through to GEORADIUS path
     }
 
     // ========================================================================
-    // ORIGINAL GEORADIUS PATH (always available, untouched)
+    // LAYER 2: GEORADIUS FALLBACK (if H3 disabled / failed / 0 results)
     // ========================================================================
-    const nearby = await availabilityService.getAvailableTransportersWithDetails(
-      vehicleKey,
-      pickupLat,
-      pickupLng,
-      Math.max(limit * 2, 100),
-      step.radiusKm
-    );
+    if (candidates === undefined) {
+      candidates = await this.findCandidatesGeoRadius({
+        pickupLat,
+        pickupLng,
+        vehicleKey,
+        radiusKm: step.radiusKm,
+        alreadyNotified,
+        limit
+      });
+    }
 
-    return nearby
-      .map((driver) => {
-        const strictDistanceKm = haversineDistanceKm(
-          pickupLat,
-          pickupLng,
-          driver.latitude,
-          driver.longitude
-        );
-        return {
-          transporterId: driver.transporterId,
-          distanceKm: strictDistanceKm,
-          latitude: driver.latitude,
-          longitude: driver.longitude
-        };
-      })
-      .filter((candidate) => {
-        return candidate.distanceKm <= step.radiusKm &&
-          !alreadyNotified.has(candidate.transporterId);
-      })
-      .sort((left, right) => left.distanceKm - right.distanceKm)
-      .slice(0, limit);
+    if (candidates.length === 0) return [];
+
+    // ========================================================================
+    // LAYER 3: GOOGLE DIRECTIONS API — ETA-BASED RANKING
+    // Falls back to haversine automatically via directionsCircuit.
+    // ========================================================================
+    try {
+      const ranked = await googleDirectionsService.rankByETA(
+        pickupLat,
+        pickupLng,
+        candidates.map(c => ({
+          transporterId: c.transporterId,
+          latitude: c.latitude,
+          longitude: c.longitude
+        }))
+      );
+
+      // Merge ETA data back into candidates
+      const etaMap = new Map(ranked.map(r => [r.transporterId, r]));
+      const enriched = candidates
+        .map(c => {
+          const eta = etaMap.get(c.transporterId);
+          return {
+            ...c,
+            etaSeconds: eta?.etaSeconds,
+            etaSource: eta?.source,
+            distanceKm: eta ? eta.distanceMeters / 1000 : c.distanceKm
+          };
+        })
+        .sort((a, b) => (a.etaSeconds ?? Infinity) - (b.etaSeconds ?? Infinity))
+        .slice(0, limit);
+
+      logger.info('[RadiusMatcher] ETA-ranked candidates', {
+        matchingSource: FF_H3_INDEX_ENABLED ? 'h3_index' : 'georadius',
+        etaSource: enriched[0]?.etaSource || 'none',
+        vehicleKey,
+        stepIndex,
+        radiusKm: step.radiusKm,
+        totalCandidates: enriched.length
+      });
+
+      return enriched;
+    } catch (error: any) {
+      // If ETA ranking completely fails, return haversine-sorted candidates
+      logger.warn(`[RadiusMatcher] ETA ranking failed, using haversine order: ${error.message}`);
+      return candidates.slice(0, limit);
+    }
   }
 
   // ==========================================================================
-  // H3 CANDIDATE FINDER (Private — only called when FF_H3_INDEX_ENABLED=true)
+  // LAYER 1: H3 CANDIDATE FINDER (Primary — no GEORADIUS)
   // ==========================================================================
 
   private async findCandidatesH3(params: {
@@ -186,53 +249,106 @@ class ProgressiveRadiusMatcher {
       );
 
       if (candidateIds.length === 0) {
-        // H3 cells empty (expired TTL / cold start) — fall through to GEORADIUS
         logger.info('[RadiusMatcher] H3 returned 0 candidates, falling back to GEORADIUS', {
           vehicleKey, ringK, radiusKm
         });
-        return undefined; // triggers GEORADIUS fallback in findCandidates()
+        return undefined; // triggers GEORADIUS fallback
       }
 
-      // H3 found candidates — load details from GEORADIUS for lat/lng + distance
-      const nearby = await availabilityService.getAvailableTransportersWithDetails(
-        vehicleKey,
-        pickupLat,
-        pickupLng,
-        Math.max(limit * 3, 200),
-        radiusKm
-      );
+      // Load transporter:details Redis hash directly — NO GEORADIUS
+      const detailsMap = await availabilityService.loadTransporterDetailsMap(candidateIds);
 
-      // UNION approach: include ALL transporters within radius (not just H3 matches)
-      // H3 is a fast hint for WHO might be nearby, GEORADIUS provides ground truth.
-      const results = nearby
-        .map(driver => ({
-          transporterId: driver.transporterId,
-          distanceKm: haversineDistanceKm(pickupLat, pickupLng, driver.latitude, driver.longitude),
-          latitude: driver.latitude,
-          longitude: driver.longitude
-        }))
-        .filter(c => c.distanceKm <= radiusKm && !alreadyNotified.has(c.transporterId))
-        .sort((a, b) => a.distanceKm - b.distanceKm)
-        .slice(0, limit);
+      // Filter: online + not on trip + within radius
+      const results: CandidateTransporter[] = [];
+      for (const transporterId of candidateIds) {
+        const details = detailsMap.get(transporterId);
 
-      logger.info('[RadiusMatcher] H3 candidate lookup', {
+        // No details = TTL expired = transporter offline → skip
+        if (!details || Object.keys(details).length === 0) continue;
+
+        // On trip → skip
+        if (details.isOnTrip === 'true') continue;
+
+        // Must have valid coordinates
+        const lat = parseFloat(details.latitude);
+        const lng = parseFloat(details.longitude);
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+
+        // Strict haversine distance check (H3 cells are approximate)
+        const distanceKm = haversineDistanceKm(pickupLat, pickupLng, lat, lng);
+        if (distanceKm > radiusKm) continue;
+
+        results.push({
+          transporterId,
+          distanceKm,
+          latitude: lat,
+          longitude: lng
+        });
+      }
+
+      // Sort by distance initially (ETA ranking happens in findCandidates)
+      results.sort((a, b) => a.distanceKm - b.distanceKm);
+
+      logger.info('[RadiusMatcher] H3 candidate lookup (no GEORADIUS)', {
         matchingSource: 'h3_index',
         vehicleKey,
         ringK,
         radiusKm,
         h3Candidates: candidateIds.length,
-        geoNearby: nearby.length,
-        matched: results.length
+        filteredOnline: results.length
       });
 
-      return results;
+      return results.slice(0, limit);
     } catch (error: any) {
-      // Fallback to GEORADIUS on H3 failure — zero latency regression
       logger.warn(`[RadiusMatcher] H3 lookup failed, falling back to GEORADIUS: ${error.message}`);
-      return undefined; // triggers GEORADIUS fallback in findCandidates()
+      return undefined; // triggers GEORADIUS fallback
     }
+  }
+
+  // ==========================================================================
+  // LAYER 2: GEORADIUS FALLBACK (automatic when H3 fails/disabled)
+  // ==========================================================================
+
+  private async findCandidatesGeoRadius(params: {
+    pickupLat: number;
+    pickupLng: number;
+    vehicleKey: string;
+    radiusKm: number;
+    alreadyNotified: Set<string>;
+    limit: number;
+  }): Promise<CandidateTransporter[]> {
+    const { pickupLat, pickupLng, vehicleKey, radiusKm, alreadyNotified, limit } = params;
+
+    const nearby = await availabilityService.getAvailableTransportersWithDetails(
+      vehicleKey,
+      pickupLat,
+      pickupLng,
+      Math.max(limit * 2, 100),
+      radiusKm
+    );
+
+    return nearby
+      .map((entry) => {
+        const strictDistanceKm = haversineDistanceKm(
+          pickupLat,
+          pickupLng,
+          entry.latitude,
+          entry.longitude
+        );
+        return {
+          transporterId: entry.transporterId,
+          distanceKm: strictDistanceKm,
+          latitude: entry.latitude,
+          longitude: entry.longitude
+        };
+      })
+      .filter((candidate) => {
+        return candidate.distanceKm <= radiusKm &&
+          !alreadyNotified.has(candidate.transporterId);
+      })
+      .sort((left, right) => left.distanceKm - right.distanceKm)
+      .slice(0, limit);
   }
 }
 
 export const progressiveRadiusMatcher = new ProgressiveRadiusMatcher();
-

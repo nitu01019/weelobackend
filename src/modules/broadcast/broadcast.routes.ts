@@ -58,14 +58,14 @@ router.get(
         role: req.user!.role,
         actorId
       });
-      
+
       const broadcasts = await broadcastService.getActiveBroadcasts({
-        driverId: actorId,
+        actorId,
         vehicleType: vehicleType as string,
         maxDistance: maxDistance ? parseFloat(maxDistance as string) : undefined
       });
       const syncCursor = new Date().toISOString();
-      
+
       res.json({
         success: true,
         broadcasts,
@@ -90,7 +90,7 @@ router.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const broadcast = await broadcastService.getBroadcastById(req.params.broadcastId);
-      
+
       res.json({
         success: true,
         broadcast
@@ -123,7 +123,7 @@ router.post(
       const effectiveDriverId = actorRole === 'driver'
         ? actorUserId
         : (body.driverId || actorUserId);
-      
+
       const result = await broadcastService.acceptBroadcast(
         req.params.broadcastId,
         {
@@ -137,7 +137,7 @@ router.post(
           idempotencyKey
         }
       );
-      
+
       res.json({
         success: true,
         message: 'Broadcast accepted successfully',
@@ -157,7 +157,7 @@ router.post(
  * @route   POST /broadcasts/:broadcastId/decline
  * @desc    Decline a broadcast
  * @access  Driver, Transporter
- * @body    { driverId, reason, notes? }
+ * @body    { actorId, reason, notes? }
  */
 router.post(
   '/:broadcastId/decline',
@@ -166,16 +166,16 @@ router.post(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { driverId, reason, notes } = req.body;
-      
+
       await broadcastService.declineBroadcast(
         req.params.broadcastId,
         {
-          driverId: driverId || req.user!.userId,
+          actorId: driverId || req.user!.userId,
           reason,
           notes
         }
       );
-      
+
       res.json({
         success: true,
         message: 'Broadcast declined'
@@ -199,14 +199,14 @@ router.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { driverId, page = '1', limit = '20', status } = req.query;
-      
+
       const result = await broadcastService.getBroadcastHistory({
-        driverId: driverId as string || req.user!.userId,
+        actorId: driverId as string || req.user!.userId,
         page: parseInt(page as string),
         limit: parseInt(limit as string),
         status: status as string
       });
-      
+
       res.json({
         success: true,
         broadcasts: result.broadcasts,
@@ -233,7 +233,7 @@ router.post(
         ...req.body,
         transporterId: req.user!.userId
       });
-      
+
       res.status(201).json({
         success: true,
         broadcast: result.broadcast,

@@ -3,19 +3,19 @@
  * AVAILABILITY SERVICE
  * =============================================================================
  * 
- * Maintains a LIVE availability table of drivers/transporters.
+ * Maintains a LIVE availability table of transporters.
  * 
  * VERSION 2.0 - REDIS POWERED:
  * - Uses Redis geospatial commands for O(log N) proximity queries
- * - Auto-expire removes stale drivers (no manual cleanup needed)
+ * - Auto-expire removes stale transporters (no manual cleanup needed)
  * - Works across multiple servers (horizontal scaling)
  * - Falls back to in-memory for development
  * 
  * REDIS KEY PATTERNS:
- * - geo:drivers:{vehicleKey}       = Geospatial index (GEOADD/GEORADIUS)
- * - driver:details:{transporterId} = Driver details hash (TTL: 60s)
- * - driver:vehicle:{transporterId} = Current vehicle key
- * - online:drivers                 = Set of all online drivers
+ * - geo:transporters:{vehicleKey}       = Geospatial index (GEOADD/GEORADIUS)
+ * - transporter:details:{transporterId} = Transporter details hash (TTL: 60s)
+ * - transporter:vehicle:{transporterId} = Current vehicle key
+ * - online:transporters                 = Set of all online transporters
  * 
  * PERFORMANCE:
  * - Update: O(log N) ~1ms
@@ -24,7 +24,7 @@
  * 
  * USAGE:
  * ```typescript
- * // Update driver location (call every 5 seconds)
+ * // Update transporter location (call every 5 seconds)
  * await availabilityService.updateAvailability({
  *   transporterId: 'trans_123',
  *   vehicleKey: 'open_17ft',
@@ -33,7 +33,7 @@
  *   longitude: 77.2090
  * });
  * 
- * // Find nearby drivers
+ * // Find nearby transporters
  * const nearby = await availabilityService.getAvailableTransporters(
  *   'open_17ft', 28.6139, 77.2090, 20
  * );
@@ -105,7 +105,7 @@ function encodeGeohash(lat: number, lng: number, precision: number = 5): string 
  *   ---+---+---
  *   SW | S | SE
  * 
- * This ensures we check all adjacent cells for nearby drivers
+ * This ensures we check all adjacent cells for nearby transporters
  * Total cells checked = 9 max (fast lookup < 5ms)
  */
 function getNeighbors(geohash: string): string[] {
@@ -142,27 +142,27 @@ function getNeighbors(geohash: string): string[] {
 // =============================================================================
 
 const REDIS_KEYS = {
-  /** Geospatial index: geo:drivers:{vehicleKey} */
-  GEO_DRIVERS: (vehicleKey: string) => `geo:drivers:${vehicleKey}`,
+  /** Geospatial index: geo:transporters:{vehicleKey} */
+  GEO_TRANSPORTERS: (vehicleKey: string) => `geo:transporters:${vehicleKey}`,
 
-  /** Driver details hash: driver:details:{transporterId} */
-  DRIVER_DETAILS: (transporterId: string) => `driver:details:${transporterId}`,
+  /** Transporter details hash: transporter:details:{transporterId} */
+  TRANSPORTER_DETAILS: (transporterId: string) => `transporter:details:${transporterId}`,
 
-  /** Driver's current vehicle key: driver:vehicle:{transporterId} */
-  DRIVER_VEHICLE: (transporterId: string) => `driver:vehicle:${transporterId}`,
+  /** Transporter's current vehicle key: transporter:vehicle:{transporterId} */
+  TRANSPORTER_VEHICLE: (transporterId: string) => `transporter:vehicle:${transporterId}`,
 
-  /** Driver's indexed vehicle keys set: driver:vehicle:keys:{transporterId} */
-  DRIVER_VEHICLE_KEYS: (transporterId: string) => `driver:vehicle:keys:${transporterId}`,
+  /** Transporter's indexed vehicle keys set: transporter:vehicle:keys:{transporterId} */
+  TRANSPORTER_VEHICLE_KEYS: (transporterId: string) => `transporter:vehicle:keys:${transporterId}`,
 
-  /** All online drivers set: online:drivers */
-  ONLINE_DRIVERS: 'online:drivers',
+  /** All online transporters set: online:transporters */
+  ONLINE_TRANSPORTERS: 'online:transporters',
 };
 
 // =============================================================================
 // TYPES
 // =============================================================================
 
-interface DriverAvailability {
+interface TransporterAvailability {
   transporterId: string;
   driverId?: string;
   vehicleKey: string;
@@ -180,7 +180,7 @@ interface AvailabilityStats {
   redisMode: boolean;
 }
 
-interface NearbyDriver {
+interface NearbyTransporter {
   transporterId: string;
   distance: number;
   vehicleKey: string;
@@ -195,8 +195,8 @@ interface NearbyDriver {
 
 class AvailabilityService {
 
-  /** TTL for driver details (60 seconds - auto-offline if no heartbeat) */
-  private readonly DRIVER_TTL_SECONDS = 60;
+  /** TTL for transporter details (60 seconds - auto-offline if no heartbeat) */
+  private readonly TRANSPORTER_TTL_SECONDS = 60;
 
   /** Heartbeat interval recommendation for clients */
   readonly HEARTBEAT_INTERVAL_MS = 5 * 1000;
@@ -227,14 +227,14 @@ class AvailabilityService {
   // ===========================================================================
 
   /**
-   * Update driver/transporter availability
+   * Update transporter availability
    * 
    * NOW USES REDIS:
    * - Stores location in Redis geospatial index (GEOADD)
    * - Auto-expires after 60 seconds (no heartbeat = offline)
    * - Works across multiple servers
    * 
-   * @param data - Driver availability data
+   * @param data - Transporter availability data
    */
   updateAvailability(data: {
     transporterId: string;
@@ -278,10 +278,10 @@ class AvailabilityService {
     try {
       // 1. Get previously indexed vehicle keys.
       const previousVehicleKey = await redisService.get(
-        REDIS_KEYS.DRIVER_VEHICLE(transporterId)
+        REDIS_KEYS.TRANSPORTER_VEHICLE(transporterId)
       );
       const previousVehicleKeys = await redisService.sMembers(
-        REDIS_KEYS.DRIVER_VEHICLE_KEYS(transporterId)
+        REDIS_KEYS.TRANSPORTER_VEHICLE_KEYS(transporterId)
       ).catch(() => []);
 
       // 2. If vehicle changed, remove stale geo index entries.
@@ -290,12 +290,12 @@ class AvailabilityService {
       for (const staleKey of staleVehicleKeys) {
         if (!staleKey || staleKey === vehicleKey) continue;
         await redisService.geoRemove(
-          REDIS_KEYS.GEO_DRIVERS(staleKey),
+          REDIS_KEYS.GEO_TRANSPORTERS(staleKey),
           transporterId
         );
       }
 
-      // 3. Store driver details (with TTL for auto-cleanup)
+      // 3. Store transporter details (with TTL for auto-cleanup)
       const details: Record<string, string> = {
         transporterId,
         vehicleKey,
@@ -310,34 +310,34 @@ class AvailabilityService {
         details.driverId = driverId;
       }
 
-      await redisService.hMSet(REDIS_KEYS.DRIVER_DETAILS(transporterId), details);
-      await redisService.expire(REDIS_KEYS.DRIVER_DETAILS(transporterId), this.DRIVER_TTL_SECONDS);
+      await redisService.hMSet(REDIS_KEYS.TRANSPORTER_DETAILS(transporterId), details);
+      await redisService.expire(REDIS_KEYS.TRANSPORTER_DETAILS(transporterId), this.TRANSPORTER_TTL_SECONDS);
 
       // 4. Store current vehicle key
       await redisService.set(
-        REDIS_KEYS.DRIVER_VEHICLE(transporterId),
+        REDIS_KEYS.TRANSPORTER_VEHICLE(transporterId),
         vehicleKey,
-        this.DRIVER_TTL_SECONDS
+        this.TRANSPORTER_TTL_SECONDS
       );
-      await redisService.del(REDIS_KEYS.DRIVER_VEHICLE_KEYS(transporterId));
-      await redisService.sAdd(REDIS_KEYS.DRIVER_VEHICLE_KEYS(transporterId), vehicleKey);
-      await redisService.expire(REDIS_KEYS.DRIVER_VEHICLE_KEYS(transporterId), this.DRIVER_TTL_SECONDS);
+      await redisService.del(REDIS_KEYS.TRANSPORTER_VEHICLE_KEYS(transporterId));
+      await redisService.sAdd(REDIS_KEYS.TRANSPORTER_VEHICLE_KEYS(transporterId), vehicleKey);
+      await redisService.expire(REDIS_KEYS.TRANSPORTER_VEHICLE_KEYS(transporterId), this.TRANSPORTER_TTL_SECONDS);
 
       // 5. Update geo index (only if NOT on trip)
       if (!isOnTrip) {
         await redisService.geoAdd(
-          REDIS_KEYS.GEO_DRIVERS(vehicleKey),
+          REDIS_KEYS.GEO_TRANSPORTERS(vehicleKey),
           longitude,
           latitude,
           transporterId
         );
 
-        await redisService.sAdd(REDIS_KEYS.ONLINE_DRIVERS, transporterId);
+        await redisService.sAdd(REDIS_KEYS.ONLINE_TRANSPORTERS, transporterId);
 
         logger.debug(`[Availability] Updated: ${transporterId} @ (${latitude}, ${longitude}) - ${vehicleKey}`);
       } else {
         await redisService.geoRemove(
-          REDIS_KEYS.GEO_DRIVERS(vehicleKey),
+          REDIS_KEYS.GEO_TRANSPORTERS(vehicleKey),
           transporterId
         );
 
@@ -394,17 +394,17 @@ class AvailabilityService {
     const now = Date.now();
 
     const previousVehicleKey = await redisService.get(
-      REDIS_KEYS.DRIVER_VEHICLE(transporterId)
+      REDIS_KEYS.TRANSPORTER_VEHICLE(transporterId)
     );
     const previousVehicleKeys = await redisService.sMembers(
-      REDIS_KEYS.DRIVER_VEHICLE_KEYS(transporterId)
+      REDIS_KEYS.TRANSPORTER_VEHICLE_KEYS(transporterId)
     ).catch(() => []);
 
     const staleVehicleKeys = new Set(previousVehicleKeys);
     if (previousVehicleKey) staleVehicleKeys.add(previousVehicleKey);
     for (const staleKey of staleVehicleKeys) {
       if (!staleKey || currentVehicleKeys.includes(staleKey)) continue;
-      await redisService.geoRemove(REDIS_KEYS.GEO_DRIVERS(staleKey), transporterId);
+      await redisService.geoRemove(REDIS_KEYS.GEO_TRANSPORTERS(staleKey), transporterId);
     }
 
     const details: Record<string, string> = {
@@ -419,30 +419,30 @@ class AvailabilityService {
     };
     if (driverId) details.driverId = driverId;
 
-    await redisService.hMSet(REDIS_KEYS.DRIVER_DETAILS(transporterId), details);
-    await redisService.expire(REDIS_KEYS.DRIVER_DETAILS(transporterId), this.DRIVER_TTL_SECONDS);
+    await redisService.hMSet(REDIS_KEYS.TRANSPORTER_DETAILS(transporterId), details);
+    await redisService.expire(REDIS_KEYS.TRANSPORTER_DETAILS(transporterId), this.TRANSPORTER_TTL_SECONDS);
     await redisService.set(
-      REDIS_KEYS.DRIVER_VEHICLE(transporterId),
+      REDIS_KEYS.TRANSPORTER_VEHICLE(transporterId),
       primary.vehicleKey,
-      this.DRIVER_TTL_SECONDS
+      this.TRANSPORTER_TTL_SECONDS
     );
-    await redisService.del(REDIS_KEYS.DRIVER_VEHICLE_KEYS(transporterId));
-    await redisService.sAdd(REDIS_KEYS.DRIVER_VEHICLE_KEYS(transporterId), ...currentVehicleKeys);
-    await redisService.expire(REDIS_KEYS.DRIVER_VEHICLE_KEYS(transporterId), this.DRIVER_TTL_SECONDS);
+    await redisService.del(REDIS_KEYS.TRANSPORTER_VEHICLE_KEYS(transporterId));
+    await redisService.sAdd(REDIS_KEYS.TRANSPORTER_VEHICLE_KEYS(transporterId), ...currentVehicleKeys);
+    await redisService.expire(REDIS_KEYS.TRANSPORTER_VEHICLE_KEYS(transporterId), this.TRANSPORTER_TTL_SECONDS);
 
     if (!isOnTrip) {
       await Promise.all(currentVehicleKeys.map((key) =>
         redisService.geoAdd(
-          REDIS_KEYS.GEO_DRIVERS(key),
+          REDIS_KEYS.GEO_TRANSPORTERS(key),
           longitude,
           latitude,
           transporterId
         )
       ));
-      await redisService.sAdd(REDIS_KEYS.ONLINE_DRIVERS, transporterId);
+      await redisService.sAdd(REDIS_KEYS.ONLINE_TRANSPORTERS, transporterId);
     } else {
       await Promise.all(currentVehicleKeys.map((key) =>
-        redisService.geoRemove(REDIS_KEYS.GEO_DRIVERS(key), transporterId)
+        redisService.geoRemove(REDIS_KEYS.GEO_TRANSPORTERS(key), transporterId)
       ));
     }
 
@@ -457,7 +457,7 @@ class AvailabilityService {
   }
 
   /**
-   * Mark driver as offline (remove from availability)
+   * Mark transporter as offline (remove from availability)
    * 
    * Call this on:
    * - App close / background
@@ -478,34 +478,34 @@ class AvailabilityService {
     try {
       // 1. Get current vehicle key
       const vehicleKey = await redisService.get(
-        REDIS_KEYS.DRIVER_VEHICLE(transporterId)
+        REDIS_KEYS.TRANSPORTER_VEHICLE(transporterId)
       );
       const vehicleKeys = await redisService.sMembers(
-        REDIS_KEYS.DRIVER_VEHICLE_KEYS(transporterId)
+        REDIS_KEYS.TRANSPORTER_VEHICLE_KEYS(transporterId)
       ).catch(() => []);
 
       // 2. Remove from geo index
       if (vehicleKey) {
         await redisService.geoRemove(
-          REDIS_KEYS.GEO_DRIVERS(vehicleKey),
+          REDIS_KEYS.GEO_TRANSPORTERS(vehicleKey),
           transporterId
         );
       }
       for (const indexedKey of vehicleKeys) {
         if (!indexedKey || indexedKey === vehicleKey) continue;
         await redisService.geoRemove(
-          REDIS_KEYS.GEO_DRIVERS(indexedKey),
+          REDIS_KEYS.GEO_TRANSPORTERS(indexedKey),
           transporterId
         );
       }
 
       // 3. Remove from online set
-      await redisService.sRem(REDIS_KEYS.ONLINE_DRIVERS, transporterId);
+      await redisService.sRem(REDIS_KEYS.ONLINE_TRANSPORTERS, transporterId);
 
-      // 4. Delete driver details
-      await redisService.del(REDIS_KEYS.DRIVER_DETAILS(transporterId));
-      await redisService.del(REDIS_KEYS.DRIVER_VEHICLE(transporterId));
-      await redisService.del(REDIS_KEYS.DRIVER_VEHICLE_KEYS(transporterId));
+      // 4. Delete transporter details
+      await redisService.del(REDIS_KEYS.TRANSPORTER_DETAILS(transporterId));
+      await redisService.del(REDIS_KEYS.TRANSPORTER_VEHICLE(transporterId));
+      await redisService.del(REDIS_KEYS.TRANSPORTER_VEHICLE_KEYS(transporterId));
 
       logger.info(`[Availability] Offline: ${transporterId}`);
 
@@ -522,7 +522,7 @@ class AvailabilityService {
    * 
    * NOW USES REDIS GEORADIUS:
    * - O(log N + M) complexity where M = results
-   * - Returns drivers sorted by distance
+   * - Returns transporters sorted by distance
    * - Auto-filters stale entries
    * 
    * @param vehicleKey - Normalized vehicle key (e.g., "open_17ft")
@@ -567,8 +567,8 @@ class AvailabilityService {
     try {
       // Runtime matching source of truth: Redis GEO index (authoritative hot path).
       // Geohash helpers in this file are auxiliary utilities and not the primary matcher.
-      const nearbyDrivers = await redisService.geoRadius(
-        REDIS_KEYS.GEO_DRIVERS(vehicleKey),
+      const nearbyTransporters = await redisService.geoRadius(
+        REDIS_KEYS.GEO_TRANSPORTERS(vehicleKey),
         longitude,
         latitude,
         radiusKm,
@@ -576,21 +576,21 @@ class AvailabilityService {
       );
 
       // Batch Redis hash lookups to avoid N round-trips under burst.
-      const detailsMap = await this.loadDriverDetailsMap(
-        nearbyDrivers.map((driver) => driver.member)
+      const detailsMap = await this.loadTransporterDetailsMap(
+        nearbyTransporters.map((entry) => entry.member)
       );
 
-      // Filter out drivers who are on trip or stale.
-      const validDrivers: Array<{ id: string; distance: number }> = [];
-      for (const driver of nearbyDrivers) {
-        const details = detailsMap.get(driver.member) || {};
+      // Filter out transporters who are on trip or stale.
+      const validTransporters: Array<{ id: string; distance: number }> = [];
+      for (const entry of nearbyTransporters) {
+        const details = detailsMap.get(entry.member) || {};
 
         // Skip if no details (TTL expired = offline).
         if (Object.keys(details).length === 0) {
           // Clean up stale geo entry in background-safe path.
           await redisService.geoRemove(
-            REDIS_KEYS.GEO_DRIVERS(vehicleKey),
-            driver.member
+            REDIS_KEYS.GEO_TRANSPORTERS(vehicleKey),
+            entry.member
           );
           continue;
         }
@@ -600,21 +600,21 @@ class AvailabilityService {
           continue;
         }
 
-        validDrivers.push({
-          id: driver.member,
-          distance: driver.distance || 0
+        validTransporters.push({
+          id: entry.member,
+          distance: entry.distance || 0
         });
       }
 
       // Already sorted by distance from GEORADIUS
-      const result = validDrivers.slice(0, limit).map(d => d.id);
+      const result = validTransporters.slice(0, limit).map(d => d.id);
 
       logger.info(`[Availability] Found ${result.length} available for ${vehicleKey} within ${radiusKm}km of (${latitude}, ${longitude})`);
       logger.info('[Availability] matching.source=redis_geo', {
         matchingSource: 'redis_geo',
         vehicleKey,
         radiusKm,
-        candidates: nearbyDrivers.length,
+        candidates: nearbyTransporters.length,
         matched: result.length
       });
 
@@ -635,48 +635,48 @@ class AvailabilityService {
     longitude: number,
     limit: number = 20,
     radiusKm: number = this.DEFAULT_SEARCH_RADIUS_KM
-  ): Promise<NearbyDriver[]> {
+  ): Promise<NearbyTransporter[]> {
     try {
       // Runtime matching source of truth: Redis GEO index (authoritative hot path).
       // Geohash helpers are intentionally retained as utility/fallback helpers.
-      const nearbyDrivers = await redisService.geoRadius(
-        REDIS_KEYS.GEO_DRIVERS(vehicleKey),
+      const nearbyTransporters = await redisService.geoRadius(
+        REDIS_KEYS.GEO_TRANSPORTERS(vehicleKey),
         longitude,
         latitude,
         radiusKm,
         'km'
       );
 
-      const detailsMap = await this.loadDriverDetailsMap(
-        nearbyDrivers.map((driver) => driver.member)
+      const detailsMap = await this.loadTransporterDetailsMap(
+        nearbyTransporters.map((entry) => entry.member)
       );
-      const result: NearbyDriver[] = [];
+      const result: NearbyTransporter[] = [];
 
-      for (const driver of nearbyDrivers) {
+      for (const entry of nearbyTransporters) {
         if (result.length >= limit) break;
 
-        const details = detailsMap.get(driver.member) || {};
+        const details = detailsMap.get(entry.member) || {};
         if (Object.keys(details).length === 0) continue;
         if (details.isOnTrip === 'true') continue;
 
-        const driverLat = Number(details.latitude);
-        const driverLng = Number(details.longitude);
-        if (!Number.isFinite(driverLat) || !Number.isFinite(driverLng)) continue;
+        const transporterLat = Number(details.latitude);
+        const transporterLng = Number(details.longitude);
+        if (!Number.isFinite(transporterLat) || !Number.isFinite(transporterLng)) continue;
 
         result.push({
-          transporterId: driver.member,
-          distance: driver.distance || 0,
+          transporterId: entry.member,
+          distance: entry.distance || 0,
           vehicleKey: details.vehicleKey || vehicleKey,
           vehicleId: details.vehicleId || '',
-          latitude: driverLat,
-          longitude: driverLng
+          latitude: transporterLat,
+          longitude: transporterLng
         });
       }
       logger.info('[Availability] matching.source=redis_geo', {
         matchingSource: 'redis_geo',
         vehicleKey,
         radiusKm,
-        candidates: nearbyDrivers.length,
+        candidates: nearbyTransporters.length,
         matched: result.length
       });
 
@@ -702,7 +702,7 @@ class AvailabilityService {
     limit: number;
     radiusKm: number;
     errorMessage: string;
-  }): Promise<NearbyDriver[]> {
+  }): Promise<NearbyTransporter[]> {
     const { vehicleKey, latitude, longitude, limit, radiusKm, errorMessage } = params;
     const normalizedVehicleKey = vehicleKey.trim().toLowerCase();
     const now = Date.now();
@@ -744,8 +744,8 @@ class AvailabilityService {
         return [];
       }
 
-      const detailsMap = await this.loadDriverDetailsMap(candidateTransporters);
-      const result: NearbyDriver[] = [];
+      const detailsMap = await this.loadTransporterDetailsMap(candidateTransporters);
+      const result: NearbyTransporter[] = [];
       for (const transporterId of candidateTransporters) {
         if (result.length >= limit) break;
 
@@ -802,13 +802,13 @@ class AvailabilityService {
     }
   }
 
-  private async loadDriverDetailsMap(
+  async loadTransporterDetailsMap(
     transporterIds: string[]
   ): Promise<Map<string, Record<string, string>>> {
     const uniqueIds = Array.from(new Set(transporterIds.filter(Boolean)));
     if (uniqueIds.length === 0) return new Map();
 
-    const keys = uniqueIds.map((id) => REDIS_KEYS.DRIVER_DETAILS(id));
+    const keys = uniqueIds.map((id) => REDIS_KEYS.TRANSPORTER_DETAILS(id));
     const detailsList = await redisService.hGetAllBatch(keys).catch(() =>
       uniqueIds.map(() => ({} as Record<string, string>))
     );
@@ -884,7 +884,7 @@ class AvailabilityService {
   async isAvailableAsync(transporterId: string): Promise<boolean> {
     try {
       const details = await redisService.hGetAll(
-        REDIS_KEYS.DRIVER_DETAILS(transporterId)
+        REDIS_KEYS.TRANSPORTER_DETAILS(transporterId)
       );
 
       if (!details || Object.keys(details).length === 0) {
@@ -899,12 +899,12 @@ class AvailabilityService {
   }
 
   /**
-   * Get driver details
+   * Get transporter details
    */
-  async getDriverDetails(transporterId: string): Promise<DriverAvailability | null> {
+  async getTransporterDetails(transporterId: string): Promise<TransporterAvailability | null> {
     try {
       const details = await redisService.hGetAll(
-        REDIS_KEYS.DRIVER_DETAILS(transporterId)
+        REDIS_KEYS.TRANSPORTER_DETAILS(transporterId)
       );
 
       if (!details || Object.keys(details).length === 0) {
@@ -940,16 +940,16 @@ class AvailabilityService {
    */
   async getStatsAsync(): Promise<AvailabilityStats> {
     try {
-      const totalOnline = await redisService.sCard(REDIS_KEYS.ONLINE_DRIVERS);
+      const totalOnline = await redisService.sCard(REDIS_KEYS.ONLINE_TRANSPORTERS);
       const byVehicleType: Record<string, number> = {};
       const byGeohash: Record<string, number> = {};
 
       // Get breakdown by vehicle type (BATCHED — single pipeline instead of N GETs)
-      const onlineDrivers = await redisService.sMembers(REDIS_KEYS.ONLINE_DRIVERS);
-      const driverSlice = onlineDrivers.slice(0, 1000);
+      const onlineTransporters = await redisService.sMembers(REDIS_KEYS.ONLINE_TRANSPORTERS);
+      const transporterSlice = onlineTransporters.slice(0, 1000);
 
-      if (driverSlice.length > 0) {
-        const detailsMap = await this.loadDriverDetailsMap(driverSlice);
+      if (transporterSlice.length > 0) {
+        const detailsMap = await this.loadTransporterDetailsMap(transporterSlice);
         for (const [, details] of detailsMap.entries()) {
           const vehicleKey = details.vehicleKey;
           if (vehicleKey) {
@@ -978,7 +978,7 @@ class AvailabilityService {
     const start = Date.now();
 
     try {
-      await redisService.sCard(REDIS_KEYS.ONLINE_DRIVERS);
+      await redisService.sCard(REDIS_KEYS.ONLINE_TRANSPORTERS);
 
       return {
         healthy: true,

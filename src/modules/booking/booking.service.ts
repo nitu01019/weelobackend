@@ -37,6 +37,7 @@ import { queueService } from '../../shared/services/queue.service';
 import { CreateBookingInput, GetBookingsQuery } from './booking.schema';
 import { availabilityService } from '../../shared/services/availability.service';
 import { generateVehicleKey } from '../../shared/services/vehicle-key.service';
+import { progressiveRadiusMatcher } from '../order/progressive-radius-matcher';
 import { transporterOnlineService } from '../../shared/services/transporter-online.service';
 import { redisService } from '../../shared/services/redis.service';
 // 4 PRINCIPLES: Import production-grade error codes
@@ -101,6 +102,8 @@ interface RadiusStepTimerData {
   bookingId: string;
   customerId: string;
   vehicleKey: string;
+  vehicleType: string;
+  vehicleSubtype: string;
   pickupLat: number;
   pickupLng: number;
   currentStep: number;  // 0-indexed (0 = step 1 already done, advance to step 2)
@@ -157,7 +160,7 @@ async function processExpiredBookings(): Promise<void> {
         error: error.message
       });
     } finally {
-      await redisService.releaseLock(lockKey, 'expiry-checker').catch(() => {});
+      await redisService.releaseLock(lockKey, 'expiry-checker').catch(() => { });
     }
   }
 }
@@ -199,7 +202,7 @@ async function processRadiusExpansionTimers(): Promise<void> {
         error: error.message
       });
     } finally {
-      await redisService.releaseLock(lockKey, 'radius-expander').catch(() => {});
+      await redisService.releaseLock(lockKey, 'radius-expander').catch(() => { });
     }
   }
 }
@@ -285,301 +288,305 @@ class BookingService {
     }
 
     try {
-    // ========================================
-    // SERVER-GENERATED IDEMPOTENCY (double-tap / retry protection)
-    // ========================================
-    const roundCoord = (n: number) => Math.round(n * 1000) / 1000;
-    const idempotencyFingerprint = [
-      customerId,
-      data.vehicleType,
-      data.vehicleSubtype || '',
-      roundCoord(data.pickup.coordinates.latitude),
-      roundCoord(data.pickup.coordinates.longitude),
-      roundCoord(data.drop.coordinates.latitude),
-      roundCoord(data.drop.coordinates.longitude)
-    ].join(':');
-    const idempotencyHash = crypto.createHash('sha256').update(idempotencyFingerprint).digest('hex').substring(0, 32);
-    const dedupeKey = `idem:broadcast:create:${customerId}:${idempotencyHash}`;
+      // ========================================
+      // SERVER-GENERATED IDEMPOTENCY (double-tap / retry protection)
+      // ========================================
+      const roundCoord = (n: number) => Math.round(n * 1000) / 1000;
+      const idempotencyFingerprint = [
+        customerId,
+        data.vehicleType,
+        data.vehicleSubtype || '',
+        roundCoord(data.pickup.coordinates.latitude),
+        roundCoord(data.pickup.coordinates.longitude),
+        roundCoord(data.drop.coordinates.latitude),
+        roundCoord(data.drop.coordinates.longitude)
+      ].join(':');
+      const idempotencyHash = crypto.createHash('sha256').update(idempotencyFingerprint).digest('hex').substring(0, 32);
+      const dedupeKey = `idem:broadcast:create:${customerId}:${idempotencyHash}`;
 
-    const existingDedupeId = await redisService.get(dedupeKey);
-    if (existingDedupeId) {
-      const existingDedupeBooking = await db.getBookingById(existingDedupeId);
-      if (existingDedupeBooking && !['cancelled', 'expired'].includes(existingDedupeBooking.status)) {
-        logger.info('Idempotent replay: returning existing booking', { bookingId: existingDedupeId, idempotencyHash });
-        const matchingTransporters = await db.getTransportersWithVehicleType(data.vehicleType);
-        return {
-          ...existingDedupeBooking,
-          matchingTransportersCount: matchingTransporters.length,
-          timeoutSeconds: Math.floor(BOOKING_CONFIG.TIMEOUT_MS / 1000)
-        };
-      }
-    }
-
-    // Get customer name
-    const customer = await db.getUserById(customerId);
-    const customerName = customer?.name || 'Customer';
-
-    // Calculate expiry based on config timeout
-    const expiresAt = new Date(Date.now() + BOOKING_CONFIG.TIMEOUT_MS).toISOString();
-
-    // ========================================
-    // PROGRESSIVE RADIUS SEARCH (Requirement 6)
-    // Step 1: Start with smallest radius (10km)
-    // If no one accepts, expiry checker expands every 15s
-    // ========================================
-    const vehicleKey = generateVehicleKey(data.vehicleType, data.vehicleSubtype);
-    const step1 = RADIUS_EXPANSION_CONFIG.steps[0];
-
-    // Step 1 search: smallest radius
-    let nearbyTransporters = await availabilityService.getAvailableTransportersAsync(
-      vehicleKey,
-      data.pickup.coordinates.latitude,
-      data.pickup.coordinates.longitude,
-      RADIUS_EXPANSION_CONFIG.maxTransportersPerStep,
-      step1.radiusKm
-    );
-
-    logger.info(`📍 [RADIUS STEP 1/${RADIUS_EXPANSION_CONFIG.steps.length}] Found ${nearbyTransporters.length} transporters within ${step1.radiusKm}km for ${vehicleKey}`);
-
-    // Fallback: If no nearby online transporters at step 1, get ALL transporters from DB
-    // This ensures we still broadcast even if no one has sent heartbeats recently
-    let matchingTransporters: string[];
-    let skipProgressiveExpansion = false;  // DB fallback already covers everyone
-    if (nearbyTransporters.length > 0) {
-      matchingTransporters = nearbyTransporters;
-      logger.info(`🎯 Using PROXIMITY-BASED matching (${nearbyTransporters.length} nearby at ${step1.radiusKm}km)`);
-    } else {
-      const allDbTransporters = await db.getTransportersWithVehicleType(data.vehicleType);
-      matchingTransporters = await transporterOnlineService.filterOnline(allDbTransporters);
-      skipProgressiveExpansion = true;  // DB fallback already notified all — no radius expansion needed
-      logger.info(`📋 Fallback to DATABASE matching (${allDbTransporters.length} total, ${matchingTransporters.length} online) — skipping progressive expansion`);
-    }
-
-    logger.info(`╔══════════════════════════════════════════════════════════════╗`);
-    logger.info(`║  🚛 NEW BOOKING REQUEST (Progressive Radius)                    ║`);
-    logger.info(`╠══════════════════════════════════════════════════════════════╣`);
-    logger.info(`║  Vehicle: ${data.vehicleType} - ${data.vehicleSubtype || 'Any'}`);
-    logger.info(`║  Trucks Needed: ${data.trucksNeeded}`);
-    logger.info(`║  Price/Truck: ₹${data.pricePerTruck}`);
-    logger.info(`║  Distance: ${data.distanceKm} km`);
-    logger.info(`║  Step 1 Radius: ${step1.radiusKm}km`);
-    logger.info(`║  Matching Transporters (Step 1): ${matchingTransporters.length}`);
-    logger.info(`║  Timeout: ${BOOKING_CONFIG.TIMEOUT_MS / 1000} seconds`);
-    logger.info(`╚══════════════════════════════════════════════════════════════╝`);
-
-    // ========================================
-    // SERIALIZABLE TRANSACTION: DB check + create (TOCTOU-safe)
-    // Prevents duplicate active bookings when Redis lock fails.
-    // PostgreSQL serializable isolation aborts one transaction on conflict.
-    // ========================================
-    const bookingId = uuid();
-    await prismaClient.$transaction(async (tx) => {
-      // DB authoritative check (covers Redis failure edge case)
-      const existingBooking = await tx.booking.findFirst({
-        where: { customerId, status: { in: [BookingStatus.created, BookingStatus.broadcasting, BookingStatus.active, BookingStatus.partially_filled] } }
-      });
-      const existingOrder = await tx.order.findFirst({
-        where: { customerId, status: { in: ['created', 'broadcasting', 'active', 'partially_filled'] } }
-      });
-      if (existingBooking || existingOrder) {
-        throw new AppError(409, 'ORDER_ACTIVE_EXISTS', 'Request already in progress. Cancel it first.');
+      const existingDedupeId = await redisService.get(dedupeKey);
+      if (existingDedupeId) {
+        const existingDedupeBooking = await db.getBookingById(existingDedupeId);
+        if (existingDedupeBooking && !['cancelled', 'expired'].includes(existingDedupeBooking.status)) {
+          logger.info('Idempotent replay: returning existing booking', { bookingId: existingDedupeId, idempotencyHash });
+          const matchingTransporters = await db.getTransportersWithVehicleType(data.vehicleType);
+          return {
+            ...existingDedupeBooking,
+            matchingTransportersCount: matchingTransporters.length,
+            timeoutSeconds: Math.floor(BOOKING_CONFIG.TIMEOUT_MS / 1000)
+          };
+        }
       }
 
-      // Create booking atomically with the check
-      await tx.booking.create({
-        data: {
-          id: bookingId,
-          customerId,
-          customerName,
-          customerPhone,
-          pickup: {
-            latitude: data.pickup.coordinates.latitude,
-            longitude: data.pickup.coordinates.longitude,
-            address: data.pickup.address,
-            city: data.pickup.city,
-            state: data.pickup.state
-          } as Prisma.JsonObject,
-          drop: {
-            latitude: data.drop.coordinates.latitude,
-            longitude: data.drop.coordinates.longitude,
-            address: data.drop.address,
-            city: data.drop.city,
-            state: data.drop.state
-          } as Prisma.JsonObject,
+      // Get customer name
+      const customer = await db.getUserById(customerId);
+      const customerName = customer?.name || 'Customer';
+
+      // Calculate expiry based on config timeout
+      const expiresAt = new Date(Date.now() + BOOKING_CONFIG.TIMEOUT_MS).toISOString();
+
+      // ========================================
+      // PROGRESSIVE RADIUS SEARCH (Requirement 6)
+      // Step 1: Start with smallest radius (10km)
+      // If no one accepts, expiry checker expands every 15s
+      // ========================================
+      const vehicleKey = generateVehicleKey(data.vehicleType, data.vehicleSubtype);
+      const step1 = RADIUS_EXPANSION_CONFIG.steps[0];
+
+      // Step 1 search: H3 primary → GEORADIUS fallback → Google ETA → Haversine
+      const step1Candidates = await progressiveRadiusMatcher.findCandidates({
+        pickupLat: data.pickup.coordinates.latitude,
+        pickupLng: data.pickup.coordinates.longitude,
+        vehicleType: data.vehicleType,
+        vehicleSubtype: data.vehicleSubtype || '',
+        stepIndex: 0,
+        alreadyNotified: new Set(),
+        limit: RADIUS_EXPANSION_CONFIG.maxTransportersPerStep
+      });
+      let nearbyTransporters = step1Candidates.map(c => c.transporterId);
+
+      logger.info(`📍 [RADIUS STEP 1/${RADIUS_EXPANSION_CONFIG.steps.length}] Found ${nearbyTransporters.length} transporters within ${step1.radiusKm}km for ${vehicleKey}`);
+
+      // Fallback: If no nearby online transporters at step 1, get ALL transporters from DB
+      // This ensures we still broadcast even if no one has sent heartbeats recently
+      let matchingTransporters: string[];
+      let skipProgressiveExpansion = false;  // DB fallback already covers everyone
+      if (nearbyTransporters.length > 0) {
+        matchingTransporters = nearbyTransporters;
+        logger.info(`🎯 Using PROXIMITY-BASED matching (${nearbyTransporters.length} nearby at ${step1.radiusKm}km)`);
+      } else {
+        const allDbTransporters = await db.getTransportersWithVehicleType(data.vehicleType);
+        matchingTransporters = await transporterOnlineService.filterOnline(allDbTransporters);
+        skipProgressiveExpansion = true;  // DB fallback already notified all — no radius expansion needed
+        logger.info(`📋 Fallback to DATABASE matching (${allDbTransporters.length} total, ${matchingTransporters.length} online) — skipping progressive expansion`);
+      }
+
+      logger.info(`╔══════════════════════════════════════════════════════════════╗`);
+      logger.info(`║  🚛 NEW BOOKING REQUEST (Progressive Radius)                    ║`);
+      logger.info(`╠══════════════════════════════════════════════════════════════╣`);
+      logger.info(`║  Vehicle: ${data.vehicleType} - ${data.vehicleSubtype || 'Any'}`);
+      logger.info(`║  Trucks Needed: ${data.trucksNeeded}`);
+      logger.info(`║  Price/Truck: ₹${data.pricePerTruck}`);
+      logger.info(`║  Distance: ${data.distanceKm} km`);
+      logger.info(`║  Step 1 Radius: ${step1.radiusKm}km`);
+      logger.info(`║  Matching Transporters (Step 1): ${matchingTransporters.length}`);
+      logger.info(`║  Timeout: ${BOOKING_CONFIG.TIMEOUT_MS / 1000} seconds`);
+      logger.info(`╚══════════════════════════════════════════════════════════════╝`);
+
+      // ========================================
+      // SERIALIZABLE TRANSACTION: DB check + create (TOCTOU-safe)
+      // Prevents duplicate active bookings when Redis lock fails.
+      // PostgreSQL serializable isolation aborts one transaction on conflict.
+      // ========================================
+      const bookingId = uuid();
+      await prismaClient.$transaction(async (tx) => {
+        // DB authoritative check (covers Redis failure edge case)
+        const existingBooking = await tx.booking.findFirst({
+          where: { customerId, status: { in: [BookingStatus.created, BookingStatus.broadcasting, BookingStatus.active, BookingStatus.partially_filled] } }
+        });
+        const existingOrder = await tx.order.findFirst({
+          where: { customerId, status: { in: ['created', 'broadcasting', 'active', 'partially_filled'] } }
+        });
+        if (existingBooking || existingOrder) {
+          throw new AppError(409, 'ORDER_ACTIVE_EXISTS', 'Request already in progress. Cancel it first.');
+        }
+
+        // Create booking atomically with the check
+        await tx.booking.create({
+          data: {
+            id: bookingId,
+            customerId,
+            customerName,
+            customerPhone,
+            pickup: {
+              latitude: data.pickup.coordinates.latitude,
+              longitude: data.pickup.coordinates.longitude,
+              address: data.pickup.address,
+              city: data.pickup.city,
+              state: data.pickup.state
+            } as Prisma.JsonObject,
+            drop: {
+              latitude: data.drop.coordinates.latitude,
+              longitude: data.drop.coordinates.longitude,
+              address: data.drop.address,
+              city: data.drop.city,
+              state: data.drop.state
+            } as Prisma.JsonObject,
+            vehicleType: data.vehicleType,
+            vehicleSubtype: data.vehicleSubtype,
+            trucksNeeded: data.trucksNeeded,
+            trucksFilled: 0,
+            distanceKm: data.distanceKm,
+            pricePerTruck: data.pricePerTruck,
+            totalAmount: data.pricePerTruck * data.trucksNeeded,
+            goodsType: data.goodsType,
+            weight: data.weight,
+            status: BookingStatus.created,
+            stateChangedAt: new Date(),
+            notifiedTransporters: matchingTransporters,
+            scheduledAt: data.scheduledAt,
+            expiresAt
+          }
+        });
+      }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+
+      // Fetch as BookingRecord (converts JSON fields + dates for downstream use)
+      const booking = await db.getBookingById(bookingId);
+      if (!booking) {
+        throw new AppError(500, 'BOOKING_CREATE_FAILED', 'Failed to create booking');
+      }
+
+      // Emit lifecycle state: created
+      emitToUser(customerId, 'broadcast_state_changed', {
+        bookingId: booking.id,
+        status: 'created',
+        stateChangedAt: new Date().toISOString()
+      });
+
+      // ========================================
+      // HANDLE: No matching transporters found
+      // ========================================
+      if (matchingTransporters.length === 0) {
+        logger.warn(`⚠️ NO TRANSPORTERS FOUND for ${data.vehicleType}`);
+
+        // Immediately notify customer
+        emitToUser(customerId, SocketEvent.NO_VEHICLES_AVAILABLE, {
+          bookingId: booking.id,
           vehicleType: data.vehicleType,
           vehicleSubtype: data.vehicleSubtype,
-          trucksNeeded: data.trucksNeeded,
-          trucksFilled: 0,
-          distanceKm: data.distanceKm,
-          pricePerTruck: data.pricePerTruck,
-          totalAmount: data.pricePerTruck * data.trucksNeeded,
-          goodsType: data.goodsType,
-          weight: data.weight,
-          status: BookingStatus.created,
-          stateChangedAt: new Date(),
-          notifiedTransporters: matchingTransporters,
-          scheduledAt: data.scheduledAt,
-          expiresAt
-        }
+          message: `No ${data.vehicleType} vehicles available right now. Please try again later or select a different vehicle type.`,
+          suggestion: 'search_again'
+        });
+
+        // Mark as expired immediately
+        await db.updateBooking(booking.id, { status: 'expired', stateChangedAt: new Date() });
+
+        return {
+          ...booking,
+          status: 'expired',
+          matchingTransportersCount: 0,
+          timeoutSeconds: 0
+        };
+      }
+
+      // ========================================
+      // BROADCAST TO ALL MATCHING TRANSPORTERS
+      // ========================================
+      // IMPORTANT: Include broadcastId AND orderId for Captain app compatibility
+      // Captain app's SocketIOService checks broadcastId first, then orderId
+      const broadcastPayload = buildBroadcastPayload(booking, {
+        timeoutSeconds: BOOKING_CONFIG.TIMEOUT_MS / 1000,
+        trucksFilled: 0
       });
-    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
 
-    // Fetch as BookingRecord (converts JSON fields + dates for downstream use)
-    const booking = await db.getBookingById(bookingId);
-    if (!booking) {
-      throw new AppError(500, 'BOOKING_CREATE_FAILED', 'Failed to create booking');
-    }
+      logger.info(`📢 Broadcasting to ${matchingTransporters.length} transporters for ${data.vehicleType} ${data.vehicleSubtype || ''} (Radius Step 1: ${step1.radiusKm}km)`);
 
-    // Emit lifecycle state: created
-    emitToUser(customerId, 'broadcast_state_changed', {
-      bookingId: booking.id,
-      status: 'created',
-      stateChangedAt: new Date().toISOString()
-    });
+      // Phase 3 optimization: No per-transporter DB queries in broadcast loop.
+      // filterOnline() already guarantees all transporters are online.
+      // Name lookup was only for logging — not needed for broadcast payload.
+      for (const transporterId of matchingTransporters) {
+        emitToUser(transporterId, SocketEvent.NEW_BROADCAST, broadcastPayload);
+      }
 
-    // ========================================
-    // HANDLE: No matching transporters found
-    // ========================================
-    if (matchingTransporters.length === 0) {
-      logger.warn(`⚠️ NO TRANSPORTERS FOUND for ${data.vehicleType}`);
-
-      // Immediately notify customer
-      emitToUser(customerId, SocketEvent.NO_VEHICLES_AVAILABLE, {
+      // Transition: created -> broadcasting (transporters have been notified)
+      await db.updateBooking(booking.id, { status: 'broadcasting', stateChangedAt: new Date() });
+      emitToUser(customerId, 'broadcast_state_changed', {
         bookingId: booking.id,
-        vehicleType: data.vehicleType,
-        vehicleSubtype: data.vehicleSubtype,
-        message: `No ${data.vehicleType} vehicles available right now. Please try again later or select a different vehicle type.`,
-        suggestion: 'search_again'
+        status: 'broadcasting',
+        stateChangedAt: new Date().toISOString()
       });
 
-      // Mark as expired immediately
-      await db.updateBooking(booking.id, { status: 'expired', stateChangedAt: new Date() });
+      // ========================================
+      // TRACK NOTIFIED TRANSPORTERS FOR PROGRESSIVE RADIUS (Requirement 6)
+      // Store in Redis SET so later steps only broadcast to NEW transporters
+      // ========================================
+      if (matchingTransporters.length > 0) {
+        const notifiedSetKey = RADIUS_KEYS.NOTIFIED_SET(booking.id);
+        const ttlSeconds = Math.ceil(BOOKING_CONFIG.TIMEOUT_MS / 1000) + 120;
+        try {
+          await redisService.sAdd(notifiedSetKey, ...matchingTransporters);
+        } catch (e: any) {
+          // Retry once — incomplete notified set causes duplicate broadcasts on radius expansion
+          logger.warn('[RADIUS] sAdd failed, retrying once', { bookingId: booking.id, error: e.message });
+          await redisService.sAdd(notifiedSetKey, ...matchingTransporters).catch((retryErr: any) => {
+            logger.error('[RADIUS] Failed to track notified transporters after retry — radius expansion may send duplicate broadcasts', {
+              bookingId: booking.id, error: retryErr.message, transporterCount: matchingTransporters.length
+            });
+          });
+        }
+        // Set TTL on the notified set (same as booking timeout + buffer)
+        await redisService.expire(notifiedSetKey, ttlSeconds).catch(() => { });
+      }
+
+      // ========================================
+      // SEND FCM PUSH NOTIFICATIONS (for app in background)
+      // ========================================
+      fcmService.notifyNewBroadcast(matchingTransporters, {
+        broadcastId: booking.id,
+        customerName: booking.customerName,
+        vehicleType: booking.vehicleType,
+        trucksNeeded: booking.trucksNeeded,
+        farePerTruck: booking.pricePerTruck,
+        pickupCity: booking.pickup.city,
+        dropCity: booking.drop.city
+      }).then(sentCount => {
+        logger.info(`📱 FCM: Push notifications sent to ${sentCount}/${matchingTransporters.length} transporters`);
+      }).catch(err => {
+        logger.warn('📱 FCM: Failed to send push notifications', err);
+      });
+
+      // ========================================
+      // START TIMEOUT TIMER
+      // ========================================
+      this.startBookingTimeout(booking.id, customerId);
+
+      // Transition: broadcasting -> active (timer started, awaiting responses)
+      await db.updateBooking(booking.id, { status: 'active', stateChangedAt: new Date() });
+      emitToUser(customerId, 'broadcast_state_changed', {
+        bookingId: booking.id,
+        status: 'active',
+        stateChangedAt: new Date().toISOString()
+      });
+
+      // ========================================
+      // START PROGRESSIVE RADIUS EXPANSION (Requirement 6)
+      // Schedule step 2 to trigger after step 1 timeout
+      // SKIP if DB fallback was used (all transporters already notified)
+      // ========================================
+      if (!skipProgressiveExpansion) {
+        this.startProgressiveExpansion(booking.id, customerId, vehicleKey,
+          data.vehicleType, data.vehicleSubtype || '',
+          data.pickup.coordinates.latitude, data.pickup.coordinates.longitude);
+      } else {
+        logger.info(`[RADIUS] Skipping progressive expansion — DB fallback already covered all transporters`);
+      }
+
+      logger.info(`✅ Booking ${booking.id} created, ${matchingTransporters.length} transporters notified (step 1/${RADIUS_EXPANSION_CONFIG.steps.length})`);
+
+      // SCALABILITY: Store idempotency key to prevent duplicate bookings
+      if (idempotencyKey) {
+        const cacheKey = `idempotency:booking:${customerId}:${idempotencyKey}`;
+        // Store for 24 hours (TTL in seconds)
+        await redisService.set(cacheKey, booking.id, 24 * 60 * 60);
+        // Also store a 'latest' pointer so cancelBooking can find the exact key to delete
+        // without using KEYS pattern scan (which fails on ElastiCache Serverless)
+        await redisService.set(`idempotency:booking:${customerId}:latest`, idempotencyKey, 24 * 60 * 60);
+        logger.info(`🔒 Idempotency key stored for booking ${booking.id}`, { idempotencyKey });
+      }
+
+      // Store server-generated idempotency key
+      const bookingTimeoutSeconds = Math.ceil(BOOKING_CONFIG.TIMEOUT_MS / 1000);
+      await redisService.set(dedupeKey, booking.id, bookingTimeoutSeconds + 30);
+      await redisService.set(`idem:broadcast:latest:${customerId}`, dedupeKey, bookingTimeoutSeconds + 30);
+
+      // Set customer active broadcast key (one-per-customer enforcement)
+      await redisService.set(activeKey, booking.id, bookingTimeoutSeconds + 60);
 
       return {
         ...booking,
-        status: 'expired',
-        matchingTransportersCount: 0,
-        timeoutSeconds: 0
+        matchingTransportersCount: matchingTransporters.length,
+        timeoutSeconds: BOOKING_CONFIG.TIMEOUT_MS / 1000
       };
-    }
-
-    // ========================================
-    // BROADCAST TO ALL MATCHING TRANSPORTERS
-    // ========================================
-    // IMPORTANT: Include broadcastId AND orderId for Captain app compatibility
-    // Captain app's SocketIOService checks broadcastId first, then orderId
-    const broadcastPayload = buildBroadcastPayload(booking, {
-      timeoutSeconds: BOOKING_CONFIG.TIMEOUT_MS / 1000,
-      trucksFilled: 0
-    });
-
-    logger.info(`📢 Broadcasting to ${matchingTransporters.length} transporters for ${data.vehicleType} ${data.vehicleSubtype || ''} (Radius Step 1: ${step1.radiusKm}km)`);
-
-    // Phase 3 optimization: No per-transporter DB queries in broadcast loop.
-    // filterOnline() already guarantees all transporters are online.
-    // Name lookup was only for logging — not needed for broadcast payload.
-    for (const transporterId of matchingTransporters) {
-      emitToUser(transporterId, SocketEvent.NEW_BROADCAST, broadcastPayload);
-    }
-
-    // Transition: created -> broadcasting (transporters have been notified)
-    await db.updateBooking(booking.id, { status: 'broadcasting', stateChangedAt: new Date() });
-    emitToUser(customerId, 'broadcast_state_changed', {
-      bookingId: booking.id,
-      status: 'broadcasting',
-      stateChangedAt: new Date().toISOString()
-    });
-
-    // ========================================
-    // TRACK NOTIFIED TRANSPORTERS FOR PROGRESSIVE RADIUS (Requirement 6)
-    // Store in Redis SET so later steps only broadcast to NEW transporters
-    // ========================================
-    if (matchingTransporters.length > 0) {
-      const notifiedSetKey = RADIUS_KEYS.NOTIFIED_SET(booking.id);
-      const ttlSeconds = Math.ceil(BOOKING_CONFIG.TIMEOUT_MS / 1000) + 120;
-      try {
-        await redisService.sAdd(notifiedSetKey, ...matchingTransporters);
-      } catch (e: any) {
-        // Retry once — incomplete notified set causes duplicate broadcasts on radius expansion
-        logger.warn('[RADIUS] sAdd failed, retrying once', { bookingId: booking.id, error: e.message });
-        await redisService.sAdd(notifiedSetKey, ...matchingTransporters).catch((retryErr: any) => {
-          logger.error('[RADIUS] Failed to track notified transporters after retry — radius expansion may send duplicate broadcasts', {
-            bookingId: booking.id, error: retryErr.message, transporterCount: matchingTransporters.length
-          });
-        });
-      }
-      // Set TTL on the notified set (same as booking timeout + buffer)
-      await redisService.expire(notifiedSetKey, ttlSeconds).catch(() => {});
-    }
-
-    // ========================================
-    // SEND FCM PUSH NOTIFICATIONS (for app in background)
-    // ========================================
-    fcmService.notifyNewBroadcast(matchingTransporters, {
-      broadcastId: booking.id,
-      customerName: booking.customerName,
-      vehicleType: booking.vehicleType,
-      trucksNeeded: booking.trucksNeeded,
-      farePerTruck: booking.pricePerTruck,
-      pickupCity: booking.pickup.city,
-      dropCity: booking.drop.city
-    }).then(sentCount => {
-      logger.info(`📱 FCM: Push notifications sent to ${sentCount}/${matchingTransporters.length} transporters`);
-    }).catch(err => {
-      logger.warn('📱 FCM: Failed to send push notifications', err);
-    });
-
-    // ========================================
-    // START TIMEOUT TIMER
-    // ========================================
-    this.startBookingTimeout(booking.id, customerId);
-
-    // Transition: broadcasting -> active (timer started, awaiting responses)
-    await db.updateBooking(booking.id, { status: 'active', stateChangedAt: new Date() });
-    emitToUser(customerId, 'broadcast_state_changed', {
-      bookingId: booking.id,
-      status: 'active',
-      stateChangedAt: new Date().toISOString()
-    });
-
-    // ========================================
-    // START PROGRESSIVE RADIUS EXPANSION (Requirement 6)
-    // Schedule step 2 to trigger after step 1 timeout
-    // SKIP if DB fallback was used (all transporters already notified)
-    // ========================================
-    if (!skipProgressiveExpansion) {
-      this.startProgressiveExpansion(booking.id, customerId, vehicleKey,
-        data.pickup.coordinates.latitude, data.pickup.coordinates.longitude);
-    } else {
-      logger.info(`[RADIUS] Skipping progressive expansion — DB fallback already covered all transporters`);
-    }
-
-    logger.info(`✅ Booking ${booking.id} created, ${matchingTransporters.length} transporters notified (step 1/${RADIUS_EXPANSION_CONFIG.steps.length})`);
-
-    // SCALABILITY: Store idempotency key to prevent duplicate bookings
-    if (idempotencyKey) {
-      const cacheKey = `idempotency:booking:${customerId}:${idempotencyKey}`;
-      // Store for 24 hours (TTL in seconds)
-      await redisService.set(cacheKey, booking.id, 24 * 60 * 60);
-      // Also store a 'latest' pointer so cancelBooking can find the exact key to delete
-      // without using KEYS pattern scan (which fails on ElastiCache Serverless)
-      await redisService.set(`idempotency:booking:${customerId}:latest`, idempotencyKey, 24 * 60 * 60);
-      logger.info(`🔒 Idempotency key stored for booking ${booking.id}`, { idempotencyKey });
-    }
-
-    // Store server-generated idempotency key
-    const bookingTimeoutSeconds = Math.ceil(BOOKING_CONFIG.TIMEOUT_MS / 1000);
-    await redisService.set(dedupeKey, booking.id, bookingTimeoutSeconds + 30);
-    await redisService.set(`idem:broadcast:latest:${customerId}`, dedupeKey, bookingTimeoutSeconds + 30);
-
-    // Set customer active broadcast key (one-per-customer enforcement)
-    await redisService.set(activeKey, booking.id, bookingTimeoutSeconds + 60);
-
-    return {
-      ...booking,
-      matchingTransportersCount: matchingTransporters.length,
-      timeoutSeconds: BOOKING_CONFIG.TIMEOUT_MS / 1000
-    };
     } finally {
       await redisService.releaseLock(lockKey, customerId).catch((err: any) => {
         logger.warn('Failed to release customer broadcast lock', { customerId, error: err.message });
@@ -730,8 +737,8 @@ class BookingService {
     // Clean up server-generated idempotency key
     const latestIdemKey = await redisService.get(`idem:broadcast:latest:${customerId}`).catch(() => null);
     if (latestIdemKey) {
-      await redisService.del(latestIdemKey).catch(() => {});
-      await redisService.del(`idem:broadcast:latest:${customerId}`).catch(() => {});
+      await redisService.del(latestIdemKey).catch(() => { });
+      await redisService.del(`idem:broadcast:latest:${customerId}`).catch(() => { });
     }
   }
 
@@ -759,6 +766,8 @@ class BookingService {
     bookingId: string,
     customerId: string,
     vehicleKey: string,
+    vehicleType: string,
+    vehicleSubtype: string,
     pickupLat: number,
     pickupLng: number
   ): Promise<void> {
@@ -779,6 +788,8 @@ class BookingService {
       bookingId,
       customerId,
       vehicleKey,
+      vehicleType,
+      vehicleSubtype,
       pickupLat,
       pickupLng,
       currentStep: 0  // Will advance to step 1 (index) when timer fires
@@ -828,24 +839,26 @@ class BookingService {
     const step = RADIUS_EXPANSION_CONFIG.steps[nextStepIndex];
     logger.info(`[RADIUS STEP ${nextStepIndex + 1}/${totalSteps}] Expanding to ${step.radiusKm}km for booking ${data.bookingId}`);
 
-    // Search at expanded radius
-    const nearbyTransporters = await availabilityService.getAvailableTransportersAsync(
-      data.vehicleKey,
-      data.pickupLat,
-      data.pickupLng,
-      RADIUS_EXPANSION_CONFIG.maxTransportersPerStep,
-      step.radiusKm
-    );
-
-    // Dedup: remove already-notified transporters
+    // Dedup: load already-notified transporters
     let alreadyNotified: string[] = [];
     try {
       alreadyNotified = await redisService.sMembers(RADIUS_KEYS.NOTIFIED_SET(data.bookingId));
     } catch (_) { }
     const alreadyNotifiedSet = new Set(alreadyNotified);
-    const newTransporters = nearbyTransporters.filter(t => !alreadyNotifiedSet.has(t));
 
-    logger.info(`[RADIUS STEP ${nextStepIndex + 1}] Found ${nearbyTransporters.length} total, ${newTransporters.length} NEW transporters`);
+    // Search at expanded radius: H3 primary → GEORADIUS fallback → Google ETA → Haversine
+    const expandedCandidates = await progressiveRadiusMatcher.findCandidates({
+      pickupLat: data.pickupLat,
+      pickupLng: data.pickupLng,
+      vehicleType: data.vehicleType || data.vehicleKey.split('_')[0] || '',
+      vehicleSubtype: data.vehicleSubtype || data.vehicleKey.split('_').slice(1).join('_') || '',
+      stepIndex: nextStepIndex,
+      alreadyNotified: alreadyNotifiedSet,
+      limit: RADIUS_EXPANSION_CONFIG.maxTransportersPerStep
+    });
+    const newTransporters = expandedCandidates.map(c => c.transporterId);
+
+    logger.info(`[RADIUS STEP ${nextStepIndex + 1}] Found ${expandedCandidates.length} candidates, ${newTransporters.length} NEW transporters`);
 
     // Broadcast to new transporters only
     if (newTransporters.length > 0) {
@@ -1151,7 +1164,7 @@ class BookingService {
     // Delete timers BEFORE the status update so a racing expiry timer cannot
     // fire in the window between the DB write and our own timer cleanup.
     // Idempotent — safe to call even if timers don't exist yet.
-    await this.clearBookingTimers(bookingId).catch(() => {});
+    await this.clearBookingTimers(bookingId).catch(() => { });
 
     // ATOMIC cancel: only succeeds if status is still cancellable
     const updated = await prismaClient.booking.updateMany({
@@ -1195,7 +1208,7 @@ class BookingService {
     await this.clearCustomerActiveBroadcast(customerId);
 
     // 3. Clear notified transporter set
-    await redisService.del(`broadcast:notified:${bookingId}`).catch(() => {});
+    await redisService.del(`broadcast:notified:${bookingId}`).catch(() => { });
 
     // 4. Clear legacy client idempotency cache
     try {
@@ -1262,7 +1275,7 @@ class BookingService {
             await prismaClient.vehicle.update({
               where: { id: assignment.vehicleId },
               data: { status: VehicleStatus.available, currentTripId: null, assignedDriverId: null }
-            }).catch(() => {});
+            }).catch(() => { });
           }
           if (assignment.driverId) {
             emitToUser(assignment.driverId, 'trip_cancelled', {
@@ -1423,7 +1436,7 @@ class BookingService {
         logger.info(`[RE-BROADCAST] Rate limited for transporter ${transporterId} — skipping`);
         return;
       }
-      await redisService.set(rateLimitKey, '1', 30).catch(() => {});
+      await redisService.set(rateLimitKey, '1', 30).catch(() => { });
 
       const bookings = await db.getActiveBookingsForTransporter(transporterId);
       const now = new Date();
