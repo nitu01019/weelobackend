@@ -195,8 +195,8 @@ interface NearbyTransporter {
 
 class AvailabilityService {
 
-  /** TTL for transporter details (60 seconds - auto-offline if no heartbeat) */
-  private readonly TRANSPORTER_TTL_SECONDS = 60;
+  /** TTL for transporter details (90 seconds - generous buffer for 2G/EDGE networks) */
+  private readonly TRANSPORTER_TTL_SECONDS = 90;
 
   /** Heartbeat interval recommendation for clients */
   readonly HEARTBEAT_INTERVAL_MS = 5 * 1000;

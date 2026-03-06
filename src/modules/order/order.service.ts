@@ -39,6 +39,7 @@ import { routingService } from '../routing';
 import { redisService } from '../../shared/services/redis.service';
 import { pricingService } from '../pricing/pricing.service';
 import { AppError } from '../../shared/types/error.types';
+import { googleMapsService } from '../../shared/services/google-maps.service';
 import { PROGRESSIVE_RADIUS_STEPS, progressiveRadiusMatcher } from './progressive-radius-matcher';
 import { candidateScorerService } from '../../shared/services/candidate-scorer.service';
 import { metrics } from '../../shared/monitoring/metrics.service';
@@ -1652,6 +1653,83 @@ class OrderService {
       const totalTrucks = request.vehicleRequirements.reduce((sum, req) => sum + req.quantity, 0);
       if (totalTrucks <= 0) {
         throw new AppError(400, 'VALIDATION_ERROR', 'Total trucks must be greater than zero');
+      }
+
+      // ==========================================================================
+      // SERVER-SIDE ROUTE DISTANCE (Google Directions API)
+      // ==========================================================================
+      // The customer app sends distanceKm which may be Haversine (straight-line)
+      // or stale. We recalculate using Google Directions API for accurate road
+      // distance. Falls back to customer value if Google fails — never blocks orders.
+      //
+      // MUST run BEFORE price validation so pricing uses accurate distance.
+      // googleMapsService.calculateRoute() has built-in 1hr cache — same route
+      // requested 1000x = 1 Google API call.
+      // ==========================================================================
+      const clientDistanceKm = request.distanceKm;
+      let distanceSource: 'google' | 'client_fallback' = 'client_fallback';
+
+      try {
+        // Build route points for Google API: pickup → waypoints → drop
+        const routePointsForGoogle: Array<{ lat: number; lng: number }> = [];
+
+        if (request.routePoints && request.routePoints.length >= 2) {
+          for (const point of request.routePoints) {
+            routePointsForGoogle.push({ lat: point.latitude, lng: point.longitude });
+          }
+        } else if (request.pickup && request.drop) {
+          routePointsForGoogle.push(
+            { lat: request.pickup.latitude, lng: request.pickup.longitude },
+            { lat: request.drop.latitude, lng: request.drop.longitude }
+          );
+        }
+
+        if (routePointsForGoogle.length >= 2) {
+          // Truck mode: OFF by default. When FF_TRUCK_MODE_ROUTING=true,
+          // heavy vehicles avoid highways/tolls for truck-accurate routing.
+          const FF_TRUCK_MODE_ROUTING = process.env.FF_TRUCK_MODE_ROUTING === 'true';
+          const HEAVY_VEHICLE_TYPES = new Set(['Open', 'Container', 'Tipper', 'Flatbed']);
+          const primaryVehicleType = request.vehicleRequirements[0]?.vehicleType || '';
+          const useTruckMode = FF_TRUCK_MODE_ROUTING && HEAVY_VEHICLE_TYPES.has(primaryVehicleType);
+
+          const googleRoute = await googleMapsService.calculateRoute(
+            routePointsForGoogle,
+            useTruckMode
+          );
+
+          if (googleRoute && googleRoute.distanceKm > 0) {
+            request.distanceKm = googleRoute.distanceKm;
+            distanceSource = 'google';
+
+            const deltaPercent = clientDistanceKm > 0
+              ? Math.round(((googleRoute.distanceKm - clientDistanceKm) / clientDistanceKm) * 100)
+              : 0;
+
+            logger.info('[ORDER] Route distance calculated via Google Directions', {
+              distanceSource: 'google',
+              clientDistanceKm,
+              serverDistanceKm: googleRoute.distanceKm,
+              deltaPercent: `${deltaPercent}%`,
+              durationMinutes: googleRoute.durationMinutes,
+              routePoints: routePointsForGoogle.length,
+              // Flag anomaly if client sent >3x different from Google
+              ...(Math.abs(deltaPercent) > 200 ? { distanceAnomaly: true } : {})
+            });
+          } else {
+            logger.warn('[ORDER] Google Directions returned null/zero — using client distance', {
+              distanceSource: 'client_fallback',
+              clientDistanceKm,
+              reason: 'google_returned_empty'
+            });
+          }
+        }
+      } catch (routeError: any) {
+        // Google API failure — keep customer distance, never block order creation
+        logger.warn('[ORDER] Google Directions API failed — using client distance', {
+          distanceSource: 'client_fallback',
+          clientDistanceKm,
+          reason: routeError?.message || 'unknown'
+        });
       }
 
       // ==========================================================================

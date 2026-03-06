@@ -22,7 +22,7 @@
  */
 
 import { availabilityService } from '../../shared/services/availability.service';
-import { generateVehicleKey } from '../../shared/services/vehicle-key.service';
+import { generateVehicleKey, generateVehicleKeyCandidates } from '../../shared/services/vehicle-key.service';
 import { h3GeoIndexService, FF_H3_INDEX_ENABLED } from '../../shared/services/h3-geo-index.service';
 import { googleDirectionsService } from '../../shared/services/google-directions.service';
 import { logger } from '../../shared/services/logger.service';
@@ -56,11 +56,11 @@ export interface CandidateTransporter {
 // PROGRESSIVE RADIUS STEPS
 // ============================================================================
 
-/** Original 3-step progression (default) */
+/** Original 3-step progression (default) — with H3 ring mappings */
 export const PROGRESSIVE_RADIUS_STEPS: RadiusStep[] = [
-  { radiusKm: 10, windowMs: 20_000 },
-  { radiusKm: 25, windowMs: 20_000 },
-  { radiusKm: 30, windowMs: 20_000 }
+  { radiusKm: 10, windowMs: 20_000, h3RingK: 15 },
+  { radiusKm: 25, windowMs: 20_000, h3RingK: 38 },
+  { radiusKm: 30, windowMs: 20_000, h3RingK: 44 }
 ];
 
 /**
@@ -140,7 +140,10 @@ class ProgressiveRadiusMatcher {
     const step = this.getStep(stepIndex);
     if (!step) return [];
 
-    const vehicleKey = generateVehicleKey(vehicleType, vehicleSubtype);
+    // FIX #2: Generate ALL possible normalized key forms to handle canonical
+    // alias ordering variants (e.g. open_17ft vs open_17_ft_open).
+    const vehicleKeyCandidates = generateVehicleKeyCandidates(vehicleType, vehicleSubtype);
+    const vehicleKey = vehicleKeyCandidates[0] || generateVehicleKey(vehicleType, vehicleSubtype);
 
     // ========================================================================
     // LAYER 1: H3 PRIMARY PATH (Feature-flagged)
@@ -154,7 +157,7 @@ class ProgressiveRadiusMatcher {
         () => this.findCandidatesH3({
           pickupLat,
           pickupLng,
-          vehicleKey,
+          vehicleKeys: vehicleKeyCandidates,
           ringK: step.h3RingK!,
           radiusKm: step.radiusKm,
           alreadyNotified,
@@ -171,7 +174,7 @@ class ProgressiveRadiusMatcher {
       candidates = await this.findCandidatesGeoRadius({
         pickupLat,
         pickupLng,
-        vehicleKey,
+        vehicleKeys: vehicleKeyCandidates,
         radiusKm: step.radiusKm,
         alreadyNotified,
         limit
@@ -234,23 +237,26 @@ class ProgressiveRadiusMatcher {
   private async findCandidatesH3(params: {
     pickupLat: number;
     pickupLng: number;
-    vehicleKey: string;
+    vehicleKeys: string[];
     ringK: number;
     radiusKm: number;
     alreadyNotified: Set<string>;
     limit: number;
   }): Promise<CandidateTransporter[] | undefined> {
-    const { pickupLat, pickupLng, vehicleKey, ringK, radiusKm, alreadyNotified, limit } = params;
+    const { pickupLat, pickupLng, vehicleKeys, ringK, radiusKm, alreadyNotified, limit } = params;
 
     try {
-      // H3 candidate lookup — O(k) Redis SUNION
-      const candidateIds = await h3GeoIndexService.getCandidates(
-        pickupLat, pickupLng, vehicleKey, ringK, alreadyNotified
+      // FIX #2: H3 lookup across ALL vehicleKey variants (parallel)
+      const candidateArrays = await Promise.all(
+        vehicleKeys.map(key =>
+          h3GeoIndexService.getCandidates(pickupLat, pickupLng, key, ringK, alreadyNotified)
+        )
       );
+      const candidateIds = [...new Set(candidateArrays.flat())];
 
       if (candidateIds.length === 0) {
         logger.info('[RadiusMatcher] H3 returned 0 candidates, falling back to GEORADIUS', {
-          vehicleKey, ringK, radiusKm
+          vehicleKeys, ringK, radiusKm
         });
         return undefined; // triggers GEORADIUS fallback
       }
@@ -291,7 +297,7 @@ class ProgressiveRadiusMatcher {
 
       logger.info('[RadiusMatcher] H3 candidate lookup (no GEORADIUS)', {
         matchingSource: 'h3_index',
-        vehicleKey,
+        vehicleKeys,
         ringK,
         radiusKm,
         h3Candidates: candidateIds.length,
@@ -312,20 +318,29 @@ class ProgressiveRadiusMatcher {
   private async findCandidatesGeoRadius(params: {
     pickupLat: number;
     pickupLng: number;
-    vehicleKey: string;
+    vehicleKeys: string[];
     radiusKm: number;
     alreadyNotified: Set<string>;
     limit: number;
   }): Promise<CandidateTransporter[]> {
-    const { pickupLat, pickupLng, vehicleKey, radiusKm, alreadyNotified, limit } = params;
+    const { pickupLat, pickupLng, vehicleKeys, radiusKm, alreadyNotified, limit } = params;
 
-    const nearby = await availabilityService.getAvailableTransportersWithDetails(
-      vehicleKey,
-      pickupLat,
-      pickupLng,
-      Math.max(limit * 2, 100),
-      radiusKm
+    // FIX #2: Query ALL possible vehicleKey forms to handle canonical alias
+    // ordering variants. Parallel queries keep latency unchanged.
+    const nearbyArrays = await Promise.all(
+      vehicleKeys.map(key =>
+        availabilityService.getAvailableTransportersWithDetails(
+          key, pickupLat, pickupLng, Math.max(limit * 2, 100), radiusKm
+        )
+      )
     );
+    // Merge + dedup by transporterId (keep first occurrence)
+    const seenTransporters = new Set<string>();
+    const nearby = nearbyArrays.flat().filter(entry => {
+      if (seenTransporters.has(entry.transporterId)) return false;
+      seenTransporters.add(entry.transporterId);
+      return true;
+    });
 
     return nearby
       .map((entry) => {

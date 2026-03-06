@@ -264,6 +264,53 @@ router.put(
         await redisService.sAdd(ONLINE_TRANSPORTERS_SET, transporterId).catch((e: any) => {
           logger.warn('[TRANSPORTER TOGGLE] Failed to SADD online set', { transporterId, error: e.message });
         });
+
+        // ============================================================
+        // FIX #1: CRITICAL — Populate geo index immediately at toggle
+        // Eliminates the toggle → first-heartbeat gap where GEORADIUS
+        // returns 0 candidates for this transporter.
+        // Uses last-known coordinates from transporter:details hash.
+        // If no prior coordinates (first-ever login), heartbeat will
+        // populate within 5s — acceptable.
+        // ============================================================
+        try {
+          const lastDetails = await redisService.hGetAll(`transporter:details:${transporterId}`);
+          const hasCoordinates = lastDetails?.latitude && lastDetails?.longitude;
+
+          if (hasCoordinates) {
+            const toggleVehicles = await db.getVehiclesByTransporter(transporterId);
+            const toggleActiveVehicles = toggleVehicles.filter(v => v.isActive);
+            if (toggleActiveVehicles.length > 0) {
+              const toggleVehicleEntries: Array<{ vehicleKey: string; vehicleId: string }> = [];
+              const toggleSeenKeys = new Set<string>();
+              for (const v of toggleActiveVehicles) {
+                const key = v.vehicleKey || generateVehicleKey(v.vehicleType, v.vehicleSubtype);
+                if (toggleSeenKeys.has(key)) continue;
+                toggleSeenKeys.add(key);
+                toggleVehicleEntries.push({ vehicleKey: key, vehicleId: v.id });
+              }
+              await availabilityService.updateAvailabilityForVehicleKeysAsync({
+                transporterId,
+                vehicleEntries: toggleVehicleEntries,
+                latitude: parseFloat(lastDetails.latitude),
+                longitude: parseFloat(lastDetails.longitude),
+                isOnTrip: false
+              });
+              logger.info('[TRANSPORTER TOGGLE] Geo index populated at toggle time', {
+                transporterId,
+                vehicleKeys: toggleVehicleEntries.length,
+                lat: lastDetails.latitude,
+                lng: lastDetails.longitude
+              });
+            }
+          }
+        } catch (geoError: any) {
+          // Non-critical: heartbeat will populate within 5s
+          logger.warn('[TRANSPORTER TOGGLE] Geo index population failed (heartbeat will catch up)', {
+            transporterId,
+            error: geoError.message
+          });
+        }
       } else {
         // OFFLINE: Delete presence key immediately
         await redisService.del(TRANSPORTER_PRESENCE_KEY(transporterId)).catch((e: any) => {
@@ -277,9 +324,10 @@ router.put(
       }
 
       // 4c. Invalidate caches (batch — faster than serial)
+      // Reuse vehicles from geo-index fix or fetch fresh if offline toggle
       try {
-        const vehicles = await db.getVehiclesByTransporter(transporterId);
-        const vehicleTypes = new Set(vehicles.map(v => v.vehicleType));
+        const cachedVehicles = await db.getVehiclesByTransporter(transporterId);
+        const vehicleTypes = new Set(cachedVehicles.map(v => v.vehicleType));
 
         await Promise.all([
           cacheService.delete(`user:${transporterId}`),

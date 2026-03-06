@@ -43,6 +43,7 @@ import { redisService } from '../../shared/services/redis.service';
 // 4 PRINCIPLES: Import production-grade error codes
 import { ErrorCode } from '../../core/constants';
 import { buildBroadcastPayload, getRemainingTimeoutSeconds } from './booking-payload.helper';
+import { googleMapsService } from '../../shared/services/google-maps.service';
 
 // =============================================================================
 // CONFIGURATION - Easy to adjust for testing vs production
@@ -324,6 +325,67 @@ class BookingService {
 
       // Calculate expiry based on config timeout
       const expiresAt = new Date(Date.now() + BOOKING_CONFIG.TIMEOUT_MS).toISOString();
+
+      // ==========================================================================
+      // SERVER-SIDE ROUTE DISTANCE (Google Directions API)
+      // ==========================================================================
+      // Recalculate pickup→drop distance using Google Directions for accurate
+      // road distance. The customer app may send Haversine (straight-line).
+      // Falls back to customer value if Google fails — never blocks bookings.
+      // ==========================================================================
+      const clientDistanceKm = data.distanceKm;
+      let distanceSource: 'google' | 'client_fallback' = 'client_fallback';
+
+      try {
+        const pickupCoords = data.pickup.coordinates;
+        const dropCoords = data.drop.coordinates;
+
+        if (pickupCoords && dropCoords) {
+          // Truck mode: OFF by default. When FF_TRUCK_MODE_ROUTING=true,
+          // heavy vehicles avoid highways/tolls for truck-accurate routing.
+          const FF_TRUCK_MODE_ROUTING = process.env.FF_TRUCK_MODE_ROUTING === 'true';
+          const HEAVY_VEHICLE_TYPES = new Set(['Open', 'Container', 'Tipper', 'Flatbed']);
+          const useTruckMode = FF_TRUCK_MODE_ROUTING && HEAVY_VEHICLE_TYPES.has(data.vehicleType);
+
+          const googleRoute = await googleMapsService.calculateRoute(
+            [
+              { lat: pickupCoords.latitude, lng: pickupCoords.longitude },
+              { lat: dropCoords.latitude, lng: dropCoords.longitude }
+            ],
+            useTruckMode
+          );
+
+          if (googleRoute && googleRoute.distanceKm > 0) {
+            data.distanceKm = googleRoute.distanceKm;
+            distanceSource = 'google';
+
+            const deltaPercent = clientDistanceKm > 0
+              ? Math.round(((googleRoute.distanceKm - clientDistanceKm) / clientDistanceKm) * 100)
+              : 0;
+
+            logger.info('[BOOKING] Route distance calculated via Google Directions', {
+              distanceSource: 'google',
+              clientDistanceKm,
+              serverDistanceKm: googleRoute.distanceKm,
+              deltaPercent: `${deltaPercent}%`,
+              durationMinutes: googleRoute.durationMinutes,
+              ...(Math.abs(deltaPercent) > 200 ? { distanceAnomaly: true } : {})
+            });
+          } else {
+            logger.warn('[BOOKING] Google Directions returned null/zero — using client distance', {
+              distanceSource: 'client_fallback',
+              clientDistanceKm,
+              reason: 'google_returned_empty'
+            });
+          }
+        }
+      } catch (routeError: any) {
+        logger.warn('[BOOKING] Google Directions API failed — using client distance', {
+          distanceSource: 'client_fallback',
+          clientDistanceKm,
+          reason: routeError?.message || 'unknown'
+        });
+      }
 
       // ========================================
       // PROGRESSIVE RADIUS SEARCH (Requirement 6)
@@ -1429,14 +1491,14 @@ class BookingService {
    */
   async deliverMissedBroadcasts(transporterId: string): Promise<void> {
     try {
-      // Rate limit: max once per 30 seconds per transporter to prevent DOS via rapid toggle
+      // Rate limit: max once per 10 seconds per transporter to prevent DOS via rapid toggle
       const rateLimitKey = `ratelimit:missed-broadcasts:${transporterId}`;
       const existing = await redisService.get(rateLimitKey).catch(() => null);
       if (existing) {
         logger.info(`[RE-BROADCAST] Rate limited for transporter ${transporterId} — skipping`);
         return;
       }
-      await redisService.set(rateLimitKey, '1', 30).catch(() => { });
+      await redisService.set(rateLimitKey, '1', 10).catch(() => { });
 
       const bookings = await db.getActiveBookingsForTransporter(transporterId);
       const now = new Date();

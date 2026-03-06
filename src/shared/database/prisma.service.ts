@@ -12,6 +12,7 @@
 import { PrismaClient, Prisma, UserRole, VehicleStatus, BookingStatus, OrderStatus, TruckRequestStatus, AssignmentStatus } from '@prisma/client';
 import { logger } from '../services/logger.service';
 import { generateVehicleKey, generateVehicleKeyCandidates } from '../services/vehicle-key.service';
+import { redisService } from '../services/redis.service';
 
 // =============================================================================
 // PAGINATION SAFETY — Prevents unbounded queries from exhausting memory
@@ -577,6 +578,14 @@ class PrismaDatabaseService {
         }
       });
       logger.info(`Vehicle updated: ${vehicle.vehicleNumber} (${vehicle.vehicleType})`);
+      // Invalidate vehicle cache for new transporter
+      redisService.del(this.vehiclesCacheKey(vehicle.transporterId)).catch(() => { });
+      // EDGE CASE: If vehicle was transferred from another transporter,
+      // invalidate the OLD transporter's cache too — otherwise old owner
+      // still sees this vehicle in their list for up to 5 minutes
+      if (existing.transporterId && existing.transporterId !== vehicle.transporterId) {
+        redisService.del(this.vehiclesCacheKey(existing.transporterId)).catch(() => { });
+      }
       return this.toVehicleRecord(updated);
     }
 
@@ -587,6 +596,8 @@ class PrismaDatabaseService {
       }
     });
     logger.info(`Vehicle registered: ${vehicle.vehicleNumber} (${vehicle.vehicleType})`);
+    // Invalidate vehicle cache for this transporter
+    redisService.del(this.vehiclesCacheKey(vehicle.transporterId)).catch(() => { });
     return this.toVehicleRecord(created);
   }
 
@@ -600,9 +611,39 @@ class PrismaDatabaseService {
     return vehicle ? this.toVehicleRecord(vehicle) : undefined;
   }
 
+  /**
+   * Redis cache key for a transporter's vehicle list.
+   * TTL = 300s (5 minutes) — safe because cache is immediately invalidated
+   * on vehicle create/update/delete. TTL is just a safety net for the rare
+   * case where the Redis DELETE itself fails.
+   * At 300K transporters × 5s heartbeat = only 1,000 DB queries/sec instead
+   * of 60,000 — a 60× reduction.
+   */
+  private vehiclesCacheKey(transporterId: string): string {
+    return `cache:vehicles:transporter:${transporterId}`;
+  }
+
   async getVehiclesByTransporter(transporterId: string): Promise<VehicleRecord[]> {
+    const cacheKey = this.vehiclesCacheKey(transporterId);
+
+    // Cache read — single Redis GET, sub-ms
+    try {
+      const cached = await redisService.get(cacheKey);
+      if (cached) {
+        return JSON.parse(cached) as VehicleRecord[];
+      }
+    } catch {
+      // Redis unavailable — fall through to DB (graceful degradation)
+    }
+
+    // Cache miss — fetch from DB
     const vehicles = await this.prisma.vehicle.findMany({ where: { transporterId } });
-    return vehicles.map(v => this.toVehicleRecord(v));
+    const records = vehicles.map(v => this.toVehicleRecord(v));
+
+    // Write to cache (fire-and-forget — don't block the caller)
+    redisService.set(cacheKey, JSON.stringify(records), 300).catch(() => { });
+
+    return records;
   }
 
   async getVehiclesByType(vehicleType: string): Promise<VehicleRecord[]> {
@@ -703,6 +744,12 @@ class PrismaDatabaseService {
 
   async updateVehicle(id: string, updates: Partial<VehicleRecord>): Promise<VehicleRecord | undefined> {
     try {
+      // EDGE CASE: Fetch old transporterId BEFORE update
+      // so we can invalidate BOTH old and new caches if owner changes
+      const oldVehicle = (updates as any).transporterId
+        ? await this.prisma.vehicle.findUnique({ where: { id }, select: { transporterId: true } })
+        : null;
+
       const { createdAt, updatedAt, ...data } = updates as any;
       const updated = await this.prisma.vehicle.update({
         where: { id },
@@ -711,6 +758,14 @@ class PrismaDatabaseService {
           status: data.status ? data.status as VehicleStatus : undefined,
         }
       });
+      // Invalidate vehicle cache for current (new) transporter
+      if (updated.transporterId) {
+        redisService.del(this.vehiclesCacheKey(updated.transporterId)).catch(() => { });
+      }
+      // If transporterId changed, invalidate OLD transporter's cache too
+      if (oldVehicle?.transporterId && oldVehicle.transporterId !== updated.transporterId) {
+        redisService.del(this.vehiclesCacheKey(oldVehicle.transporterId)).catch(() => { });
+      }
       return this.toVehicleRecord(updated);
     } catch {
       return undefined;
@@ -719,7 +774,12 @@ class PrismaDatabaseService {
 
   async deleteVehicle(id: string): Promise<boolean> {
     try {
+      // Fetch transporterId before deleting so we can invalidate cache
+      const vehicle = await this.prisma.vehicle.findUnique({ where: { id }, select: { transporterId: true } });
       await this.prisma.vehicle.delete({ where: { id } });
+      if (vehicle?.transporterId) {
+        redisService.del(this.vehiclesCacheKey(vehicle.transporterId)).catch(() => { });
+      }
       return true;
     } catch {
       return false;
@@ -772,15 +832,32 @@ class PrismaDatabaseService {
 
   async getActiveBookingsForTransporter(transporterId: string): Promise<BookingRecord[]> {
     const vehicles = await this.getVehiclesByTransporter(transporterId);
-    const vehicleTypes = [...new Set(vehicles.map(v => v.vehicleType))];
 
+    // FIX #5: Build vehicleKey candidate set for precise truck-subtype matching
+    const transporterVehicleKeys = new Set<string>();
+    const vehicleTypes = new Set<string>();
+    for (const v of vehicles) {
+      if (!v.isActive) continue;
+      vehicleTypes.add(v.vehicleType);
+      const candidates = generateVehicleKeyCandidates(v.vehicleType, v.vehicleSubtype || '');
+      for (const key of candidates) transporterVehicleKeys.add(key);
+    }
+
+    // DB query uses vehicleType IN (...) for index efficiency (broad filter)
     const bookings = await this.prisma.booking.findMany({
       where: {
         status: { in: ['active', 'partially_filled'] },
-        vehicleType: { in: vehicleTypes }
+        vehicleType: { in: [...vehicleTypes] }
       }
     });
-    return bookings.map(b => this.toBookingRecord(b));
+
+    // Precise client-side filter: booking's vehicleKey must match transporter's fleet
+    return bookings
+      .filter(b => {
+        const bookingKeys = generateVehicleKeyCandidates(b.vehicleType, b.vehicleSubtype || '');
+        return bookingKeys.some(key => transporterVehicleKeys.has(key));
+      })
+      .map(b => this.toBookingRecord(b));
   }
 
   async updateBooking(id: string, updates: Partial<BookingRecord>): Promise<BookingRecord | undefined> {
