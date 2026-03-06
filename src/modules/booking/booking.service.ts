@@ -536,17 +536,26 @@ class BookingService {
       // ========================================
       // IMPORTANT: Include broadcastId AND orderId for Captain app compatibility
       // Captain app's SocketIOService checks broadcastId first, then orderId
-      const broadcastPayload = buildBroadcastPayload(booking, {
-        timeoutSeconds: BOOKING_CONFIG.TIMEOUT_MS / 1000,
-        trucksFilled: 0
-      });
+      //
+      // Per-transporter pickup distance: Build a lookup map from candidates.
+      // Each transporter gets their OWN pickupDistanceKm and pickupEtaMinutes.
+      const candidateMap = new Map<string, { distanceKm: number; etaSeconds: number }>();
+      for (const c of step1Candidates) {
+        candidateMap.set(c.transporterId, { distanceKm: c.distanceKm || 0, etaSeconds: c.etaSeconds || 0 });
+      }
 
       logger.info(`📢 Broadcasting to ${matchingTransporters.length} transporters for ${data.vehicleType} ${data.vehicleSubtype || ''} (Radius Step 1: ${step1.radiusKm}km)`);
 
       // Phase 3 optimization: No per-transporter DB queries in broadcast loop.
       // filterOnline() already guarantees all transporters are online.
-      // Name lookup was only for logging — not needed for broadcast payload.
       for (const transporterId of matchingTransporters) {
+        const candidate = candidateMap.get(transporterId);
+        const broadcastPayload = buildBroadcastPayload(booking, {
+          timeoutSeconds: BOOKING_CONFIG.TIMEOUT_MS / 1000,
+          trucksFilled: 0,
+          pickupDistanceKm: candidate ? Math.round(candidate.distanceKm * 10) / 10 : 0,
+          pickupEtaMinutes: candidate ? Math.ceil(candidate.etaSeconds / 60) : 0
+        });
         emitToUser(transporterId, SocketEvent.NEW_BROADCAST, broadcastPayload);
       }
 
@@ -922,15 +931,22 @@ class BookingService {
 
     logger.info(`[RADIUS STEP ${nextStepIndex + 1}] Found ${expandedCandidates.length} candidates, ${newTransporters.length} NEW transporters`);
 
-    // Broadcast to new transporters only
+    // Broadcast to new transporters only (with per-transporter pickup distance)
     if (newTransporters.length > 0) {
       const now = new Date();
-      const broadcastPayload = buildBroadcastPayload(booking, {
-        timeoutSeconds: getRemainingTimeoutSeconds(booking, BOOKING_CONFIG.TIMEOUT_MS),
-        radiusStep: nextStepIndex + 1
-      });
+      const expandedCandidateMap = new Map<string, { distanceKm: number; etaSeconds: number }>();
+      for (const c of expandedCandidates) {
+        expandedCandidateMap.set(c.transporterId, { distanceKm: c.distanceKm || 0, etaSeconds: c.etaSeconds || 0 });
+      }
 
       for (const transporterId of newTransporters) {
+        const candidate = expandedCandidateMap.get(transporterId);
+        const broadcastPayload = buildBroadcastPayload(booking, {
+          timeoutSeconds: getRemainingTimeoutSeconds(booking, BOOKING_CONFIG.TIMEOUT_MS),
+          radiusStep: nextStepIndex + 1,
+          pickupDistanceKm: candidate ? Math.round(candidate.distanceKm * 10) / 10 : 0,
+          pickupEtaMinutes: candidate ? Math.ceil(candidate.etaSeconds / 60) : 0
+        });
         emitToUser(transporterId, SocketEvent.NEW_BROADCAST, broadcastPayload);
       }
 

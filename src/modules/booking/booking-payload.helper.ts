@@ -32,6 +32,8 @@ export function buildBroadcastPayload(
         isRebroadcast?: boolean;
         radiusStep?: number;
         trucksFilled?: number;  // Override if stale in record
+        pickupDistanceKm?: number;  // How far THIS transporter is from pickup
+        pickupEtaMinutes?: number;  // ETA for THIS transporter to reach pickup
     }
 ): Record<string, any> {
     const trucksFilled = options?.trucksFilled ?? booking.trucksFilled;
@@ -84,6 +86,10 @@ export function buildBroadcastPayload(
         distance: booking.distanceKm,
         goodsType: booking.goodsType,
         weight: booking.weight,
+
+        // Per-transporter pickup proximity (0 = unknown, e.g. DB fallback)
+        pickupDistanceKm: options?.pickupDistanceKm ?? 0,
+        pickupEtaMinutes: options?.pickupEtaMinutes ?? 0,
 
         // Timing
         createdAt: booking.createdAt,
