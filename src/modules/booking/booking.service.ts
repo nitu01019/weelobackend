@@ -40,6 +40,7 @@ import { generateVehicleKey } from '../../shared/services/vehicle-key.service';
 import { progressiveRadiusMatcher } from '../order/progressive-radius-matcher';
 import { transporterOnlineService } from '../../shared/services/transporter-online.service';
 import { redisService } from '../../shared/services/redis.service';
+import { haversineDistanceKm } from '../../shared/utils/geospatial.utils';
 // 4 PRINCIPLES: Import production-grade error codes
 import { ErrorCode } from '../../core/constants';
 import { buildBroadcastPayload, getRemainingTimeoutSeconds } from './booking-payload.helper';
@@ -421,6 +422,41 @@ class BookingService {
         matchingTransporters = await transporterOnlineService.filterOnline(allDbTransporters);
         skipProgressiveExpansion = true;  // DB fallback already notified all — no radius expansion needed
         logger.info(`📋 Fallback to DATABASE matching (${allDbTransporters.length} total, ${matchingTransporters.length} online) — skipping progressive expansion`);
+
+        // Load transporter locations from Redis → calculate haversine pickup distance.
+        // Without this, DB-fallback transporters get pickupDistanceKm = 0.
+        if (matchingTransporters.length > 0) {
+          try {
+            const detailsMap = await availabilityService.loadTransporterDetailsMap(matchingTransporters);
+            for (const tid of matchingTransporters) {
+              const details = detailsMap.get(tid);
+              if (details) {
+                const lat = parseFloat(details.latitude);
+                const lng = parseFloat(details.longitude);
+                if (Number.isFinite(lat) && Number.isFinite(lng)) {
+                  const distKm = haversineDistanceKm(
+                    data.pickup.coordinates.latitude,
+                    data.pickup.coordinates.longitude,
+                    lat, lng
+                  );
+                  // Haversine-based ETA: ~30 km/h average truck speed in city/highway mix
+                  const etaSec = Math.round((distKm / 30) * 3600);
+                  step1Candidates.push({
+                    transporterId: tid,
+                    distanceKm: distKm,
+                    latitude: lat,
+                    longitude: lng,
+                    etaSeconds: etaSec,
+                    etaSource: 'haversine'
+                  });
+                }
+              }
+            }
+            logger.info(`📍 DB fallback: Calculated haversine pickup distance for ${step1Candidates.length}/${matchingTransporters.length} transporters`);
+          } catch (err: any) {
+            logger.warn(`⚠️ Failed to load transporter locations for DB fallback: ${err.message}`);
+          }
+        }
       }
 
       logger.info(`╔══════════════════════════════════════════════════════════════╗`);
