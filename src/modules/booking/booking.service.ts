@@ -41,6 +41,7 @@ import { progressiveRadiusMatcher } from '../order/progressive-radius-matcher';
 import { transporterOnlineService } from '../../shared/services/transporter-online.service';
 import { redisService } from '../../shared/services/redis.service';
 import { haversineDistanceKm } from '../../shared/utils/geospatial.utils';
+import { googleDirectionsService } from '../../shared/services/google-directions.service';
 // 4 PRINCIPLES: Import production-grade error codes
 import { ErrorCode } from '../../core/constants';
 import { buildBroadcastPayload, getRemainingTimeoutSeconds } from './booking-payload.helper';
@@ -423,38 +424,48 @@ class BookingService {
         skipProgressiveExpansion = true;  // DB fallback already notified all — no radius expansion needed
         logger.info(`📋 Fallback to DATABASE matching (${allDbTransporters.length} total, ${matchingTransporters.length} online) — skipping progressive expansion`);
 
-        // Load transporter locations from Redis → calculate haversine pickup distance.
+        // Load transporter locations from Redis → Google Directions API for pickup distance + ETA.
         // Without this, DB-fallback transporters get pickupDistanceKm = 0.
         if (matchingTransporters.length > 0) {
           try {
             const detailsMap = await availabilityService.loadTransporterDetailsMap(matchingTransporters);
+            const candidatesWithLocation: Array<{ transporterId: string; latitude: number; longitude: number }> = [];
+
             for (const tid of matchingTransporters) {
               const details = detailsMap.get(tid);
               if (details) {
                 const lat = parseFloat(details.latitude);
                 const lng = parseFloat(details.longitude);
                 if (Number.isFinite(lat) && Number.isFinite(lng)) {
-                  const distKm = haversineDistanceKm(
-                    data.pickup.coordinates.latitude,
-                    data.pickup.coordinates.longitude,
-                    lat, lng
-                  );
-                  // Haversine-based ETA: ~30 km/h average truck speed in city/highway mix
-                  const etaSec = Math.round((distKm / 30) * 3600);
-                  step1Candidates.push({
-                    transporterId: tid,
-                    distanceKm: distKm,
-                    latitude: lat,
-                    longitude: lng,
-                    etaSeconds: etaSec,
-                    etaSource: 'haversine'
-                  });
+                  candidatesWithLocation.push({ transporterId: tid, latitude: lat, longitude: lng });
                 }
               }
             }
-            logger.info(`📍 DB fallback: Calculated haversine pickup distance for ${step1Candidates.length}/${matchingTransporters.length} transporters`);
+
+            if (candidatesWithLocation.length > 0) {
+              // Google Directions API → real road distance + ETA (same as proximity path)
+              // Built-in circuit breaker → haversine fallback if Google fails
+              const ranked = await googleDirectionsService.rankByETA(
+                data.pickup.coordinates.latitude,
+                data.pickup.coordinates.longitude,
+                candidatesWithLocation
+              );
+
+              for (const r of ranked) {
+                step1Candidates.push({
+                  transporterId: r.transporterId,
+                  distanceKm: r.distanceMeters / 1000,
+                  latitude: r.latitude,
+                  longitude: r.longitude,
+                  etaSeconds: r.etaSeconds,
+                  etaSource: r.source
+                });
+              }
+
+              logger.info(`📍 DB fallback: Google Directions pickup distance for ${ranked.length}/${matchingTransporters.length} transporters (source: ${ranked[0]?.source || 'n/a'})`);
+            }
           } catch (err: any) {
-            logger.warn(`⚠️ Failed to load transporter locations for DB fallback: ${err.message}`);
+            logger.warn(`⚠️ Failed to calculate pickup distance for DB fallback: ${err.message}`);
           }
         }
       }
