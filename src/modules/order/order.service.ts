@@ -2212,6 +2212,11 @@ class OrderService {
         source: process.env.FF_DIRECTIONS_API_SCORING_ENABLED === 'true' ? 'directions_api' : 'h3_approx'
       });
       const targetTransporters = scoredCandidates.map((c) => c.transporterId);
+      // Preserve per-transporter pickup distance from scored candidates
+      // (already computed by progressive-radius-matcher via Distance Matrix API)
+      const candidateDistanceMap = new Map(
+        scoredCandidates.map((c) => [c.transporterId, { distanceKm: c.distanceKm, etaSeconds: c.etaSeconds }])
+      );
       onlineCandidates += targetTransporters.length;
 
       if (targetTransporters.length > 0) {
@@ -2225,7 +2230,8 @@ class OrderService {
           vehicleType,
           vehicleSubtype,
           targetTransporters,
-          expiresAt
+          expiresAt,
+          candidateDistanceMap
         );
         await this.markTransportersNotified(orderId, vehicleType, vehicleSubtype, sendResult.sentTransporters);
         notifiedTransporters += sendResult.sentTransporters.length;
@@ -2299,6 +2305,10 @@ class OrderService {
       source: process.env.FF_DIRECTIONS_API_SCORING_ENABLED === 'true' ? 'directions_api' : 'h3_approx'
     });
     const targetTransporters = scoredCandidates.map((c) => c.transporterId);
+    // Preserve per-transporter pickup distance from scored candidates
+    const candidateDistanceMap = new Map(
+      scoredCandidates.map((c) => [c.transporterId, { distanceKm: c.distanceKm, etaSeconds: c.etaSeconds }])
+    );
 
     if (targetTransporters.length === 0) {
       metrics.incrementCounter('broadcast_skipped_no_available', { vehicleType: timerData.vehicleType });
@@ -2351,7 +2361,8 @@ class OrderService {
       timerData.vehicleType,
       timerData.vehicleSubtype,
       targetTransporters,
-      order.expiresAt
+      order.expiresAt,
+      candidateDistanceMap
     );
     await this.markTransportersNotified(
       timerData.orderId,
@@ -2435,7 +2446,8 @@ class OrderService {
     vehicleType: string,
     vehicleSubtype: string,
     matchingTransporters: string[],
-    expiresAt: string
+    expiresAt: string,
+    candidateDistanceMap?: Map<string, { distanceKm: number; etaSeconds: number }>
   ): Promise<{ sentTransporters: string[]; skippedNoAvailable: number }> {
     if (matchingTransporters.length === 0) {
       return { sentTransporters: [], skippedNoAvailable: 0 };
@@ -2586,6 +2598,8 @@ class OrderService {
       }
 
       const trucksYouCanProvide = Math.min(availability.available, trucksStillNeeded);
+      // Per-transporter pickup distance from Distance Matrix API (already computed)
+      const pickupData = candidateDistanceMap?.get(transporterId);
       const personalizedBroadcast = {
         ...extendedBroadcast,
         trucksYouCanProvide,
@@ -2594,6 +2608,8 @@ class OrderService {
         yourTotalTrucks: availability.totalOwned,
         trucksStillNeeded,
         trucksNeededOfThisType: trucksStillNeeded,
+        pickupDistanceKm: pickupData?.distanceKm ?? 0,
+        pickupEtaMinutes: Math.ceil((pickupData?.etaSeconds ?? 0) / 60),
         isPersonalized: true,
         personalizedFor: transporterId
       };
