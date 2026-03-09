@@ -243,7 +243,10 @@ class DirectionsApiService {
     }
 
     // ===========================================================================
-    // PRIVATE — GOOGLE DIRECTIONS API CALL
+    // PRIVATE — GOOGLE DISTANCE MATRIX API CALL
+    // Uses Distance Matrix API (NOT Directions API) for pickup distance + ETA.
+    // Distance Matrix API: computes distance and duration between origin/dest.
+    // Directions API: computes full route path — NOT needed for ETA/distance.
     // ===========================================================================
 
     private async callGoogleDirections(
@@ -253,12 +256,12 @@ class DirectionsApiService {
         destLng: number
     ): Promise<DirectionsResult> {
         const apiKey = config.googleMaps.apiKey;
-        const url = `https://maps.googleapis.com/maps/api/directions/json` +
-            `?origin=${originLat},${originLng}` +
-            `&destination=${destLat},${destLng}` +
+        const origin = `${originLat},${originLng}`;
+        const destination = `${destLat},${destLng}`;
+        const url = `https://maps.googleapis.com/maps/api/distancematrix/json` +
+            `?origins=${encodeURIComponent(origin)}` +
+            `&destinations=${encodeURIComponent(destination)}` +
             `&mode=driving` +
-            `&departure_time=now` +
-            `&traffic_model=best_guess` +
             `&key=${apiKey}`;
 
         const controller = new AbortController();
@@ -268,18 +271,18 @@ class DirectionsApiService {
             const response = await fetch(url, { signal: controller.signal });
             const data: any = await response.json();
 
-            if (data.status !== 'OK' || !data.routes?.[0]?.legs?.[0]) {
-                throw new Error(`Directions API returned: ${data.status}`);
+            if (data.status !== 'OK') {
+                throw new Error(`Distance Matrix API returned: ${data.status}`);
             }
 
-            const leg = data.routes[0].legs[0];
-
-            // Use duration_in_traffic if available (more accurate)
-            const duration = leg.duration_in_traffic || leg.duration;
+            const element = data.rows?.[0]?.elements?.[0];
+            if (!element || element.status !== 'OK') {
+                throw new Error(`Distance Matrix element status: ${element?.status || 'MISSING'}`);
+            }
 
             return {
-                durationSeconds: duration.value,
-                distanceMeters: leg.distance.value,
+                durationSeconds: element.duration.value,
+                distanceMeters: element.distance.value,
                 cached: false,
                 source: 'google_api'
             };
