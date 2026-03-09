@@ -41,6 +41,7 @@ import { progressiveRadiusMatcher } from '../order/progressive-radius-matcher';
 import { transporterOnlineService } from '../../shared/services/transporter-online.service';
 import { redisService } from '../../shared/services/redis.service';
 import { haversineDistanceKm } from '../../shared/utils/geospatial.utils';
+import { directionsApiService } from '../../shared/services/directions-api.service';
 // 4 PRINCIPLES: Import production-grade error codes
 import { ErrorCode } from '../../core/constants';
 import { buildBroadcastPayload, getRemainingTimeoutSeconds } from './booking-payload.helper';
@@ -69,10 +70,12 @@ const BOOKING_CONFIG = {
 // =============================================================================
 const RADIUS_EXPANSION_CONFIG = {
   steps: [
-    { radiusKm: 10, timeoutMs: 15_000 },  // Step 1: 10km, wait 15s
-    { radiusKm: 25, timeoutMs: 15_000 },  // Step 2: 25km, wait 15s
-    { radiusKm: 50, timeoutMs: 15_000 },  // Step 3: 50km, wait 15s
-    { radiusKm: 75, timeoutMs: 15_000 },  // Step 4: 75km (max), wait 15s
+    { radiusKm: 5,   timeoutMs: 10_000 },   // Step 0: 5km, immediate
+    { radiusKm: 10,  timeoutMs: 10_000 },   // Step 1: 10km at +10s
+    { radiusKm: 15,  timeoutMs: 15_000 },   // Step 2: 15km at +20s
+    { radiusKm: 30,  timeoutMs: 15_000 },   // Step 3: 30km at +25s
+    { radiusKm: 60,  timeoutMs: 15_000 },   // Step 4: 60km at +30s
+    { radiusKm: 100, timeoutMs: 15_000 },   // Step 5: 100km at +40s
   ],
   maxTransportersPerStep: 20,  // Top N nearest per step
 };
@@ -423,38 +426,80 @@ class BookingService {
         skipProgressiveExpansion = true;  // DB fallback already notified all — no radius expansion needed
         logger.info(`📋 Fallback to DATABASE matching (${allDbTransporters.length} total, ${matchingTransporters.length} online) — skipping progressive expansion`);
 
-        // Load transporter locations from Redis → calculate haversine pickup distance.
-        // Without this, DB-fallback transporters get pickupDistanceKm = 0.
+        // Load transporter locations from Redis → calculate road distance + ETA
+        // Uses directionsApiService (Redis cache → Google Distance Matrix → Haversine)
         if (matchingTransporters.length > 0) {
           try {
             const detailsMap = await availabilityService.loadTransporterDetailsMap(matchingTransporters);
+            const origins: Array<{ lat: number; lng: number; id: string }> = [];
+
             for (const tid of matchingTransporters) {
               const details = detailsMap.get(tid);
               if (details) {
                 const lat = parseFloat(details.latitude);
                 const lng = parseFloat(details.longitude);
                 if (Number.isFinite(lat) && Number.isFinite(lng)) {
-                  const distKm = haversineDistanceKm(
-                    data.pickup.coordinates.latitude,
-                    data.pickup.coordinates.longitude,
-                    lat, lng
-                  );
-                  // Haversine-based ETA: ~30 km/h average truck speed in city/highway mix
-                  const etaSec = Math.round((distKm / 30) * 3600);
-                  step1Candidates.push({
-                    transporterId: tid,
-                    distanceKm: distKm,
-                    latitude: lat,
-                    longitude: lng,
-                    etaSeconds: etaSec,
-                    etaSource: 'haversine'
-                  });
+                  origins.push({ lat, lng, id: tid });
                 }
               }
             }
-            logger.info(`📍 DB fallback: Calculated haversine pickup distance for ${step1Candidates.length}/${matchingTransporters.length} transporters`);
+
+            if (origins.length > 0) {
+              const etaResults = await directionsApiService.batchGetEta(
+                origins,
+                data.pickup.coordinates.latitude,
+                data.pickup.coordinates.longitude
+              );
+
+              for (const origin of origins) {
+                const eta = etaResults.get(origin.id);
+                if (eta) {
+                  step1Candidates.push({
+                    transporterId: origin.id,
+                    distanceKm: eta.distanceMeters / 1000,
+                    latitude: origin.lat,
+                    longitude: origin.lng,
+                    etaSeconds: eta.durationSeconds,
+                    etaSource: eta.source as any
+                  });
+                }
+              }
+
+              const cacheHits = Array.from(etaResults.values()).filter(r => r.cached).length;
+              logger.info(`📍 DB fallback: Road distance for ${origins.length} transporters (cache hits: ${cacheHits}, API calls: ${origins.length - cacheHits})`);
+            }
           } catch (err: any) {
-            logger.warn(`⚠️ Failed to load transporter locations for DB fallback: ${err.message}`);
+            logger.warn(`⚠️ Failed to calculate ETA for DB fallback: ${err.message}`);
+            // Last-resort haversine fallback if directionsApiService completely fails
+            try {
+              const detailsMap = await availabilityService.loadTransporterDetailsMap(matchingTransporters);
+              for (const tid of matchingTransporters) {
+                const details = detailsMap.get(tid);
+                if (details) {
+                  const lat = parseFloat(details.latitude);
+                  const lng = parseFloat(details.longitude);
+                  if (Number.isFinite(lat) && Number.isFinite(lng)) {
+                    const distKm = haversineDistanceKm(
+                      data.pickup.coordinates.latitude,
+                      data.pickup.coordinates.longitude,
+                      lat, lng
+                    );
+                    const etaSec = Math.round((distKm / 30) * 3600);
+                    step1Candidates.push({
+                      transporterId: tid,
+                      distanceKm: distKm,
+                      latitude: lat,
+                      longitude: lng,
+                      etaSeconds: etaSec,
+                      etaSource: 'haversine'
+                    });
+                  }
+                }
+              }
+              logger.info(`📍 DB fallback: Haversine fallback for ${step1Candidates.length} transporters`);
+            } catch (fallbackErr: any) {
+              logger.warn(`⚠️ Haversine fallback also failed: ${fallbackErr.message}`);
+            }
           }
         }
       }

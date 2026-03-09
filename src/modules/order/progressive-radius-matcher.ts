@@ -24,7 +24,7 @@
 import { availabilityService } from '../../shared/services/availability.service';
 import { generateVehicleKey, generateVehicleKeyCandidates } from '../../shared/services/vehicle-key.service';
 import { h3GeoIndexService, FF_H3_INDEX_ENABLED } from '../../shared/services/h3-geo-index.service';
-import { googleDirectionsService } from '../../shared/services/google-directions.service';
+import { directionsApiService } from '../../shared/services/directions-api.service';
 import { logger } from '../../shared/services/logger.service';
 
 export interface RadiusStep {
@@ -184,42 +184,46 @@ class ProgressiveRadiusMatcher {
     if (candidates.length === 0) return [];
 
     // ========================================================================
-    // LAYER 3: GOOGLE DIRECTIONS API — ETA-BASED RANKING
-    // Falls back to haversine automatically via directionsCircuit.
+    // LAYER 3: CACHED ETA RANKING (Redis cache → Google Distance Matrix → Haversine)
+    // Uses directionsApiService which has:
+    //   - Redis cache (geohash6 precision, 3-min TTL, ~60-80% hit rate)
+    //   - Token-bucket rate limiter (450 QPS)
+    //   - Circuit breaker (auto-trips → haversine fallback)
+    //   - Haversine fallback (always-available)
     // ========================================================================
     try {
-      const ranked = await googleDirectionsService.rankByETA(
-        pickupLat,
-        pickupLng,
-        candidates.map(c => ({
-          transporterId: c.transporterId,
-          latitude: c.latitude,
-          longitude: c.longitude
-        }))
-      );
+      const origins = candidates.map(c => ({
+        lat: c.latitude,
+        lng: c.longitude,
+        id: c.transporterId
+      }));
+
+      const etaResults = await directionsApiService.batchGetEta(origins, pickupLat, pickupLng);
 
       // Merge ETA data back into candidates
-      const etaMap = new Map(ranked.map(r => [r.transporterId, r]));
       const enriched = candidates
         .map(c => {
-          const eta = etaMap.get(c.transporterId);
+          const eta = etaResults.get(c.transporterId);
           return {
             ...c,
-            etaSeconds: eta?.etaSeconds,
-            etaSource: eta?.source,
+            etaSeconds: eta?.durationSeconds,
+            etaSource: eta?.source as ('google' | 'haversine' | undefined),
             distanceKm: eta ? eta.distanceMeters / 1000 : c.distanceKm
           };
         })
         .sort((a, b) => (a.etaSeconds ?? Infinity) - (b.etaSeconds ?? Infinity))
         .slice(0, limit);
 
+      const cacheHits = Array.from(etaResults.values()).filter(r => r.cached).length;
       logger.info('[RadiusMatcher] ETA-ranked candidates', {
         matchingSource: FF_H3_INDEX_ENABLED ? 'h3_index' : 'georadius',
         etaSource: enriched[0]?.etaSource || 'none',
         vehicleKey,
         stepIndex,
         radiusKm: step.radiusKm,
-        totalCandidates: enriched.length
+        totalCandidates: enriched.length,
+        cacheHits,
+        apiCalls: etaResults.size - cacheHits
       });
 
       return enriched;
