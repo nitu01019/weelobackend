@@ -625,17 +625,30 @@ class BookingService {
         candidateMap.set(c.transporterId, { distanceKm: c.distanceKm || 0, etaSeconds: c.etaSeconds || 0 });
       }
 
+      // DEBUG: Log candidate distance data to trace pickup distance issue
+      logger.info(`📊 [PICKUP_DEBUG] step1Candidates count: ${step1Candidates.length}, candidateMap size: ${candidateMap.size}, matchingTransporters: ${matchingTransporters.length}`);
+      if (step1Candidates.length > 0) {
+        const sample = step1Candidates[0];
+        logger.info(`📊 [PICKUP_DEBUG] First candidate: id=${sample.transporterId}, distanceKm=${sample.distanceKm}, etaSeconds=${sample.etaSeconds}, etaSource=${sample.etaSource}`);
+      }
+
       logger.info(`📢 Broadcasting to ${matchingTransporters.length} transporters for ${data.vehicleType} ${data.vehicleSubtype || ''} (Radius Step 1: ${step1.radiusKm}km)`);
 
       // Phase 3 optimization: No per-transporter DB queries in broadcast loop.
       // filterOnline() already guarantees all transporters are online.
       for (const transporterId of matchingTransporters) {
         const candidate = candidateMap.get(transporterId);
+        const pickupDistKm = candidate ? Math.round(candidate.distanceKm * 10) / 10 : 0;
+        const pickupEtaMin = candidate ? Math.ceil(candidate.etaSeconds / 60) : 0;
+
+        // DEBUG: Log per-transporter pickup distance
+        logger.info(`📊 [PICKUP_DEBUG] Transporter ${transporterId}: candidate_found=${!!candidate}, pickupDistanceKm=${pickupDistKm}, pickupEtaMinutes=${pickupEtaMin}`);
+
         const broadcastPayload = buildBroadcastPayload(booking, {
           timeoutSeconds: BOOKING_CONFIG.TIMEOUT_MS / 1000,
           trucksFilled: 0,
-          pickupDistanceKm: candidate ? Math.round(candidate.distanceKm * 10) / 10 : 0,
-          pickupEtaMinutes: candidate ? Math.ceil(candidate.etaSeconds / 60) : 0
+          pickupDistanceKm: pickupDistKm,
+          pickupEtaMinutes: pickupEtaMin
         });
         emitToUser(transporterId, SocketEvent.NEW_BROADCAST, broadcastPayload);
       }
