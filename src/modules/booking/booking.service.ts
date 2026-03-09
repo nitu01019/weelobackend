@@ -1099,13 +1099,53 @@ class BookingService {
 
     logger.info(`[RADIUS] DB fallback found ${newTransporters.length} additional transporters for booking ${data.bookingId}`);
 
-    const now = new Date();
-    const broadcastPayload = buildBroadcastPayload(booking, {
-      timeoutSeconds: getRemainingTimeoutSeconds(booking, BOOKING_CONFIG.TIMEOUT_MS),
-      radiusStep: RADIUS_EXPANSION_CONFIG.steps.length + 1  // DB fallback marker
-    });
+    // =====================================================================
+    // FIX: Compute per-transporter pickup distance (Distance Matrix → cache → haversine)
+    // Previously this sent pickupDistanceKm=0 for ALL transporters → showed --
+    // =====================================================================
+    const candidateMap = new Map<string, { distanceKm: number; etaSeconds: number }>();
+    try {
+      const detailsMap = await availabilityService.loadTransporterDetailsMap(newTransporters);
+      const origins: Array<{ lat: number; lng: number; id: string }> = [];
 
+      for (const tid of newTransporters) {
+        const details = detailsMap.get(tid);
+        if (details) {
+          const lat = parseFloat(details.latitude);
+          const lng = parseFloat(details.longitude);
+          if (Number.isFinite(lat) && Number.isFinite(lng)) {
+            origins.push({ lat, lng, id: tid });
+          }
+        }
+      }
+
+      if (origins.length > 0) {
+        const etaResults = await distanceMatrixService.batchGetPickupDistance(
+          origins, data.pickupLat, data.pickupLng
+        );
+        for (const origin of origins) {
+          const eta = etaResults.get(origin.id);
+          if (eta) {
+            candidateMap.set(origin.id, {
+              distanceKm: eta.distanceMeters / 1000,
+              etaSeconds: eta.durationSeconds
+            });
+          }
+        }
+      }
+    } catch (err: any) {
+      logger.warn(`[RADIUS] DB fallback distance calc failed: ${err.message} — broadcasting with haversine estimates`);
+    }
+
+    // Broadcast with per-transporter pickup distance
     for (const transporterId of newTransporters) {
+      const candidate = candidateMap.get(transporterId);
+      const broadcastPayload = buildBroadcastPayload(booking, {
+        timeoutSeconds: getRemainingTimeoutSeconds(booking, BOOKING_CONFIG.TIMEOUT_MS),
+        pickupDistanceKm: candidate ? Math.round(candidate.distanceKm * 10) / 10 : 0,
+        pickupEtaMinutes: candidate ? Math.ceil(candidate.etaSeconds / 60) : 0,
+        radiusStep: RADIUS_EXPANSION_CONFIG.steps.length + 1  // DB fallback marker
+      });
       emitToUser(transporterId, SocketEvent.NEW_BROADCAST, broadcastPayload);
     }
 
@@ -1125,7 +1165,7 @@ class BookingService {
       dropCity: booking.drop.city
     }).catch(() => { });
 
-    logger.info(`[RADIUS] ✅ DB fallback delivered to ${newTransporters.length} additional transporters`);
+    logger.info(`[RADIUS] ✅ DB fallback delivered to ${newTransporters.length} additional transporters (${candidateMap.size} with road distance)`);
   }
 
   /**

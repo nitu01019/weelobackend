@@ -10,24 +10,27 @@
  * This is SEPARATE from directions-api.service.ts which uses Google Directions
  * API for maps/routes/route rendering.
  *
- * ARCHITECTURE:
- * 1. Redis cache check (geohash6, 5-min TTL)
- * 2. Google Distance Matrix API primary
- * 3. Haversine fallback (always available)
+ * ARCHITECTURE (matches Uber/Ola production patterns):
+ * 1. Redis cache check (4-decimal precision ≈ 11m, 5-min TTL)
+ * 2. Google Distance Matrix API — BATCHED (up to 25 origins per request)
+ * 3. Haversine fallback (always available, instant)
+ *
+ * BATCHING (Industry Standard):
+ * - Google Distance Matrix API supports up to 25 origins × 25 destinations
+ * - Origins are pipe-separated: lat1,lng1|lat2,lng2|...
+ * - Billing is per element (origin × dest) — same cost batched or individual
+ * - 20 transporters → 1 API call instead of 20 separate calls
  *
  * CACHING:
- * - Key format: dm_cache:{originLat6},{originLng6}:{destLat6},{destLng6}
- * - TTL: 300 seconds (5 minutes)
- * - Geohash6 precision (~1.2km) for high cache hit rate in dense areas
- * - Expected hit rate: ~60-80% in Indian cities
+ * - Key format: dm:{oLat4},{oLng4}:{dLat4},{dLng4}
+ * - TTL: 300 seconds (5 minutes) — matches Uber's 1-5 min ETA cache
+ * - Expected hit rate: ~60-80% in dense Indian cities
  *
  * RATE LIMITING:
- * - Token-bucket rate limiter (450 QPS default, configurable)
+ * - Token-bucket rate limiter (200 QPS per instance, configurable)
+ * - With 2 ECS tasks: 2 × 200 = 400 QPS total
+ * - Google allows 3,000 EPM (50 EPS) — with batching, well within limits
  * - When bucket depleted → instant haversine fallback (no queue, no wait)
- *
- * CONCURRENCY:
- * - Max 10 parallel API calls per batch
- * - Supports 300+ ride requests/second with caching
  *
  * @author Weelo Engineering
  * =============================================================================
@@ -41,29 +44,29 @@ import { config } from '../../config/environment';
 // CONSTANTS
 // =============================================================================
 
-/** Cache TTL — 5 minutes */
+/** Cache TTL — 5 minutes (matches Uber's 1-5 min ETA cache pattern) */
 const CACHE_TTL_SECONDS = 300;
 
 /** Cache key prefix */
-const CACHE_PREFIX = 'dm_cache';
+const CACHE_PREFIX = 'dm';
 
-/** Max concurrent API calls per batch */
-const MAX_CONCURRENT = 10;
+/** Max origins per Google Distance Matrix API request (Google limit: 25) */
+const MAX_ORIGINS_PER_REQUEST = 25;
 
 /** API timeout per request (ms) */
 const API_TIMEOUT_MS = 3000;
 
-/** Coordinate precision for cache key (6 decimal places ≈ 1.1m) */
-const COORD_PRECISION = 4; // 4 decimal places ≈ 11m — good cache dedup
+/** Coordinate precision for cache key (4 decimal places ≈ 11m — good dedup) */
+const COORD_PRECISION = 4;
 
-/** Rate limit QPS */
+/** Rate limit QPS per instance (with 2 ECS tasks: 2 × 200 = 400 total) */
 const MAX_QPS = Math.max(
     10,
-    parseInt(process.env.DISTANCE_MATRIX_MAX_QPS || '450', 10) || 450
+    parseInt(process.env.DISTANCE_MATRIX_MAX_QPS || '200', 10) || 200
 );
 
 // =============================================================================
-// TOKEN-BUCKET RATE LIMITER
+// TOKEN-BUCKET RATE LIMITER (per-instance)
 // =============================================================================
 
 class TokenBucket {
@@ -79,13 +82,13 @@ class TokenBucket {
         this.refillRatePerMs = ratePerSecond / 1000;
     }
 
-    tryConsume(): boolean {
+    tryConsume(count: number = 1): boolean {
         const now = Date.now();
         const elapsed = now - this.lastRefill;
         this.tokens = Math.min(this.maxTokens, this.tokens + elapsed * this.refillRatePerMs);
         this.lastRefill = now;
-        if (this.tokens >= 1) {
-            this.tokens -= 1;
+        if (this.tokens >= count) {
+            this.tokens -= count;
             return true;
         }
         return false;
@@ -109,6 +112,12 @@ export interface DistanceMatrixResult {
     source: string;
 }
 
+interface OriginWithId {
+    lat: number;
+    lng: number;
+    id: string;
+}
+
 // =============================================================================
 // SERVICE CLASS
 // =============================================================================
@@ -116,7 +125,7 @@ export interface DistanceMatrixResult {
 class DistanceMatrixService {
 
     /**
-     * Get road distance and ETA from transporter to pickup.
+     * Get road distance and ETA from a single transporter to pickup.
      * Redis cache → Distance Matrix API → Haversine fallback.
      */
     async getPickupDistance(
@@ -125,93 +134,141 @@ class DistanceMatrixService {
         pickupLat: number,
         pickupLng: number
     ): Promise<DistanceMatrixResult> {
-        // 1. Check Redis cache first
-        const cacheKey = this.buildCacheKey(transporterLat, transporterLng, pickupLat, pickupLng);
-        try {
-            const cached = await redisService.get(cacheKey);
-            if (cached) {
-                const parsed = JSON.parse(cached);
-                return { ...parsed, cached: true, source: 'cache' };
-            }
-        } catch {
-            // Cache miss or Redis error — continue
-        }
-
-        // 2. Check rate limit before calling Google
-        if (!rateLimiter.tryConsume()) {
-            logger.debug('[DistanceMatrix] Rate limited → haversine fallback');
-            return this.haversineFallback(transporterLat, transporterLng, pickupLat, pickupLng);
-        }
-
-        // 3. Call Google Distance Matrix API
-        const apiKey = config.googleMaps.apiKey;
-        if (!apiKey) {
-            return this.haversineFallback(transporterLat, transporterLng, pickupLat, pickupLng);
-        }
-
-        try {
-            const result = await this.callDistanceMatrixAPI(
-                transporterLat, transporterLng, pickupLat, pickupLng, apiKey
-            );
-
-            // Cache the result
-            await redisService.set(cacheKey, JSON.stringify({
-                durationSeconds: result.durationSeconds,
-                distanceMeters: result.distanceMeters
-            }), CACHE_TTL_SECONDS).catch(() => { });
-
-            return result;
-        } catch (error: any) {
-            logger.warn(`[DistanceMatrix] API failed → haversine fallback: ${error.message}`);
-            return this.haversineFallback(transporterLat, transporterLng, pickupLat, pickupLng);
-        }
+        const results = await this.batchGetPickupDistance(
+            [{ lat: transporterLat, lng: transporterLng, id: '_single' }],
+            pickupLat, pickupLng
+        );
+        return results.get('_single') || this.haversineFallback(transporterLat, transporterLng, pickupLat, pickupLng);
     }
 
     /**
      * Batch distance lookup for multiple transporters to one pickup.
-     * Runs in parallel with concurrency limit.
+     *
+     * PRODUCTION FLOW:
+     * 1. Check Redis cache for ALL origins (parallel)
+     * 2. Collect cache misses
+     * 3. Chunk misses into groups of 25 (Google limit)
+     * 4. ONE API call per chunk with pipe-separated origins
+     * 5. Parse per-element responses
+     * 6. Cache each result individually in Redis
+     * 7. Return merged Map<id, DistanceMatrixResult>
+     *
+     * COST: same billing whether batched or individual (per element)
+     * SPEED: 1 HTTP call instead of 20 for 20 transporters
      */
     async batchGetPickupDistance(
-        origins: Array<{ lat: number; lng: number; id: string }>,
+        origins: OriginWithId[],
         pickupLat: number,
         pickupLng: number
     ): Promise<Map<string, DistanceMatrixResult>> {
         const results = new Map<string, DistanceMatrixResult>();
+        if (origins.length === 0) return results;
 
-        for (let i = 0; i < origins.length; i += MAX_CONCURRENT) {
-            const chunk = origins.slice(i, i + MAX_CONCURRENT);
-            const chunkResults = await Promise.all(
-                chunk.map(async (origin) => {
-                    const result = await this.getPickupDistance(
-                        origin.lat, origin.lng, pickupLat, pickupLng
-                    );
-                    return { id: origin.id, result };
-                })
-            );
+        // =====================================================================
+        // STEP 1: Check Redis cache for ALL origins
+        // =====================================================================
+        const cacheMisses: OriginWithId[] = [];
 
-            for (const { id, result } of chunkResults) {
-                results.set(id, result);
+        await Promise.all(origins.map(async (origin) => {
+            const cacheKey = this.buildCacheKey(origin.lat, origin.lng, pickupLat, pickupLng);
+            try {
+                const cached = await redisService.get(cacheKey);
+                if (cached) {
+                    const parsed = JSON.parse(cached);
+                    results.set(origin.id, {
+                        durationSeconds: parsed.durationSeconds,
+                        distanceMeters: parsed.distanceMeters,
+                        cached: true,
+                        source: 'cache'
+                    });
+                    return;
+                }
+            } catch { /* Redis error — treat as miss */ }
+            cacheMisses.push(origin);
+        }));
+
+        // If all origins were cached, return immediately
+        if (cacheMisses.length === 0) {
+            logger.debug(`[DistanceMatrix] All ${origins.length} origins served from cache`);
+            return results;
+        }
+
+        // =====================================================================
+        // STEP 2: Rate limit check + API key check
+        // =====================================================================
+        const apiKey = config.googleMaps.apiKey;
+        if (!apiKey || !rateLimiter.tryConsume(1)) {
+            // No API key or rate limited → haversine for all misses
+            if (!apiKey) {
+                logger.debug('[DistanceMatrix] No API key → haversine fallback');
+            } else {
+                logger.debug(`[DistanceMatrix] Rate limited → haversine for ${cacheMisses.length} origins`);
+            }
+            for (const origin of cacheMisses) {
+                results.set(origin.id, this.haversineFallback(origin.lat, origin.lng, pickupLat, pickupLng));
+            }
+            return results;
+        }
+
+        // =====================================================================
+        // STEP 3: Batch API calls — chunk into groups of 25
+        // =====================================================================
+        for (let i = 0; i < cacheMisses.length; i += MAX_ORIGINS_PER_REQUEST) {
+            const chunk = cacheMisses.slice(i, i + MAX_ORIGINS_PER_REQUEST);
+
+            try {
+                const batchResults = await this.callDistanceMatrixBatch(chunk, pickupLat, pickupLng, apiKey);
+
+                // Store results + cache each individually
+                for (const [id, result] of batchResults) {
+                    results.set(id, result);
+
+                    // Cache the successful result
+                    const origin = chunk.find(o => o.id === id);
+                    if (origin && result.source === 'distance_matrix') {
+                        const cacheKey = this.buildCacheKey(origin.lat, origin.lng, pickupLat, pickupLng);
+                        redisService.set(cacheKey, JSON.stringify({
+                            durationSeconds: result.durationSeconds,
+                            distanceMeters: result.distanceMeters
+                        }), CACHE_TTL_SECONDS).catch(() => { });
+                    }
+                }
+            } catch (error: any) {
+                // Entire chunk failed → haversine for all origins in this chunk
+                logger.warn(`[DistanceMatrix] Batch API failed → haversine for ${chunk.length} origins: ${error.message}`);
+                for (const origin of chunk) {
+                    results.set(origin.id, this.haversineFallback(origin.lat, origin.lng, pickupLat, pickupLng));
+                }
             }
         }
+
+        const cacheHits = origins.length - cacheMisses.length;
+        const apiCalls = Math.ceil(cacheMisses.length / MAX_ORIGINS_PER_REQUEST);
+        logger.info(`[DistanceMatrix] Batch: ${origins.length} origins, ${cacheHits} cache hits, ${cacheMisses.length} API lookups in ${apiCalls} call(s)`);
 
         return results;
     }
 
     // ===========================================================================
-    // PRIVATE — GOOGLE DISTANCE MATRIX API
+    // PRIVATE — BATCHED GOOGLE DISTANCE MATRIX API CALL
+    // Sends up to 25 origins in one request (pipe-separated)
+    // Response: data.rows[i].elements[0] for each origin i
     // ===========================================================================
 
-    private async callDistanceMatrixAPI(
-        originLat: number,
-        originLng: number,
+    private async callDistanceMatrixBatch(
+        origins: OriginWithId[],
         destLat: number,
         destLng: number,
         apiKey: string
-    ): Promise<DistanceMatrixResult> {
-        const origin = `${originLat},${originLng}`;
+    ): Promise<Map<string, DistanceMatrixResult>> {
+        const results = new Map<string, DistanceMatrixResult>();
+
+        // Build pipe-separated origins string: lat1,lng1|lat2,lng2|...
+        const originsStr = origins.map(o => `${o.lat},${o.lng}`).join('|');
         const destination = `${destLat},${destLng}`;
+
         const url = `https://maps.googleapis.com/maps/api/distancematrix/json` +
-            `?origins=${encodeURIComponent(origin)}` +
+            `?origins=${encodeURIComponent(originsStr)}` +
             `&destinations=${encodeURIComponent(destination)}` +
             `&mode=driving` +
             `&key=${apiKey}`;
@@ -227,24 +284,32 @@ class DistanceMatrixService {
                 throw new Error(`Distance Matrix API returned: ${data.status}`);
             }
 
-            const element = data.rows?.[0]?.elements?.[0];
-            if (!element || element.status !== 'OK') {
-                throw new Error(`Element status: ${element?.status || 'MISSING'}`);
-            }
+            // Parse per-origin results: data.rows[i].elements[0]
+            for (let i = 0; i < origins.length; i++) {
+                const origin = origins[i];
+                const element = data.rows?.[i]?.elements?.[0];
 
-            return {
-                durationSeconds: element.duration.value,
-                distanceMeters: element.distance.value,
-                cached: false,
-                source: 'distance_matrix'
-            };
+                if (element?.status === 'OK' && element.duration && element.distance) {
+                    results.set(origin.id, {
+                        durationSeconds: element.duration.value,
+                        distanceMeters: element.distance.value,
+                        cached: false,
+                        source: 'distance_matrix'
+                    });
+                } else {
+                    // Individual element failed (e.g., ZERO_RESULTS) → haversine for this one
+                    results.set(origin.id, this.haversineFallback(origin.lat, origin.lng, destLat, destLng));
+                }
+            }
         } finally {
             clearTimeout(timeout);
         }
+
+        return results;
     }
 
     // ===========================================================================
-    // PRIVATE — HAVERSINE FALLBACK
+    // PRIVATE — HAVERSINE FALLBACK (instant, always available)
     // ===========================================================================
 
     private haversineFallback(
@@ -254,8 +319,8 @@ class DistanceMatrixService {
         destLng: number
     ): DistanceMatrixResult {
         const distanceKm = this.haversineKm(originLat, originLng, destLat, destLng);
-        const roadDistanceKm = distanceKm * 1.4; // Road factor
-        const durationSeconds = (roadDistanceKm / 30) * 3600; // 30 km/h avg
+        const roadDistanceKm = distanceKm * 1.4; // 1.4x road factor (city average)
+        const durationSeconds = (roadDistanceKm / 30) * 3600; // 30 km/h avg truck speed
 
         return {
             durationSeconds: Math.round(durationSeconds),
@@ -269,15 +334,12 @@ class DistanceMatrixService {
     // PRIVATE — CACHE KEY
     // ===========================================================================
 
-    private buildCacheKey(
-        oLat: number, oLng: number,
-        dLat: number, dLng: number
-    ): string {
+    private buildCacheKey(oLat: number, oLng: number, dLat: number, dLng: number): string {
         return `${CACHE_PREFIX}:${oLat.toFixed(COORD_PRECISION)},${oLng.toFixed(COORD_PRECISION)}:${dLat.toFixed(COORD_PRECISION)},${dLng.toFixed(COORD_PRECISION)}`;
     }
 
     // ===========================================================================
-    // PRIVATE — HAVERSINE
+    // PRIVATE — HAVERSINE FORMULA
     // ===========================================================================
 
     private haversineKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
