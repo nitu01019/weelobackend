@@ -67,8 +67,8 @@ const MAX_CONCURRENT_API_CALLS = 10;
 /** API timeout per request (ms) — 2s: fast fail on slow network */
 const API_TIMEOUT_MS = 2000;
 
-/** Geohash precision for cache key (6 = ~1.2km) */
-const GEOHASH_PRECISION = 6;
+/** Coordinate precision for cache key (2 decimal places ≈ ~1.1km for cache sharing) */
+const GEOHASH_PRECISION = 2;
 
 /**
  * Google Directions API QPS limit (configurable via env).
@@ -323,7 +323,7 @@ class DirectionsApiService {
         destLat: number,
         destLng: number
     ): string {
-        // Quantize to geohash6 precision (~1.2km) for better cache hit rate
+        // Quantize to ~1.1km precision for better cache hit rate between nearby drivers
         const oLat = originLat.toFixed(GEOHASH_PRECISION);
         const oLng = originLng.toFixed(GEOHASH_PRECISION);
         const dLat = destLat.toFixed(GEOHASH_PRECISION);

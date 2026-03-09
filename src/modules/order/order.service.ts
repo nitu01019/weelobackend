@@ -2600,6 +2600,13 @@ class OrderService {
       const trucksYouCanProvide = Math.min(availability.available, trucksStillNeeded);
       // Per-transporter pickup distance from Distance Matrix API (already computed)
       const pickupData = candidateDistanceMap?.get(transporterId);
+      if (!pickupData) {
+        logger.warn('broadcast.pickup_data_missing', {
+          orderId,
+          transporterId,
+          candidateMapSize: candidateDistanceMap?.size ?? 0
+        });
+      }
       const personalizedBroadcast = {
         ...extendedBroadcast,
         trucksYouCanProvide,
