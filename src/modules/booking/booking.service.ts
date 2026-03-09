@@ -41,7 +41,7 @@ import { progressiveRadiusMatcher } from '../order/progressive-radius-matcher';
 import { transporterOnlineService } from '../../shared/services/transporter-online.service';
 import { redisService } from '../../shared/services/redis.service';
 import { haversineDistanceKm } from '../../shared/utils/geospatial.utils';
-import { directionsApiService } from '../../shared/services/directions-api.service';
+import { distanceMatrixService } from '../../shared/services/distance-matrix.service';
 // 4 PRINCIPLES: Import production-grade error codes
 import { ErrorCode } from '../../core/constants';
 import { buildBroadcastPayload, getRemainingTimeoutSeconds } from './booking-payload.helper';
@@ -445,7 +445,7 @@ class BookingService {
             }
 
             if (origins.length > 0) {
-              const etaResults = await directionsApiService.batchGetEta(
+              const etaResults = await distanceMatrixService.batchGetPickupDistance(
                 origins,
                 data.pickup.coordinates.latitude,
                 data.pickup.coordinates.longitude

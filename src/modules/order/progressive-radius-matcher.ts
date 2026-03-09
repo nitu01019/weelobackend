@@ -24,7 +24,7 @@
 import { availabilityService } from '../../shared/services/availability.service';
 import { generateVehicleKey, generateVehicleKeyCandidates } from '../../shared/services/vehicle-key.service';
 import { h3GeoIndexService, FF_H3_INDEX_ENABLED } from '../../shared/services/h3-geo-index.service';
-import { directionsApiService } from '../../shared/services/directions-api.service';
+import { distanceMatrixService } from '../../shared/services/distance-matrix.service';
 import { logger } from '../../shared/services/logger.service';
 
 export interface RadiusStep {
@@ -184,12 +184,12 @@ class ProgressiveRadiusMatcher {
     if (candidates.length === 0) return [];
 
     // ========================================================================
-    // LAYER 3: CACHED ETA RANKING (Redis cache → Google Distance Matrix → Haversine)
-    // Uses directionsApiService which has:
-    //   - Redis cache (geohash6 precision, 3-min TTL, ~60-80% hit rate)
+    // LAYER 3: DISTANCE MATRIX ETA RANKING
+    // Uses distanceMatrixService (Google Distance Matrix API) which has:
+    //   - Redis cache (5-min TTL, ~60-80% hit rate in dense areas)
     //   - Token-bucket rate limiter (450 QPS)
-    //   - Circuit breaker (auto-trips → haversine fallback)
     //   - Haversine fallback (always-available)
+    // NOTE: This is SEPARATE from directions-api.service.ts (maps/routes)
     // ========================================================================
     try {
       const origins = candidates.map(c => ({
@@ -198,7 +198,7 @@ class ProgressiveRadiusMatcher {
         id: c.transporterId
       }));
 
-      const etaResults = await directionsApiService.batchGetEta(origins, pickupLat, pickupLng);
+      const etaResults = await distanceMatrixService.batchGetPickupDistance(origins, pickupLat, pickupLng);
 
       // Merge ETA data back into candidates
       const enriched = candidates
