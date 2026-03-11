@@ -37,6 +37,7 @@ import { generateVehicleKey } from '../../shared/services/vehicle-key.service';
 import { transporterOnlineService } from '../../shared/services/transporter-online.service';
 import { routingService } from '../routing';
 import { redisService } from '../../shared/services/redis.service';
+import { liveAvailabilityService } from '../../shared/services/live-availability.service';
 import { pricingService } from '../pricing/pricing.service';
 import { AppError } from '../../shared/types/error.types';
 import { googleMapsService } from '../../shared/services/google-maps.service';
@@ -3242,6 +3243,15 @@ class OrderService {
                 assignedDriverId: null
               }
             }).catch(() => { });
+            // Live availability: vehicles released back to available (bypass path)
+            for (const assignment of cancelledAssignments) {
+              if (assignment.vehicleId && assignment.transporterId) {
+                const vKey = generateVehicleKey(assignment.vehicleType || '', assignment.vehicleSubtype || '');
+                liveAvailabilityService.onVehicleStatusChange(
+                  assignment.transporterId, vKey, 'in_transit', 'available'
+                ).catch(() => { });
+              }
+            }
           }
 
           for (const assignment of cancelledAssignments) {
@@ -3701,6 +3711,8 @@ class OrderService {
       transportersNotified: 0
     };
     let statusCode = 400;
+    // Live availability: capture vehicle data from inside transaction for post-commit hook
+    let releasedVehicleData: Array<{ transporterId: string; vehicleType: string; vehicleSubtype: string }> = [];
 
     const cancellableOrderStatuses: OrderStatus[] = [
       OrderStatus.created,
@@ -3741,7 +3753,10 @@ class OrderService {
           status: true,
           driverId: true,
           tripId: true,
-          vehicleId: true
+          vehicleId: true,
+          transporterId: true,
+          vehicleType: true,
+          vehicleSubtype: true
         }
       });
       const stageEvaluation = this.evaluateTruckCancelPolicy(order as unknown as OrderRecord, assignmentRows, normalizedReason);
@@ -3957,6 +3972,14 @@ class OrderService {
             assignedDriverId: null
           }
         });
+        // Capture data for post-commit live availability hook
+        releasedVehicleData = assignmentRows
+          .filter(a => a.vehicleId && a.transporterId)
+          .map(a => ({
+            transporterId: a.transporterId,
+            vehicleType: a.vehicleType || '',
+            vehicleSubtype: a.vehicleSubtype || ''
+          }));
       }
 
       await tx.orderDispatchOutbox.updateMany({
@@ -4116,6 +4139,14 @@ class OrderService {
       await this.clearCustomerActiveBroadcast(customerId);
       await this.registerCancelRebookChurn(customerId);
       await truckHoldService.clearHoldCacheEntries(closedHoldIds);
+
+      // Live availability: vehicles released back to available AFTER transaction committed
+      for (const rv of releasedVehicleData) {
+        const vKey = generateVehicleKey(rv.vehicleType, rv.vehicleSubtype);
+        liveAvailabilityService.onVehicleStatusChange(
+          rv.transporterId, vKey, 'in_transit', 'available'
+        ).catch(() => { });
+      }
 
       metrics.incrementCounter('holds_released_on_cancel_total', {
         bucket: closedHoldsCount > 0 ? 'has_holds' : 'none'
@@ -4472,6 +4503,12 @@ class OrderService {
     logger.info(`   Vehicle: ${vehicleNumber} (${vehicleType})`);
     logger.info(`   Driver: ${driverName} (${driverPhone})`);
     logger.info(`   Order progress: ${newTrucksFilled}/${orderTotalTrucks}`);
+
+    // Live availability: vehicle went in_transit AFTER transaction committed (bypass path)
+    const acceptVKey = generateVehicleKey(vehicleType || '', vehicleSubtype || '');
+    liveAvailabilityService.onVehicleStatusChange(
+      transporterId, acceptVKey, 'available', 'in_transit'
+    ).catch(() => { });
 
     // ============== NOTIFY DRIVER ==============
     const driverNotification = {

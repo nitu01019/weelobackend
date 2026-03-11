@@ -13,6 +13,7 @@ import { PrismaClient, Prisma, UserRole, VehicleStatus, BookingStatus, OrderStat
 import { logger } from '../services/logger.service';
 import { generateVehicleKey, generateVehicleKeyCandidates } from '../services/vehicle-key.service';
 import { redisService } from '../services/redis.service';
+import { liveAvailabilityService } from '../services/live-availability.service';
 
 // =============================================================================
 // PAGINATION SAFETY — Prevents unbounded queries from exhausting memory
@@ -526,8 +527,25 @@ class PrismaDatabaseService {
   }
 
   async getUserById(id: string): Promise<UserRecord | undefined> {
+    // Redis cache-aside — reduces most-frequent DB query by 90%+
+    try {
+      const { redisService } = require('../services/redis.service');
+      const cacheKey = `user:profile:${id}`;
+      const cached = await redisService.get(cacheKey);
+      if (cached) return JSON.parse(cached);
+    } catch (_) { /* cache miss or Redis down — fall through to DB */ }
+
     const user = await this.prisma.user.findUnique({ where: { id } });
-    return user ? this.toUserRecord(user) : undefined;
+    const record = user ? this.toUserRecord(user) : undefined;
+
+    // Cache for 60s (short TTL — user data rarely changes within a minute)
+    if (record) {
+      try {
+        const { redisService } = require('../services/redis.service');
+        redisService.set(`user:profile:${id}`, JSON.stringify(record), 60).catch(() => {});
+      } catch (_) { /* graceful degradation */ }
+    }
+    return record;
   }
 
   async getUserByPhone(phone: string, role: string): Promise<UserRecord | undefined> {
@@ -554,6 +572,13 @@ class PrismaDatabaseService {
           role: data.role ? data.role as UserRole : undefined,
         }
       });
+
+      // Invalidate user cache on update
+      try {
+        const { redisService } = require('../services/redis.service');
+        await redisService.del(`user:profile:${id}`);
+      } catch (_) { /* cache invalidation failure is non-fatal */ }
+
       return this.toUserRecord(updated);
     } catch {
       return undefined;
@@ -586,6 +611,15 @@ class PrismaDatabaseService {
       if (existing.transporterId && existing.transporterId !== vehicle.transporterId) {
         redisService.del(this.vehiclesCacheKey(existing.transporterId)).catch(() => { });
       }
+      // Live availability: handle status change on re-registration
+      if (existing.status !== (vehicle.status || 'available')) {
+        liveAvailabilityService.onVehicleStatusChange(
+          updated.transporterId,
+          updated.vehicleKey || vehicle.vehicleKey || '',
+          existing.status || 'available',
+          (vehicle.status || 'available') as string
+        ).catch(err => logger.warn('[LiveAvail] createVehicle re-reg hook failed:', (err as Error).message));
+      }
       return this.toVehicleRecord(updated);
     }
 
@@ -598,6 +632,11 @@ class PrismaDatabaseService {
     logger.info(`Vehicle registered: ${vehicle.vehicleNumber} (${vehicle.vehicleType})`);
     // Invalidate vehicle cache for this transporter
     redisService.del(this.vehiclesCacheKey(vehicle.transporterId)).catch(() => { });
+    // Live availability: new vehicle starts as available
+    if (!vehicle.status || vehicle.status === 'available') {
+      liveAvailabilityService.onVehicleCreated(vehicle.transporterId, vehicle.vehicleKey || '')
+        .catch(err => logger.warn('[LiveAvail] createVehicle hook failed:', (err as Error).message));
+    }
     return this.toVehicleRecord(created);
   }
 
@@ -744,10 +783,15 @@ class PrismaDatabaseService {
 
   async updateVehicle(id: string, updates: Partial<VehicleRecord>): Promise<VehicleRecord | undefined> {
     try {
-      // EDGE CASE: Fetch old transporterId BEFORE update
-      // so we can invalidate BOTH old and new caches if owner changes
-      const oldVehicle = (updates as any).transporterId
-        ? await this.prisma.vehicle.findUnique({ where: { id }, select: { transporterId: true } })
+      // Fetch old vehicle state BEFORE update for:
+      // 1. Cache invalidation when transporterId changes
+      // 2. Live availability tracking when status changes
+      const needsOldState = (updates as any).transporterId || (updates as any).status;
+      const oldVehicle = needsOldState
+        ? await this.prisma.vehicle.findUnique({
+            where: { id },
+            select: { transporterId: true, status: true, vehicleKey: true }
+          })
         : null;
 
       const { createdAt, updatedAt, ...data } = updates as any;
@@ -766,6 +810,15 @@ class PrismaDatabaseService {
       if (oldVehicle?.transporterId && oldVehicle.transporterId !== updated.transporterId) {
         redisService.del(this.vehiclesCacheKey(oldVehicle.transporterId)).catch(() => { });
       }
+      // Live availability: update Redis set + count when status changes
+      if (oldVehicle && (updates as any).status && oldVehicle.status !== (updates as any).status) {
+        liveAvailabilityService.onVehicleStatusChange(
+          updated.transporterId,
+          updated.vehicleKey || oldVehicle.vehicleKey || '',
+          oldVehicle.status || 'available',
+          (updates as any).status
+        ).catch(err => logger.warn('[LiveAvail] updateVehicle hook failed:', (err as Error).message));
+      }
       return this.toVehicleRecord(updated);
     } catch {
       return undefined;
@@ -774,11 +827,19 @@ class PrismaDatabaseService {
 
   async deleteVehicle(id: string): Promise<boolean> {
     try {
-      // Fetch transporterId before deleting so we can invalidate cache
-      const vehicle = await this.prisma.vehicle.findUnique({ where: { id }, select: { transporterId: true } });
+      // Fetch vehicle details before deleting for cache + availability cleanup
+      const vehicle = await this.prisma.vehicle.findUnique({
+        where: { id },
+        select: { transporterId: true, status: true, vehicleKey: true }
+      });
       await this.prisma.vehicle.delete({ where: { id } });
       if (vehicle?.transporterId) {
         redisService.del(this.vehiclesCacheKey(vehicle.transporterId)).catch(() => { });
+      }
+      // Live availability: decrement if the deleted vehicle was available
+      if (vehicle && vehicle.status === 'available' && vehicle.vehicleKey) {
+        liveAvailabilityService.onVehicleRemoved(vehicle.transporterId, vehicle.vehicleKey)
+          .catch(err => logger.warn('[LiveAvail] deleteVehicle hook failed:', (err as Error).message));
       }
       return true;
     } catch {
@@ -1411,6 +1472,20 @@ class PrismaDatabaseService {
     vehicleType: string,
     vehicleSubtype?: string
   ): Promise<Array<{ transporterId: string; transporterName: string; totalOwned: number; available: number; inTransit: number }>> {
+    // Live Redis: try Redis snapshot first (zero DB queries)
+    try {
+      const vehicleKey = vehicleSubtype
+        ? generateVehicleKey(vehicleType, vehicleSubtype)
+        : generateVehicleKey(vehicleType, '');
+      const redisResult = await liveAvailabilityService.getSnapshotFromRedis(vehicleKey);
+      if (redisResult && redisResult.length > 0) {
+        logger.debug(`[AvailSnapshot] Live Redis: ${redisResult.length} transporters for ${vehicleKey}`);
+        return redisResult;
+      }
+    } catch { /* Redis down — fall through to DB */ }
+
+    // Fallback: DB queries (unchanged)
+
     const vehicleKeyCandidates = vehicleSubtype
       ? generateVehicleKeyCandidates(vehicleType, vehicleSubtype)
       : [];
@@ -1488,7 +1563,9 @@ class PrismaDatabaseService {
       });
     }
 
-    return result.filter(t => t.available > 0);
+    const filtered = result.filter(t => t.available > 0);
+
+    return filtered;
   }
 
   // ==========================================================================

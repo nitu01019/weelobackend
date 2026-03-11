@@ -17,7 +17,7 @@ import { logger } from '../../shared/services/logger.service';
 import { emitToUser, emitToUsers, emitToRoom, emitToAllTransporters, emitToAll } from '../../shared/services/socket.service';
 import { sendPushNotification } from '../../shared/services/fcm.service';
 import { redisService } from '../../shared/services/redis.service';
-import { prismaClient } from '../../shared/database/prisma.service';
+import { prismaClient, withDbTimeout } from '../../shared/database/prisma.service';
 
 // =============================================================================
 // BROADCAST EXPIRY EVENTS - For real-time timeout handling
@@ -449,7 +449,7 @@ class BroadcastService {
 
       for (let attempt = 1; attempt <= maxTransactionAttempts; attempt += 1) {
         try {
-          txResult = await prismaClient.$transaction(async (tx) => {
+          txResult = await withDbTimeout(async (tx) => {
             const booking = await tx.booking.findUnique({ where: { id: broadcastId } });
             if (!booking) {
               throw new AppError(404, 'INVALID_ASSIGNMENT_STATE', 'Broadcast not found');
@@ -626,7 +626,7 @@ class BroadcastService {
               vehicle,
               transporter
             };
-          }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+          }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable, timeoutMs: 8000 });
           break;
         } catch (transactionError: any) {
           const isRetryableContention = transactionError?.code === 'P2034' || transactionError?.code === '40001';

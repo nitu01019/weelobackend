@@ -108,6 +108,56 @@ validateAndLogEnvironment();
 // Without this call, redisService stays in in-memory mode!
 redisService.initialize().then(() => {
   logger.info('✅ RedisService initialized');
+
+  // Cache warming: Rebuild H3 geo index from existing Redis data on startup
+  // Without this, H3 cells are empty after restart until transporters heartbeat in (~60s gap)
+  if (process.env.FF_H3_INDEX_ENABLED === 'true') {
+    (async () => {
+      try {
+        const { h3GeoIndexService } = await import('./shared/services/h3-geo-index.service');
+        // Get all active vehicle keys from GEO index
+        const geoKeys = await redisService.keys('geo:transporters:*');
+        const vehicleKeys = geoKeys.map(k => k.replace('geo:transporters:', '')).filter(Boolean);
+
+        if (vehicleKeys.length === 0) {
+          logger.info('[CacheWarm] H3 rebuild skipped — no online transporters in Redis yet');
+          return;
+        }
+
+        const count = await h3GeoIndexService.rebuildFromGeoIndex(
+          vehicleKeys,
+          async (transporterId: string) => {
+            const raw = await redisService.hGetAll(`transporter:details:${transporterId}`);
+            if (!raw?.latitude || !raw?.longitude) return null;
+            return {
+              latitude: parseFloat(raw.latitude),
+              longitude: parseFloat(raw.longitude),
+              vehicleKeys: raw.vehicleKeys || ''
+            };
+          }
+        );
+        logger.info(`🔥 [CacheWarm] H3 index rebuilt: ${count} transporters indexed`);
+      } catch (err: any) {
+        logger.warn(`[CacheWarm] H3 rebuild failed (heartbeats will fill index): ${err.message}`);
+      }
+    })();
+  }
+
+  // Live availability: rebuild Redis sets + hashes from database on startup
+  (async () => {
+    try {
+      const { liveAvailabilityService } = await import('./shared/services/live-availability.service');
+      await liveAvailabilityService.rebuildFromDatabase();
+
+      // Periodic reconciliation: compare Redis with DB every 5 minutes as a safety net
+      setInterval(() => {
+        liveAvailabilityService.reconcile()
+          .catch(err => logger.warn('[LiveAvail] Reconciliation failed:', (err as Error).message));
+      }, 5 * 60 * 1000);
+    } catch (err: any) {
+      logger.warn(`[LiveAvail] Bootstrap failed: ${err.message}`);
+    }
+  })();
 }).catch((err) => {
   logger.error('❌ RedisService initialization failed:', err);
 });

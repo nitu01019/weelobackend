@@ -11,7 +11,7 @@
 import { v4 as uuid } from 'uuid';
 import { Prisma } from '@prisma/client';
 import { db, AssignmentRecord } from '../../shared/database/db';
-import { prismaClient } from '../../shared/database/prisma.service';
+import { prismaClient, withDbTimeout } from '../../shared/database/prisma.service';
 import { AppError } from '../../shared/types/error.types';
 import { logger } from '../../shared/services/logger.service';
 import { emitToUser, emitToBooking, SocketEvent } from '../../shared/services/socket.service';
@@ -203,7 +203,7 @@ class AssignmentService {
       assignedAt: new Date().toISOString()
     };
 
-    await prismaClient.$transaction(async (tx) => {
+    await withDbTimeout(async (tx) => {
       // Re-check inside transaction with Serializable isolation
       const activeStatuses = ['pending', 'driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit', 'arrived_at_drop'];
       const activeAssignment = await tx.assignment.findFirst({
@@ -217,7 +217,7 @@ class AssignmentService {
       // CRITICAL: use tx (transaction context) not db (global client) so the
       // Serializable isolation actually prevents concurrent duplicate assignments.
       await tx.assignment.create({ data: assignment as any });
-    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable, timeoutMs: 8000 });
 
     // =========================================================================
     // START 60-SECOND TIMEOUT TIMER (Redis-based)

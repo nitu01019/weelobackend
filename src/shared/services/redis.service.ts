@@ -128,6 +128,7 @@ interface IRedisClient {
   hGetAll(key: string): Promise<Record<string, string>>;
   hGetAllBatch(keys: string[]): Promise<Record<string, string>[]>;
   hDel(key: string, ...fields: string[]): Promise<number>;
+  hIncrBy(key: string, field: string, increment: number): Promise<number>;
   hMSet(key: string, data: Record<string, string>): Promise<void>;
 
   // Geospatial
@@ -592,6 +593,18 @@ class InMemoryRedisClient implements IRedisClient {
     }
 
     return deleted;
+  }
+
+  async hIncrBy(key: string, field: string, increment: number): Promise<number> {
+    let entry = this.store.get(key);
+    if (!entry || entry.type !== 'hash') {
+      entry = { value: new Map<string, string>(), type: 'hash' };
+      this.store.set(key, entry);
+    }
+    const current = parseInt(entry.value.get(field) || '0', 10);
+    const newVal = current + increment;
+    entry.value.set(field, newVal.toString());
+    return newVal;
   }
 
   async hMSet(key: string, data: Record<string, string>): Promise<void> {
@@ -1112,6 +1125,10 @@ class RealRedisClient implements IRedisClient {
   async hDel(key: string, ...fields: string[]): Promise<number> {
     if (fields.length === 0) return 0;
     return this.client.hdel(key, ...fields);
+  }
+
+  async hIncrBy(key: string, field: string, increment: number): Promise<number> {
+    return this.client.hincrby(key, field, increment);
   }
 
   async hMSet(key: string, data: Record<string, string>): Promise<void> {
@@ -1864,6 +1881,10 @@ class RedisService {
     return this.client.hDel(key, ...fields);
   }
 
+  async hIncrBy(key: string, field: string, increment: number): Promise<number> {
+    return this.client.hIncrBy(key, field, increment);
+  }
+
   async hMSet(key: string, data: Record<string, string>): Promise<void> {
     return this.client.hMSet(key, data);
   }
@@ -2076,6 +2097,10 @@ class RedisService {
 
   async unsubscribe(channel: string): Promise<void> {
     return this.client.unsubscribe(channel);
+  }
+
+  async eval(script: string, keys: string[], args: string[]): Promise<any> {
+    return this.client.eval(script, keys, args);
   }
 
   // ===========================================================================

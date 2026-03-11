@@ -59,10 +59,15 @@ const API_TIMEOUT_MS = 3000;
 /** Coordinate precision for cache key (4 decimal places ≈ 11m — good dedup) */
 const COORD_PRECISION = 4;
 
-/** Rate limit QPS per instance (with 2 ECS tasks: 2 × 200 = 400 total) */
-const MAX_QPS = Math.max(
+/**
+ * Rate limit: Elements Per Second (EPS) per instance.
+ * Google allows 60,000 EPM = 1,000 EPS total across all instances.
+ * With 2 ECS tasks: 1000 / 2 = 500 EPS per instance.
+ * Default 400 (leaves 20% safety margin for burst absorption).
+ */
+const MAX_EPS = Math.max(
     10,
-    parseInt(process.env.DISTANCE_MATRIX_MAX_QPS || '200', 10) || 200
+    parseInt(process.env.DISTANCE_MATRIX_MAX_EPS || '400', 10) || 400
 );
 
 // =============================================================================
@@ -95,7 +100,7 @@ class TokenBucket {
     }
 }
 
-const rateLimiter = new TokenBucket(MAX_QPS);
+const rateLimiter = new TokenBucket(MAX_EPS);
 
 // =============================================================================
 // TYPES
@@ -194,16 +199,11 @@ class DistanceMatrixService {
         }
 
         // =====================================================================
-        // STEP 2: Rate limit check + API key check
+        // STEP 2: API key check (fast fail — no point chunking without key)
         // =====================================================================
         const apiKey = config.googleMaps.apiKey;
-        if (!apiKey || !rateLimiter.tryConsume(1)) {
-            // No API key or rate limited → haversine for all misses
-            if (!apiKey) {
-                logger.debug('[DistanceMatrix] No API key → haversine fallback');
-            } else {
-                logger.debug(`[DistanceMatrix] Rate limited → haversine for ${cacheMisses.length} origins`);
-            }
+        if (!apiKey) {
+            logger.debug('[DistanceMatrix] No API key → haversine fallback');
             for (const origin of cacheMisses) {
                 results.set(origin.id, this.haversineFallback(origin.lat, origin.lng, pickupLat, pickupLng));
             }
@@ -212,9 +212,21 @@ class DistanceMatrixService {
 
         // =====================================================================
         // STEP 3: Batch API calls — chunk into groups of 25
+        // Rate limit per chunk: consume tokens = element count (not 1 per batch).
+        // Google bills per element (60,000 EPM = 1,000 EPS).
+        // If a chunk exceeds budget → haversine for that chunk only.
         // =====================================================================
         for (let i = 0; i < cacheMisses.length; i += MAX_ORIGINS_PER_REQUEST) {
             const chunk = cacheMisses.slice(i, i + MAX_ORIGINS_PER_REQUEST);
+
+            // Per-chunk rate limit: consume tokens equal to element count
+            if (!rateLimiter.tryConsume(chunk.length)) {
+                logger.debug(`[DistanceMatrix] Rate limited → haversine for ${chunk.length} elements (tokens insufficient)`);
+                for (const origin of chunk) {
+                    results.set(origin.id, this.haversineFallback(origin.lat, origin.lng, pickupLat, pickupLng));
+                }
+                continue; // Try next chunk (tokens may have refilled)
+            }
 
             try {
                 const batchResults = await this.callDistanceMatrixBatch(chunk, pickupLat, pickupLng, apiKey);

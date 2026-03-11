@@ -28,7 +28,7 @@ import crypto from 'crypto';
 import { v4 as uuid } from 'uuid';
 import { db, BookingRecord } from '../../shared/database/db';
 import { Prisma } from '@prisma/client';
-import { prismaClient, BookingStatus, AssignmentStatus, VehicleStatus } from '../../shared/database/prisma.service';
+import { prismaClient, withDbTimeout, BookingStatus, AssignmentStatus, VehicleStatus } from '../../shared/database/prisma.service';
 import { AppError } from '../../shared/types/error.types';
 import { logger } from '../../shared/services/logger.service';
 import { emitToUser, emitToBooking, SocketEvent, isUserConnected } from '../../shared/services/socket.service';
@@ -40,6 +40,7 @@ import { generateVehicleKey } from '../../shared/services/vehicle-key.service';
 import { progressiveRadiusMatcher } from '../order/progressive-radius-matcher';
 import { transporterOnlineService } from '../../shared/services/transporter-online.service';
 import { redisService } from '../../shared/services/redis.service';
+import { liveAvailabilityService } from '../../shared/services/live-availability.service';
 import { haversineDistanceKm } from '../../shared/utils/geospatial.utils';
 import { distanceMatrixService } from '../../shared/services/distance-matrix.service';
 // 4 PRINCIPLES: Import production-grade error codes
@@ -522,7 +523,7 @@ class BookingService {
       // PostgreSQL serializable isolation aborts one transaction on conflict.
       // ========================================
       const bookingId = uuid();
-      await prismaClient.$transaction(async (tx) => {
+      await withDbTimeout(async (tx) => {
         // DB authoritative check (covers Redis failure edge case)
         const existingBooking = await tx.booking.findFirst({
           where: { customerId, status: { in: [BookingStatus.created, BookingStatus.broadcasting, BookingStatus.active, BookingStatus.partially_filled] } }
@@ -571,7 +572,7 @@ class BookingService {
             expiresAt
           }
         });
-      }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+      }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable, timeoutMs: 8000 });
 
       // Fetch as BookingRecord (converts JSON fields + dates for downstream use)
       const booking = await db.getBookingById(bookingId);
@@ -1488,6 +1489,11 @@ class BookingService {
               where: { id: assignment.vehicleId },
               data: { status: VehicleStatus.available, currentTripId: null, assignedDriverId: null }
             }).catch(() => { });
+            // Live availability: vehicle released back to available (bypass path — not through db.updateVehicle)
+            const vKey = generateVehicleKey(assignment.vehicleType || booking.vehicleType, assignment.vehicleSubtype || booking.vehicleSubtype || '');
+            liveAvailabilityService.onVehicleStatusChange(
+              assignment.transporterId, vKey, 'in_transit', 'available'
+            ).catch(() => { });
           }
           if (assignment.driverId) {
             emitToUser(assignment.driverId, 'trip_cancelled', {

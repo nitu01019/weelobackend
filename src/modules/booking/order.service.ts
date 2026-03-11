@@ -28,7 +28,7 @@
 import { v4 as uuid } from 'uuid';
 import { Prisma } from '@prisma/client';
 import { db, OrderRecord, TruckRequestRecord } from '../../shared/database/db';
-import { prismaClient } from '../../shared/database/prisma.service';
+import { prismaClient, withDbTimeout } from '../../shared/database/prisma.service';
 import { AppError } from '../../shared/types/error.types';
 import { logger } from '../../shared/services/logger.service';
 import { emitToUser, emitToBooking, SocketEvent } from '../../shared/services/socket.service';
@@ -679,7 +679,7 @@ class OrderService {
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
-        txResult = await prismaClient.$transaction(async (tx) => {
+        txResult = await withDbTimeout(async (tx) => {
 
           // STEP 1: Validate request exists and is still available (inside tx)
           const request = await tx.truckRequest.findUnique({ where: { id: requestId } });

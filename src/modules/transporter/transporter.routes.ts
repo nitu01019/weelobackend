@@ -29,6 +29,7 @@ import { availabilityService } from '../../shared/services/availability.service'
 import { generateVehicleKey } from '../../shared/services/vehicle-key.service';
 import { prismaClient } from '../../shared/database/prisma.service';
 import { bookingService } from '../booking/booking.service';
+import { broadcastService } from '../broadcast/broadcast.service';
 
 const router = Router();
 
@@ -366,6 +367,14 @@ router.put(
       if (requestedState) {
         bookingService.deliverMissedBroadcasts(transporterId).catch((err: any) => {
           logger.warn('[TRANSPORTER TOGGLE] Re-broadcast failed (non-critical)', {
+            transporterId,
+            error: err.message
+          });
+        });
+
+        // Cache warming: pre-fill broadcast poll cache so first HTTP request is instant
+        broadcastService.getActiveBroadcasts({ actorId: transporterId }).catch((err: any) => {
+          logger.warn('[TRANSPORTER TOGGLE] Broadcast cache warm failed (non-critical)', {
             transporterId,
             error: err.message
           });

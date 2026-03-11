@@ -46,7 +46,9 @@ export async function cleanupExpiredOrders(): Promise<void> {
         customerId: true,
         expiresAt: true,
         status: true
-      }
+      },
+      take: 200,  // Batch limit — prevents scanning entire orders table
+      orderBy: { expiresAt: 'asc' }  // Oldest first
     });
     
     if (expiredOrders.length === 0) {

@@ -76,10 +76,11 @@ import { v4 as uuidv4 } from 'uuid';
 import crypto from 'crypto';
 import { Prisma } from '@prisma/client';
 import { db } from '../../shared/database/db';
-import { prismaClient, AssignmentStatus, OrderStatus, TruckRequestStatus, VehicleStatus } from '../../shared/database/prisma.service';
+import { prismaClient, withDbTimeout, AssignmentStatus, OrderStatus, TruckRequestStatus, VehicleStatus } from '../../shared/database/prisma.service';
 import { logger } from '../../shared/services/logger.service';
 import { socketService } from '../../shared/services/socket.service';
 import { redisService } from '../../shared/services/redis.service';
+import { liveAvailabilityService } from '../../shared/services/live-availability.service';
 import { queueService } from '../../shared/services/queue.service';
 import { metrics } from '../../shared/monitoring/metrics.service';
 
@@ -698,7 +699,7 @@ class TruckHoldService {
       const expiresAt = new Date(now.getTime() + CONFIG.HOLD_DURATION_SECONDS * 1000);
       let heldCount = 0;
 
-      await prismaClient.$transaction(async (tx) => {
+      await withDbTimeout(async (tx) => {
         const order = await tx.order.findUnique({
           where: { id: orderId },
           select: { id: true, status: true }
@@ -769,7 +770,8 @@ class TruckHoldService {
 
         heldCount = claimUpdate.count;
       }, {
-        isolationLevel: Prisma.TransactionIsolationLevel.Serializable
+        isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+        timeoutMs: 8000
       });
 
       response = {
@@ -871,7 +873,7 @@ class TruckHoldService {
       }
 
       const now = new Date().toISOString();
-      const confirmed = await prismaClient.$transaction(async (tx) => {
+      const confirmed = await withDbTimeout(async (tx) => {
         const order = await tx.order.findUnique({
           where: { id: hold.orderId },
           select: { status: true, id: true }
@@ -916,7 +918,8 @@ class TruckHoldService {
 
         return update.count;
       }, {
-        isolationLevel: Prisma.TransactionIsolationLevel.Serializable
+        isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+        timeoutMs: 8000
       });
 
       // 5. Broadcast update
@@ -1180,7 +1183,7 @@ class TruckHoldService {
 
       const transporter = await db.getUserById(transporterId);
       const now = new Date().toISOString();
-      const confirmedAssignments = await prismaClient.$transaction(async (tx) => {
+      const confirmedAssignments = await withDbTimeout(async (tx) => {
         const txAssignments: Array<{
           assignmentId: string;
           tripId: string;
@@ -1343,6 +1346,14 @@ class TruckHoldService {
       const tripIds = confirmedAssignments.assignments.map((assignment) => assignment.tripId);
       const newTrucksFilled = confirmedAssignments.newTrucksFilled;
       const newStatus = confirmedAssignments.newStatus;
+
+      // Live availability: vehicles went available → in_transit AFTER transaction committed
+      for (const assignment of confirmedAssignments.assignments) {
+        const vKey = assignment.vehicle.vehicleKey || '';
+        liveAvailabilityService.onVehicleStatusChange(
+          transporterId, vKey, 'available', 'in_transit'
+        ).catch(() => { });
+      }
 
       for (const assignment of confirmedAssignments.assignments) {
         logger.info(
@@ -1545,7 +1556,7 @@ class TruckHoldService {
       }
 
       const resolvedTransporterId = hold.transporterId;
-      await prismaClient.$transaction(async (tx) => {
+      await withDbTimeout(async (tx) => {
         const order = await tx.order.findUnique({
           where: { id: hold.orderId },
           select: { status: true }
@@ -1593,7 +1604,8 @@ class TruckHoldService {
           }
         });
       }, {
-        isolationLevel: Prisma.TransactionIsolationLevel.Serializable
+        isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+        timeoutMs: 8000
       });
 
       // best-effort Redis cleanup for stale lock/index keys
@@ -1764,7 +1776,7 @@ class TruckHoldService {
       ? TruckRequestStatus.cancelled
       : TruckRequestStatus.expired;
     for (const hold of activeHolds) {
-      await prismaClient.$transaction(async (tx) => {
+      await withDbTimeout(async (tx) => {
         await tx.truckRequest.updateMany({
           where: {
             id: { in: hold.truckRequestIds },
