@@ -604,14 +604,13 @@ const gracefulShutdown = async (signal: string) => {
     const { stopBookingExpiryChecker } = require('./modules/booking/booking.service');
     const { stopOrderExpiryChecker } = require('./modules/booking/order.service');
     const { stopOrderTimerChecker } = require('./modules/order/order.service');
-    const { stopAssignmentExpiryChecker } = require('./modules/assignment/assignment.service');
+    // Assignment timeouts now use queue-based delayed jobs (no polling to stop)
     const { broadcastService } = require('./modules/broadcast/broadcast.service');
     const { stopStaleTransporterCleanup } = require('./shared/services/transporter-online.service');
     const { trackingService } = require('./modules/tracking/tracking.service');
     stopBookingExpiryChecker();
     stopOrderExpiryChecker();
     stopOrderTimerChecker();
-    stopAssignmentExpiryChecker();
     broadcastService?.stopExpiryChecker?.();
     stopStaleTransporterCleanup();
     trackingService?.stopDriverOfflineChecker?.();

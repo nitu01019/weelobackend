@@ -403,6 +403,54 @@ export function initializeSocket(server: HttpServer): Server {
           logger.warn(`[Socket] Failed to restore driver presence: ${e.message}`);
         }
       })();
+
+      // ================================================================
+      // PENDING ASSIGNMENT RE-SEND ON DRIVER RECONNECT
+      // ================================================================
+      // Industry pattern (Ola, Gojek): When driver's socket reconnects,
+      // check if they have a pending assignment and re-emit it with the
+      // remaining seconds. Without this, a driver who disconnects for
+      // 10 seconds comes back to a blank screen and misses the trip.
+      //
+      // Same concept as transporter reconnect push (line ~450 below)
+      // but for driver assignments instead of broadcasts.
+      // ================================================================
+      (async () => {
+        try {
+          const { prismaClient } = await import('../database/prisma.service');
+          const pendingAssignment = await prismaClient.assignment.findFirst({
+            where: { driverId: userId, status: 'pending' },
+            orderBy: { assignedAt: 'desc' }
+          });
+
+          if (pendingAssignment) {
+            // Calculate remaining seconds from the 60s timeout
+            const ASSIGNMENT_TIMEOUT_MS = 60 * 1000;
+            const assignedAtMs = new Date(pendingAssignment.assignedAt || '').getTime();
+            const elapsedMs = Date.now() - assignedAtMs;
+            const remainingMs = ASSIGNMENT_TIMEOUT_MS - elapsedMs;
+
+            if (remainingMs > 2000) {
+              // Still within timeout window — re-send the assignment
+              socket.emit(SocketEvent.ASSIGNMENT_STATUS_CHANGED, {
+                assignmentId: pendingAssignment.id,
+                tripId: pendingAssignment.tripId,
+                bookingId: pendingAssignment.bookingId,
+                status: 'pending',
+                message: 'New trip assigned to you',
+                remainingSeconds: Math.floor(remainingMs / 1000),
+                _reconnectDelivery: true
+              });
+              logger.info(`[Socket] 📡 Re-sent pending assignment ${pendingAssignment.id} to driver ${userId} on reconnect (${Math.floor(remainingMs / 1000)}s remaining)`);
+            } else {
+              logger.debug(`[Socket] Pending assignment ${pendingAssignment.id} for driver ${userId} has <2s remaining — skipping re-send`);
+            }
+          }
+        } catch (e: any) {
+          // Non-critical — driver can still accept via FCM notification
+          logger.warn(`[Socket] Failed to re-send pending assignment on reconnect for ${userId}: ${e.message}`);
+        }
+      })();
     } else if (role === 'transporter') {
       (async () => {
         try {

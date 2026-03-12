@@ -728,7 +728,9 @@ class QueueService {
     SMS: 'sms',                       // SMS notifications (future)
     ANALYTICS: 'analytics',           // Analytics events
     CLEANUP: 'cleanup',               // Cleanup/maintenance tasks
-    CUSTOM_BOOKING: 'custom-booking'  // Custom booking events
+    CUSTOM_BOOKING: 'custom-booking',  // Custom booking events
+    ASSIGNMENT_TIMEOUT: 'assignment-timeout',  // Delayed assignment timeout jobs
+    ASSIGNMENT_RECONCILIATION: 'assignment-reconciliation'  // Periodic orphaned assignment cleanup
   };
 
   constructor() {
@@ -1013,7 +1015,112 @@ class QueueService {
       await this.trackingStreamSink.publishTrackingEvents([job.data as TrackingEventPayload]);
     });
 
-    logger.info('📋 Queue processors registered');
+    // Assignment timeout processor — fires exactly at delay, zero polling
+    // Replaces setInterval(5000) + Redis SCAN pattern
+    this.queue.process(QueueService.QUEUES.ASSIGNMENT_TIMEOUT, async (job) => {
+      const { assignmentService } = require('../../modules/assignment/assignment.service');
+      const timerData = job.data;
+
+      // Distributed lock — prevents duplicate processing if job runs twice
+      const lockKey = `lock:assignment-expiry:${timerData.assignmentId}`;
+      const lock = await redisService.acquireLock(lockKey, 'queue-worker', 30);
+      if (!lock.acquired) {
+        logger.debug('Assignment timeout already handled by another worker', {
+          assignmentId: timerData.assignmentId
+        });
+        return;
+      }
+
+      try {
+        await assignmentService.handleAssignmentTimeout(timerData);
+        logger.info('⏱️ Assignment timeout processed via queue', {
+          assignmentId: timerData.assignmentId,
+          driverName: timerData.driverName
+        });
+      } catch (error: any) {
+        logger.error('Assignment timeout job failed', {
+          assignmentId: timerData.assignmentId,
+          error: error.message
+        });
+        throw error; // Queue will retry up to maxAttempts
+      } finally {
+        await redisService.releaseLock(lockKey, 'queue-worker');
+      }
+    });
+
+    // =========================================================================
+    // RECONCILIATION JOB — Safety net for orphaned pending assignments
+    // Industry pattern (Uber uTask): Periodic background sweep catches orphaned
+    // records left behind when queue/Redis was down during assignment creation.
+    // Runs every 5 minutes via setInterval. Uses distributed lock — safe on
+    // multiple ECS instances.
+    // =========================================================================
+    this.queue.process(QueueService.QUEUES.ASSIGNMENT_RECONCILIATION, async (job) => {
+      const lockKey = 'lock:assignment-reconciliation';
+      const lock = await redisService.acquireLock(lockKey, 'reconciler', 60);
+      if (!lock.acquired) {
+        return; // Another instance is processing
+      }
+
+      try {
+        // assignedAt is String (ISO), so compare as string — ISO strings sort lexicographically
+        const threeMinutesAgoISO = new Date(Date.now() - 3 * 60 * 1000).toISOString();
+        const orphaned = await prismaClient.assignment.findMany({
+          where: {
+            status: 'pending',
+            assignedAt: { lt: threeMinutesAgoISO }
+          },
+          take: 100
+        });
+
+        if (orphaned.length === 0) return;
+
+        logger.warn(`[RECONCILIATION] Found ${orphaned.length} orphaned pending assignments`);
+
+        // Use the FULL handleAssignmentTimeout pipeline (same as normal timeout).
+        // This includes: status update, vehicle release, booking decrement,
+        // transporter notification, driver notification, booking room emit, FCM push.
+        // Industry pattern (Uber uTask): reconciliation uses same cleanup path as normal flow.
+        const { assignmentService } = require('../../modules/assignment/assignment.service');
+
+        for (const assignment of orphaned) {
+          try {
+            await assignmentService.handleAssignmentTimeout({
+              assignmentId: assignment.id,
+              driverId: assignment.driverId,
+              driverName: assignment.driverName || '',
+              transporterId: assignment.transporterId,
+              vehicleId: assignment.vehicleId,
+              vehicleNumber: assignment.vehicleNumber || '',
+              bookingId: assignment.bookingId || assignment.orderId || '',
+              tripId: assignment.tripId || '',
+              createdAt: assignment.assignedAt
+            });
+            logger.info(`[RECONCILIATION] Processed orphaned: ${assignment.id}`);
+          } catch (err: any) {
+            logger.error(`[RECONCILIATION] Failed: ${assignment.id}`, { error: err.message });
+          }
+        }
+      } finally {
+        await redisService.releaseLock(lockKey, 'reconciler').catch(() => {});
+      }
+    });
+
+    // Self-scheduling reconciliation: enqueue every 5 minutes via setInterval
+    setInterval(async () => {
+      try {
+        await this.queue.add(
+          QueueService.QUEUES.ASSIGNMENT_RECONCILIATION,
+          'reconcile-orphaned',
+          {},
+          { maxAttempts: 1 }
+        );
+      } catch (err) {
+        logger.warn('[RECONCILIATION] Failed to schedule reconciliation job');
+      }
+    }, 5 * 60 * 1000);
+
+    logger.info('📋 Queue processors registered (including reconciliation)');
   }
 
   private resolveBroadcastOrderId(data: any): string {
@@ -1142,6 +1249,33 @@ class QueueService {
     }));
 
     return this.queue.addBatch(QueueService.QUEUES.PUSH_NOTIFICATION, jobs);
+  }
+
+  /**
+   * Schedule a delayed assignment timeout job.
+   * Job fires exactly at delayMs — zero polling, zero wasted CPU.
+   * 
+   * SAFETY: If driver accepts before timeout, handleAssignmentTimeout()
+   * no-ops because updateMany({ where: { status: 'pending' }}) matches 0 rows.
+   * Distributed lock prevents duplicate processing across ECS instances.
+   */
+  async scheduleAssignmentTimeout(data: {
+    assignmentId: string;
+    driverId: string;
+    driverName: string;
+    transporterId: string;
+    vehicleId: string;
+    vehicleNumber: string;
+    bookingId: string;
+    tripId: string;
+    createdAt: string;
+  }, delayMs: number): Promise<string> {
+    return this.queue.add(
+      QueueService.QUEUES.ASSIGNMENT_TIMEOUT,
+      'assignment_timeout',
+      data,
+      { delay: delayMs, maxAttempts: 3 }
+    );
   }
 
   /**

@@ -590,17 +590,38 @@ class DriverService {
         onlineSince: new Date().toISOString(),
         lastHeartbeat: new Date().toISOString()
       });
-      await redisService.set(PRESENCE_KEY(driverId), presenceData, PRESENCE_TTL_SECONDS);
+      // Compensating transaction: rollback DB if Redis fails
+      // Industry pattern (Grab): multi-store writes with compensation
+      try {
+        await redisService.set(PRESENCE_KEY(driverId), presenceData, PRESENCE_TTL_SECONDS);
+      } catch (redisErr: any) {
+        logger.error('[DRIVER PRESENCE] Redis SET failed — rolling back DB', {
+          driverId, error: redisErr.message
+        });
+        await prismaClient.user.update({
+          where: { id: driverId },
+          data: { isAvailable: false }
+        }).catch(() => {}); // Best-effort rollback
+        throw new AppError(500, 'INTERNAL_ERROR', 'Failed to go online. Please try again.');
+      }
 
-      // 3. SADD to transporter's online drivers set
+      // 3. SADD to transporter's online drivers set + notify transporter
+      // Best-effort: if these fail, driver is still online (DB+Redis correct).
+      // Transporter sees the update on next heartbeat/fleet refresh.
       const driver = await prismaClient.user.findUnique({
         where: { id: driverId },
         select: { transporterId: true, name: true }
       });
       if (driver?.transporterId) {
-        await redisService.sAdd(ONLINE_DRIVERS_KEY(driver.transporterId), driverId);
+        try {
+          await redisService.sAdd(ONLINE_DRIVERS_KEY(driver.transporterId), driverId);
+        } catch (sAddErr: any) {
+          logger.warn('[DRIVER PRESENCE] SADD failed (best-effort, driver still online)', {
+            driverId, error: sAddErr.message
+          });
+        }
 
-        // 4. Emit real-time status change to transporter
+        // 4. Emit real-time status change to transporter (fire-and-forget)
         socketService.emitToUser(driver.transporterId, 'driver_status_changed', {
           driverId,
           driverName: driver.name,
@@ -610,7 +631,7 @@ class DriverService {
         });
 
         // 5. Invalidate fleet cache so next list fetch shows updated status
-        await fleetCacheService.invalidateDriverCache(driver.transporterId, driverId);
+        await fleetCacheService.invalidateDriverCache(driver.transporterId, driverId).catch(() => {});
       }
 
       logger.info('[DRIVER PRESENCE] Driver is now ONLINE', { driverId });

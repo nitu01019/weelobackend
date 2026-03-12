@@ -15,34 +15,31 @@ import { prismaClient, withDbTimeout } from '../../shared/database/prisma.servic
 import { AppError } from '../../shared/types/error.types';
 import { logger } from '../../shared/services/logger.service';
 import { emitToUser, emitToBooking, SocketEvent } from '../../shared/services/socket.service';
-import { redisService } from '../../shared/services/redis.service';
 import { queueService } from '../../shared/services/queue.service';
+import { redisService } from '../../shared/services/redis.service';
 import { bookingService } from '../booking/booking.service';
+import { trackingService } from '../tracking/tracking.service';
 import { CreateAssignmentInput, UpdateStatusInput, GetAssignmentsQuery } from './assignment.schema';
 
 // =============================================================================
-// ASSIGNMENT TIMEOUT CONFIGURATION
+// ASSIGNMENT TIMEOUT — Queue-based (replaces setInterval polling)
 // =============================================================================
 // 
-// SCALABILITY: Redis-based timers survive server restarts and work across ECS
-// EASY UNDERSTANDING: Driver has 60 seconds to accept/decline, then auto-expires
-// MODULARITY: Same timer pattern as booking.service.ts and booking/order.service.ts
+// BEFORE: setInterval(5000ms) on EVERY ECS instance → Redis SCAN for expired keys
+//   → 50 instances × SCAN every 5s = 600 Redis ops/minute even at 3am
+//
+// NOW: Queue delayed job fires exactly at 60s → ONE worker processes it
+//   → Zero polling, zero wasted CPU, sub-second accuracy
+//
+// Processor registered in: queue.service.ts → registerDefaultProcessors()
 // =============================================================================
 
 const ASSIGNMENT_CONFIG = {
   /** How long driver has to respond (60 seconds) */
   TIMEOUT_MS: 60 * 1000,
-
-  /** How often to check for expired assignments (every 5 seconds) */
-  EXPIRY_CHECK_INTERVAL_MS: 5 * 1000,
 };
 
-/** Redis key pattern for assignment timers */
-const TIMER_KEYS = {
-  ASSIGNMENT_EXPIRY: (assignmentId: string) => `timer:assignment:${assignmentId}`,
-};
-
-/** Timer data stored in Redis */
+/** Timer data — used by both queue processor and createAssignment */
 interface AssignmentTimerData {
   assignmentId: string;
   driverId: string;
@@ -54,78 +51,6 @@ interface AssignmentTimerData {
   tripId: string;
   createdAt: string;
 }
-
-// =============================================================================
-// ASSIGNMENT EXPIRY CHECKER (Runs on every server instance)
-// =============================================================================
-// 
-// SCALABILITY: Every ECS instance runs this checker, but Redis distributed locks
-//   ensure only ONE instance processes each expired assignment (no duplicates)
-// EASY UNDERSTANDING: Same pattern as booking.service.ts expiry checker
-// MODULARITY: Independent from AssignmentService — runs as background job
-// =============================================================================
-
-let assignmentExpiryCheckerInterval: NodeJS.Timeout | null = null;
-
-/**
- * Start the assignment expiry checker
- * Uses Redis locks to prevent duplicate processing across ECS instances
- */
-function startAssignmentExpiryChecker(): void {
-  if (assignmentExpiryCheckerInterval) return;
-
-  assignmentExpiryCheckerInterval = setInterval(async () => {
-    try {
-      await processExpiredAssignments();
-    } catch (error: any) {
-      logger.error('Assignment expiry checker error', { error: error.message });
-    }
-  }, ASSIGNMENT_CONFIG.EXPIRY_CHECK_INTERVAL_MS);
-
-  logger.info('📅 Assignment expiry checker started (Redis-based, cluster-safe)');
-}
-
-export function stopAssignmentExpiryChecker(): void {
-  if (assignmentExpiryCheckerInterval) {
-    clearInterval(assignmentExpiryCheckerInterval);
-    assignmentExpiryCheckerInterval = null;
-    logger.info('Assignment expiry checker stopped');
-  }
-}
-
-/**
- * Process all expired assignment timers
- * 
- * SCALABILITY: Distributed lock prevents duplicate handling across instances
- * EASY UNDERSTANDING: Scan expired → lock → handle timeout → unlock
- * CODING STANDARDS: Same pattern as processExpiredOrders() in booking/order.service.ts
- */
-async function processExpiredAssignments(): Promise<void> {
-  const expiredTimers = await redisService.getExpiredTimers<AssignmentTimerData>('timer:assignment:');
-
-  for (const timer of expiredTimers) {
-    // Acquire distributed lock (prevents duplicate processing)
-    const lockKey = `lock:assignment-expiry:${timer.data.assignmentId}`;
-    const lock = await redisService.acquireLock(lockKey, 'expiry-checker', 30);
-
-    if (!lock.acquired) continue; // Another instance is handling this
-
-    try {
-      await assignmentService.handleAssignmentTimeout(timer.data);
-      await redisService.cancelTimer(timer.key);
-    } catch (error: any) {
-      logger.error('Failed to process expired assignment', {
-        assignmentId: timer.data.assignmentId,
-        error: error.message
-      });
-    } finally {
-      await redisService.releaseLock(lockKey, 'expiry-checker');
-    }
-  }
-}
-
-// Start expiry checker when module loads
-startAssignmentExpiryChecker();
 
 // =============================================================================
 // ASSIGNMENT SERVICE
@@ -220,13 +145,12 @@ class AssignmentService {
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable, timeoutMs: 8000 });
 
     // =========================================================================
-    // START 60-SECOND TIMEOUT TIMER (Redis-based)
+    // START 60-SECOND TIMEOUT TIMER (Queue-based delayed job)
     // =========================================================================
-    // SCALABILITY: Redis timer survives restarts, works across ECS instances
+    // SCALABILITY: Queue job fires exactly at 60s — zero polling, one worker
     // EASY UNDERSTANDING: Driver has 60s to accept/decline, then auto-expires
-    // MODULARITY: Same pattern as booking.service.ts timer
+    // SAFETY: If driver accepts before 60s, job fires but no-ops (idempotent)
     // =========================================================================
-    const expiresAt = new Date(Date.now() + ASSIGNMENT_CONFIG.TIMEOUT_MS);
     const timerData: AssignmentTimerData = {
       assignmentId: assignment.id,
       driverId: data.driverId,
@@ -239,11 +163,7 @@ class AssignmentService {
       createdAt: new Date().toISOString()
     };
 
-    await redisService.setTimer(
-      TIMER_KEYS.ASSIGNMENT_EXPIRY(assignment.id),
-      timerData,
-      expiresAt
-    );
+    await queueService.scheduleAssignmentTimeout(timerData, ASSIGNMENT_CONFIG.TIMEOUT_MS);
     logger.info(`⏱️ Assignment timeout started: ${assignment.id} (${ASSIGNMENT_CONFIG.TIMEOUT_MS / 1000}s)`);
 
     // Update booking trucks filled
@@ -269,7 +189,27 @@ class AssignmentService {
       message: 'New trip assigned to you'
     });
 
-    logger.info(`Assignment created: ${assignment.id} for booking ${data.bookingId}`);
+    // =====================================================================
+    // FCM PUSH BACKUP — same pattern as truck-hold.service.ts:1393-1405
+    // Industry (Uber CCG): Every critical notification via Socket + FCM
+    // for at-least-once delivery. Dedup handled by SocketIOService.kt
+    // seenBroadcastIds LRU cache (2048 entries).
+    // =====================================================================
+    queueService.queuePushNotification(data.driverId, {
+      title: '🚛 New Trip Assigned!',
+      body: `Trip for ${vehicle.vehicleNumber}. Accept within 60 seconds.`,
+      data: {
+        type: 'trip_assigned',
+        assignmentId: assignment.id,
+        tripId,
+        bookingId: data.bookingId,
+        vehicleNumber: vehicle.vehicleNumber
+      }
+    }).catch(err => {
+      logger.warn(`FCM: Failed to queue assignment push for driver ${data.driverId}`, err);
+    });
+
+    logger.info(`Assignment created: ${assignment.id} for booking ${data.bookingId} (Socket + FCM)`);
     return assignment;
   }
 
@@ -381,7 +321,26 @@ class AssignmentService {
     }
 
     if (assignment.status !== 'pending') {
-      throw new AppError(400, 'INVALID_STATUS', 'Assignment cannot be accepted');
+      // =====================================================================
+      // FIX: Include currentStatus in error so app can show helpful message
+      //   - 'driver_accepted' → "You've already accepted this trip" (not an error)
+      //   - 'cancelled'       → "This trip was cancelled by the transporter"
+      //   - 'driver_declined'  → "This trip has expired"
+      // Uber pattern: error response contains the actual state for client-side handling
+      // =====================================================================
+      const statusMessages: Record<string, string> = {
+        'driver_accepted': 'You have already accepted this trip',
+        'cancelled': 'This trip was cancelled by the transporter',
+        'driver_declined': 'This trip has expired or been declined',
+        'en_route_pickup': 'You have already accepted this trip',
+        'at_pickup': 'You have already accepted this trip',
+        'in_transit': 'This trip is already in progress',
+        'completed': 'This trip has already been completed'
+      };
+      const message = statusMessages[assignment.status] || `Assignment cannot be accepted (current status: ${assignment.status})`;
+      const error = new AppError(400, 'INVALID_STATUS', message);
+      (error as any).currentStatus = assignment.status;
+      throw error;
     }
 
     // =================================================================
@@ -396,16 +355,53 @@ class AssignmentService {
         'You already have an active trip. Complete or cancel it before accepting a new one.');
     }
 
-    // Cancel timeout timer BEFORE DB update — prevents race with timeout handler
-    await redisService.cancelTimer(TIMER_KEYS.ASSIGNMENT_EXPIRY(assignmentId)).catch(err => {
-      logger.warn(`Failed to cancel assignment timer on accept (non-fatal)`, { assignmentId, error: err.message });
-    });
-    logger.info(`⏱️ Assignment timeout cancelled (accepted): ${assignmentId}`);
+    // Queue job is idempotent: handleAssignmentTimeout() uses updateMany({ where: { status: 'pending' }})
+    // so if driver accepted first, the queue job no-ops when it fires at 60s.
+    // No explicit cancellation needed.
 
     const updated = await db.updateAssignment(assignmentId, {
       status: 'driver_accepted',
       driverAcceptedAt: new Date().toISOString()
     });
+
+    // =====================================================================
+    // FIX: Seed tracking at acceptance with driver's real GPS
+    // =====================================================================
+    // BEFORE: initializeTracking() existed but was never called → customer
+    //   hit 404 "No tracking data" for 5–30 seconds after driver accepted
+    // NOW: Fetch driver's last known GPS from Redis and seed trip tracking
+    //   immediately. Customer sees driver position on map right away.
+    // Uber/Grab pattern: backend seeds tracking at acceptance time.
+    // =====================================================================
+    try {
+      const driverLocationKey = `driver:location:${driverId}`;
+      const driverLocation = await redisService.getJSON<{ latitude: number; longitude: number }>(driverLocationKey);
+      // initializeTracking seeds the Redis trip key + adds driver to fleet set
+      await trackingService.initializeTracking(
+        assignment.tripId,
+        driverId,
+        assignment.vehicleNumber,
+        assignment.bookingId,
+        assignment.transporterId,
+        assignment.vehicleId
+      );
+      // If we have the driver's real GPS, overwrite the 0,0 default
+      if (driverLocation?.latitude && driverLocation?.longitude) {
+        const tripKey = `driver:trip:${assignment.tripId}`;
+        const tripData = await redisService.getJSON<any>(tripKey);
+        if (tripData) {
+          tripData.latitude = driverLocation.latitude;
+          tripData.longitude = driverLocation.longitude;
+          tripData.status = 'driver_accepted';
+          await redisService.setJSON(tripKey, tripData, 86400);
+        }
+      }
+    } catch (err: any) {
+      // Non-fatal — tracking will initialize on first GPS update anyway
+      logger.warn(`[ASSIGNMENT] Failed to seed tracking at acceptance (non-fatal)`, {
+        tripId: assignment.tripId, error: err?.message
+      });
+    }
 
     // Notify booking room
     emitToBooking(assignment.bookingId, SocketEvent.ASSIGNMENT_STATUS_CHANGED, {
@@ -546,10 +542,7 @@ class AssignmentService {
       throw new AppError(403, 'FORBIDDEN', 'Access denied');
     }
 
-    // Cancel timeout timer BEFORE DB update — prevents race with timeout handler
-    await redisService.cancelTimer(TIMER_KEYS.ASSIGNMENT_EXPIRY(assignmentId)).catch(err => {
-      logger.warn(`Failed to cancel assignment timer on cancel (non-fatal)`, { assignmentId, error: err.message });
-    });
+    // Queue job is idempotent: if assignment is cancelled, handleAssignmentTimeout() no-ops.
 
     await db.updateAssignment(assignmentId, { status: 'cancelled' });
 
@@ -573,6 +566,39 @@ class AssignmentService {
       status: 'cancelled',
       vehicleNumber: assignment.vehicleNumber
     });
+
+    // =====================================================================
+    // FIX: Notify driver directly on cancellation
+    // =====================================================================
+    // BEFORE: Only emitted to booking room. Driver may not be in that room
+    //   → driver keeps driving to a cancelled order, never gets the message.
+    // NOW: Direct WebSocket to driver + FCM push for background coverage.
+    // Uber/Grab/Gojek pattern: direct push notification to driver on cancel.
+    // =====================================================================
+    if (assignment.driverId) {
+      // WebSocket — direct to driver
+      emitToUser(assignment.driverId, SocketEvent.ASSIGNMENT_STATUS_CHANGED, {
+        assignmentId,
+        tripId: assignment.tripId,
+        status: 'cancelled',
+        vehicleNumber: assignment.vehicleNumber,
+        message: 'This trip has been cancelled. Please return to dashboard.'
+      });
+
+      // FCM push — covers backgrounded/closed app
+      queueService.queuePushNotification(assignment.driverId, {
+        title: '🚫 Trip Cancelled',
+        body: `Trip ${assignment.vehicleNumber} has been cancelled. Please return to dashboard.`,
+        data: {
+          type: 'assignment_update',
+          assignmentId,
+          tripId: assignment.tripId,
+          status: 'cancelled'
+        }
+      }).catch(err => {
+        logger.warn(`FCM: Failed to notify driver of cancellation`, err);
+      });
+    }
 
     logger.info(`Assignment cancelled: ${assignmentId}`);
   }
@@ -610,10 +636,8 @@ class AssignmentService {
       throw new AppError(400, 'INVALID_STATUS', 'Assignment cannot be declined');
     }
 
-    // 1. Cancel timeout timer BEFORE DB update — prevents race with timeout handler
-    await redisService.cancelTimer(TIMER_KEYS.ASSIGNMENT_EXPIRY(assignmentId)).catch(err => {
-      logger.warn(`Failed to cancel assignment timer on decline (non-fatal)`, { assignmentId, error: err.message });
-    });
+    // Queue job fires at 60s but handleAssignmentTimeout() no-ops if assignment is no longer pending.
+    // No explicit cancellation needed.
 
     // 2. Update status to driver_declined
     await db.updateAssignment(assignmentId, { status: 'driver_declined' });
@@ -673,10 +697,10 @@ class AssignmentService {
   // HANDLE ASSIGNMENT TIMEOUT (Driver didn't respond in 60s)
   // ==========================================================================
   // 
-  // Called by expiry checker when Redis timer expires.
-  // Same effect as decline, but with 'timeout' reason for transporter UI.
+  // Called by the queue processor in queue.service.ts when the delayed job fires.
+  // Safe to call even if driver already accepted/declined — updateMany no-ops.
   // 
-  // SCALABILITY: Called from expiry checker with distributed lock
+  // SCALABILITY: Distributed lock in queue processor prevents duplicate handling
   // EASY UNDERSTANDING: No response in 60s → same as decline + timeout reason
   // MODULARITY: Uses same vehicle release + notification pattern as decline
   // ==========================================================================

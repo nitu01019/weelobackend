@@ -267,7 +267,7 @@ class FCMService {
       return false;
     }
 
-    return this.sendToTokens(tokens, notification);
+    return this.sendToTokens(tokens, notification, userId);
   }
 
   /**
@@ -292,7 +292,8 @@ class FCMService {
    */
   async sendToTokens(
     tokens: string[],
-    notification: FCMNotification
+    notification: FCMNotification,
+    userId?: string
   ): Promise<boolean> {
     if (tokens.length === 0) return false;
 
@@ -311,15 +312,54 @@ class FCMService {
           token: tokens[0]
         });
       } else {
-        await this.admin.messaging().sendMulticast({
+        // =====================================================================
+        // INDUSTRY PATTERN (Uber/Grab): Clean dead FCM tokens on multicast.
+        // FCM returns per-token responses. If a token gets UNREGISTERED or
+        // NOT_FOUND, the app was uninstalled or token rotated — remove it.
+        // Without cleanup, every future notification to this user fails silently.
+        // =====================================================================
+        const sendResult = await this.admin.messaging().sendEachForMulticast({
           ...message,
           tokens
         });
+        // Clean up dead tokens
+        if (sendResult.failureCount > 0 && userId) {
+          const deadTokens: string[] = [];
+          sendResult.responses.forEach((resp: any, idx: number) => {
+            if (
+              resp.error &&
+              (resp.error.code === 'messaging/registration-token-not-registered' ||
+               resp.error.code === 'messaging/invalid-registration-token')
+            ) {
+              deadTokens.push(tokens[idx]);
+            }
+          });
+          if (deadTokens.length > 0) {
+            logger.info(`FCM: Cleaning ${deadTokens.length} dead token(s) for user ${userId}`);
+            for (const deadToken of deadTokens) {
+              this.removeToken(userId, deadToken).catch(() => {});
+            }
+          }
+        }
       }
       
       logger.info(`FCM: Notification sent to ${tokens.length} device(s)`);
       return true;
-    } catch (error) {
+    } catch (error: any) {
+      // =====================================================================
+      // SINGLE TOKEN: If error is UNREGISTERED/NOT_FOUND, clean it up
+      // This happens when app is uninstalled or token rotated.
+      // Uber/Grab/Gojek pattern: always clean dead tokens on send failure.
+      // =====================================================================
+      if (
+        userId &&
+        tokens.length === 1 &&
+        (error?.code === 'messaging/registration-token-not-registered' ||
+         error?.code === 'messaging/invalid-registration-token')
+      ) {
+        logger.info(`FCM: Removing dead token for user ${userId}`);
+        this.removeToken(userId, tokens[0]).catch(() => {});
+      }
       logger.error('FCM: Failed to send notification', error);
       return false;
     }

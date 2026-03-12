@@ -185,6 +185,25 @@ class TrackingService {
 
       const now = new Date().toISOString();
 
+      // =====================================================================
+      // GPS SPOOF DETECTION — Layer 1 (Uber/Grab/Gojek pattern)
+      // =====================================================================
+      // Android Location.isMock() (API 31+) reports if GPS is from a mock provider.
+      // We LOG and FLAG but do NOT BLOCK — budget phones sometimes trigger false
+      // positives via WiFi-based location providers.
+      // Redis flag tracks mock usage per trip for post-trip review.
+      // Broadcast includes isMockLocation so customer app can show "⚠️ GPS accuracy low".
+      // =====================================================================
+      if (data.isMockLocation === true) {
+        logger.warn('🚨 [SPOOF] Mock GPS location detected', {
+          tripId: data.tripId, driverId,
+          lat: data.latitude, lng: data.longitude,
+          speed: data.speed, accuracy: data.accuracy
+        });
+        // Flag the trip in Redis (expires with trip data — 24h)
+        redisService.set(`mock_gps:${data.tripId}`, 'true', TTL.TRIP).catch(() => {});
+      }
+
       // 2. Create location data
       const locationData: LocationData = {
         tripId: data.tripId,
@@ -240,7 +259,9 @@ class TrackingService {
         bearing: data.bearing,
         timestamp: now,
         isStale: locationAgeMs > 60_000,
-        locationAgeMs
+        locationAgeMs,
+        // GPS spoof flag — customer app can show "⚠️ GPS accuracy low" when true
+        ...(data.isMockLocation === true && { isMockLocation: true })
       };
 
       // Broadcast to booking room (customer watches this)
@@ -942,6 +963,36 @@ class TrackingService {
             });
           }
 
+          // =================================================================
+          // FIX 7.6: Release vehicle back to 'available' on completion
+          // =================================================================
+          // BEFORE: Only cancelAssignment and declineAssignment released the
+          //   vehicle. Completion path skipped this entirely.
+          //   → vehicle stays as 'busy' forever in transporter's fleet view.
+          // NOW: Same db.updateVehicle() call as cancel/decline uses.
+          // Non-fatal: if this fails, the trip is still complete.
+          // Uber/Grab pattern: vehicle status is always updated atomically
+          // with the trip terminal state (completed/cancelled).
+          // =================================================================
+          if (assignment.vehicleId) {
+            try {
+              const { db: dbService } = await import('../../shared/database/db');
+              await dbService.updateVehicle(assignment.vehicleId, {
+                status: 'available',
+                currentTripId: undefined,
+                assignedDriverId: undefined,
+                lastStatusChange: new Date().toISOString()
+              });
+              logger.info('[TRACKING] Vehicle released on completion', {
+                vehicleId: assignment.vehicleId, tripId
+              });
+            } catch (vehErr: any) {
+              logger.warn('[TRACKING] Vehicle release failed on completion (non-fatal)', {
+                vehicleId: assignment.vehicleId, tripId, error: vehErr.message
+              });
+            }
+          }
+
           // Phase 5: Check if ALL trucks for this booking are now completed
           // If yes → update booking status + notify customer
           const completedBookingId = assignment.booking?.id || assignment.bookingId;
@@ -1499,12 +1550,37 @@ class TrackingService {
 
   /**
    * Add driver to transporter's fleet (for fleet tracking)
+   *
+   * INDUSTRY PATTERN (Uber/Grab): Retry failed Redis set operations.
+   * Without retry, a single Redis blip during acceptance makes the driver
+   * invisible in the transporter's fleet map for the entire trip.
+   * Max 2 retries with 200ms backoff. Non-fatal — driver still gets
+   * tracked via trip key, just not visible in fleet map temporarily.
    */
   async addDriverToFleet(transporterId: string, driverId: string): Promise<void> {
-    await redisService.sAdd(REDIS_KEYS.FLEET_DRIVERS(transporterId), driverId);
-    await redisService.expire(REDIS_KEYS.FLEET_DRIVERS(transporterId), TTL.TRIP);
-    await redisService.sAdd(REDIS_KEYS.ACTIVE_FLEET_TRANSPORTERS, transporterId);
-    logger.debug('Driver added to fleet', { transporterId, driverId });
+    const MAX_RETRIES = 2;
+    for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt++) {
+      try {
+        await redisService.sAdd(REDIS_KEYS.FLEET_DRIVERS(transporterId), driverId);
+        await redisService.expire(REDIS_KEYS.FLEET_DRIVERS(transporterId), TTL.TRIP);
+        await redisService.sAdd(REDIS_KEYS.ACTIVE_FLEET_TRANSPORTERS, transporterId);
+        logger.debug('Driver added to fleet', { transporterId, driverId });
+        return; // Success — exit
+      } catch (err: any) {
+        if (attempt <= MAX_RETRIES) {
+          const backoffMs = 200 * attempt;
+          logger.warn(`[FLEET] sAdd failed, retry ${attempt}/${MAX_RETRIES} after ${backoffMs}ms`, {
+            transporterId, driverId, error: err?.message
+          });
+          await new Promise(resolve => setTimeout(resolve, backoffMs));
+        } else {
+          // All retries exhausted — log but don't throw (non-fatal)
+          logger.error(`[FLEET] addDriverToFleet failed after ${MAX_RETRIES} retries`, {
+            transporterId, driverId, error: err?.message
+          });
+        }
+      }
+    }
   }
 
   /**

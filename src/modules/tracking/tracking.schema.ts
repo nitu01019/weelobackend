@@ -60,6 +60,13 @@ export const updateLocationSchema = z.object({
   bearing: z.number().min(0).max(360).optional().default(0),    // degrees
   accuracy: z.number().min(0).max(500).optional(),              // meters (GPS accuracy)
   timestamp: z.string().datetime().optional(),                   // Device timestamp (ISO)
+  // =====================================================================
+  // GPS SPOOF DETECTION — Layer 1 (Uber/Grab/Gojek pattern)
+  // Android: Location.isMock() (API 31+) or isFromMockProvider() (older)
+  // Backend logs and flags mock GPS usage for review.
+  // We do NOT block — some budget phones use WiFi-based mock providers.
+  // =====================================================================
+  isMockLocation: z.boolean().optional(),                        // true if Android reports mock GPS
 }).strict();
 
 // =============================================================================
@@ -78,6 +85,7 @@ export const batchLocationPointSchema = z.object({
   bearing: z.number().min(0).max(360).optional().default(0),
   accuracy: z.number().min(0).max(500).optional(),
   timestamp: z.string().datetime(),  // REQUIRED for batch - when point was captured
+  isMockLocation: z.boolean().optional(),  // GPS spoof detection flag
 });
 
 /**

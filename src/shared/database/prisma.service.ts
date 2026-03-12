@@ -344,22 +344,68 @@ export async function withDbTimeout<T>(
   options: {
     isolationLevel?: Prisma.TransactionIsolationLevel;
     timeoutMs?: number;
+    /** Max retries for serializable conflicts (P2034). Default: 3. Industry standard. */
+    maxRetries?: number;
   } = {}
 ): Promise<T> {
   const timeoutMs = options.timeoutMs ?? DB_STATEMENT_TIMEOUT_MS;
+  // =====================================================================
+  // INDUSTRY STANDARD: Automatic retry for serializable conflicts
+  // =====================================================================
+  // PostgreSQL docs: "Applications using SERIALIZABLE must be prepared
+  //   to retry transactions due to serialization failures."
+  // Prisma P2034: "Transaction failed due to a write conflict or deadlock.
+  //   Please retry your transaction."
+  // Pattern: Stripe, Uber, Prisma official docs — client-side retry loop
+  //   with exponential backoff. Max 3 retries (100ms → 200ms → 400ms).
+  // =====================================================================
+  const maxRetries = options.maxRetries ?? 3;
+  const RETRYABLE_CODES = new Set(['P2034', 'P2028']);
 
-  return prismaClient.$transaction(
-    async (tx) => {
-      // SET LOCAL — applies only within this transaction, zero global impact
-      await tx.$executeRawUnsafe(`SET LOCAL statement_timeout = ${timeoutMs}`);
-      return fn(tx);
-    },
-    {
-      isolationLevel: options.isolationLevel,
-      // Prisma-level timeout is 2s above statement_timeout as safety buffer
-      timeout: timeoutMs + 2000
+  for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+    try {
+      return await prismaClient.$transaction(
+        async (tx) => {
+          // SET LOCAL — applies only within this transaction, zero global impact
+          await tx.$executeRawUnsafe(`SET LOCAL statement_timeout = ${timeoutMs}`);
+          return fn(tx);
+        },
+        {
+          isolationLevel: options.isolationLevel,
+          // Prisma-level timeout is 2s above statement_timeout as safety buffer
+          timeout: timeoutMs + 2000
+        }
+      );
+    } catch (error: any) {
+      const prismaCode = error?.code || '';
+      const isRetryable = RETRYABLE_CODES.has(prismaCode);
+
+      if (isRetryable && attempt <= maxRetries) {
+        // Exponential backoff: 100ms, 200ms, 400ms
+        const backoffMs = 100 * Math.pow(2, attempt - 1);
+        logger.warn(`[withDbTimeout] Serializable conflict (${prismaCode}), retry ${attempt}/${maxRetries} after ${backoffMs}ms`);
+        await new Promise(resolve => setTimeout(resolve, backoffMs));
+        continue;
+      }
+
+      // All retries exhausted OR non-retryable error — throw friendly error
+      if (isRetryable) {
+        logger.error(`[withDbTimeout] Serializable conflict persisted after ${maxRetries} retries`);
+        const { AppError } = require('../../shared/errors/app-error');
+        throw new AppError(
+          409,
+          'TRANSACTION_CONFLICT',
+          'This action conflicted with another request. Please try again in a moment.'
+        );
+      }
+
+      // Non-retryable error — rethrow as-is (e.g., AppError from fn())
+      throw error;
     }
-  );
+  }
+
+  // TypeScript safety — should never reach here
+  throw new Error('withDbTimeout: unexpected exit from retry loop');
 }
 
 

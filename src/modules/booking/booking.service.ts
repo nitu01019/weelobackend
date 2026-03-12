@@ -1524,13 +1524,31 @@ class BookingService {
       throw new AppError(404, 'BOOKING_NOT_FOUND', 'Booking not found');
     }
 
-    const newFilled = booking.trucksFilled + 1;
-    const newStatus = newFilled >= booking.trucksNeeded ? 'fully_filled' : 'partially_filled';
+    // =====================================================================
+    // ATOMIC INCREMENT — Industry standard (Uber, Airbnb, Booking.com)
+    // Old code: read trucksFilled → add 1 in JS → write back (RACE CONDITION)
+    //   Two concurrent assigns both read 1, both write 2 → count = 2 (should be 3)
+    // New code: single SQL SET "trucksFilled" = "trucksFilled" + 1 (NO RACE)
+    //   Database guarantees atomicity — impossible to lose an increment
+    // =====================================================================
+    const atomicResult = await prismaClient.$queryRaw<Array<{ trucksFilled: number; trucksNeeded: number }>>`
+      UPDATE "Booking"
+      SET "trucksFilled" = "trucksFilled" + 1,
+          "stateChangedAt" = NOW()
+      WHERE id = ${bookingId}
+      RETURNING "trucksFilled", "trucksNeeded"
+    `;
 
+    if (!atomicResult || atomicResult.length === 0) {
+      throw new AppError(500, 'INCREMENT_FAILED', 'Failed to increment trucks filled');
+    }
+
+    const newFilled = atomicResult[0].trucksFilled;
+    const newStatus = newFilled >= atomicResult[0].trucksNeeded ? 'fully_filled' : 'partially_filled';
+
+    // Update status based on the atomically-incremented count
     const updated = await db.updateBooking(bookingId, {
-      trucksFilled: newFilled,
-      status: newStatus,
-      stateChangedAt: new Date()
+      status: newStatus
     });
 
     // Notify customer via WebSocket
@@ -1604,13 +1622,31 @@ class BookingService {
       throw new AppError(404, 'BOOKING_NOT_FOUND', 'Booking not found');
     }
 
-    const newFilled = Math.max(0, booking.trucksFilled - 1);
+    // =====================================================================
+    // ATOMIC DECREMENT — Same pattern as incrementTrucksFilled fix
+    // Old code: read trucksFilled → subtract 1 in JS → write back (RACE)
+    //   Two concurrent cancels both read 3, both write 2 → count = 2 (should be 1)
+    // New code: single SQL SET "trucksFilled" = GREATEST(0, "trucksFilled" - 1)
+    //   Database guarantees atomicity. GREATEST(0, ...) prevents negative values.
+    // =====================================================================
+    const atomicResult = await prismaClient.$queryRaw<Array<{ trucksFilled: number }>>`
+      UPDATE "Booking"
+      SET "trucksFilled" = GREATEST(0, "trucksFilled" - 1),
+          "stateChangedAt" = NOW()
+      WHERE id = ${bookingId}
+      RETURNING "trucksFilled"
+    `;
+
+    if (!atomicResult || atomicResult.length === 0) {
+      throw new AppError(500, 'DECREMENT_FAILED', 'Failed to decrement trucks filled');
+    }
+
+    const newFilled = atomicResult[0].trucksFilled;
     const newStatus = newFilled === 0 ? 'active' : 'partially_filled';
 
+    // Update status based on the atomically-decremented count
     const updated = await db.updateBooking(bookingId, {
-      trucksFilled: newFilled,
-      status: newStatus,
-      stateChangedAt: new Date()
+      status: newStatus
     });
 
     // Notify via WebSocket
