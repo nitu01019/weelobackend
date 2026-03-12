@@ -403,6 +403,37 @@ class FleetCacheService {
     }
 
     // =========================================================================
+    // ACTIVE ASSIGNMENT CHECK — Prevent assigning drivers with pending jobs
+    // =========================================================================
+    // A driver may have currentTripId=null in the User table (no trip running)
+    // but still have a 'pending' Assignment row from a previous hold/confirm.
+    // The @@unique([driverId, status]) constraint would block a new create.
+    // Industry standard (Uber/Ola): check assignment table at listing time.
+    // Uses @@index([driverId, status]) — O(log n), sub-50ms.
+    // =========================================================================
+    let activeAssignmentMap: Record<string, string> = {};
+    try {
+      const allDriverIds = dbDrivers.map((d: any) => d.id);
+      if (allDriverIds.length > 0) {
+        const activeAssignments = await prismaClient.assignment.findMany({
+          where: {
+            driverId: { in: allDriverIds },
+            status: { in: ['pending', 'driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit'] }
+          },
+          select: { driverId: true, tripId: true }
+        });
+        for (const a of activeAssignments) {
+          activeAssignmentMap[a.driverId] = a.tripId;
+        }
+        if (activeAssignments.length > 0) {
+          logger.info(`[FleetCache] ${activeAssignments.length} driver(s) have active assignments — excluded from available list`);
+        }
+      }
+    } catch (err: any) {
+      logger.warn(`[FleetCache] Failed to check active assignments, using fallback`, { error: err.message });
+    }
+
+    // =========================================================================
     // REAL-TIME ONLINE STATUS — Check Redis presence for each driver
     // =========================================================================
     // Driver is ONLINE if: DB isAvailable=true AND Redis presence key exists
@@ -438,7 +469,7 @@ class FleetCacheService {
       status: d.status || 'active',
       isAvailable: d.isAvailable !== false,
       isOnline: (d.isAvailable !== false) && (onlineStatusMap[d.id] === true),
-      currentTripId: d.currentTripId,
+      currentTripId: d.currentTripId || activeAssignmentMap[d.id] || undefined,
       lastUpdated: new Date().toISOString()
     }));
 

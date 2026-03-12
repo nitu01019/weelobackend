@@ -1488,7 +1488,38 @@ class TruckHoldService {
       };
 
     } catch (error: any) {
-      logger.error(`[TruckHold] Error confirming with assignments: ${error.message}`, error);
+      const msg = String(error?.message || '');
+      logger.error(`[TruckHold] Error confirming with assignments: ${msg}`, error);
+
+      // Prisma unique constraint violation (P2002) — driver already has an active assignment
+      if (error?.code === 'P2002') {
+        const target = Array.isArray(error?.meta?.target) ? error.meta.target.join(', ') : '';
+        if (target.includes('driverId')) {
+          return { success: false, message: 'This driver already has an active assignment. Please choose a different driver.' };
+        }
+        return { success: false, message: `Duplicate assignment conflict (${target}). Please try again.` };
+      }
+
+      // Prisma serialization failure (P2034) — concurrent transaction conflict
+      if (error?.code === 'P2034') {
+        return { success: false, message: 'Another transaction is in progress. Please try again in a moment.' };
+      }
+
+      // Known thrown errors from within the transaction
+      if (msg.startsWith('DRIVER_BUSY:')) {
+        const parts = msg.split(':');
+        return { success: false, message: `Driver ${parts[1] || ''} is already on a trip. Choose a different driver.` };
+      }
+      if (msg.startsWith('VEHICLE_UNAVAILABLE:')) {
+        return { success: false, message: 'Vehicle is no longer available. Please go back and select another vehicle.' };
+      }
+      if (msg.startsWith('TRUCK_REQUEST_NOT_HELD:') || msg.startsWith('TRUCK_REQUEST_STATE_CHANGED:')) {
+        return { success: false, message: 'Hold expired or was taken by another transporter. Please try again.' };
+      }
+      if (msg === 'ORDER_NOT_FOUND' || msg.startsWith('TRUCK_REQUEST_NOT_FOUND')) {
+        return { success: false, message: 'This order is no longer available.' };
+      }
+
       return { success: false, message: 'Failed to confirm. Please try again.' };
     }
   }
