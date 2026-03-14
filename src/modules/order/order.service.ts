@@ -4340,7 +4340,7 @@ class OrderService {
           await tx.assignment.create({
             data: {
               id: assignmentId,
-              bookingId: truckRequest.orderId, // Legacy field
+              bookingId: null,  // New multi-truck system uses orderId + truckRequestId, not legacy Booking
               truckRequestId,
               orderId: truckRequest.orderId,
               transporterId,

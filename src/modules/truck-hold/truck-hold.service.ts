@@ -1292,7 +1292,7 @@ class TruckHoldService {
           await tx.assignment.create({
             data: {
               id: assignmentId,
-              bookingId: hold.orderId,
+              bookingId: null,  // New multi-truck system uses orderId + truckRequestId, not legacy Booking
               truckRequestId,
               orderId: hold.orderId,
               transporterId,
