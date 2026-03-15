@@ -1378,6 +1378,7 @@ class TruckHoldService {
           customerName: order.customerName,
           customerPhone: order.customerPhone,
           assignedAt: now,
+          expiresAt: new Date(Date.now() + 60000).toISOString(),
           message: `New trip assigned! ${order.pickup.address} → ${order.drop.address}`
         };
 
@@ -1398,13 +1399,34 @@ class TruckHoldService {
             assignmentId: assignment.assignmentId,
             tripId: assignment.tripId,
             orderId: order.id,
-            vehicleNumber: assignment.vehicle.vehicleNumber
+            vehicleNumber: assignment.vehicle.vehicleNumber,
+            expiresAt: new Date(Date.now() + 60000).toISOString()
           }
         }).catch(err => {
           logger.warn(`FCM: Failed to queue trip_assigned push for driver ${assignment.driver.id}`, err);
         });
 
         logger.info(`   📢 Notified driver ${assignment.driver.name} (WebSocket + FCM)`);
+
+        // =====================================================================
+        // CRITICAL FIX: Schedule timeout job for multi-truck assignments
+        // Each driver gets independent 60-second timeout
+        // =========================================================================
+        const assignmentTimerData = {
+          assignmentId: assignment.assignmentId,
+          tripId: assignment.tripId,
+          driverId: assignment.driver.id,
+          driverName: assignment.driver.name,
+          transporterId,
+          vehicleId: assignment.vehicle.id,
+          vehicleNumber: assignment.vehicle.vehicleNumber,
+          orderId: order.id,
+          truckRequestId: assignment.truckRequestId,
+          createdAt: now
+        };
+
+        await queueService.scheduleAssignmentTimeout(assignmentTimerData, 60000);
+        logger.info(`   ⏱️ Multi-truck timeout scheduled: ${assignment.assignmentId} (${assignment.vehicle.vehicleNumber} → ${assignment.driver.name})`);
       }
 
       // =========================================================================

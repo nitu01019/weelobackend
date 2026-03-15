@@ -1266,9 +1266,11 @@ class QueueService {
     transporterId: string;
     vehicleId: string;
     vehicleNumber: string;
-    bookingId: string;
+    bookingId?: string;  // Optional for multi-truck system
     tripId: string;
     createdAt: string;
+    orderId?: string;      // Optional for multi-truck system
+    truckRequestId?: string; // Optional for multi-truck system
   }, delayMs: number): Promise<string> {
     return this.queue.add(
       QueueService.QUEUES.ASSIGNMENT_TIMEOUT,

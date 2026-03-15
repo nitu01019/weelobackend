@@ -47,9 +47,11 @@ interface AssignmentTimerData {
   transporterId: string;
   vehicleId: string;
   vehicleNumber: string;
-  bookingId: string;
+  bookingId?: string;  // Optional for multi-truck system (uses orderId instead)
   tripId: string;
   createdAt: string;
+  orderId?: string;      // Optional for multi-truck system
+  truckRequestId?: string; // Optional for multi-truck system
 }
 
 // =============================================================================
@@ -706,7 +708,7 @@ class AssignmentService {
   // ==========================================================================
 
   async handleAssignmentTimeout(timerData: AssignmentTimerData): Promise<void> {
-    const { assignmentId, driverId, driverName, transporterId, vehicleId, vehicleNumber, bookingId, tripId } = timerData;
+    const { assignmentId, driverId, driverName, transporterId, vehicleId, vehicleNumber, bookingId, tripId, orderId, truckRequestId } = timerData;
 
     logger.info(`⏰ TIMEOUT: Assignment ${assignmentId} — driver ${driverName} didn't respond`);
 
@@ -742,7 +744,23 @@ class AssignmentService {
     }
 
     // 3. Decrement trucks filled
-    await bookingService.decrementTrucksFilled(bookingId);
+    // For multi-truck system: use orderId instead of bookingId
+    if (bookingId) {
+      await bookingService.decrementTrucksFilled(bookingId);
+    } else if (orderId) {
+      // Multi-truck system: decrement trucksFilled on Order
+      await prismaClient.order.update({
+        where: { id: orderId },
+        data: { trucksFilled: { decrement: 1 } }
+      });
+      // Also update TruckRequest status back to held
+      if (truckRequestId) {
+        await prismaClient.truckRequest.updateMany({
+          where: { id: truckRequestId, orderId },
+          data: { status: 'held', assignedVehicleId: null, assignedDriverId: null }
+        });
+      }
+    }
 
     // 4. Notify transporter: driver timed out (WebSocket)
     emitToUser(transporterId, SocketEvent.DRIVER_TIMEOUT, {
