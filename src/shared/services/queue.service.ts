@@ -732,7 +732,8 @@ class QueueService {
     CLEANUP: 'cleanup',               // Cleanup/maintenance tasks
     CUSTOM_BOOKING: 'custom-booking',  // Custom booking events
     ASSIGNMENT_TIMEOUT: 'assignment-timeout',  // Delayed assignment timeout jobs
-    ASSIGNMENT_RECONCILIATION: 'assignment-reconciliation'  // Periodic orphaned assignment cleanup
+    ASSIGNMENT_RECONCILIATION: 'assignment-reconciliation',  // Periodic orphaned assignment cleanup
+    HOLD_EXPIRY: 'hold-expiry'  // Periodic hold expiry cleanup jobs
   };
 
   constructor() {

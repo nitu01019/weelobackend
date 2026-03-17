@@ -34,6 +34,7 @@ import { logger } from '../../shared/services/logger.service';
 import { redisService } from '../../shared/services/redis.service';
 import { socketService } from '../../shared/services/socket.service';
 import { queueService } from '../../shared/services/queue.service';
+import { holdExpiryCleanupService } from '../hold-expiry/hold-expiry-cleanup.service';
 
 // =============================================================================
 // TYPES & INTERFACES
@@ -154,10 +155,51 @@ class ConfirmedHoldService {
         trucksPending: updated.quantity,
       });
 
-      // Schedule driver acceptance timeouts
+      // Schedule expiry cleanup job (Layer 1)
+      await holdExpiryCleanupService.scheduleConfirmedHoldCleanup(holdId, confirmedExpiresAt);
+      logger.debug('[CONFIRMED HOLD] Cleanup job scheduled', { holdId });
+
+      // ================================================================
+      // FIX #3: Fetch full assignment data with driver and vehicle info
+      // ================================================================
+      const assignmentIds = assignments.map(a => a.assignmentId);
+
+      const assignmentsData = await prismaClient.assignment.findMany({
+        where: {
+          id: { in: assignmentIds }
+        },
+        select: {
+          id: true,
+          driverId: true,
+          driverName: true,
+          transporterId: true,
+          vehicleId: true,
+          vehicleNumber: true,
+          tripId: true,
+          orderId: true,
+          truckRequestId: true,
+        }
+      });
+
+      // Create a map for quick lookup
+      const assignmentMap = new Map(
+        assignmentsData.map(a => [a.id, a])
+      );
+
+      // Schedule driver acceptance timeouts with full data
       for (const assignment of assignments) {
+        const fullData = assignmentMap.get(assignment.assignmentId);
+
+        if (!fullData) {
+          logger.warn('[CONFIRMED HOLD] Assignment not found in database', {
+            assignmentId: assignment.assignmentId
+          });
+          continue;
+        }
+
         await this.scheduleDriverAcceptanceTimeout(
           assignment.assignmentId,
+          fullData,
           this.config.driverAcceptTimeoutSeconds
         );
       }
@@ -530,27 +572,35 @@ class ConfirmedHoldService {
    */
   private async scheduleDriverAcceptanceTimeout(
     assignmentId: string,
+    assignmentData: {
+      driverId: string;
+      driverName: string;
+      transporterId: string;
+      vehicleId: string;
+      vehicleNumber: string;
+      tripId: string;
+      orderId: string;
+      truckRequestId?: string;
+    },
     timeoutSeconds: number
   ): Promise<void> {
-    // We'll use simpler approach - just add a delayed job that will check if assignment expired
-    // For now, schedule with basic data
-    await queueService.scheduleAssignmentTimeout(
-      {
-        assignmentId,
-        driverId: '',
-        driverName: '',
-        transporterId: '',
-        vehicleId: '',
-        vehicleNumber: '',
-        tripId: assignmentId,
-        createdAt: new Date().toISOString(),
-      },
-      timeoutSeconds * 1000
-    );
+    await queueService.scheduleAssignmentTimeout({
+      assignmentId,
+      driverId: assignmentData.driverId,
+      driverName: assignmentData.driverName,
+      transporterId: assignmentData.transporterId,
+      vehicleId: assignmentData.vehicleId,
+      vehicleNumber: assignmentData.vehicleNumber,
+      tripId: assignmentData.tripId,
+      orderId: assignmentData.orderId,
+      truckRequestId: assignmentData.truckRequestId,
+      createdAt: new Date().toISOString(),
+    }, timeoutSeconds * 1000);
 
     logger.debug('[CONFIRMED HOLD] Driver acceptance timeout scheduled', {
       assignmentId,
       timeoutSeconds,
+      driverId: assignmentData.driverId,
     });
   }
 }

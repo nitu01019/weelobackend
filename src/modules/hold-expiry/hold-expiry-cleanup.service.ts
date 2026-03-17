@@ -46,8 +46,10 @@ import { generateVehicleKey } from '../../shared/services/vehicle-key.service';
  */
 interface HoldExpiryJobData {
   holdId: string;
-  phase: HoldPhase;
-  expiresAt: string;
+  phase: 'flex' | 'confirmed';
+  expiresAt?: string;
+  orderId?: string;
+  transporterId?: string;
 }
 
 /**
@@ -101,7 +103,7 @@ class HoldExpiryCleanupService {
       JOB_TYPES.FLEX_HOLD_EXPIRED,
       {
         holdId,
-        phase: 'FLEX',
+        phase: 'flex',
         expiresAt: expiresAtDate.toISOString(),
       },
       {
@@ -136,7 +138,7 @@ class HoldExpiryCleanupService {
       JOB_TYPES.CONFIRMED_HOLD_EXPIRED,
       {
         holdId,
-        phase: 'CONFIRMED',
+        phase: 'confirmed',
         expiresAt: expiresAtDate.toISOString(),
       },
       {
@@ -193,11 +195,12 @@ class HoldExpiryCleanupService {
       }
 
       // Phase mismatch check (safety guard)
-      if (hold.phase !== phase) {
+      const holdPhase = (hold.phase as string).toLowerCase();
+      if (holdPhase !== phase) {
         logger.warn(`[HoldExpiry] Phase mismatch, skipping`, {
           holdId,
           jobPhase: phase,
-          holdPhase: hold.phase,
+          holdPhase: holdPhase,
         });
         return;
       }
@@ -207,7 +210,7 @@ class HoldExpiryCleanupService {
         where: { holdId },
         data: {
           status: 'expired',
-          terminalReason: phase === 'FLEX' ? 'flex_hold_expired' : 'confirmed_hold_expired',
+          terminalReason: phase === 'flex' ? 'flex_hold_expired' : 'confirmed_hold_expired',
           releasedAt: new Date(),
         },
       });
@@ -215,7 +218,7 @@ class HoldExpiryCleanupService {
       logger.info(`[HoldExpiry] Updated hold to expired`, { holdId, phase });
 
       // Phase 2 (CONFIRMED): Release vehicles
-      if (phase === 'CONFIRMED') {
+      if (phase === 'confirmed') {
         await this.releaseConfirmedVehicles(hold);
       }
 
@@ -328,17 +331,17 @@ class HoldExpiryCleanupService {
    * @param hold - The hold record
    * @param phase - The phase that expired
    */
-  private async notifyTransporterExpiry(hold: any, phase: HoldPhase): Promise<void> {
+  private async notifyTransporterExpiry(hold: any, phase: 'flex' | 'confirmed'): Promise<void> {
     const { emitToUser } = await import('../../shared/services/socket.service');
 
-    const eventName = phase === 'FLEX' ? 'flex_hold_expired' : 'confirmed_hold_expired';
+    const eventName = phase === 'flex' ? 'flex_hold_expired' : 'confirmed_hold_expired';
 
     emitToUser(hold.transporterId, eventName, {
       holdId: hold.holdId,
       orderId: hold.orderId,
-      phase: hold.phase,
+      phase: phase,
       status: 'expired',
-      reason: phase === 'FLEX' ? 'flex_hold_expired' : 'confirmed_hold_expired',
+      reason: phase === 'flex' ? 'flex_hold_expired' : 'confirmed_hold_expired',
       vehicleType: hold.vehicleType,
       vehicleSubtype: hold.vehicleSubtype,
       quantity: hold.quantity,
@@ -362,8 +365,8 @@ class HoldExpiryCleanupService {
    * @param holdId - The hold ID
    * @param phase - The phase of the hold
    */
-  async cancelScheduledCleanup(holdId: string, phase: HoldPhase): Promise<void> {
-    const jobType = phase === 'FLEX' ? JOB_TYPES.FLEX_HOLD_EXPIRED : JOB_TYPES.CONFIRMED_HOLD_EXPIRED;
+  async cancelScheduledCleanup(holdId: string, phase: 'flex' | 'confirmed'): Promise<void> {
+    const jobType = phase === 'flex' ? JOB_TYPES.FLEX_HOLD_EXPIRED : JOB_TYPES.CONFIRMED_HOLD_EXPIRED;
 
     logger.info(`[HoldExpiry] Cancel requested for hold cleanup (will be skipped idempotently)`, {
       holdId,

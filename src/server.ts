@@ -84,6 +84,8 @@ import { notificationRouter } from './modules/notification/notification.routes';
 import orderRouter from './modules/order/order.routes';
 import transporterRouter from './modules/transporter/transporter.routes';
 import { truckHoldRouter } from './modules/truck-hold';
+import { registerHoldExpiryProcessor, holdExpiryCleanupService } from './modules/hold-expiry/hold-expiry-cleanup.service';
+import { holdReconciliationService } from './modules/hold-expiry/hold-reconciliation.service';
 import { customBookingRouter } from './modules/custom-booking';
 import geocodingRouter from './modules/routing/geocoding.routes';
 import { healthRoutes } from './shared/routes/health.routes';
@@ -249,6 +251,16 @@ if (config.isProduction && hasSSLCertificates()) {
 
 // Initialize Socket.IO
 initializeSocket(server);
+
+// Register hold expiry cleanup processor (Layer 1)
+registerHoldExpiryProcessor();
+logger.info('✅ Hold expiry cleanup processor registered (Layer 1)');
+
+// Start hold reconciliation worker in production (Layer 2 - defense in depth)
+if (process.env.NODE_ENV === 'production') {
+  holdReconciliationService.start();
+  logger.info('✅ Hold reconciliation worker started (Layer 2) - Periodic scans every 30s');
+}
 
 // Initialize FCM Service for Push Notifications
 fcmService.initialize().then(() => {

@@ -34,6 +34,7 @@ import { prismaClient, HoldPhase } from '../../shared/database/prisma.service';
 import { logger } from '../../shared/services/logger.service';
 import { redisService } from '../../shared/services/redis.service';
 import { socketService } from '../../shared/services/socket.service';
+import { holdExpiryCleanupService } from '../hold-expiry/hold-expiry-cleanup.service';
 
 // =============================================================================
 // TYPES & INTERFACES
@@ -517,15 +518,12 @@ class FlexHoldService {
   }
 
   /**
-   * Schedule expiry check for flex hold
+   * Schedule expiry cleanup for flex hold (Layer 1)
+   * Uses delayed queue job that persists across server restarts
    */
   private async scheduleExpiryCheck(holdId: string, expiresAt: Date): Promise<void> {
-    const ttl = Math.max(1, Math.floor((expiresAt.getTime() - Date.now()) / 1000));
-    await redisService.set(
-      `flex-hold:expiry-scheduled:${holdId}`,
-      '1',
-      ttl
-    );
+    // Schedule delayed queue job for expiry cleanup
+    await holdExpiryCleanupService.scheduleFlexHoldCleanup(holdId, expiresAt);
   }
 }
 
