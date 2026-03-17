@@ -17,6 +17,7 @@ import { logger } from '../../shared/services/logger.service';
 import { emitToUser, emitToBooking, SocketEvent } from '../../shared/services/socket.service';
 import { queueService } from '../../shared/services/queue.service';
 import { redisService } from '../../shared/services/redis.service';
+import { liveAvailabilityService } from '../../shared/services/live-availability.service';
 import { bookingService } from '../booking/booking.service';
 import { trackingService } from '../tracking/tracking.service';
 import { CreateAssignmentInput, UpdateStatusInput, GetAssignmentsQuery } from './assignment.schema';
@@ -367,6 +368,53 @@ class AssignmentService {
     });
 
     // =====================================================================
+    // FIX: Vehicle becomes 'in_transit' ONLY when driver ACTUALLY accepts
+    // =====================================================================
+    // BEFORE: Vehicle was set to 'in_transit' when transporter confirmed (too early)
+    //   → Driver could get stuck in 'on trip' state before accepting
+    // NOW: Vehicle stays 'available' until driver accepts, then becomes 'in_transit'
+    //   → Vehicle only busy when driver has committed
+    // Uber/Grab pattern: Vehicle and Assignment status are separate concepts.
+    //   - Vehicle status: is the vehicle physically on a trip?
+    //   - Assignment status: what is the state of THIS trip?
+    // =====================================================================
+    if (assignment.vehicleId) {
+      try {
+        await prismaClient.vehicle.update({
+          where: { id: assignment.vehicleId },
+          data: {
+            status: 'in_transit',
+            currentTripId: assignment.tripId,
+            assignedDriverId: driverId,
+            lastStatusChange: new Date().toISOString()
+          }
+        });
+        logger.info(`[ASSIGNMENT] Vehicle set to in_transit: ${assignment.vehicleNumber} (driver accepted)`);
+
+        // Update Redis availability so vehicle matching system stays in sync
+        const vehicle = await prismaClient.vehicle.findUnique({
+          where: { id: assignment.vehicleId },
+          select: { vehicleKey: true, transporterId: true }
+        });
+        if (vehicle?.vehicleKey && vehicle?.transporterId) {
+          await liveAvailabilityService.onVehicleStatusChange(
+            vehicle.transporterId,
+            vehicle.vehicleKey,
+            'available',          // Was available while pending
+            'in_transit'          // Now in transit after driver accepted
+          ).catch(err => logger.warn('[acceptAssignment] Redis update failed', err));
+        }
+      } catch (err: any) {
+        // Vehicle update failed - non-fatal but log for investigation
+        logger.error('[ASSIGNMENT] Failed to set vehicle to in_transit', {
+          vehicleId: assignment.vehicleId,
+          assignmentId,
+          error: err?.message
+        });
+      }
+    }
+
+    // =====================================================================
     // FIX: Seed tracking at acceptance with driver's real GPS
     // =====================================================================
     // BEFORE: initializeTracking() existed but was never called → customer
@@ -553,12 +601,28 @@ class AssignmentService {
 
     // Release vehicle back to available
     if (assignment.vehicleId) {
+      const vehicle = await prismaClient.vehicle.findUnique({
+        where: { id: assignment.vehicleId },
+        select: { vehicleKey: true, transporterId: true }
+      });
+      const vehicleKey = vehicle?.vehicleKey;
+
       await db.updateVehicle(assignment.vehicleId, {
         status: 'available',
         currentTripId: undefined,
         assignedDriverId: undefined,
         lastStatusChange: new Date().toISOString()
       });
+
+      // Update Redis availability so DB and Redis stay in sync
+      if (vehicleKey && assignment.transporterId) {
+        await liveAvailabilityService.onVehicleStatusChange(
+          assignment.transporterId,
+          vehicleKey,
+          'in_transit',    // Vehicle was in_transit (if driver had accepted)
+          'available'       // Now available again after cancellation
+        ).catch(err => logger.warn('[cancelAssignment] Redis update failed', err));
+      }
     }
 
     // Notify booking room
@@ -646,12 +710,28 @@ class AssignmentService {
 
     // 3. Release vehicle back to available
     if (assignment.vehicleId) {
+      const vehicle = await prismaClient.vehicle.findUnique({
+        where: { id: assignment.vehicleId },
+        select: { vehicleKey: true, transporterId: true }
+      });
+      const vehicleKey = vehicle?.vehicleKey;
+
       await db.updateVehicle(assignment.vehicleId, {
         status: 'available',
         currentTripId: undefined,
         assignedDriverId: undefined,
         lastStatusChange: new Date().toISOString()
       });
+
+      // Update Redis availability so DB and Redis stay in sync
+      if (vehicleKey && assignment.transporterId) {
+        await liveAvailabilityService.onVehicleStatusChange(
+          assignment.transporterId,
+          vehicleKey,
+          'in_transit',    // Vehicle was in_transit (if driver had accepted)
+          'available'       // Now available again after decline
+        ).catch(err => logger.warn('[declineAssignment] Redis update failed', err));
+      }
     }
 
     // 4. Decrement trucks filled
@@ -734,13 +814,34 @@ class AssignmentService {
     }
 
     // 2. Release vehicle back to available
+    let vehicleKey: string | undefined = undefined;
+    let vehicleTransporterId: string | undefined = undefined;
+
     if (vehicleId) {
+      // Fetch vehicle info for Redis sync
+      const vehicle = await prismaClient.vehicle.findUnique({
+        where: { id: vehicleId },
+        select: { vehicleKey: true, transporterId: true }
+      });
+      vehicleKey = vehicle?.vehicleKey;
+      vehicleTransporterId = vehicle?.transporterId;
+
       await db.updateVehicle(vehicleId, {
         status: 'available',
         currentTripId: undefined,
         assignedDriverId: undefined,
         lastStatusChange: new Date().toISOString()
       });
+
+      // Update Redis availability so DB and Redis stay in sync
+      if (vehicleKey && vehicleTransporterId) {
+        await liveAvailabilityService.onVehicleStatusChange(
+          vehicleTransporterId,
+          vehicleKey,
+          'in_transit',    // Vehicle was in_transit (if driver had accepted)
+          'available'       // Now available again after timeout
+        ).catch(err => logger.warn('[timeout] Redis update failed', err));
+      }
     }
 
     // 3. Decrement trucks filled

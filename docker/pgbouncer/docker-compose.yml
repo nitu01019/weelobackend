@@ -1,0 +1,76 @@
+# Weelo Backend - Docker Compose with PgBouncer
+# =============================================================================
+# This adds PgBouncer to your existing docker-compose.yml
+#
+# How to use:
+# 1. Add this section to your docker-compose.yml
+# 2. docker-compose up -d
+# 3. Update DATABASE_URL from postgres:5432 to pgbouncer:6432
+# =============================================================================
+
+version: '3.8'
+
+services:
+  # Add these services to your existing docker-compose.yml
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:14-alpine
+    container_name: weelo-postgres
+    environment:
+      POSTGRES_DB: weelo_db
+      POSTGRES_USER: weelo_user
+      POSTGRES_PASSWORD: weelo_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=200"
+      - "-c"
+      - "shared_buffers=256MB"
+      - "-c"
+      "-c"
+      "-c"
+      - "work_mem=16MB"
+      - "-c"
+      "-c"
+      - "maintenance_work_mem=128MB"
+      - "-c"
+      - "effective_cache_size=1GB"
+    networks:
+      - weelo-network
+    restart: unless-stopped
+
+  # PgBouncer - Connection Pool (NEW)
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: weelo-pgbouncer
+    environment:
+      DATABASE_URL: postgres://weelo_user:weelo_password@postgres:5432/weelo_db
+    volumes:
+      - ./docker/pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./docker/pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    ports:
+      - "6432:6432"
+    depends_on:
+      - postgres
+    networks:
+      - weelo-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pgbouncer --version"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Your existing backend service
+  backend:
+    # ... your existing configuration ...
+
+volumes:
+  postgres_data:
+
+networks:
+  weelo-network:
+    driver: bridge

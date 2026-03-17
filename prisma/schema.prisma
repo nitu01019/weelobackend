@@ -107,6 +107,26 @@ enum RoutePointType {
 }
 
 // =============================================================================
+// TWO-PHASE TRUCK HOLD SYSTEM (PRD 7777)
+// =============================================================================
+
+// Hold phase for two-phase hold system
+enum HoldPhase {
+  FLEX       // Phase 1: 90s base, can be extended (max 130s total)
+  CONFIRMED  // Phase 2: Trucks locked, max 180s from confirmation
+  EXPIRED    // Hold expired
+  RELEASED   // Hold released by transporter
+}
+
+// Timeout extension type for tracking
+enum TimeoutExtensionType {
+  BASE          // Initial 120s timeout
+  FIRST_DRIVER  // +60s extension on first driver confirmation
+  SUBSEQUENT    // +30s extension on each subsequent driver
+  NO_PROGRESS   // Reset on no progress (for recovery)
+}
+
+// =============================================================================
 // USER MODEL
 // =============================================================================
 // 
@@ -462,6 +482,7 @@ model Order {
   // =========================================
   truckRequests TruckRequest[]
   assignments   Assignment[]
+  timeout       OrderTimeout? @relation("OrderTimeoutLink", fields: [id], references: [orderId])
 
   // =========================================
   // INDEXES FOR SCALABILITY
@@ -651,24 +672,46 @@ model CancelDispute {
 // =============================================================================
 // TRUCK HOLD LEDGER (durable hold state for recovery and reconciliation)
 // =============================================================================
+// Updated for Two-Phase Hold System (PRD 7777)
+// - Phase 1 (FLEX): 90s base, auto-extend +30s per driver, max 130s total
+// - Phase 2 (CONFIRMED): Max 180s from confirmation, trucks locked
 model TruckHoldLedger {
-  holdId         String   @id
+  holdId         String     @id
   orderId        String
   transporterId  String
   vehicleType    String
   vehicleSubtype String
   quantity       Int
-  truckRequestIds String[] @default([])
-  status         String   @default("active") // active|confirmed|released|expired|cancelled
+  truckRequestIds String[]   @default([])
+
+  // Legacy status field (for backward compatibility)
+  status         String     @default("active") // active|confirmed|released|expired|cancelled
+
+  // Two-Phase Hold System (NEW)
+  phase          HoldPhase  @default(FLEX)     // FLEX → CONFIRMED → EXPIRED/RELEASED
+  phaseChangedAt DateTime?                      // When phase last changed
+
+  // Phase 1: FLEX Hold fields
+  flexExpiresAt      DateTime?  // Phase 1 expiry time
+  flexExtendedCount  Int        @default(0)  // Number of extensions used (max 3)
+
+  // Phase 2: CONFIRMED Hold fields
+  confirmedAt        DateTime?  // When moved to Phase 2
+  confirmedExpiresAt DateTime?  // Phase 2 expiry time (max 180s from confirm)
+
+  // Legacy fields (kept for backward compatibility)
   expiresAt      DateTime
   terminalReason String?
   releasedAt     DateTime?
-  confirmedAt    DateTime?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  confirmedAtLegacy DateTime?  // Legacy field (use confirmedAt instead)
+
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
 
   @@index([orderId, status, expiresAt])
   @@index([transporterId, status, expiresAt])
+  @@index([phase, flexExpiresAt])
+  @@index([phase, confirmedExpiresAt])
 }
 
 // =============================================================================
@@ -687,6 +730,89 @@ model TruckHoldIdempotency {
 
   @@unique([transporterId, operation, idempotencyKey])
   @@index([transporterId, operation, createdAt])
+}
+
+// =============================================================================
+// TWO-PHASE TRUCK HOLD NEW MODELS (PRD 7777)
+// =============================================================================
+
+// =============================================================================
+// PROGRESS EVENT (for UI transparency - "+30s added" display)
+// =============================================================================
+// Tracks each driver acceptance that extends the order timeout
+model ProgressEvent {
+  id              String  @id @default(uuid())
+  orderId         String
+  orderTimeout    OrderTimeout @relation("OrderTimeoutProgress", fields: [orderId], references: [orderId], onDelete: Cascade)
+
+  // Driver info
+  driverId        String
+  driverName      String
+
+  // Extension details
+  extensionType   TimeoutExtensionType
+  addedSeconds    Int
+  reason          String?
+
+  // What triggered the extension
+  trigger         String
+  assignmentId    String?
+  truckRequestId  String?
+
+  timestamp       DateTime @default(now())
+
+  @@index([orderId, timestamp])
+  @@index([driverId])
+}
+
+// =============================================================================
+// ORDER TIMEOUT TRACKING (PRD 7777 - Smart Timeout Extension)
+// =============================================================================
+// Tracks order timeout with smart extensions based on progress
+model OrderTimeout {
+  orderId         String   @id
+  baseTimeoutMs   Int      @default(120000)
+  extendedMs      Int      @default(0)
+  lastProgressAt  DateTime?
+  expiresAt       DateTime
+  isExpired       Boolean  @default(false)
+  expiredAt       DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  progressEvents  ProgressEvent[] @relation("OrderTimeoutProgress")
+  order           Order?   @relation("OrderTimeoutLink")
+
+  @@index([expiresAt])
+  @@index([isExpired])
+}
+
+// =============================================================================
+// TRANSPORTER BROADCAST VIEW (for partial assignment visibility)
+// =============================================================================
+// Per-transporter view of broadcast with remaining trucks count
+// Ensures new transporters see correct remaining count, not original total
+model TransporterBroadcastView {
+  id                String  @id @default(uuid())
+  broadcastId       String
+  transporterId     String
+
+  // Vehicle availability as seen by this transporter
+  vehicleType       String
+  vehicleSubtype    String
+  trucksNeeded      Int
+  trucksAssigned    Int    @default(0)
+  trucksRemaining   Int
+
+  // Trucks assigned by others (for transparency)
+  assignedByOthers  Json?
+
+  // Tracking
+  lastUpdateAt      DateTime @default(now())
+
+  @@unique([broadcastId, transporterId])
+  @@index([transporterId, lastUpdateAt])
+  @@index([broadcastId, trucksRemaining])
 }
 
 // =============================================================================

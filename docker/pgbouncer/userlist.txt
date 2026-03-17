@@ -1,0 +1,19 @@
+# PgBouncer User List
+# Format: "username" "md5_hashed_password"
+#
+# Generate MD5 hash: echo -n "password" | md5sum
+#
+# Example for password "weelo@2024":
+#   echo -n "weelo@2024" | md5sum → a8f5f167f44f4964e6c998dee827110c
+#
+# IMPORTANT: Change these before production deployment!
+# =============================================================================
+
+# Stats user (for monitoring dashboard)
+"stats" "8f5f167f44f4964e6c998dee827110c"
+
+# Application user (weelo_backend)
+"weelo_user" "CHANGEME_PASSWORD"
+
+# Read replica user (add when setting up read replicas)
+# weelo_reader "CHANGEME_PASSWORD"

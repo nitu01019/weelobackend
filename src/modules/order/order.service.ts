@@ -4381,15 +4381,8 @@ class OrderService {
             data: { status: newStatus, stateChangedAt: new Date() }
           });
 
-          // ----- Update vehicle status inside transaction -----
-          await tx.vehicle.update({
-            where: { id: vehicleId },
-            data: {
-              status: VehicleStatus.in_transit,
-              currentTripId: tripId,
-              assignedDriverId: driverId
-            }
-          });
+          // FIX: Vehicle stays 'available' until driver accepts
+          // Vehicle will be set to 'in_transit' in assignment.acceptAssignment()
 
           // Parse JSON fields for notification use outside the transaction
           const pickup = typeof order.pickup === 'string'
@@ -4504,11 +4497,8 @@ class OrderService {
     logger.info(`   Driver: ${driverName} (${driverPhone})`);
     logger.info(`   Order progress: ${newTrucksFilled}/${orderTotalTrucks}`);
 
-    // Live availability: vehicle went in_transit AFTER transaction committed (bypass path)
-    const acceptVKey = generateVehicleKey(vehicleType || '', vehicleSubtype || '');
-    liveAvailabilityService.onVehicleStatusChange(
-      transporterId, acceptVKey, 'available', 'in_transit'
-    ).catch(() => { });
+    // FIX: No Redis sync here - vehicle stays 'available' until driver accepts
+    // Redis will be updated in assignment.acceptAssignment()
 
     // ============== NOTIFY DRIVER ==============
     const driverNotification = {
@@ -4546,98 +4536,103 @@ class OrderService {
       logger.warn(`FCM to driver failed: ${errorMessage}`);
     });
 
-    // ============== NOTIFY CUSTOMER ==============
-    const customerEventId = uuidv4();
-    const customerNotification = {
-      type: 'truck_confirmed',
-      orderId,
-      truckRequestId,
-      assignmentId,
-      truckNumber: newTrucksFilled,
-      totalTrucks: orderTotalTrucks,
-      trucksConfirmed: newTrucksFilled,
-      remainingTrucks: orderTotalTrucks - newTrucksFilled,
-      isFullyFilled: newTrucksFilled >= orderTotalTrucks,
-      driver: {
-        name: driverName,
-        phone: driverPhone
-      },
-      vehicle: {
-        number: vehicleNumber,
-        type: vehicleType,
-        subtype: vehicleSubtype
-      },
-      transporter: {
-        name: transporterName,
-        phone: transporterPhone
-      },
-      message: `Truck ${newTrucksFilled}/${orderTotalTrucks} confirmed!`,
-      eventId: customerEventId,
-      emittedAt: now
-    };
-
-    emitToUser(customerId, 'truck_confirmed', customerNotification);
-    logger.info(`Notified customer - ${newTrucksFilled}/${orderTotalTrucks} trucks confirmed`);
-
+    // ============== NOTIFY CUSTOMER - PRD 7777: ONLY ON DRIVER ACCEPT ==============
+    // REMOVED: Customer notification during truck hold/assignment
+    // Customer should ONLY be notified when driver accepts - see assignment.service.ts
+    // The customer will be notified in assignment.acceptAssignment() when driver accepts
+    //
+    // const customerEventId = uuidv4();
+    // const customerNotification = {
+    //   type: 'truck_confirmed',
+    //   orderId,
+    //   truckRequestId,
+    //   assignmentId,
+    //   truckNumber: newTrucksFilled,
+    //   totalTrucks: orderTotalTrucks,
+    //   trucksConfirmed: newTrucksFilled,
+    //   remainingTrucks: orderTotalTrucks - newTrucksFilled,
+    //   isFullyFilled: newTrucksFilled >= orderTotalTrucks,
+    //   driver: {
+    //     name: driverName,
+    //     phone: driverPhone
+    //   },
+    //   vehicle: {
+    //     number: vehicleNumber,
+    //     type: vehicleType,
+    //     subtype: vehicleSubtype
+    //   },
+    //   transporter: {
+    //     name: transporterName,
+    //     phone: transporterPhone
+    //   },
+    //   message: `Truck ${newTrucksFilled}/${orderTotalTrucks} confirmed!`,
+    //   eventId: customerEventId,
+    //   emittedAt: now
+    // };
+    // emitToUser(customerId, 'truck_confirmed', customerNotification);
+    // logger.info(`Notified customer - ${newTrucksFilled}/${orderTotalTrucks} trucks confirmed`);
+    //
     // Phase 3 parity: keep searching dialog in sync with backend fill progress.
-    emitToUser(customerId, 'trucks_remaining_update', {
-      orderId,
-      trucksNeeded: orderTotalTrucks,
-      trucksFilled: newTrucksFilled,
-      trucksRemaining: Math.max(orderTotalTrucks - newTrucksFilled, 0),
-      isFullyFilled: newTrucksFilled >= orderTotalTrucks,
-      timestamp: now,
-      eventId: customerEventId,
-      emittedAt: now
-    });
-
+    // emitToUser(customerId, 'trucks_remaining_update', {
+    //   orderId,
+    //   trucksNeeded: orderTotalTrucks,
+    //   trucksFilled: newTrucksFilled,
+    //   trucksRemaining: Math.max(orderTotalTrucks - newTrucksFilled, 0),
+    //   isFullyFilled: newTrucksFilled >= orderTotalTrucks,
+    //   timestamp: now,
+    //   eventId: customerEventId,
+    //   emittedAt: now
+    // });
+    //
     // Lifecycle update whenever order status changes due to accept flow.
-    emitToUser(customerId, 'broadcast_state_changed', this.withEventMeta({
-      orderId,
-      status: newStatus,
-      dispatchState: 'dispatched',
-      eventVersion: 1,
-      serverTimeMs: Date.now(),
-      stateChangedAt: now
-    }, customerEventId));
+    // emitToUser(customerId, 'broadcast_state_changed', this.withEventMeta({
+    //   orderId,
+    //   status: newStatus,
+    //   dispatchState: 'dispatched',
+    //   eventVersion: 1,
+    //   serverTimeMs: Date.now(),
+    //   stateChangedAt: now
+    // }, customerEventId));
 
-    if (newStatus === 'fully_filled') {
-      const latestAssignment = {
-        assignmentId,
-        tripId,
-        vehicleNumber,
-        driverName,
-        driverPhone
-      };
-      emitToUser(customerId, 'booking_fully_filled', {
-        orderId,
-        trucksNeeded: orderTotalTrucks,
-        trucksFilled: newTrucksFilled,
-        filledAt: now,
-        eventId: customerEventId,
-        emittedAt: now,
-        latestAssignment,
-        // Keep array for backward compatibility with existing consumers.
-        assignments: [
-          latestAssignment
-        ]
-      });
-    }
+    // PRD 7777: Customer notification removed - will be notified on driver accept
+    // if (newStatus === 'fully_filled') {
+    //   const latestAssignment = {
+    //     assignmentId,
+    //     tripId,
+    //     vehicleNumber,
+    //     driverName,
+    //     driverPhone
+    //   };
+    //   emitToUser(customerId, 'booking_fully_filled', {
+    //     orderId,
+    //     trucksNeeded: orderTotalTrucks,
+    //     trucksFilled: newTrucksFilled,
+    //     filledAt: now,
+    //     eventId: customerEventId,
+    //     emittedAt: now,
+    //     latestAssignment,
+    //     // Keep array for backward compatibility with existing consumers.
+    //     assignments: [
+    //       latestAssignment
+    //     ]
+    //   });
+    // }
 
-    // Push notification to customer
-    sendPushNotification(customerId, {
-      title: `Truck ${newTrucksFilled}/${orderTotalTrucks} Confirmed!`,
-      body: `${vehicleNumber} (${driverName}) assigned`,
-      data: {
-        type: 'truck_confirmed',
-        orderId,
-        trucksConfirmed: newTrucksFilled,
-        totalTrucks: orderTotalTrucks
-      }
-    }).catch((err: unknown) => {
-      const errorMessage = err instanceof Error ? err.message : String(err);
-      logger.warn(`FCM to customer failed: ${errorMessage}`);
-    });
+    // Push notification to customer - REMOVED per PRD 7777
+    // Customer will be notified when driver accepts
+    // sendPushNotification(customerId, {
+    //   title: `Truck ${newTrucksFilled}/${orderTotalTrucks} Confirmed!`,
+    //   body: `${vehicleNumber} (${driverName}) assigned`,
+    //   data: {
+    //     type: 'truck_confirmed',
+    //     orderId,
+    //     trucksConfirmed: newTrucksFilled,
+    //     totalTrucks: orderTotalTrucks
+    //   }
+    // }).catch((err: unknown) => {
+    //   const errorMessage = err instanceof Error ? err.message : String(err);
+    //   logger.warn(`FCM to customer failed: ${errorMessage}`);
+    // });
 
     // If fully filled, cancel expiry timer and clear active key
     if (newStatus === 'fully_filled') {

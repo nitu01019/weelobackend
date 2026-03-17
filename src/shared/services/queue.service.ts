@@ -26,6 +26,7 @@ import { redisService } from './redis.service';
 import { createTrackingStreamSink } from './tracking-stream-sink';
 import { metrics } from '../monitoring/metrics.service';
 import { prismaClient } from '../database/prisma.service';
+import * as admin from 'firebase-admin';
 
 // =============================================================================
 // TYPES
@@ -722,7 +723,8 @@ class QueueService {
   // Queue names for organization
   static readonly QUEUES = {
     BROADCAST: 'broadcast',           // Broadcast notifications to transporters
-    PUSH_NOTIFICATION: 'push',        // FCM push notifications
+    PUSH_NOTIFICATION: 'push',        // FCM push notifications (per user)
+    FCM_BATCH: 'fcm_batch',          // FCM batch notifications (up to 500 drivers at once)
     TRACKING_EVENTS: 'tracking-events', // Driver telemetry stream fanout
     EMAIL: 'email',                   // Email notifications (future)
     SMS: 'sms',                       // SMS notifications (future)
@@ -1009,6 +1011,74 @@ class QueueService {
       await sendPushNotification(userId, notification);
     });
 
+    // FCM batch processor - sends to up to 500 drivers in ONE API call
+    this.queue.process(QueueService.QUEUES.FCM_BATCH, async (job) => {
+      const { tokens, notification } = job.data;
+
+      // Import fcmService
+      const fcmService = (await import('./fcm.service')).fcmService;
+
+      // Get FCM SDK
+      let admin: any;
+      try {
+        admin = require('firebase-admin');
+      } catch (error) {
+        logger.warn('[FCM_BATCH] Firebase Admin not available, falling back to individual sends');
+        // Fallback: Send one-by-one using fcmService
+        for (const token of tokens) {
+          try {
+            await fcmService.sendToTokens([token], {
+              type: notification.data?.type || 'general',
+              title: notification.title,
+              body: notification.body,
+              priority: 'high',
+              data: notification.data
+            });
+          } catch (err) {
+            if (err?.code === 'messaging/registration-token-not-registered') {
+              // Token invalid, remove from Redis
+              await redisService.del(`fcm_token:${token}`);
+            }
+          }
+        }
+        return;
+      }
+
+      // Use Firebase Admin SDK multicast for batch send
+      // FCM supports up to 500 tokens per request
+      if (tokens.length === 1) {
+        await fcmService.sendToTokens(tokens, {
+          type: notification.data?.type || 'general',
+          title: notification.title,
+          body: notification.body,
+          priority: 'high',
+          data: notification.data
+        });
+      } else {
+        const batchResponse = await admin.messaging().sendMulticast({
+          tokens: tokens.slice(0, 500),  // FCM limit: 500
+          notification: {
+            title: notification.title,
+            body: notification.body
+          },
+          data: notification.data || {}
+        });
+
+        const successCount = batchResponse.successCount || 0;
+        const failureCount = (tokens.length || 1) - successCount;
+
+        logger.info(`[FCM_BATCH] Sent to ${tokens.length} drivers: ${successCount} succeeded, ${failureCount} failed`);
+
+        // Remove invalid tokens from Redis
+        for (const token of tokens) {
+          const index = batchResponse.responses.findIndex(r => r.success === false);
+          if (index !== -1 && batchResponse.responses[index].error?.code === 'messaging/registration-token-not-registered') {
+            await redisService.del(`fcm_token:${token}`);
+          }
+        }
+      }
+    });
+
     // Tracking stream processor (sink pluggable via env/integration service).
     // Default sink is no-op to avoid blocking hot path when no sink is configured.
     this.queue.process(QueueService.QUEUES.TRACKING_EVENTS, async (job) => {
@@ -1250,6 +1320,61 @@ class QueueService {
 
     return this.queue.addBatch(QueueService.QUEUES.PUSH_NOTIFICATION, jobs);
   }
+
+  /**
+   * Batch FCM Push - Send to up to 500 drivers in ONE API call
+   *
+   * FCM supports up to 500 registration tokens per request.
+   * This is critical for transporter broadcasts to many drivers.
+   *
+   * Queue job format:
+   * {
+   *   tokens: string[],  // FCM registration tokens
+   *   notification: { title, body, data }
+   * }
+   */
+  async queueBatchPush(
+    tokens: string[],
+    notification: {
+      title: string;
+      body: string;
+      data?: Record<string, any>;
+    }
+  ): Promise<string> {
+    // Remove empty/null tokens
+    const validTokens = tokens.filter(t => t && t.length > 0);
+
+    if (validTokens.length === 0) {
+      logger.warn('[Queue] No valid FCM tokens for batch push');
+      return 'empty';
+    }
+
+    // Batch size limits
+    const BATCH_SIZE = 500;
+    const batches: string[][] = [];
+
+    for (let i = 0; i < validTokens.length; i += BATCH_SIZE) {
+      batches.push(validTokens.slice(i, i + BATCH_SIZE));
+    }
+
+    let jobId = '';
+
+    for (let i = 0; i < batches.length; i++) {
+      const batch = batches[i];
+      jobId += await this.queue.add(
+        QueueService.QUEUES.FCM_BATCH,
+        'fcm_batch_send',
+        { tokens: batch, notification },
+        { maxAttempts: 3, priority: 2 }  // HIGH priority
+      );
+    }
+
+    logger.info(`[Queue] Batch FCM queued: ${validTokens.length} tokens in ${batches.length} batch(es)`);
+    return jobId;
+  }
+
+  /**
+   * Schedule a delayed assignment timeout job.
 
   /**
    * Schedule a delayed assignment timeout job.

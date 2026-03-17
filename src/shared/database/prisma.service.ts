@@ -9,7 +9,7 @@
  * =============================================================================
  */
 
-import { PrismaClient, Prisma, UserRole, VehicleStatus, BookingStatus, OrderStatus, TruckRequestStatus, AssignmentStatus } from '@prisma/client';
+import { PrismaClient, Prisma, UserRole, VehicleStatus, BookingStatus, OrderStatus, TruckRequestStatus, AssignmentStatus, HoldPhase, TimeoutExtensionType } from '@prisma/client';
 import { logger } from '../services/logger.service';
 import { generateVehicleKey, generateVehicleKeyCandidates } from '../services/vehicle-key.service';
 import { redisService } from '../services/redis.service';
@@ -24,7 +24,7 @@ const DEFAULT_PAGE_SIZE = 50;
 const MAX_PAGE_SIZE = 500;
 
 // Re-export types for compatibility
-export { UserRole, VehicleStatus, BookingStatus, OrderStatus, TruckRequestStatus, AssignmentStatus };
+export { UserRole, VehicleStatus, BookingStatus, OrderStatus, TruckRequestStatus, AssignmentStatus, HoldPhase, TimeoutExtensionType };
 
 // =============================================================================
 // TYPE DEFINITIONS (matching original db.ts interfaces)

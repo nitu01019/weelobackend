@@ -128,6 +128,8 @@ export const SocketEvent = {
   JOIN_ORDER: 'join_order',                     // Join order room for updates
   LEAVE_ORDER: 'leave_order',
   UPDATE_LOCATION: 'update_location',
+  JOIN_TRANSPORTER: 'join_transporter', // Driver joins transporter room for broadcasts
+  LEAVE_TRANSPORTER: 'leave_transporter',   // Driver leaves transporter room
   BROADCAST_ACK: 'broadcast_ack'            // Phase 4: client ACKs sequence-numbered message
 };
 
@@ -278,6 +280,27 @@ export function initializeSocket(server: HttpServer): Server {
     socket.on(SocketEvent.JOIN_BOOKING, (bookingId: string) => {
       socket.join(`booking:${bookingId}`);
       logger.debug(`User ${userId} joined booking room: ${bookingId}`);
+    });
+
+    // Handle joining transporter room - for driver notifications
+    socket.on('join_transporter', async ({ transporterId }: { transporterId: string }) => {
+      // Verify driver belongs to this transporter
+      const driverId = socket.data.userId;
+      const driverTransporterId = socket.data.transporterId;
+
+      if (!transporterId) {
+        return socket.emit('error', { message: 'Transporter ID required' });
+      }
+
+      // Verify the user is a driver and belongs to this transporter
+      if (driverTransporterId && driverTransporterId !== transporterId) {
+        logger.warn(`Socket ${socket.id} rejected: driver ${driverId} trying to join transporter ${transporterId} (doesn't belong)`);
+        return socket.emit('error', { message: 'Access denied' });
+      }
+
+      // Join transporter room
+      await socket.join(`transporter:${transporterId}`);
+      logger.debug(`Socket ${socket.id} joined transporter:${transporterId}`);
     });
 
     // Handle leaving booking room
@@ -861,6 +884,25 @@ export function emitToAllTransporters(event: string, data: any): void {
   logger.debug(`Broadcast ${event} to transporters`);
 }
 
+/**
+ * Emit to all drivers belonging to a specific transporter
+ *
+ * This is CRITICAL for the transporter→driver flow - ensures notifications reach
+ * only the drivers who work for that transporter.
+ *
+ * @param transporterId The transporter's UUID
+ * @param event Socket.IO event name
+ * @param data Event payload
+ */
+export function emitToTransporterDrivers(transporterId: string, event: string, data: any): void {
+  if (!io) return;
+
+  // Emit to all drivers in transporter room
+  io.to(`transporter:${transporterId}`).emit(event, withSocketMeta(data));
+
+  logger.debug(`Emitted ${event} to drivers of transporter:${transporterId}`);
+}
+
 export function getRedisAdapterStatus(): {
   enabled: boolean;
   mode: 'enabled' | 'disabled' | 'disabled_by_config' | 'disabled_by_capability' | 'failed';
@@ -922,4 +964,7 @@ export const socketService = {
   // Redis adapter status
   isRedisPubSubEnabled: () => redisPubSubInitialized,
   getRedisAdapterStatus,
+
+  // Emit to transporter's drivers
+  emitToTransporterDrivers,
 };
