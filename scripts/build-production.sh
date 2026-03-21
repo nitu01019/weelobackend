@@ -70,9 +70,25 @@ echo -e "${GREEN}✅ Prisma client generated${NC}"
 echo ""
 
 # =============================================================================
-# STEP 5: Build TypeScript
+# STEP 5: Apply Database Migrations (Production)
 # =============================================================================
-echo "⚡ Step 5: Building TypeScript..."
+echo "🔄 Step 5: Applying database migrations..."
+
+# Load production environment variables for DATABASE_URL
+if [ -f ".env.production" ]; then
+    export $(cat .env.production | grep -v '^#' | xargs)
+fi
+
+# Run migration deploy - idempotent, only runs new migrations
+npx prisma migrate deploy
+
+echo -e "${GREEN}✅ Database migrations applied${NC}"
+echo ""
+
+# =============================================================================
+# STEP 6: Build TypeScript
+# =============================================================================
+echo "⚡ Step 6: Building TypeScript..."
 
 npm run build
 
@@ -80,9 +96,9 @@ echo -e "${GREEN}✅ TypeScript compiled${NC}"
 echo ""
 
 # =============================================================================
-# STEP 6: Verify Build
+# STEP 7: Verify Build
 # =============================================================================
-echo "✓ Step 6: Verifying build..."
+echo "✓ Step 7: Verifying build..."
 
 if [ ! -f "dist/server.js" ]; then
     echo -e "${RED}❌ Build failed - dist/server.js not found${NC}"
