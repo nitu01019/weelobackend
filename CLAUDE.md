@@ -417,4 +417,136 @@ When implementing backend features:
 
 ---
 
-**Last Modified:** 2026-03-17
+**Last Modified:** 2026-03-22
+
+---
+
+## 🚨 SESSION 2026-03-22 — CRITICAL DB FIXES APPLIED
+
+### What Was Broken (Root Cause)
+The two-phase hold system code was pushed to GitHub and deployed to ECS, but the database schema was **never migrated**. The DB was originally set up with `prisma db push` (NOT `prisma migrate deploy`), so there is **no `_prisma_migrations` table** in production. All migration files pushed by other AI sessions never actually ran on the live DB.
+
+### Fixes Applied Directly to Production DB (via psql)
+
+#### Fix 1 — HoldPhase ENUM (was causing error every 30 seconds)
+```sql
+-- Error was: type "public.HoldPhase" does not exist
+CREATE TYPE "HoldPhase" AS ENUM ('FLEX', 'CONFIRMED', 'EXPIRED', 'RELEASED');
+ALTER TABLE "TruckHoldLedger" ALTER COLUMN phase DROP DEFAULT;
+ALTER TABLE "TruckHoldLedger" ALTER COLUMN phase TYPE "HoldPhase" USING phase::"HoldPhase";
+ALTER TABLE "TruckHoldLedger" ALTER COLUMN phase SET DEFAULT 'FLEX'::"HoldPhase";
+```
+
+#### Fix 2 — confirmedAtLegacy column (was causing 500 on /hold and /truck-hold/my-active)
+```sql
+-- Error was: column TruckHoldLedger.confirmedAtLegacy does not exist
+ALTER TABLE "TruckHoldLedger" ADD COLUMN IF NOT EXISTS "confirmedAtLegacy" TIMESTAMP(3);
+```
+
+### Current DB State (post-fix, 2026-03-22)
+- ✅ `HoldPhase` ENUM exists with values: FLEX, CONFIRMED, EXPIRED, RELEASED
+- ✅ `TruckHoldLedger.phase` is ENUM type (was TEXT)
+- ✅ `TruckHoldLedger.confirmedAtLegacy` column exists (nullable)
+- ✅ All 92 existing rows preserved, phase = FLEX
+- ✅ `[RECONCILIATION] Scan complete` — working every 30s
+- ✅ `/hold` POST returns 200
+- ❌ `_prisma_migrations` table does NOT exist — DB was set up via prisma db push
+
+### How to Connect to Production DB
+```bash
+# RDS is currently PUBLICLY ACCESSIBLE (see DB_SECURITY_CHANGES.md on Desktop)
+PGPASSWORD='N1it2is4h' PGCONNECT_TIMEOUT=15 /opt/homebrew/opt/postgresql@18/bin/psql \
+  --host=weelodb-new.cdqoiou8wm0y.ap-south-1.rds.amazonaws.com \
+  --port=5432 \
+  --username=weelo_admin \
+  --dbname=weelo
+
+# Connection string:
+# postgresql://weelo_admin:N1it2is4h@weelodb-new.cdqoiou8wm0y.ap-south-1.rds.amazonaws.com:5432/weelo
+```
+
+### How to Check CloudWatch Logs
+```bash
+# Get latest log stream
+STREAM=$(aws logs describe-log-streams \
+  --log-group-name weelobackendtask \
+  --order-by LastEventTime \
+  --descending \
+  --max-items 1 \
+  --region ap-south-1 \
+  --output json | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['logStreams'][0]['logStreamName'])")
+
+# Read errors only
+aws logs get-log-events \
+  --log-group-name weelobackendtask \
+  --log-stream-name "$STREAM" \
+  --limit 100 \
+  --region ap-south-1 \
+  --query 'events[*].message' \
+  --output text | tr '\t' '\n' | grep -i "error\|warn\|failed" | tail -30
+```
+
+---
+
+## 🔴 KNOWN REMAINING ISSUES (as of 2026-03-22)
+
+### 1. 🔴 `/api/v1/transporter/dispatch/replay` — 404 (HIGH PRIORITY)
+- **What:** Captain app calls this endpoint but returns 404
+- **Impact:** Captains miss broadcasts if they were offline — can never recover missed bookings
+- **Fix needed:** Find correct route path or add missing route in transporter routes
+
+### 2. 🟡 FleetCache JSON Corruption (MEDIUM)
+- **What:** `[FleetCache] Cache read error: SyntaxError: Unexpected token 'o', "[object Obj"... is not valid JSON`
+- **Root cause:** Redis storing `[object Object]` string — `JSON.stringify()` missing somewhere in `fleet-cache.service.ts`
+- **Impact:** Cache miss every time → DB hit every time → slower performance
+- **Fix needed:** Find where Redis.set() is called without JSON.stringify in `src/shared/services/fleet-cache.service.ts`
+
+### 3. 🟡 Metrics Counters Not Registered (MEDIUM)
+- **What:** `WARN: Counter hold.request.total not found`, `WARN: Histogram hold.latency_ms not found` etc
+- **Root cause:** `truck-hold.service.ts` calls `metrics.incrementCounter('hold.*')` but these counters are never registered in `metrics.service.ts` constructor
+- **Impact:** Noisy WARN logs, monitoring dashboard blind to hold activity
+- **Fix needed:** Register these in `MetricsService` constructor:
+  - Counter: `hold.request.total`
+  - Counter: `hold.success.total`
+  - Counter: `hold.conflict.total`
+  - Counter: `hold.idempotent_replay.total`
+  - Counter: `hold.release.total`
+  - Counter: `hold.cleanup.released_total`
+  - Counter: `hold.idempotency.purged_total`
+  - Histogram: `hold.latency_ms`
+  - Histogram: `confirm.latency_ms`
+
+### 4. 🟢 No `_prisma_migrations` table (LOW — future risk)
+- **What:** DB was set up with `prisma db push` not `prisma migrate deploy`
+- **Impact:** Future schema changes must be done via direct SQL (not prisma migrate). Do NOT run `prisma migrate deploy` — it will fail or corrupt the schema.
+- **Rule:** Always add columns via direct SQL on this DB until migration tracking is set up
+
+---
+
+## ⚠️ CRITICAL RULES FOR THIS DB
+
+1. **NEVER run `prisma migrate deploy`** on production — `_prisma_migrations` doesn't exist, it will fail
+2. **NEVER run `prisma db push`** on production — it may drop/alter columns without warning
+3. **All schema changes = direct SQL** via psql connection above
+4. **Always use `ADD COLUMN IF NOT EXISTS`** and `DO $$ BEGIN...EXCEPTION...END $$` for safety
+5. **Always wrap in BEGIN/COMMIT** transaction and verify before committing
+
+---
+
+## 📋 DB SECURITY STATUS (2026-03-22)
+
+RDS is currently PUBLICLY ACCESSIBLE. See `Desktop/DB_SECURITY_CHANGES.md` for exact steps to secure it back.
+
+**To secure DB (when ready for production):** Tell Rovo Dev: "Secure the DB back as it was before"
+
+---
+
+## 📊 PRODUCTION DB QUICK STATS (2026-03-22)
+
+| Role | Count |
+|------|-------|
+| Transporters | 1 (Nitish, 7889559631) |
+| Drivers | 3 (agaj 9797040090, shivu 9103674650, + 1 test) |
+| Customers | 9 |
+| Vehicles | 7 (all under Nitish) |
+| TruckHoldLedger rows | 92 (all FLEX phase) |
