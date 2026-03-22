@@ -40,6 +40,17 @@ jobs:
         env:
           NODE_ENV: test
 
+      - name: Run database migrations
+        run: |
+          echo "🔄 Applying database migrations..."
+          npx prisma migrate deploy || {
+            echo "❌ Migration failed — blocking deployment to protect production DB"
+            exit 1
+          }
+          echo "✅ Migrations applied successfully"
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:

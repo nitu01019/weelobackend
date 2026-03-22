@@ -33,14 +33,16 @@ fi
 # Check if DATABASE_URL is set and starts with postgres
 if [ -n "$DATABASE_URL" ] && echo "$DATABASE_URL" | grep -q "^postgres"; then
     echo "📦 PostgreSQL DATABASE_URL detected"
-    echo "🔄 Running Prisma db push to sync database schema..."
-    
-    # Run prisma db push to create/update tables
-    # --accept-data-loss is NOT used - this will fail if there's data loss
-    # --skip-generate because we already generated in Docker build
-    npx prisma db push --skip-generate 2>&1 || {
-        echo "⚠️ Prisma db push failed, but continuing..."
-        echo "   Tables may already exist or there's a connection issue"
+    echo "🔄 Running Prisma migrations to sync database schema..."
+
+    # Industry-standard: prisma migrate deploy
+    # - Runs ONLY new migration files (tracks state in _prisma_migrations table)
+    # - Idempotent: safe to run on every container start (skips already-applied)
+    # - Does NOT drop data (unlike db push which can drop columns)
+    # - If migration fails → exit 1 → ECS won't route traffic to broken container
+    npx prisma migrate deploy 2>&1 || {
+        echo "❌ Prisma migrate deploy failed — aborting startup to prevent broken state"
+        exit 1
     }
     
     # Create OtpStore table (for cross-task OTP fallback when Redis is unavailable)
