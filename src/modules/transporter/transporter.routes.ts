@@ -30,6 +30,8 @@ import { generateVehicleKey } from '../../shared/services/vehicle-key.service';
 import { prismaClient } from '../../shared/database/prisma.service';
 import { bookingService } from '../booking/booking.service';
 import { broadcastService } from '../broadcast/broadcast.service';
+import { haversineDistanceKm } from '../../shared/utils/geospatial.utils';
+import { generateVehicleKeyCandidates } from '../../shared/services/vehicle-key.service';
 
 const router = Router();
 
@@ -924,6 +926,234 @@ router.get(
 
     } catch (error: any) {
       logger.error(`Get stats error: ${error.message}`);
+      next(error);
+    }
+  }
+);
+
+/**
+ * GET /api/v1/transporter/dispatch/replay
+ *
+ * Dispatch replay endpoint — returns all active broadcasts near this
+ * transporter that were created within the replay window.
+ *
+ * Called by Captain app BroadcastFlowCoordinator on every reconcile.
+ * Returns eventType="broadcast_created" per active order/booking so
+ * Captain app fetches the full snapshot via getBroadcastSnapshot().
+ *
+ * Industry pattern: Uber RAMEN — event log + snapshot on demand.
+ * Captain app applyReplayEvents() handles "broadcast_created" by calling
+ * GET /bookings/orders/:orderId/broadcast-snapshot (already exists).
+ *
+ * Query params:
+ *   cursor  (Long, ms epoch) — only return events after this time
+ *   limit   (Int, default 50, max 100)
+ *
+ * Role: transporter
+ */
+router.get(
+  '/dispatch/replay',
+  authMiddleware,
+  roleGuard(['transporter']),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const user = (req as any).user;
+      const transporterId: string = user.userId;
+
+      // ─── Rate limit: max 1 call per 3s per transporter ─────────────────
+      // Captain reconcile loop can be aggressive; protect Redis + DB.
+      const replayRateLimitKey = `ratelimit:dispatch-replay:${transporterId}`;
+      const rateLimited = await redisService.get(replayRateLimitKey).catch(() => null);
+      if (rateLimited) {
+        // Return empty success (not error) so Captain app doesn't treat as failure
+        const nowMs = Date.now();
+        return res.json({
+          success: true,
+          data: {
+            cursor: nowMs,
+            snapshotRequired: false,
+            hasMore: false,
+            replayWindowStart: nowMs,
+            replayWindowEnd: nowMs,
+            cursorType: 'timestamp_ms',
+            events: []
+          }
+        });
+      }
+      await redisService.set(replayRateLimitKey, '1', 3).catch(() => {});
+
+      // ─── Parse query params ─────────────────────────────────────────────
+      const cursorParam = req.query.cursor ? Number(req.query.cursor) : null;
+      const limit = Math.min(
+        100,
+        Math.max(1, parseInt((req.query.limit as string) || '50', 10) || 50)
+      );
+
+      const nowMs = Date.now();
+      // Replay window: cursor → now (default: last 30 min, matches deliverMissedBroadcasts)
+      const THIRTY_MIN_MS = 30 * 60 * 1000;
+      const replayWindowStart = (cursorParam && Number.isFinite(cursorParam) && cursorParam > 0)
+        ? cursorParam
+        : nowMs - THIRTY_MIN_MS;
+      const replayWindowEnd = nowMs;
+
+      // ─── Get transporter location from Redis ────────────────────────────
+      // Used for geo-filtering: only include orders with pickup within 150km.
+      // Graceful: if location unknown → include all (transporter just toggled online).
+      const transporterDetails = await availabilityService
+        .getTransporterDetails(transporterId)
+        .catch(() => null);
+
+      // ─── Get transporter's vehicle types ────────────────────────────────
+      const vehicles = await db.getVehiclesByTransporter(transporterId).catch(() => []);
+      const transporterVehicleKeys = new Set<string>();
+      const transporterVehicleTypes = new Set<string>();
+      for (const v of vehicles) {
+        if (!v.isActive) continue;
+        transporterVehicleTypes.add(v.vehicleType.toLowerCase());
+        for (const key of generateVehicleKeyCandidates(v.vehicleType, v.vehicleSubtype || '')) {
+          transporterVehicleKeys.add(key);
+        }
+      }
+
+      // ─── Geo filter helper ──────────────────────────────────────────────
+      const isWithinRadius = (pickupLat: number, pickupLng: number): boolean => {
+        if (!transporterDetails?.latitude || !transporterDetails?.longitude) {
+          return true; // No location in Redis → graceful fallback, include all
+        }
+        return haversineDistanceKm(
+          transporterDetails.latitude,
+          transporterDetails.longitude,
+          pickupLat,
+          pickupLng
+        ) <= 150;
+      };
+
+      // ─── Fetch active Orders (new multi-truck system) ───────────────────
+      // db.getActiveOrders() already filters: expiresAt > now AND trucksFilled < totalTrucks
+      const activeOrders = await db.getActiveOrders().catch(() => []);
+
+      // Batch-fetch truck requests for all orders (single DB round-trip — N+1 avoided)
+      const orderIds = activeOrders.map((o: any) => o.id);
+      const allTruckRequests = orderIds.length > 0
+        ? await prismaClient.truckRequest.findMany({
+            where: {
+              orderId: { in: orderIds },
+              status: 'searching'
+            }
+          }).catch(() => [])
+        : [];
+
+      // Index truck requests by orderId for O(1) lookup
+      const truckRequestsByOrderId = new Map<string, typeof allTruckRequests>();
+      for (const tr of allTruckRequests) {
+        const list = truckRequestsByOrderId.get(tr.orderId) || [];
+        list.push(tr);
+        truckRequestsByOrderId.set(tr.orderId, list);
+      }
+
+      // ─── Fetch active Bookings (legacy single-truck system) ─────────────
+      const activeBookings = await db.getActiveBookingsForTransporter(transporterId).catch(() => []);
+
+      // ─── Build replay events ────────────────────────────────────────────
+      type ReplayEvent = {
+        sequence: number;
+        orderId: string;
+        dispatchRevision: number;
+        orderLifecycleVersion: number;
+        eventType: string;
+        expiresAtMs: number;
+        createdAt: string;
+      };
+      const events: ReplayEvent[] = [];
+
+      // Process Orders
+      for (const order of activeOrders) {
+        // Vehicle type filter: does transporter have any matching truck type?
+        const requests = truckRequestsByOrderId.get(order.id) || [];
+        const hasMatchingVehicle = requests.some((tr: any) => {
+          const keys = generateVehicleKeyCandidates(tr.vehicleType, tr.vehicleSubtype || '');
+          return keys.some((k: string) => transporterVehicleKeys.has(k)) ||
+            transporterVehicleTypes.has((tr.vehicleType || '').toLowerCase());
+        });
+        if (!hasMatchingVehicle) continue;
+
+        // Geo filter: only within 150km of transporter
+        if (!isWithinRadius(order.pickup.latitude, order.pickup.longitude)) continue;
+
+        const createdAtMs = new Date(order.createdAt).getTime();
+        const expiresAtMs = new Date(order.expiresAt).getTime();
+
+        // Cursor filter: only events after cursor
+        if (cursorParam && Number.isFinite(cursorParam) && createdAtMs <= cursorParam) continue;
+
+        events.push({
+          sequence: createdAtMs,
+          orderId: order.id,
+          dispatchRevision: 1,
+          orderLifecycleVersion: 1,
+          eventType: 'broadcast_created',
+          expiresAtMs,
+          createdAt: order.createdAt
+        });
+      }
+
+      // Process legacy Bookings
+      const addedOrderIds = new Set(events.map(e => e.orderId));
+      for (const booking of activeBookings) {
+        // Expiry check (getActiveBookingsForTransporter doesn't filter expiresAt)
+        if (booking.expiresAt && new Date(booking.expiresAt) <= new Date()) continue;
+        if (booking.trucksFilled >= booking.trucksNeeded) continue;
+
+        // Geo filter
+        if (!isWithinRadius(booking.pickup.latitude, booking.pickup.longitude)) continue;
+
+        const createdAtMs = new Date(booking.createdAt).getTime();
+        const expiresAtMs = new Date(booking.expiresAt).getTime();
+
+        // Cursor filter
+        if (cursorParam && Number.isFinite(cursorParam) && createdAtMs <= cursorParam) continue;
+
+        // Avoid duplicate if booking was already included as an Order above
+        if (addedOrderIds.has(booking.id)) continue;
+
+        events.push({
+          sequence: createdAtMs,
+          orderId: booking.id,
+          dispatchRevision: 1,
+          orderLifecycleVersion: 1,
+          eventType: 'broadcast_created',
+          expiresAtMs,
+          createdAt: booking.createdAt
+        });
+      }
+
+      // Sort chronologically, apply limit
+      events.sort((a, b) => a.sequence - b.sequence);
+      const limitedEvents = events.slice(0, limit);
+      const hasMore = events.length > limit;
+
+      logger.info(
+        `[DISPATCH REPLAY] Transporter ${transporterId} → ${limitedEvents.length} events ` +
+        `(orders=${activeOrders.length}, bookings=${activeBookings.length}, ` +
+        `geo=${!!transporterDetails?.latitude}, cursor=${cursorParam ?? 'none'})`
+      );
+
+      res.json({
+        success: true,
+        data: {
+          cursor: replayWindowEnd,     // Captain uses this as next cursor
+          snapshotRequired: false,     // We return full active list — no full re-sync needed
+          hasMore,
+          replayWindowStart,
+          replayWindowEnd,
+          cursorType: 'timestamp_ms',
+          events: limitedEvents
+        }
+      });
+
+    } catch (error: any) {
+      logger.error(`[DISPATCH REPLAY] Failed for transporter`, { error: error.message });
       next(error);
     }
   }

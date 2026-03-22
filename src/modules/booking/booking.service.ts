@@ -1697,13 +1697,48 @@ class BookingService {
 
       // Filter: only unexpired bookings created within last 30 minutes (prevents huge fan-out)
       const thirtyMinsAgo = new Date(now.getTime() - 30 * 60 * 1000);
-      const activeBookings = bookings.filter(b => {
+      let activeBookings = bookings.filter(b => {
         if (!b.expiresAt) return true; // No expiry = still active
         if (new Date(b.expiresAt) <= now) return false; // Already expired
         // Only deliver recent bookings — old ones are unlikely to still need trucks
         const createdAt = b.createdAt ? new Date(b.createdAt) : now;
         return createdAt >= thirtyMinsAgo;
       }).slice(0, 20); // Cap at 20 to prevent unbounded fan-out
+
+      // ===================================================================
+      // GEO FILTER: Only deliver bookings within 150km of transporter's
+      // current location. Graceful fallback: if location not in Redis yet
+      // (transporter just toggled online, GPS ping hasn't arrived), deliver
+      // all — same safe behaviour as before this fix.
+      // Industry standard: Uber's DISCO only replays offers within the
+      // driver's H3 k-ring. We use haversine (already imported) as it
+      // works across all booking types (legacy + order).
+      // ===================================================================
+      const transporterGeoDetails = await availabilityService
+        .getTransporterDetails(transporterId)
+        .catch(() => null);
+
+      if (transporterGeoDetails?.latitude && transporterGeoDetails?.longitude) {
+        const beforeGeo = activeBookings.length;
+        activeBookings = activeBookings.filter(b => {
+          const distKm = haversineDistanceKm(
+            transporterGeoDetails.latitude,
+            transporterGeoDetails.longitude,
+            b.pickup.latitude,
+            b.pickup.longitude
+          );
+          return distKm <= 150;
+        });
+        logger.info(
+          `[RE-BROADCAST] Geo-filtered: ${beforeGeo} → ${activeBookings.length} ` +
+          `bookings within 150km of transporter ${transporterId}`
+        );
+      } else {
+        logger.info(
+          `[RE-BROADCAST] No Redis location for transporter ${transporterId} ` +
+          `— skipping geo filter (graceful fallback)`
+        );
+      }
 
       if (activeBookings.length === 0) {
         logger.info(`[RE-BROADCAST] Transporter ${transporterId} came online — 0 active bookings to deliver`);
