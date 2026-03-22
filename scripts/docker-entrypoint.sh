@@ -36,10 +36,26 @@ if [ -n "$DATABASE_URL" ] && echo "$DATABASE_URL" | grep -q "^postgres"; then
     echo "🔄 Running Prisma migrations to sync database schema..."
 
     # Industry-standard: prisma migrate deploy
-    # - Runs ONLY new migration files (tracks state in _prisma_migrations table)
-    # - Idempotent: safe to run on every container start (skips already-applied)
-    # - Does NOT drop data (unlike db push which can drop columns)
-    # - If migration fails → exit 1 → ECS won't route traffic to broken container
+    # - Tracks applied migrations in _prisma_migrations table
+    # - Idempotent: skips already-applied migrations
+    # - Does NOT drop data (unlike db push)
+    # - If DB has no _prisma_migrations table yet → baseline first, then deploy
+
+    # Step 1: Check if _prisma_migrations table exists (first-time setup)
+    MIGRATION_TABLE_EXISTS=$(npx prisma migrate status 2>&1 | grep -c "No migration" || true)
+
+    if echo "$(npx prisma migrate status 2>&1)" | grep -q "P3005\|The database schema is not empty"; then
+        echo "📋 Existing DB detected — baselining previous migrations..."
+        # Mark all pre-existing migrations as already applied (they were done via db push)
+        npx prisma migrate resolve --applied "20260219_add_broadcast_lifecycle_states" 2>&1 || true
+        npx prisma migrate resolve --applied "20260225_add_truckrequest_notified_transporters_gin_index" 2>&1 || true
+        npx prisma migrate resolve --applied "20260228_phase2_reliability_core" 2>&1 || true
+        npx prisma migrate resolve --applied "20260228_phase4_hold_reliability" 2>&1 || true
+        npx prisma migrate resolve --applied "20260228_phase5_cancel_reliability" 2>&1 || true
+        echo "✅ Baseline complete — existing migrations marked as applied"
+    fi
+
+    # Step 2: Deploy any NEW migrations (e.g. 20260321_hold_phase_system)
     npx prisma migrate deploy 2>&1 || {
         echo "❌ Prisma migrate deploy failed — aborting startup to prevent broken state"
         exit 1
