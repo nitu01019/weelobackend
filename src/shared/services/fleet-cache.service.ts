@@ -178,10 +178,10 @@ class FleetCacheService {
     // Check cache first (unless force refresh)
     if (!forceRefresh) {
       try {
-        const cached = await cacheService.get(cacheKey);
+        const cached = await cacheService.get<CachedVehicle[]>(cacheKey);
         if (cached) {
           logger.debug(`[FleetCache] HIT: vehicles for ${transporterId.substring(0, 8)}`);
-          return JSON.parse(cached);
+          return cached;
         }
       } catch (error) {
         logger.warn(`[FleetCache] Cache read error: ${error}`);
@@ -218,7 +218,7 @@ class FleetCacheService {
 
     // Store in cache
     try {
-      await cacheService.set(cacheKey, JSON.stringify(vehicles), CACHE_TTL.VEHICLE_LIST);
+      await cacheService.set(cacheKey, vehicles, CACHE_TTL.VEHICLE_LIST);
       logger.debug(`[FleetCache] Cached ${vehicles.length} vehicles for ${transporterId.substring(0, 8)}`);
     } catch (error) {
       logger.warn(`[FleetCache] Cache write error: ${error}`);
@@ -244,10 +244,10 @@ class FleetCacheService {
 
     // Check cache first
     try {
-      const cached = await cacheService.get(cacheKey);
+      const cached = await cacheService.get<CachedVehicle[]>(cacheKey);
       if (cached) {
         logger.debug(`[FleetCache] HIT: ${vehicleType} vehicles for ${transporterId.substring(0, 8)}`);
-        return JSON.parse(cached);
+        return cached;
       }
     } catch (error) {
       logger.warn(`[FleetCache] Cache read error: ${error}`);
@@ -265,7 +265,7 @@ class FleetCacheService {
 
     // Store filtered result in cache
     try {
-      await cacheService.set(cacheKey, JSON.stringify(filtered), CACHE_TTL.VEHICLE_LIST);
+      await cacheService.set(cacheKey, filtered, CACHE_TTL.VEHICLE_LIST);
     } catch (error) {
       logger.warn(`[FleetCache] Cache write error: ${error}`);
     }
@@ -302,9 +302,9 @@ class FleetCacheService {
     const cacheKey = CACHE_KEYS.VEHICLE(vehicleId);
 
     try {
-      const cached = await cacheService.get(cacheKey);
+      const cached = await cacheService.get<CachedVehicle>(cacheKey);
       if (cached) {
-        return JSON.parse(cached);
+        return cached;
       }
     } catch (error) {
       logger.warn(`[FleetCache] Cache read error: ${error}`);
@@ -330,7 +330,7 @@ class FleetCacheService {
     };
 
     try {
-      await cacheService.set(cacheKey, JSON.stringify(cachedVehicle), CACHE_TTL.INDIVIDUAL);
+      await cacheService.set(cacheKey, cachedVehicle, CACHE_TTL.INDIVIDUAL);
     } catch (error) {
       logger.warn(`[FleetCache] Cache write error: ${error}`);
     }
@@ -353,10 +353,10 @@ class FleetCacheService {
 
     if (!forceRefresh) {
       try {
-        const cached = await cacheService.get(cacheKey);
+        const cached = await cacheService.get<CachedDriver[]>(cacheKey);
         if (cached) {
           logger.debug(`[FleetCache] HIT: drivers for ${transporterId.substring(0, 8)}`);
-          return JSON.parse(cached);
+          return cached;
         }
       } catch (error) {
         logger.warn(`[FleetCache] Cache read error: ${error}`);
@@ -474,7 +474,7 @@ class FleetCacheService {
     }));
 
     try {
-      await cacheService.set(cacheKey, JSON.stringify(drivers), CACHE_TTL.DRIVER_LIST);
+      await cacheService.set(cacheKey, drivers, CACHE_TTL.DRIVER_LIST);
       logger.debug(`[FleetCache] Cached ${drivers.length} drivers for ${transporterId.substring(0, 8)}`);
     } catch (error) {
       logger.warn(`[FleetCache] Cache write error: ${error}`);
@@ -498,9 +498,9 @@ class FleetCacheService {
     const cacheKey = CACHE_KEYS.DRIVER(driverId);
 
     try {
-      const cached = await cacheService.get(cacheKey);
+      const cached = await cacheService.get<CachedDriver>(cacheKey);
       if (cached) {
-        return JSON.parse(cached);
+        return cached;
       }
     } catch (error) {
       logger.warn(`[FleetCache] Cache read error: ${error}`);
@@ -535,7 +535,7 @@ class FleetCacheService {
     };
 
     try {
-      await cacheService.set(cacheKey, JSON.stringify(cached), CACHE_TTL.INDIVIDUAL);
+      await cacheService.set(cacheKey, cached, CACHE_TTL.INDIVIDUAL);
     } catch (error) {
       logger.warn(`[FleetCache] Cache write error: ${error}`);
     }
@@ -559,9 +559,9 @@ class FleetCacheService {
     const cacheKey = CACHE_KEYS.AVAILABILITY_SNAPSHOT(transporterId, vehicleType);
 
     try {
-      const cached = await cacheService.get(cacheKey);
+      const cached = await cacheService.get<AvailabilitySnapshot>(cacheKey);
       if (cached) {
-        return JSON.parse(cached);
+        return cached;
       }
     } catch (error) {
       logger.warn(`[FleetCache] Cache read error: ${error}`);
@@ -588,7 +588,7 @@ class FleetCacheService {
     };
 
     try {
-      await cacheService.set(cacheKey, JSON.stringify(snapshot), CACHE_TTL.SNAPSHOT);
+      await cacheService.set(cacheKey, snapshot, CACHE_TTL.SNAPSHOT);
     } catch (error) {
       logger.warn(`[FleetCache] Cache write error: ${error}`);
     }
@@ -706,14 +706,13 @@ class FleetCacheService {
     const cacheKey = CACHE_KEYS.VEHICLE(vehicleId);
 
     try {
-      const cached = await cacheService.get(cacheKey);
-      if (cached) {
-        const vehicle: CachedVehicle = JSON.parse(cached);
+      const vehicle = await cacheService.get<CachedVehicle>(cacheKey);
+      if (vehicle) {
         vehicle.status = status;
         vehicle.currentTripId = tripId;
         vehicle.lastUpdated = new Date().toISOString();
 
-        await cacheService.set(cacheKey, JSON.stringify(vehicle), CACHE_TTL.INDIVIDUAL);
+        await cacheService.set(cacheKey, vehicle, CACHE_TTL.INDIVIDUAL);
 
         // Also invalidate list caches for this transporter
         await this.invalidateVehicleCache(vehicle.transporterId);
@@ -736,14 +735,13 @@ class FleetCacheService {
     const cacheKey = CACHE_KEYS.DRIVER(driverId);
 
     try {
-      const cached = await cacheService.get(cacheKey);
-      if (cached) {
-        const driver: CachedDriver = JSON.parse(cached);
+      const driver = await cacheService.get<CachedDriver>(cacheKey);
+      if (driver) {
         driver.isAvailable = isAvailable;
         driver.currentTripId = tripId;
         driver.lastUpdated = new Date().toISOString();
 
-        await cacheService.set(cacheKey, JSON.stringify(driver), CACHE_TTL.INDIVIDUAL);
+        await cacheService.set(cacheKey, driver, CACHE_TTL.INDIVIDUAL);
 
         // Also invalidate list caches for this transporter
         await this.invalidateDriverCache(driver.transporterId);
