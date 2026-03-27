@@ -14,7 +14,7 @@ import { Prisma } from '@prisma/client';
 import { db, BookingRecord, AssignmentRecord } from '../../shared/database/db';
 import { AppError } from '../../shared/types/error.types';
 import { logger } from '../../shared/services/logger.service';
-import { emitToUser, emitToUsers, emitToRoom, emitToAllTransporters, emitToAll } from '../../shared/services/socket.service';
+import { emitToUser, emitToUsers, emitToRoom, emitToAllTransporters, emitToAll, SocketEvent } from '../../shared/services/socket.service';
 import { sendPushNotification } from '../../shared/services/fcm.service';
 import { redisService } from '../../shared/services/redis.service';
 import { prismaClient, withDbTimeout } from '../../shared/database/prisma.service';
@@ -427,13 +427,19 @@ class BroadcastService {
       lockAcquired = lock.acquired;
       if (!lockAcquired) {
         this.incrementAcceptMetric('lockContention');
-        logger.warn('[BroadcastAccept] Lock contention detected', {
+        logger.warn('[BroadcastAccept] Lock contention — returning 429', {
           broadcastId,
           vehicleId,
           driverId
         });
+        // FIX #8: Return retryable 429 instead of falling through to DB transaction.
+        // Client already has idempotency key — safe to retry after 2s.
+        // DB Serializable isolation is the safety net for Redis failures (catch block below).
+        throw new AppError(429, 'LOCK_CONTENTION',
+          'Another accept is being processed for this broadcast. Please retry in 2 seconds.');
       }
     } catch (error: any) {
+      if (error instanceof AppError) throw error;  // Re-throw intentional 429
       logger.warn('[BroadcastAccept] Lock acquisition failed, proceeding with transactional safety', {
         broadcastId,
         vehicleId,
@@ -705,7 +711,7 @@ class BroadcastService {
           message: `New trip assigned! ${pickup.address || 'Pickup'} → ${drop.address || 'Drop'}`
         };
 
-        emitToUser(driverId, 'trip_assigned', driverNotification);
+        emitToUser(driverId, SocketEvent.TRIP_ASSIGNED, driverNotification);
 
         sendPushNotification(driverId, {
           title: '🚛 New Trip Assigned!',
@@ -745,8 +751,8 @@ class BroadcastService {
           message: `Truck ${result.trucksConfirmed}/${booking.trucksNeeded} confirmed! ${vehicle?.vehicleNumber || 'Vehicle'} assigned.`
         };
 
-        emitToUser(booking.customerId, 'truck_confirmed', customerNotification);
-        emitToRoom(`booking:${broadcastId}`, 'booking_updated', {
+        emitToUser(booking.customerId, SocketEvent.TRUCK_CONFIRMED, customerNotification);
+        emitToRoom(`booking:${broadcastId}`, SocketEvent.BOOKING_UPDATED, {
           bookingId: broadcastId,
           status: booking.status,
           trucksFilled: result.trucksConfirmed,
@@ -822,8 +828,18 @@ class BroadcastService {
   async declineBroadcast(broadcastId: string, params: DeclineBroadcastParams) {
     const { actorId, reason, notes } = params;
 
-    // Just log the decline - no need to store for now
-    logger.info(`Broadcast ${broadcastId} declined by ${actorId}. Reason: ${reason}`, { notes });
+    // FIX #7: Track decline in Redis SET for analytics + re-broadcast prevention
+    // TTL = 1 hour (matches booking max lifetime)
+    const declineKey = `broadcast:declined:${broadcastId}`;
+    await redisService.sAdd(declineKey, actorId).catch((err: any) => {
+      logger.warn('[declineBroadcast] Redis sAdd failed', { broadcastId, actorId, error: err.message });
+    });
+    await redisService.expire(declineKey, 3600).catch(() => {});
+
+    logger.info(`Broadcast ${broadcastId} declined by ${actorId}. Reason: ${reason}`, {
+      notes,
+      declineTracked: true
+    });
 
     return { success: true };
   }
@@ -864,6 +880,14 @@ class BroadcastService {
    * Create a new broadcast (from transporter)
    */
   async createBroadcast(params: CreateBroadcastParams) {
+    // FIX #3: DEPRECATED — This method uses hardcoded mock values and does NOT
+    // actually find/notify drivers. The real broadcast path is:
+    //   booking.service.ts → createBooking() → progressive radius → emitToUser()
+    // This endpoint remains for backward compatibility but logs a deprecation warning.
+    logger.warn('[DEPRECATED] createBroadcast() called — use booking.service.ts createBooking() instead', {
+      transporterId: params.transporterId
+    });
+
     const broadcastId = uuidv4();
 
     // Get customer info
@@ -892,7 +916,7 @@ class BroadcastService {
       vehicleSubtype: params.vehicleSubtype || '',
       trucksNeeded: params.totalTrucksNeeded,
       trucksFilled: 0,
-      distanceKm: 0, // Would be calculated
+      distanceKm: 0,
       pricePerTruck: params.farePerTruck,
       totalAmount: params.farePerTruck * params.totalTrucksNeeded,
       goodsType: params.goodsType,
@@ -904,10 +928,10 @@ class BroadcastService {
 
     const createdBooking = await db.createBooking(booking);
 
-    // TODO: Send push notifications to drivers
-    const notifiedDrivers = 10; // Mock number
+    // DEPRECATED: No drivers actually notified via this path
+    const notifiedDrivers = 0;
 
-    logger.info(`Broadcast ${broadcastId} created, ${notifiedDrivers} drivers notified`);
+    logger.info(`[DEPRECATED] Broadcast ${broadcastId} created via legacy endpoint, 0 drivers notified`);
 
     return {
       broadcast: this.mapBookingToBroadcast(createdBooking),
@@ -923,63 +947,24 @@ class BroadcastService {
   // ===========================================================================
 
   /**
-   * Check and expire old broadcasts
+   * Check and expire old orders (multi-vehicle system)
    * Called periodically (every 5 seconds) by the expiry job
    * 
-   * SCALABILITY: O(n) where n = active broadcasts. For millions of users,
-   * use Redis sorted set with expiry times for O(log n) performance.
+   * NOTE: Booking expiry is handled by booking.service.ts → processExpiredBookings()
+   * using Redis timers (O(m) where m = expired only). This method only handles
+   * ORDER expiry which is not covered by booking.service.ts.
    * 
-   * DISTRIBUTED LOCK: Each expired booking/order is locked individually
+   * DISTRIBUTED LOCK: Each expired order is locked individually
    * to prevent duplicate processing across multiple ECS instances.
-   * Same pattern as processExpiredBookings() in booking.service.ts.
    */
   async checkAndExpireBroadcasts(): Promise<number> {
     const now = new Date();
     let expiredCount = 0;
 
-    // Get all active bookings
-    const allBookings = db.getAllBookings ? await db.getAllBookings() : [];
-
-    for (const booking of allBookings) {
-      // Check if expired and still active
-      if (
-        booking.status === 'active' ||
-        booking.status === 'partially_filled'
-      ) {
-        const expiresAt = new Date(booking.expiresAt);
-        if (expiresAt < now) {
-          // Distributed lock: prevent duplicate processing across ECS instances
-          const lockKey = `lock:broadcast-expiry:${booking.id}`;
-          const lock = await redisService.acquireLock(lockKey, 'broadcast-expiry-checker', 15);
-
-          if (!lock.acquired) {
-            // Another instance is already processing this booking expiry
-            continue;
-          }
-
-          try {
-            // Mark as expired in database
-            await db.updateBooking(booking.id, { status: 'expired' });
-
-            // CRITICAL: Notify notified transporters to remove this broadcast
-            await this.emitBroadcastExpired(booking.id, 'timeout');
-
-            // Notify customer that their request expired
-            this.notifyCustomerBroadcastExpired(booking);
-
-            expiredCount++;
-            logger.info(`⏰ Broadcast ${booking.id} expired - notified all transporters`);
-          } catch (error: any) {
-            logger.error('Failed to process expired broadcast', {
-              bookingId: booking.id,
-              error: error.message
-            });
-          } finally {
-            await redisService.releaseLock(lockKey, 'broadcast-expiry-checker').catch(() => { });
-          }
-        }
-      }
-    }
+    // FIX #9: BOOKING EXPIRY is already handled by booking.service.ts → processExpiredBookings()
+    // which uses Redis timers (O(m) where m = expired only, not ALL bookings).
+    // The previous O(n) scan of ALL bookings every 5s was duplicate work and a DB bottleneck.
+    // Only ORDER expiry is handled here (not covered by booking.service.ts).
 
     // Also check orders (multi-vehicle system)
     let allOrders: any[] = [];

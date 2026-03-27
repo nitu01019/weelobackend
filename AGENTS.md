@@ -201,6 +201,18 @@ curl -s http://weelo-alb-380596483.ap-south-1.elb.amazonaws.com/health | python3
 
 ## 🔄 Session Log
 
+### 2026-03-23 — Transporter to Driver Pending-Assignment Hotfix ✅ LOCAL
+
+- ✅ `truck-hold.service.ts` — removed early `vehicle.status = in_transit` / live availability promotion from `confirm-with-assignments`
+- ✅ `truck-hold.service.ts` — added active-vehicle assignment validation alongside existing active-driver validation, including transactional re-checks
+- ✅ `assignment.service.ts` — multi-truck decline/timeout/cancel now restore truck-request assignment metadata consistently and decrement `order.trucksFilled` when `bookingId` is absent
+- ✅ `assignment.service.ts` — booking-room emits now fall back to `orderId` when legacy `bookingId` is absent
+- ✅ `progress.service.ts` — `GET /truck-hold/order-assignments/:orderId` now returns pending/declined/in-progress rows for transporter tracking instead of accepted-only rows
+- ✅ `tsc --noEmit` — 0 errors
+- ✅ `npx jest --testPathPattern="health|toggle" --forceExit` — 54/54 passed
+- ℹ️ Android app repo updated separately in the paired workspace to add global driver assignment ingress + transporter tracking route/screen
+- 🔄 Changes are local only in this session (no commit/push performed)
+
 ### 2026-02-20 — CodeRabbit Round 8 Fixes ✅ PUSHED
 
 - ✅ `assignment.service.ts:218` — CRITICAL: `db.createAssignment` inside Serializable `$transaction` replaced with `tx.assignment.create` — now actually uses tx context, preventing concurrent duplicate assignments

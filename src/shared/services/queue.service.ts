@@ -749,7 +749,15 @@ class QueueService {
     if (isProduction && redisQueueEnabled) {
       this.queue = new RedisQueue();
       this.isRedisMode = true;
-      logger.info('✅ Queue Service: Using Redis Queue (Production Mode)');
+      // FIX #11: Log BRPOP connection usage so operators can monitor Redis connection saturation
+      const totalQueues = Object.keys(QueueService.QUEUES).length;
+      logger.info('✅ Queue Service: Using Redis Queue (Production Mode)', {
+        totalQueues,
+        defaultWorkersPerQueue: 2,
+        trackingWorkers: 4,
+        estimatedBlockedConnections: (2 * totalQueues) + 2, // +2 for tracking extra workers
+        killSwitch: 'Set REDIS_QUEUE_ENABLED=false to disable'
+      });
     } else {
       this.queue = new InMemoryQueue();
       this.isRedisMode = false;

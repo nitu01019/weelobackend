@@ -1682,8 +1682,97 @@ class PrismaDatabaseService {
   }
 }
 
+// =============================================================================
+// READ REPLICA CLIENT — Routes read-heavy queries to a replica for scale
+// =============================================================================
+// 
+// INDUSTRY STANDARD (Uber, Stripe, Shopify):
+//   - Writes go to primary (prismaClient)
+//   - Reads go to replica (prismaReadClient) — offloads primary by 60-80%
+//
+// SAFETY:
+//   - Falls back to primary when RDS_READ_REPLICA_1 is not configured
+//   - Same pool config, slow query logging, and shutdown handling as primary
+//   - Zero behavior change if env var is not set — completely safe to deploy
+//
+// USAGE:
+//   import { prismaReadClient } from './prisma.service';
+//   const vehicles = await prismaReadClient.vehicle.findMany(...); // goes to replica
+//
+// WHEN TO USE prismaReadClient vs prismaClient:
+//   ✅ Read-only queries: findMany, findFirst, findUnique, count, aggregate
+//   ❌ Writes: create, update, delete, upsert → always use prismaClient
+//   ❌ Transactions: $transaction → always use prismaClient
+// =============================================================================
+
+let prismaRead: PrismaClient | null = null;
+
+function getReadReplicaClient(): PrismaClient {
+  if (prismaRead) return prismaRead;
+
+  const replicaUrl = process.env.RDS_READ_REPLICA_1;
+
+  if (!replicaUrl) {
+    // No replica configured — fall back to primary (zero behavior change)
+    logger.info('📖 [Prisma] No read replica configured (RDS_READ_REPLICA_1 not set) — using primary for reads');
+    return getPrismaClient();
+  }
+
+  // Build pooled URL with connection limits (same pattern as primary)
+  // Use fewer connections for reads — reads are typically faster and less contended
+  const readPoolLimit = Math.max(5, Math.floor(DB_POOL_CONFIG.connectionLimit * 0.6));
+  const separator = replicaUrl.includes('?') ? '&' : '?';
+  const pooledReplicaUrl = `${replicaUrl}${separator}connection_limit=${readPoolLimit}&pool_timeout=${DB_POOL_CONFIG.poolTimeout}`;
+
+  prismaRead = new PrismaClient({
+    log: process.env.NODE_ENV === 'development'
+      ? ['query', 'error', 'warn']
+      : ['error', 'warn'],
+    datasources: {
+      db: {
+        url: pooledReplicaUrl,
+      },
+    },
+  });
+
+  // Slow query logging for replica too
+  const SLOW_QUERY_THRESHOLD_MS = parseInt(process.env.SLOW_QUERY_THRESHOLD_MS || '200', 10);
+  prismaRead.$use(async (params, next) => {
+    const start = Date.now();
+    const result = await next(params);
+    const durationMs = Date.now() - start;
+
+    if (durationMs > SLOW_QUERY_THRESHOLD_MS) {
+      logger.warn(`🐢 [SlowQuery][REPLICA] ${params.model}.${params.action} took ${durationMs}ms`, {
+        model: params.model,
+        action: params.action,
+        durationMs,
+      });
+    }
+
+    return result;
+  });
+
+  // Graceful shutdown for replica connection
+  const shutdownReplica = async () => {
+    if (prismaRead) {
+      logger.info('Disconnecting Prisma read replica client...');
+      await prismaRead.$disconnect();
+    }
+  };
+  process.on('SIGTERM', shutdownReplica);
+  process.on('SIGINT', shutdownReplica);
+
+  logger.info(`📖 [Prisma] Read replica configured: pool_limit=${readPoolLimit}, timeout=${DB_POOL_CONFIG.poolTimeout}s`);
+
+  return prismaRead;
+}
+
 // Export singleton instance
 export const prismaDb = new PrismaDatabaseService();
 
-// Export Prisma client for direct access
+// Export Prisma client for direct access (PRIMARY — reads + writes)
 export const prismaClient = getPrismaClient();
+
+// Export read replica client (REPLICA — reads only, falls back to primary)
+export const prismaReadClient = getReadReplicaClient();

@@ -50,7 +50,7 @@ jest.mock('../../../shared/database/db', () => ({
 
 jest.mock('uuid', () => ({
   v4: jest.fn(() => 'lock-token')
-}));
+}), { virtual: true });
 
 import { otpChallengeService } from '../otp-challenge.service';
 

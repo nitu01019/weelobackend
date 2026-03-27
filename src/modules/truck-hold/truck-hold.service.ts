@@ -78,12 +78,13 @@ import { Prisma } from '@prisma/client';
 import { db } from '../../shared/database/db';
 import { prismaClient, withDbTimeout, AssignmentStatus, OrderStatus, TruckRequestStatus, VehicleStatus } from '../../shared/database/prisma.service';
 import { logger } from '../../shared/services/logger.service';
-import { socketService } from '../../shared/services/socket.service';
+import { socketService, SocketEvent } from '../../shared/services/socket.service';
 import { redisService } from '../../shared/services/redis.service';
 import { liveAvailabilityService } from '../../shared/services/live-availability.service';
 import { queueService } from '../../shared/services/queue.service';
 import { metrics } from '../../shared/monitoring/metrics.service';
 import { fcmService } from '../../shared/services/fcm.service';
+import { driverService } from '../driver/driver.service';
 
 // =============================================================================
 // TYPES & INTERFACES
@@ -1033,7 +1034,7 @@ class TruckHoldService {
       // =========================================================================
       const failedAssignments: Array<{ vehicleId: string; reason: string }> = [];
       const validatedVehicles: Array<{ vehicle: any; driver: any; truckRequestId: string }> = [];
-      const activeDriverStatuses: AssignmentStatus[] = [
+      const activeAssignmentStatuses: AssignmentStatus[] = [
         AssignmentStatus.pending,
         AssignmentStatus.driver_accepted,
         AssignmentStatus.en_route_pickup,
@@ -1047,7 +1048,7 @@ class TruckHoldService {
       const uniqueVehicleIds = Array.from(new Set(vehicleIds));
       const uniqueDriverIds = Array.from(new Set(driverIds));
 
-      const [vehicleRows, driverRows, activeDriverAssignments] = await Promise.all([
+      const [vehicleRows, driverRows, activeDriverAssignments, activeVehicleAssignments] = await Promise.all([
         prismaClient.vehicle.findMany({
           where: { id: { in: uniqueVehicleIds } },
           select: {
@@ -1072,10 +1073,20 @@ class TruckHoldService {
         prismaClient.assignment.findMany({
           where: {
             driverId: { in: uniqueDriverIds },
-            status: { in: activeDriverStatuses }
+            status: { in: activeAssignmentStatuses }
           },
           select: {
             driverId: true,
+            tripId: true
+          }
+        }),
+        prismaClient.assignment.findMany({
+          where: {
+            vehicleId: { in: uniqueVehicleIds },
+            status: { in: activeAssignmentStatuses }
+          },
+          select: {
+            vehicleId: true,
             tripId: true
           }
         })
@@ -1084,6 +1095,7 @@ class TruckHoldService {
       const vehicleMap = new Map(vehicleRows.map((vehicle) => [vehicle.id, vehicle]));
       const driverMap = new Map(driverRows.map((driver) => [driver.id, driver]));
       const activeDriverMap = new Map(activeDriverAssignments.map((assignment) => [assignment.driverId, assignment]));
+      const activeVehicleMap = new Map(activeVehicleAssignments.map((assignment) => [assignment.vehicleId, assignment]));
 
       for (let i = 0; i < assignments.length; i++) {
         const { vehicleId, driverId } = assignments[i];
@@ -1116,6 +1128,15 @@ class TruckHoldService {
           failedAssignments.push({
             vehicleId,
             reason: `Vehicle is ${vehicle.status}${vehicle.currentTripId ? ` (Trip: ${vehicle.currentTripId})` : ''}`
+          });
+          continue;
+        }
+
+        const activeVehicleAssignment = activeVehicleMap.get(vehicleId);
+        if (activeVehicleAssignment) {
+          failedAssignments.push({
+            vehicleId,
+            reason: `Vehicle ${vehicle.vehicleNumber} is already reserved for trip ${activeVehicleAssignment.tripId}`
           });
           continue;
         }
@@ -1220,22 +1241,57 @@ class TruckHoldService {
           throw new Error('TRUCK_REQUEST_NOT_FOUND');
         }
 
-        const txBusyDrivers = await tx.assignment.findMany({
-          where: {
-            driverId: { in: uniqueDriverIds },
-            status: { in: activeDriverStatuses }
-          },
+        const txVehicles = await tx.vehicle.findMany({
+          where: { id: { in: uniqueVehicleIds } },
           select: {
-            driverId: true,
-            tripId: true
+            id: true,
+            transporterId: true,
+            status: true,
+            currentTripId: true
           }
         });
+        const txVehicleMap = new Map(txVehicles.map((vehicle) => [vehicle.id, vehicle]));
+
+        const [txBusyDrivers, txBusyVehicles] = await Promise.all([
+          tx.assignment.findMany({
+            where: {
+              driverId: { in: uniqueDriverIds },
+              status: { in: activeAssignmentStatuses }
+            },
+            select: {
+              driverId: true,
+              tripId: true
+            }
+          }),
+          tx.assignment.findMany({
+            where: {
+              vehicleId: { in: uniqueVehicleIds },
+              status: { in: activeAssignmentStatuses }
+            },
+            select: {
+              vehicleId: true,
+              tripId: true
+            }
+          })
+        ]);
         if (txBusyDrivers.length > 0) {
           const busyDriver = txBusyDrivers[0];
           throw new Error(`DRIVER_BUSY:${busyDriver.driverId}:${busyDriver.tripId}`);
         }
+        if (txBusyVehicles.length > 0) {
+          const busyVehicle = txBusyVehicles[0];
+          throw new Error(`VEHICLE_RESERVED:${busyVehicle.vehicleId}:${busyVehicle.tripId}`);
+        }
 
         for (const { vehicle, driver, truckRequestId } of validatedVehicles) {
+          const txVehicle = txVehicleMap.get(vehicle.id);
+          if (!txVehicle || txVehicle.transporterId !== transporterId) {
+            throw new Error(`VEHICLE_NOT_IN_FLEET:${vehicle.id}`);
+          }
+          if (txVehicle.status !== VehicleStatus.available) {
+            throw new Error(`VEHICLE_UNAVAILABLE:${vehicle.id}:${txVehicle.currentTripId || ''}`);
+          }
+
           const truckRequest = txTruckRequestMap.get(truckRequestId);
           if (!truckRequest || truckRequest.orderId !== hold.orderId) {
             throw new Error(`TRUCK_REQUEST_NOT_FOUND:${truckRequestId}`);
@@ -1246,23 +1302,6 @@ class TruckHoldService {
 
           const assignmentId = uuidv4();
           const tripId = uuidv4();
-
-          const vehicleUpdated = await tx.vehicle.updateMany({
-            where: {
-              id: vehicle.id,
-              transporterId,
-              status: VehicleStatus.available
-            },
-            data: {
-              status: VehicleStatus.in_transit,
-              currentTripId: tripId,
-              assignedDriverId: driver.id,
-              lastStatusChange: now
-            }
-          });
-          if (vehicleUpdated.count === 0) {
-            throw new Error(`VEHICLE_UNAVAILABLE:${vehicle.id}`);
-          }
 
           const requestUpdated = await tx.truckRequest.updateMany({
             where: {
@@ -1348,14 +1387,6 @@ class TruckHoldService {
       const newTrucksFilled = confirmedAssignments.newTrucksFilled;
       const newStatus = confirmedAssignments.newStatus;
 
-      // Live availability: vehicles went available → in_transit AFTER transaction committed
-      for (const assignment of confirmedAssignments.assignments) {
-        const vKey = assignment.vehicle.vehicleKey || '';
-        liveAvailabilityService.onVehicleStatusChange(
-          transporterId, vKey, 'available', 'in_transit'
-        ).catch(() => { });
-      }
-
       // =========================================================================
       // STEP 4: OPTIMIZED BROADCAST NOTIFICATIONS (100K SCALE READY)
       // =========================================================================
@@ -1370,6 +1401,9 @@ class TruckHoldService {
           `   ✅ Assignment created: ${assignment.vehicle.vehicleNumber} → ${assignment.driver.name} (Trip: ${assignment.tripId.substring(0, 8)})`
         );
       }
+
+      // Driver response timeout — matches assignment.service.ts config
+      const DRIVER_TIMEOUT_MS = parseInt(process.env.ASSIGNMENT_TIMEOUT_MS || '30000', 10);
 
       // OPTIMIZATION 1: Single room broadcast to all drivers
       // All drivers receive their assignment in one message and filter by driverId
@@ -1390,7 +1424,7 @@ class TruckHoldService {
         customerName: order.customerName,
         customerPhone: order.customerPhone,
         assignedAt: now,
-        expiresAt: new Date(Date.now() + 60000).toISOString(),
+        expiresAt: new Date(Date.now() + DRIVER_TIMEOUT_MS).toISOString(),
         message: `New trip assigned! ${order.pickup.address} → ${order.drop.address}`
       }));
 
@@ -1414,23 +1448,23 @@ class TruckHoldService {
           customerName: order.customerName,
           customerPhone: order.customerPhone,
           assignedAt: now,
-          expiresAt: new Date(Date.now() + 60000).toISOString(),
+          expiresAt: new Date(Date.now() + DRIVER_TIMEOUT_MS).toISOString(),
           message: `New trip assigned! ${order.pickup.address} → ${order.drop.address}`
         };
 
+        // Industry Standard: Check driver is online before assigning trip
+        // Uber/Ola Pattern: Verify driver presence to avoid failed notifications
+        const isDriverOnline = await driverService.isDriverOnline(assignment.driver.id);
+        if (!isDriverOnline) {
+          logger.warn(`⚠️  Driver online check failed: ${assignment.driver.id} (${assignment.driver.name}) is offline - skipping trip_assigned notification`);
+          // Continue to next driver - don't emit to offline driver
+          continue;
+        }
+
         // Individual emit for backward compatibility with current Android app
-        socketService.emitToUser(assignment.driver.id, 'trip_assigned', driverNotification);
+        socketService.emitToUser(assignment.driver.id, SocketEvent.TRIP_ASSIGNED, driverNotification);
       }
       logger.info(`   📢 Individual trip_assigned events sent to ${assignmentsData.length} driver(s) (backward compatible)`);
-
-      // OPTIMIZATION: Also send batch event for future app updates (optional, additive only)
-      // socketService.emitToTransporterDrivers(transporterId, 'trip_assigned_batch', {
-      //   transporterId,
-      //   orderId: order.id,
-      //   assignments: assignmentsData,
-      //   totalAssignments: assignmentsData.length
-      // });
-      // logger.info(`   📢 Batch trip_assigned_batch event ready for future app updates`);
 
       // OPTIMIZATION 2: Batch FCM push (up to 500 tokens per request)
       // Get FCM tokens for all drivers in one batch operation
@@ -1470,7 +1504,7 @@ class TruckHoldService {
       }
 
       // OPTIMIZATION 3: Schedule timeout jobs for each driver (kept separate for correctness)
-      // Each driver needs independent 60-second timeout
+      // Each driver needs independent timeout (env-configurable, default 30s)
       for (const assignment of confirmedAssignments.assignments) {
         const assignmentTimerData = {
           assignmentId: assignment.assignmentId,
@@ -1485,8 +1519,8 @@ class TruckHoldService {
           createdAt: now
         };
 
-        await queueService.scheduleAssignmentTimeout(assignmentTimerData, 60000);
-        logger.info(`   ⏱️ Multi-truck timeout scheduled: ${assignment.assignmentId} (${assignment.vehicle.vehicleNumber} → ${assignment.driver.name})`);
+        await queueService.scheduleAssignmentTimeout(assignmentTimerData, DRIVER_TIMEOUT_MS);
+        logger.info(`   ⏱️ Multi-truck timeout scheduled: ${assignment.assignmentId} (${assignment.vehicle.vehicleNumber} → ${assignment.driver.name}) [${DRIVER_TIMEOUT_MS / 1000}s]`);
       }
 
       // =========================================================================

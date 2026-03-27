@@ -19,6 +19,8 @@ import { broadcastService } from './broadcast.service';
 import { authMiddleware, roleGuard } from '../../shared/middleware/auth.middleware';
 import { validateSchema } from '../../shared/utils/validation.utils';
 import { logger } from '../../shared/services/logger.service';
+import { redisService } from '../../shared/services/redis.service';
+import { AppError } from '../../shared/types/error.types';
 
 const router = Router();
 
@@ -36,6 +38,28 @@ const idempotencyKeyHeaderSchema = z
   .min(8)
   .max(128)
   .regex(/^[A-Za-z0-9:_-]+$/, 'Invalid idempotency key format');
+
+// =============================================================================
+// FIX #10: Per-user rate limiter for broadcast accept (10 requests per minute)
+// Prevents abuse/flooding of Redis locks + DB serializable transactions.
+// SAFETY: Fails open on Redis error (allows request through).
+// =============================================================================
+async function acceptRateLimiter(req: Request, _res: Response, next: NextFunction) {
+  const userId = req.user?.userId;
+  if (!userId) return next();
+  const key = `rl:broadcast-accept:${userId}`;
+  try {
+    const count = await redisService.incr(key);
+    if (count === 1) await redisService.expire(key, 60);
+    if (count > 10) {
+      return next(new AppError(429, 'RATE_LIMITED', 'Too many accept attempts. Please wait a moment.'));
+    }
+  } catch (err: any) {
+    // Redis failure — fail open (allow request through)
+    logger.warn('[RateLimit] Redis error in acceptRateLimiter', { error: err.message });
+  }
+  return next();
+}
 
 /**
  * @route   GET /broadcasts/active
@@ -111,6 +135,7 @@ router.post(
   '/:broadcastId/accept',
   authMiddleware,
   roleGuard(['driver', 'transporter']),
+  acceptRateLimiter,
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const body = validateSchema(acceptBroadcastBodySchema, req.body);

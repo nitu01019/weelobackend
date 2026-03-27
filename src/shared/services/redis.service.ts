@@ -804,47 +804,109 @@ class RealRedisClient implements IRedisClient {
       // Dynamic import of ioredis (production dependency)
       const Redis = require('ioredis');
 
-      // Main client for commands
-      // CRITICAL: Enable TLS for ElastiCache Serverless (requires rediss://)
+      // =====================================================================
+      // CLUSTER MODE — Horizontal scaling for 500K+ ops/sec or 13GB+ data
+      // =====================================================================
+      // INDUSTRY STANDARD (Uber, Stripe):
+      //   - Single node: up to ~100K ops/sec, 13GB data (ElastiCache Serverless)
+      //   - Cluster mode: multiple shards, linear scaling with shard count
+      //
+      // SAFETY: Falls back to single-node when REDIS_CLUSTER != 'true'
+      //         Zero behavior change for existing deployments
+      // =====================================================================
+      const isClusterMode = process.env.REDIS_CLUSTER === 'true';
+      const clusterNodes = (process.env.REDIS_NODES || '').split(',').filter(Boolean);
       const useTls = this.config.url.startsWith('rediss://');
-      this.client = new Redis(this.config.url, {
-        maxRetriesPerRequest: 1, // Fast fail — 1 retry max to avoid stacking latency
-        retryStrategy: (times: number) => {
-          if (times > this.config.maxRetries) {
-            logger.error(`[Redis] Max retries (${this.config.maxRetries}) exceeded`);
-            return null; // Stop retrying
-          }
-          // CRITICAL FIX: exponential backoff capped at 3s (was linear up to 10s)
-          // Prevents reconnect storm when ElastiCache Serverless drops connections.
-          const delay = Math.min(Math.pow(2, times) * 200, 3000);
-          logger.warn(`[Redis] Retry ${times}/${this.config.maxRetries} in ${delay}ms`);
-          return delay;
-        },
-        connectTimeout: this.config.connectionTimeoutMs,
-        // CRITICAL FIX: commandTimeout 3000ms — commands abort fast so API
-        // requests don't hang. ElastiCache Serverless silently drops idle TCP
-        // connections; without a short timeout every command hangs until the
-        // socket OS timeout (~minutes).
-        commandTimeout: this.config.commandTimeoutMs,
-        enableOfflineQueue: false,
-        enableReadyCheck: true,
-        lazyConnect: false,
-        // CRITICAL FIX: keepAlive 1000ms (was 10000ms) — sends TCP keepalive
-        // probes every 1s so the OS detects dead connections within ~3s instead
-        // of waiting for commandTimeout. This prevents the silent-drop problem
-        // on ElastiCache Serverless which has a 20s idle connection timeout.
-        keepAlive: 1000,
-        // TLS required for ElastiCache Serverless
-        tls: useTls ? { rejectUnauthorized: false } : undefined,
-      });
 
-      // Subscriber client for pub/sub (needs separate connection)
-      this.subscriber = new Redis(this.config.url, {
-        maxRetriesPerRequest: this.config.maxRetries,
-        connectTimeout: this.config.connectionTimeoutMs,
-        // TLS required for ElastiCache Serverless
-        tls: useTls ? { rejectUnauthorized: false } : undefined,
-      });
+      if (isClusterMode && clusterNodes.length > 0) {
+        // Parse cluster nodes: "host1:port1,host2:port2,..."
+        const nodes = clusterNodes.map(node => {
+          const [host, port] = node.split(':');
+          return { host: host.trim(), port: parseInt(port || '6379', 10) };
+        });
+
+        logger.info(`[Redis] Cluster mode: connecting to ${nodes.length} node(s)`);
+
+        this.client = new Redis.Cluster(nodes, {
+          redisOptions: {
+            maxRetriesPerRequest: 1,
+            commandTimeout: this.config.commandTimeoutMs,
+            enableOfflineQueue: false,
+            keepAlive: 1000,
+            tls: useTls ? { rejectUnauthorized: false } : undefined,
+            password: process.env.REDIS_PASSWORD || undefined,
+          },
+          clusterRetryStrategy: (times: number) => {
+            if (times > this.config.maxRetries) {
+              logger.error(`[Redis] Cluster max retries (${this.config.maxRetries}) exceeded`);
+              return null;
+            }
+            const delay = Math.min(Math.pow(2, times) * 200, 3000);
+            logger.warn(`[Redis] Cluster retry ${times}/${this.config.maxRetries} in ${delay}ms`);
+            return delay;
+          },
+          // Follow redirects (MOVED/ASK) — standard for cluster mode
+          enableReadyCheck: true,
+          scaleReads: 'slave', // Read from replicas for better distribution
+          natMap: undefined,   // Set if using NAT/port forwarding
+          dnsLookup: undefined,
+        });
+
+        // Subscriber in cluster mode — same cluster client works for pub/sub
+        this.subscriber = new Redis.Cluster(nodes, {
+          redisOptions: {
+            tls: useTls ? { rejectUnauthorized: false } : undefined,
+            password: process.env.REDIS_PASSWORD || undefined,
+          },
+        });
+
+        logger.info(`[Redis] Cluster mode initialized (${nodes.length} nodes, TLS: ${useTls})`);
+
+      } else {
+        // =====================================================================
+        // SINGLE NODE MODE — Default, existing behavior (unchanged)
+        // =====================================================================
+        // Main client for commands
+        // CRITICAL: Enable TLS for ElastiCache Serverless (requires rediss://)
+        this.client = new Redis(this.config.url, {
+          maxRetriesPerRequest: 1, // Fast fail — 1 retry max to avoid stacking latency
+          retryStrategy: (times: number) => {
+            if (times > this.config.maxRetries) {
+              logger.error(`[Redis] Max retries (${this.config.maxRetries}) exceeded`);
+              return null; // Stop retrying
+            }
+            // CRITICAL FIX: exponential backoff capped at 3s (was linear up to 10s)
+            // Prevents reconnect storm when ElastiCache Serverless drops connections.
+            const delay = Math.min(Math.pow(2, times) * 200, 3000);
+            logger.warn(`[Redis] Retry ${times}/${this.config.maxRetries} in ${delay}ms`);
+            return delay;
+          },
+          connectTimeout: this.config.connectionTimeoutMs,
+          // CRITICAL FIX: commandTimeout 3000ms — commands abort fast so API
+          // requests don't hang. ElastiCache Serverless silently drops idle TCP
+          // connections; without a short timeout every command hangs until the
+          // socket OS timeout (~minutes).
+          commandTimeout: this.config.commandTimeoutMs,
+          enableOfflineQueue: false,
+          enableReadyCheck: true,
+          lazyConnect: false,
+          // CRITICAL FIX: keepAlive 1000ms (was 10000ms) — sends TCP keepalive
+          // probes every 1s so the OS detects dead connections within ~3s instead
+          // of waiting for commandTimeout. This prevents the silent-drop problem
+          // on ElastiCache Serverless which has a 20s idle connection timeout.
+          keepAlive: 1000,
+          // TLS required for ElastiCache Serverless
+          tls: useTls ? { rejectUnauthorized: false } : undefined,
+        });
+
+        // Subscriber client for pub/sub (needs separate connection)
+        this.subscriber = new Redis(this.config.url, {
+          maxRetriesPerRequest: this.config.maxRetries,
+          connectTimeout: this.config.connectionTimeoutMs,
+          // TLS required for ElastiCache Serverless
+          tls: useTls ? { rejectUnauthorized: false } : undefined,
+        });
+      }
 
       // Event handlers
       this.client.on('connect', () => {

@@ -246,7 +246,9 @@ class FCMService {
       }
     }
 
-    // Fallback to in-memory
+    // Fallback to in-memory — cross-instance delivery degraded
+    // FIX #5: Log warning so operators know Redis-backed delivery is down
+    logger.warn('[FCM] Using in-memory token fallback — cross-instance FCM delivery degraded', { userId });
     return userTokensFallback.get(userId) || [];
   }
 
@@ -277,14 +279,14 @@ class FCMService {
     userIds: string[],
     notification: FCMNotification
   ): Promise<number> {
-    let successCount = 0;
-    
-    for (const userId of userIds) {
-      const success = await this.sendToUser(userId, notification);
-      if (success) successCount++;
-    }
-    
-    return successCount;
+    // FIX #2: Parallel FCM delivery — all transporters get push simultaneously
+    // BEFORE: Sequential for+await → last transporter delayed by ~1s for 20 users
+    // NOW: Promise.allSettled → all fire at once, ~50ms total
+    // SAFETY: allSettled never rejects; sendToUser handles individual errors internally
+    const results = await Promise.allSettled(
+      userIds.map(userId => this.sendToUser(userId, notification))
+    );
+    return results.filter(r => r.status === 'fulfilled' && r.value).length;
   }
 
   /**

@@ -328,6 +328,21 @@ class BookingService {
       const customer = await db.getUserById(customerId);
       const customerName = customer?.name || 'Customer';
 
+      // ========================================
+      // SERVER-SIDE FARE SANITY CHECK
+      // ========================================
+      // Prevents financial exploits (e.g., ₹1 per truck for 200km)
+      // Uses env-configurable floor: MIN_FARE_PER_KM (default ₹8/km)
+      // Tolerance: FARE_TOLERANCE (default 0.5 = 50% below estimate)
+      // Formula: reject if pricePerTruck < max(500, distKm × minRate × tolerance)
+      const MIN_FARE_PER_KM = parseInt(process.env.MIN_FARE_PER_KM || '8', 10);
+      const FARE_TOLERANCE = parseFloat(process.env.FARE_TOLERANCE || '0.5');
+      const estimatedMinFare = Math.max(500, Math.round(data.distanceKm * MIN_FARE_PER_KM * FARE_TOLERANCE));
+      if (data.pricePerTruck < estimatedMinFare) {
+        throw new AppError(400, 'FARE_TOO_LOW',
+          `Price ₹${data.pricePerTruck} is below minimum ₹${estimatedMinFare} for ${data.distanceKm}km trip`);
+      }
+
       // Calculate expiry based on config timeout
       const expiresAt = new Date(Date.now() + BOOKING_CONFIG.TIMEOUT_MS).toISOString();
 
@@ -626,6 +641,21 @@ class BookingService {
         candidateMap.set(c.transporterId, { distanceKm: c.distanceKm || 0, etaSeconds: c.etaSeconds || 0 });
       }
 
+      // Fill gap: Transporters in matchingTransporters but not in candidateMap
+      // (happens when Redis has no location for a DB-fallback transporter)
+      // Use -1 as sentinel → broadcast helper renders "nearby" instead of "0 km"
+      let locationGapCount = 0;
+      for (const tid of matchingTransporters) {
+        if (!candidateMap.has(tid)) {
+          candidateMap.set(tid, { distanceKm: -1, etaSeconds: 0 });
+          locationGapCount++;
+        }
+      }
+      if (locationGapCount > 0) {
+        logger.warn(`📊 [PICKUP_GAP] ${locationGapCount} transporter(s) have no location data — pickup distance unknown`);
+      }
+
+
       // DEBUG: Log candidate distance data to trace pickup distance issue
       logger.info(`📊 [PICKUP_DEBUG] step1Candidates count: ${step1Candidates.length}, candidateMap size: ${candidateMap.size}, matchingTransporters: ${matchingTransporters.length}`);
       if (step1Candidates.length > 0) {
@@ -639,8 +669,9 @@ class BookingService {
       // filterOnline() already guarantees all transporters are online.
       for (const transporterId of matchingTransporters) {
         const candidate = candidateMap.get(transporterId);
-        const pickupDistKm = candidate ? Math.round(candidate.distanceKm * 10) / 10 : 0;
-        const pickupEtaMin = candidate ? Math.ceil(candidate.etaSeconds / 60) : 0;
+        // Math.max(0, ...) clamps -1 sentinel (unknown location) to 0
+        const pickupDistKm = candidate ? Math.max(0, Math.round(candidate.distanceKm * 10) / 10) : 0;
+        const pickupEtaMin = candidate ? Math.max(0, Math.ceil(candidate.etaSeconds / 60)) : 0;
 
         // DEBUG: Log per-transporter pickup distance
         logger.info(`📊 [PICKUP_DEBUG] Transporter ${transporterId}: candidate_found=${!!candidate}, pickupDistanceKm=${pickupDistKm}, pickupEtaMinutes=${pickupEtaMin}`);

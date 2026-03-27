@@ -28,7 +28,7 @@ import { Prisma } from '@prisma/client';
 import { db, OrderRecord, TruckRequestRecord } from '../../shared/database/db';
 import { prismaClient, withDbTimeout, OrderStatus, AssignmentStatus, VehicleStatus, BookingStatus, TruckRequestStatus } from '../../shared/database/prisma.service';
 import { logger } from '../../shared/services/logger.service';
-import { emitToUser, emitToUsers } from '../../shared/services/socket.service';
+import { emitToUser, emitToUsers, SocketEvent } from '../../shared/services/socket.service';
 import { sendPushNotification } from '../../shared/services/fcm.service';
 import { cacheService } from '../../shared/services/cache.service';
 import { queueService } from '../../shared/services/queue.service';
@@ -4518,7 +4518,7 @@ class OrderService {
       message: `New trip assigned! ${orderPickup.address} → ${orderDrop.address}`
     };
 
-    emitToUser(driverId, 'trip_assigned', driverNotification);
+    emitToUser(driverId, SocketEvent.TRIP_ASSIGNED, driverNotification);
     logger.info(`Notified driver ${driverName} about trip assignment`);
 
     // Push notification to driver

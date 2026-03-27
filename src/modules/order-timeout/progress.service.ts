@@ -82,13 +82,21 @@ export interface OrderProgressSummary {
  * Truck assignment detail
  */
 export interface TruckAssignmentDetail {
+  assignmentId: string;
+  truckRequestId: string | null;
+  vehicleId: string;
   vehicleNumber: string;
   vehicleType: string;
+  driverId: string;
   driverName: string;
   driverPhone: string;
   tripId: string;
-  assignmentId: string;
+  status: string;
+  reason: string | null;
   assignedAt: string;
+  driverAcceptedAt: string | null;
+  startedAt: string | null;
+  canReassign: boolean;
 }
 
 // =============================================================================
@@ -246,7 +254,9 @@ class ProgressTrackingService {
             { orderId },
             { bookingId: orderId },
           ],
-          status: { in: ['driver_accepted', 'en_route_pickup', 'in_transit'] },
+          status: {
+            in: ['pending', 'driver_accepted', 'driver_declined', 'en_route_pickup', 'at_pickup', 'in_transit']
+          },
         },
         include: {
           driver: {
@@ -266,14 +276,30 @@ class ProgressTrackingService {
         },
       });
 
+      const reasonEntries = await Promise.all(
+        assignments.map(async (assignment) => [
+          assignment.id,
+          await redisService.get(`assignment:reason:${assignment.id}`).catch(() => null)
+        ] as const)
+      );
+      const reasonMap = new Map(reasonEntries);
+
       const assignmentDetails: TruckAssignmentDetail[] = assignments.map((a) => ({
+        assignmentId: a.id,
+        truckRequestId: a.truckRequestId,
+        vehicleId: a.vehicle.id,
         vehicleNumber: a.vehicle.vehicleNumber,
         vehicleType: a.vehicle.vehicleType,
+        driverId: a.driver.id,
         driverName: a.driver.name,
         driverPhone: a.driver.phone,
         tripId: a.tripId,
-        assignmentId: a.id,
         assignedAt: a.assignedAt,
+        status: a.status,
+        reason: reasonMap.get(a.id) ?? (a.status === 'driver_declined' ? 'declined' : null),
+        driverAcceptedAt: a.driverAcceptedAt,
+        startedAt: a.startedAt,
+        canReassign: a.status === 'driver_declined',
       }));
 
       return {

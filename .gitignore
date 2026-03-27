@@ -51,3 +51,4 @@ docker-compose.override.yml
 coverage/
 .nyc_output/
 AWS_DEPLOYMENT_REFERENCE.md
+settings.local.json

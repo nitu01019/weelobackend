@@ -86,7 +86,7 @@ jest.mock('jsonwebtoken', () => ({
 
 jest.mock('uuid', () => ({
   v4: jest.fn(() => 'uuid-1')
-}));
+}), { virtual: true });
 
 import { authService } from '../auth.service';
 
