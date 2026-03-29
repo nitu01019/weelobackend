@@ -43,6 +43,7 @@ enum UserRole {
 // Vehicle operational status
 enum VehicleStatus {
   available   // Ready for new trips
+  on_hold    // Reserved while driver decides
   in_transit  // Currently on a trip
   maintenance // Under maintenance
   inactive    // Not operational
@@ -982,6 +983,7 @@ model Assignment {
   @@index([status])             // Active assignments
   @@index([driverId, status])   // Driver's active trips
   @@index([transporterId, status]) // Transporter's active assignments
+  @@index([vehicleId, status])  // Phase 3: Watchdog — find active assignments per vehicle
 
   // DB-level guarantee: one active trip per driver
   // Service logic already checks this, but this prevents edge-case concurrency bypasses

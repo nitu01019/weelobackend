@@ -119,7 +119,7 @@ interface CachedVehicle {
   vehicleType: string;
   vehicleSubtype: string;
   capacityTons: number;
-  status: 'available' | 'in_transit' | 'maintenance' | 'inactive';
+  status: 'available' | 'on_hold' | 'in_transit' | 'maintenance' | 'inactive';
   currentTripId?: string;
   assignedDriverId?: string;
   isActive: boolean;
@@ -700,7 +700,7 @@ class FleetCacheService {
    */
   async updateVehicleStatus(
     vehicleId: string,
-    status: 'available' | 'in_transit' | 'maintenance' | 'inactive',
+    status: 'available' | 'on_hold' | 'in_transit' | 'maintenance' | 'inactive',
     tripId?: string
   ): Promise<void> {
     const cacheKey = CACHE_KEYS.VEHICLE(vehicleId);

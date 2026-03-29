@@ -78,7 +78,7 @@ export interface UserRecord {
 }
 
 // Vehicle Status - Operational state of the vehicle
-export type VehicleStatus = 'available' | 'in_transit' | 'maintenance' | 'inactive';
+export type VehicleStatus = 'available' | 'on_hold' | 'in_transit' | 'maintenance' | 'inactive';
 
 // Vehicle Record - Registered by Transporter
 export interface VehicleRecord {
@@ -290,7 +290,7 @@ export interface AssignmentRecord {
   driverPhone: string;
   tripId: string;
   
-  status: 'pending' | 'driver_accepted' | 'driver_declined' | 'en_route_pickup' | 'at_pickup' | 'in_transit' | 'completed' | 'cancelled';
+  status: 'pending' | 'driver_accepted' | 'driver_declined' | 'en_route_pickup' | 'at_pickup' | 'in_transit' | 'arrived_at_drop' | 'completed' | 'cancelled';
   
   assignedAt: string;
   driverAcceptedAt?: string;

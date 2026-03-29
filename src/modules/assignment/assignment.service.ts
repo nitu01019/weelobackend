@@ -221,6 +221,27 @@ class AssignmentService {
       // CRITICAL: use tx (transaction context) not db (global client) so the
       // Serializable isolation actually prevents concurrent duplicate assignments.
       await tx.assignment.create({ data: assignment as any });
+
+      // =====================================================================
+      // FIX: Set vehicle to on_hold ATOMICALLY with assignment creation
+      // =====================================================================
+      // BEFORE: Vehicle stayed 'available' during pending phase → could be
+      //   double-booked by another assignment request.
+      // NOW: Vehicle becomes 'on_hold' inside same transaction → if assignment
+      //   creation fails, vehicle status rolls back too.
+      // =====================================================================
+      await tx.vehicle.updateMany({
+        where: {
+          id: data.vehicleId,
+          status: { in: ['available'] as any }  // Only hold if currently available
+        },
+        data: {
+          status: 'on_hold',
+          currentTripId: tripId,
+          assignedDriverId: data.driverId,
+          lastStatusChange: new Date().toISOString()
+        }
+      });
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable, timeoutMs: 8000 });
 
     // =========================================================================
@@ -470,26 +491,35 @@ class AssignmentService {
     // so if driver accepted first, the queue job no-ops when it fires at 60s.
     // No explicit cancellation needed.
 
-    const updated = await db.updateAssignment(assignmentId, {
-      status: 'driver_accepted',
-      driverAcceptedAt: new Date().toISOString()
-    });
+    // =====================================================================
+    // CRITICAL FIX: Atomic transaction for assignment + vehicle status
+    // =====================================================================
+    // BEFORE: Two separate DB writes — assignment update could succeed
+    //   but vehicle update could fail, leaving inconsistent state.
+    // NOW: Single Prisma transaction — both succeed or both roll back.
+    // =====================================================================
+    const updated = await withDbTimeout(async (tx) => {
+      // 1. Atomically update assignment status (only if still pending)
+      const updatedAssignment = await tx.assignment.updateMany({
+        where: { id: assignmentId, status: 'pending' },
+        data: {
+          status: 'driver_accepted',
+          driverAcceptedAt: new Date().toISOString()
+        }
+      });
 
-    // =====================================================================
-    // FIX: Vehicle becomes 'in_transit' ONLY when driver ACTUALLY accepts
-    // =====================================================================
-    // BEFORE: Vehicle was set to 'in_transit' when transporter confirmed (too early)
-    //   → Driver could get stuck in 'on trip' state before accepting
-    // NOW: Vehicle stays 'available' until driver accepts, then becomes 'in_transit'
-    //   → Vehicle only busy when driver has committed
-    // Uber/Grab pattern: Vehicle and Assignment status are separate concepts.
-    //   - Vehicle status: is the vehicle physically on a trip?
-    //   - Assignment status: what is the state of THIS trip?
-    // =====================================================================
-    if (assignment.vehicleId) {
-      try {
-        await prismaClient.vehicle.update({
-          where: { id: assignment.vehicleId },
+      if (updatedAssignment.count === 0) {
+        throw new AppError(400, 'ASSIGNMENT_STATE_CHANGED',
+          'Assignment is no longer pending — it may have timed out or been cancelled.');
+      }
+
+      // 2. Atomically update vehicle status: on_hold → in_transit
+      if (assignment.vehicleId) {
+        await tx.vehicle.updateMany({
+          where: {
+            id: assignment.vehicleId,
+            status: { in: ['on_hold', 'available'] as any }  // Accept from on_hold (normal) or available (legacy)
+          },
           data: {
             status: 'in_transit',
             currentTripId: assignment.tripId,
@@ -497,9 +527,21 @@ class AssignmentService {
             lastStatusChange: new Date().toISOString()
           }
         });
-        logger.info(`[ASSIGNMENT] Vehicle set to in_transit: ${assignment.vehicleNumber} (driver accepted)`);
+      }
 
-        // Update Redis availability so vehicle matching system stays in sync
+      // Return the updated assignment
+      return await tx.assignment.findUnique({ where: { id: assignmentId } });
+    }, { timeoutMs: 8000 });
+
+    if (!updated) {
+      throw new AppError(500, 'ACCEPT_FAILED', 'Failed to accept assignment');
+    }
+
+    // =====================================================================
+    // Post-transaction: Update Redis availability (non-fatal)
+    // =====================================================================
+    if (assignment.vehicleId) {
+      try {
         const vehicle = await prismaClient.vehicle.findUnique({
           where: { id: assignment.vehicleId },
           select: { vehicleKey: true, transporterId: true }
@@ -508,13 +550,13 @@ class AssignmentService {
           await liveAvailabilityService.onVehicleStatusChange(
             vehicle.transporterId,
             vehicle.vehicleKey,
-            'available',          // Was available while pending
+            'on_hold',            // Was on_hold while pending
             'in_transit'          // Now in transit after driver accepted
           ).catch(err => logger.warn('[acceptAssignment] Redis update failed', err));
         }
+        logger.info(`[ASSIGNMENT] Vehicle set to in_transit: ${assignment.vehicleNumber} (driver accepted)`);
       } catch (err: any) {
-        // Vehicle update failed - non-fatal but log for investigation
-        logger.error('[ASSIGNMENT] Failed to set vehicle to in_transit', {
+        logger.error('[ASSIGNMENT] Failed to update Redis vehicle status', {
           vehicleId: assignment.vehicleId,
           assignmentId,
           error: err?.message

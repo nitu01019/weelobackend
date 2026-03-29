@@ -84,7 +84,8 @@ router.get(
       const vehicles = cachedVehicles.filter(v => v.isActive !== false);
       
       // Calculate status counts
-      const available = vehicles.filter(v => v.status === 'available' || !v.status).length;
+      const available = vehicles.filter(v => (v.status === 'available' || !v.status) && v.status !== 'on_hold').length;
+      const onHold = vehicles.filter(v => v.status === 'on_hold').length;
       const inTransit = vehicles.filter(v => v.status === 'in_transit').length;
       const maintenance = vehicles.filter(v => v.status === 'maintenance').length;
       
@@ -94,7 +95,7 @@ router.get(
         status: v.status || 'available'
       }));
       
-      logger.info(`[Vehicles] Returning ${normalizedVehicles.length} vehicles (${available} available)`);
+      logger.info(`[Vehicles] Returning ${normalizedVehicles.length} vehicles (${available} available, ${onHold} on_hold)`);
       
       res.json({
         success: true,
@@ -102,6 +103,7 @@ router.get(
           vehicles: normalizedVehicles,
           total: normalizedVehicles.length,
           available,
+          onHold,
           inTransit,
           maintenance,
           cached: !forceRefresh  // Indicate if from cache

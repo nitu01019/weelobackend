@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { vehicleNumberSchema, vehicleTypeSchema, paginationSchema } from '../../shared/utils/validation.utils';
 
 // Vehicle status enum for validation
-export const vehicleStatusSchema = z.enum(['available', 'in_transit', 'maintenance', 'inactive']);
+export const vehicleStatusSchema = z.enum(['available', 'on_hold', 'in_transit', 'maintenance', 'inactive']);
 
 /**
  * Register Vehicle Schema

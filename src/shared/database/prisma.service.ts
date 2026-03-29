@@ -89,7 +89,7 @@ export interface VehicleRecord {
   capacity: string;
   model?: string | null;
   year?: number | null;
-  status: 'available' | 'in_transit' | 'maintenance' | 'inactive';
+  status: 'available' | 'on_hold' | 'in_transit' | 'maintenance' | 'inactive';
   currentTripId?: string | null;
   maintenanceReason?: string | null;
   maintenanceEndDate?: string | null;
@@ -209,7 +209,7 @@ export interface AssignmentRecord {
   driverName: string;
   driverPhone: string;
   tripId: string;
-  status: 'pending' | 'driver_accepted' | 'driver_declined' | 'en_route_pickup' | 'at_pickup' | 'in_transit' | 'completed' | 'cancelled';
+  status: 'pending' | 'driver_accepted' | 'driver_declined' | 'en_route_pickup' | 'at_pickup' | 'in_transit' | 'arrived_at_drop' | 'completed' | 'cancelled';
   assignedAt: string;
   driverAcceptedAt?: string | null;
   startedAt?: string | null;
@@ -244,12 +244,21 @@ export interface TrackingRecord {
 // MODULARITY: Pool config is centralized here, not scattered across services
 // 
 // FORMULA: For N ECS instances, total connections = N × connection_limit
-// RDS default max_connections ≈ 100-400 depending on instance size
-// With 4 ECS instances × 20 = 80 connections (safe under RDS limits)
+// MUST satisfy: N × connection_limit < max_connections - 5 (reserved for admin)
+//
+// CURRENT INFRA (db.t4g.micro, 1GB RAM):
+//   max_connections ≈ 87
+//   Reserved for RDS internals + admin: ~7
+//   Available for app: ~80
+//   With 2 ECS tasks × 10 = 20 connections (23% utilization — safe)
+//
+// PRODUCTION SCALE (db.r6g.large, 16GB RAM):
+//   max_connections ≈ 1600
+//   With 4 ECS tasks × 25 = 100 connections (6% utilization — excellent)
 // =============================================================================
 
 const DB_POOL_CONFIG = {
-  connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT || '20', 10),
+  connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT || '10', 10),
   // Phase 10: Reduced from 10s to 5s — fail fast for user-facing APIs
   // 10s wait = user already abandoned. 5s returns meaningful 503 quickly.
   poolTimeout: parseInt(process.env.DB_POOL_TIMEOUT || '5', 10),

@@ -1350,6 +1350,21 @@ class TruckHoldService {
             }
           });
 
+          // FIX: Set vehicle to on_hold atomically inside transaction
+          // Vehicle stays on_hold until driver accepts (→ in_transit) or times out (→ available)
+          await tx.vehicle.updateMany({
+            where: {
+              id: vehicle.id,
+              status: { in: ['available'] as any }
+            },
+            data: {
+              status: 'on_hold',
+              currentTripId: tripId,
+              assignedDriverId: driver.id,
+              lastStatusChange: now
+            }
+          });
+
           txAssignments.push({
             assignmentId,
             tripId,

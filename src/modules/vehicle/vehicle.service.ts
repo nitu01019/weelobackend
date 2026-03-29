@@ -378,6 +378,7 @@ class VehicleService {
   private calculateStatusCounts(vehicles: VehicleRecord[]): Record<string, number> {
     const counts: Record<string, number> = {
       available: 0,
+      on_hold: 0,
       in_transit: 0,
       maintenance: 0,
       inactive: 0,
@@ -512,7 +513,8 @@ class VehicleService {
   private validateStatusTransition(currentStatus: VehicleStatus | undefined, newStatus: VehicleStatus): void {
     // Define valid transitions
     const validTransitions: Record<string, string[]> = {
-      'available': ['in_transit', 'maintenance', 'inactive'],
+      'available': ['on_hold', 'in_transit', 'maintenance', 'inactive'],
+      'on_hold': ['in_transit', 'available'],
       'in_transit': ['available', 'maintenance'],  // Trip completed or breakdown
       'maintenance': ['available', 'inactive'],     // Fixed or decommissioned
       'inactive': ['available', 'maintenance']      // Reactivated
@@ -552,6 +554,15 @@ class VehicleService {
   }
 
   /**
+   * Mark vehicle as on_hold (reserved while driver decides)
+   * Called when assignment is created but driver hasn't accepted yet.
+   * Vehicle stays on_hold until driver accepts (→ in_transit) or rejects/times out (→ available).
+   */
+  async setOnHold(vehicleId: string, transporterId: string, tripId?: string): Promise<VehicleRecord> {
+    return this.updateVehicleStatus(vehicleId, transporterId, 'on_hold', tripId ? { tripId } : undefined);
+  }
+
+  /**
    * Mark vehicle as in transit (assigned to a trip)
    * Usually called by booking/assignment service
    */
@@ -569,7 +580,7 @@ class VehicleService {
       ? await vehiclesResult 
       : vehiclesResult;
     
-    let vehicles = (allVehicles || []).filter(v => v.isActive && (v.status === 'available' || !v.status));
+    let vehicles = (allVehicles || []).filter(v => v.isActive && (v.status === 'available' || !v.status) && v.status !== 'on_hold');
     
     if (vehicleType) {
       vehicles = vehicles.filter(v => v.vehicleType === vehicleType);

@@ -733,7 +733,8 @@ class QueueService {
     CUSTOM_BOOKING: 'custom-booking',  // Custom booking events
     ASSIGNMENT_TIMEOUT: 'assignment-timeout',  // Delayed assignment timeout jobs
     ASSIGNMENT_RECONCILIATION: 'assignment-reconciliation',  // Periodic orphaned assignment cleanup
-    HOLD_EXPIRY: 'hold-expiry'  // Periodic hold expiry cleanup jobs
+    HOLD_EXPIRY: 'hold-expiry',  // Periodic hold expiry cleanup jobs
+    STALE_VEHICLE_WATCHDOG: 'stale-vehicle-watchdog'  // Phase 3: Auto-release stuck vehicles
   };
 
   constructor() {
@@ -1171,7 +1172,9 @@ class QueueService {
               transporterId: assignment.transporterId,
               vehicleId: assignment.vehicleId,
               vehicleNumber: assignment.vehicleNumber || '',
-              bookingId: assignment.bookingId || assignment.orderId || '',
+              bookingId: assignment.bookingId || '',
+              orderId: assignment.orderId || '',
+              truckRequestId: assignment.truckRequestId || '',
               tripId: assignment.tripId || '',
               createdAt: assignment.assignedAt
             });
@@ -1199,7 +1202,171 @@ class QueueService {
       }
     }, 5 * 60 * 1000);
 
-    logger.info('📋 Queue processors registered (including reconciliation)');
+    // =========================================================================
+    // PHASE 3.2: STALE VEHICLE WATCHDOG
+    // =========================================================================
+    // Catches vehicles stuck in on_hold (>5 min) or in_transit (>6 hours)
+    // with no corresponding active assignment. Auto-releases them to 'available'.
+    // Runs every 10 minutes. Uses distributed lock for ECS safety.
+    //
+    // Thresholds:
+    //   on_hold  → 5 minutes (assignment timeout is 60s, 5 min is generous)
+    //   in_transit → 6 hours (freight trips can be long, 6h is safe upper bound)
+    //
+    // Industry pattern: Uber's "Ghost Ride Detector" uses similar watchdog logic.
+    // =========================================================================
+    const STALE_ON_HOLD_MS = parseInt(process.env.STALE_ON_HOLD_THRESHOLD_MS || '300000', 10);      // 5 min
+    const STALE_IN_TRANSIT_MS = parseInt(process.env.STALE_IN_TRANSIT_THRESHOLD_MS || '21600000', 10); // 6 hours
+    const WATCHDOG_INTERVAL_MS = parseInt(process.env.STALE_VEHICLE_WATCHDOG_INTERVAL_MS || '600000', 10); // 10 min
+
+    this.queue.process(QueueService.QUEUES.STALE_VEHICLE_WATCHDOG, async (job) => {
+      const lockKey = 'lock:stale-vehicle-watchdog';
+      const lock = await redisService.acquireLock(lockKey, 'watchdog', 120);
+      if (!lock.acquired) {
+        return; // Another ECS instance is processing
+      }
+
+      try {
+        let releasedCount = 0;
+
+        // ---------------------------------------------------------------
+        // 1. Find vehicles stuck in on_hold for > threshold
+        // ---------------------------------------------------------------
+        const onHoldThreshold = new Date(Date.now() - STALE_ON_HOLD_MS).toISOString();
+        const stuckOnHold = await prismaClient.vehicle.findMany({
+          where: {
+            status: 'on_hold' as any,
+            lastStatusChange: { lt: onHoldThreshold }
+          },
+          select: { id: true, vehicleNumber: true, transporterId: true, vehicleKey: true, lastStatusChange: true },
+          take: 50
+        });
+
+        for (const vehicle of stuckOnHold) {
+          // Verify no active assignment exists for this vehicle
+          const activeAssignment = await prismaClient.assignment.findFirst({
+            where: {
+              vehicleId: vehicle.id,
+              status: { in: ['pending', 'driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit'] }
+            },
+            select: { id: true, status: true }
+          });
+
+          if (activeAssignment) {
+            logger.debug(`[WATCHDOG] Vehicle ${vehicle.vehicleNumber} on_hold but has active assignment ${activeAssignment.id} (${activeAssignment.status}), skipping`);
+            continue;
+          }
+
+          // Release: on_hold → available (idempotent with status precondition)
+          const result = await prismaClient.vehicle.updateMany({
+            where: { id: vehicle.id, status: 'on_hold' as any },
+            data: {
+              status: 'available',
+              currentTripId: null,
+              assignedDriverId: null,
+              lastStatusChange: new Date().toISOString()
+            }
+          });
+
+          if (result.count > 0) {
+            releasedCount++;
+            logger.warn(`[WATCHDOG] Released stuck on_hold vehicle: ${vehicle.vehicleNumber} (held since ${vehicle.lastStatusChange})`);
+
+            // Update Redis availability cache
+            if (vehicle.vehicleKey && vehicle.transporterId) {
+              const { liveAvailabilityService } = require('./live-availability.service');
+              await liveAvailabilityService.onVehicleStatusChange(
+                vehicle.transporterId,
+                vehicle.vehicleKey,
+                'on_hold',
+                'available'
+              ).catch(err => logger.warn('[WATCHDOG] Redis update failed', err));
+            }
+          }
+        }
+
+        // ---------------------------------------------------------------
+        // 2. Find vehicles stuck in in_transit for > threshold
+        //    with NO active (non-terminal) assignment
+        // ---------------------------------------------------------------
+        const inTransitThreshold = new Date(Date.now() - STALE_IN_TRANSIT_MS).toISOString();
+        const stuckInTransit = await prismaClient.vehicle.findMany({
+          where: {
+            status: 'in_transit',
+            lastStatusChange: { lt: inTransitThreshold }
+          },
+          select: { id: true, vehicleNumber: true, transporterId: true, vehicleKey: true, lastStatusChange: true },
+          take: 50
+        });
+
+        for (const vehicle of stuckInTransit) {
+          // Verify no active assignment exists for this vehicle
+          const activeAssignment = await prismaClient.assignment.findFirst({
+            where: {
+              vehicleId: vehicle.id,
+              status: { in: ['driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit'] }
+            },
+            select: { id: true, status: true }
+          });
+
+          if (activeAssignment) {
+            logger.debug(`[WATCHDOG] Vehicle ${vehicle.vehicleNumber} in_transit with active assignment ${activeAssignment.id} (${activeAssignment.status}), skipping`);
+            continue;
+          }
+
+          // Release: in_transit → available (idempotent with status precondition)
+          const result = await prismaClient.vehicle.updateMany({
+            where: { id: vehicle.id, status: 'in_transit' },
+            data: {
+              status: 'available',
+              currentTripId: null,
+              assignedDriverId: null,
+              lastStatusChange: new Date().toISOString()
+            }
+          });
+
+          if (result.count > 0) {
+            releasedCount++;
+            logger.warn(`[WATCHDOG] Released stuck in_transit vehicle: ${vehicle.vehicleNumber} (since ${vehicle.lastStatusChange})`);
+
+            // Update Redis availability cache
+            if (vehicle.vehicleKey && vehicle.transporterId) {
+              const { liveAvailabilityService: las } = require('./live-availability.service');
+              await las.onVehicleStatusChange(
+                vehicle.transporterId,
+                vehicle.vehicleKey,
+                'in_transit',
+                'available'
+              ).catch(err => logger.warn('[WATCHDOG] Redis update failed', err));
+            }
+          }
+        }
+
+        if (releasedCount > 0) {
+          logger.warn(`[WATCHDOG] 🐕 Released ${releasedCount} stuck vehicle(s) (${stuckOnHold.length} on_hold checked, ${stuckInTransit.length} in_transit checked)`);
+        }
+      } catch (err: any) {
+        logger.error('[WATCHDOG] Stale vehicle watchdog failed', { error: err.message });
+      } finally {
+        await redisService.releaseLock(lockKey, 'watchdog').catch(() => {});
+      }
+    });
+
+    // Self-scheduling watchdog: enqueue every 10 minutes
+    setInterval(async () => {
+      try {
+        await this.queue.add(
+          QueueService.QUEUES.STALE_VEHICLE_WATCHDOG,
+          'stale-vehicle-watchdog',
+          {},
+          { maxAttempts: 1 }
+        );
+      } catch (err) {
+        logger.warn('[WATCHDOG] Failed to schedule watchdog job');
+      }
+    }, WATCHDOG_INTERVAL_MS);
+
+    logger.info(`📋 Queue processors registered (including reconciliation + stale vehicle watchdog [${WATCHDOG_INTERVAL_MS/1000}s interval])`);
   }
 
   private resolveBroadcastOrderId(data: any): string {
