@@ -1304,14 +1304,29 @@ class QueueService {
           const activeAssignment = await prismaClient.assignment.findFirst({
             where: {
               vehicleId: vehicle.id,
-              status: { in: ['driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit'] }
+              status: { in: ['pending', 'driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit'] }
             },
-            select: { id: true, status: true }
+            select: { id: true, status: true, assignedAt: true }
           });
 
           if (activeAssignment) {
-            logger.debug(`[WATCHDOG] Vehicle ${vehicle.vehicleNumber} in_transit with active assignment ${activeAssignment.id} (${activeAssignment.status}), skipping`);
-            continue;
+            // If the assignment is 'pending', only treat it as active if it's < 10 min old.
+            // A pending assignment older than 10 minutes means the timeout job was lost
+            // (ECS crash, Redis eviction, etc.) — treat it as dead and release the vehicle.
+            if (activeAssignment.status === 'pending') {
+              const pendingAgeMs = Date.now() - new Date(activeAssignment.assignedAt).getTime();
+              const STALE_PENDING_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
+              if (pendingAgeMs > STALE_PENDING_THRESHOLD_MS) {
+                logger.warn(`[WATCHDOG] Vehicle ${vehicle.vehicleNumber} has stale pending assignment ${activeAssignment.id} (${Math.round(pendingAgeMs / 60000)}m old), treating as dead`);
+                // Fall through to release the vehicle below
+              } else {
+                logger.debug(`[WATCHDOG] Vehicle ${vehicle.vehicleNumber} has fresh pending assignment ${activeAssignment.id} (${Math.round(pendingAgeMs / 1000)}s old), skipping`);
+                continue;
+              }
+            } else {
+              logger.debug(`[WATCHDOG] Vehicle ${vehicle.vehicleNumber} in_transit with active assignment ${activeAssignment.id} (${activeAssignment.status}), skipping`);
+              continue;
+            }
           }
 
           // Release: in_transit → available (idempotent with status precondition)
