@@ -384,6 +384,13 @@ class RedisQueue extends EventEmitter {
   private readonly blockingPopTimeoutSec = Math.max(1, parseInt(process.env.REDIS_QUEUE_BLOCKING_POP_TIMEOUT_SEC || '2', 10) || 2);
   private readonly queuePrefix: string = 'queue:';
   private readonly deadLetterPrefix: string = 'dlq:';
+  private readonly processingPrefix: string = 'processing:';
+  private readonly delayedPrefix: string = 'delayed:';
+  private delayPollerInterval: ReturnType<typeof setInterval> | null = null;
+
+  // At-least-once delivery: max age (ms) before a processing job is considered stale
+  // and re-enqueued on startup. 5 minutes is generous — most jobs complete in <10s.
+  private readonly STALE_PROCESSING_THRESHOLD_MS = 5 * 60 * 1000;
 
   constructor() {
     super();
@@ -402,6 +409,22 @@ class RedisQueue extends EventEmitter {
    */
   private getDeadLetterKey(queueName: string): string {
     return `${this.deadLetterPrefix}${queueName}`;
+  }
+
+  /**
+   * Get Redis key for processing hash (at-least-once delivery)
+   * Stores jobs being processed — recovered on crash/restart
+   */
+  private getProcessingKey(queueName: string): string {
+    return `${this.processingPrefix}${queueName}`;
+  }
+
+  /**
+   * Get Redis key for delayed sorted set
+   * Jobs with processAfter sit here until ready, then moved to main queue
+   */
+  private getDelayedKey(queueName: string): string {
+    return `${this.delayedPrefix}${queueName}`;
   }
 
   /**
@@ -429,15 +452,21 @@ class RedisQueue extends EventEmitter {
       processAfter: options?.delay ? Date.now() + options.delay : undefined
     };
 
-    const queueKey = this.getQueueKey(queueName);
-
     try {
-      // Use LPUSH to add to head of list (FIFO with BRPOP)
-      await redisService.lPush(queueKey, JSON.stringify(job));
+      if (job.processAfter) {
+        // Bug #3 fix: Delayed jobs go to Redis Sorted Set (ZADD) instead of main LIST.
+        // A poller moves them to the main queue when ready — zero busy-polling.
+        const delayedKey = this.getDelayedKey(queueName);
+        await redisService.zAdd(delayedKey, job.processAfter, JSON.stringify(job));
+        logger.debug(`Redis Queue: Job ${job.id} delayed until ${new Date(job.processAfter).toISOString()} in ${queueName}`);
+      } else {
+        // Immediate jobs go to main LIST as before (FIFO with BRPOP)
+        const queueKey = this.getQueueKey(queueName);
+        await redisService.lPush(queueKey, JSON.stringify(job));
+        logger.debug(`Redis Queue: Job ${job.id} added to ${queueName} (type: ${type})`);
+      }
 
-      logger.debug(`Redis Queue: Job ${job.id} added to ${queueName} (type: ${type})`);
       this.emit('job:added', { queueName, job });
-
       return job.id;
     } catch (error: any) {
       logger.error(`Redis Queue: Failed to add job to ${queueName}:`, error.message);
@@ -502,11 +531,17 @@ class RedisQueue extends EventEmitter {
   }
 
   /**
-   * Start queue workers
+   * Start queue workers + recover any stale processing jobs from a previous crash
    */
   private startWorkersForQueue(queueName: string): void {
     const processor = this.processors.get(queueName);
     if (!processor || !this.isRunning) return;
+
+    // Bug #2 fix: Recover stale processing jobs left behind by a crash.
+    // On startup, scan the processing hash and re-enqueue anything older than threshold.
+    this.recoverStaleProcessingJobs(queueName).catch((err: any) => {
+      logger.warn(`[Queue] Failed to recover processing jobs for ${queueName}: ${err.message}`);
+    });
 
     const targetWorkers = this.getWorkerCount(queueName);
     if (!this.queueWorkers.has(queueName)) {
@@ -526,6 +561,47 @@ class RedisQueue extends EventEmitter {
     }
   }
 
+  /**
+   * Bug #2: Recover jobs that were being processed when ECS crashed.
+   * Scans the processing:{queueName} hash. If a job's createdAt is older
+   * than STALE_PROCESSING_THRESHOLD_MS, re-enqueue it to the main queue.
+   * Industry pattern: Sidekiq's "reliable fetch" + Bull's "stalled job recovery".
+   */
+  private async recoverStaleProcessingJobs(queueName: string): Promise<void> {
+    const processingKey = this.getProcessingKey(queueName);
+    const staleJobs = await redisService.hGetAll(processingKey);
+    const jobIds = Object.keys(staleJobs);
+    if (jobIds.length === 0) return;
+
+    const now = Date.now();
+    let recoveredCount = 0;
+
+    for (const jobId of jobIds) {
+      try {
+        const job: QueueJob = JSON.parse(staleJobs[jobId]);
+        const processingAgeMs = now - (job.createdAt || 0);
+
+        if (processingAgeMs > this.STALE_PROCESSING_THRESHOLD_MS) {
+          // Stale — re-enqueue to main queue for reprocessing
+          const queueKey = this.getQueueKey(queueName);
+          await redisService.lPush(queueKey, staleJobs[jobId]);
+          await redisService.hDel(processingKey, jobId);
+          recoveredCount++;
+          logger.warn(`[Queue] Recovered stale processing job ${jobId} (${queueName}, age: ${Math.round(processingAgeMs / 1000)}s)`);
+        }
+        // If not stale, another worker may still be processing it — leave it alone
+      } catch (err: any) {
+        // Corrupt entry — remove it
+        await redisService.hDel(processingKey, jobId).catch(() => {});
+        logger.warn(`[Queue] Removed corrupt processing entry ${jobId}: ${err.message}`);
+      }
+    }
+
+    if (recoveredCount > 0) {
+      logger.warn(`[Queue] 🔄 Recovered ${recoveredCount} stale job(s) for ${queueName}`);
+    }
+  }
+
   private getWorkerCount(queueName: string): number {
     if (queueName === QueueService.QUEUES.TRACKING_EVENTS) {
       return this.trackingWorkerCount;
@@ -535,6 +611,7 @@ class RedisQueue extends EventEmitter {
 
   private async runWorkerLoop(queueName: string, workerId: number, processor: JobProcessor): Promise<void> {
     const queueKey = this.getQueueKey(queueName);
+    const processingKey = this.getProcessingKey(queueName);
 
     while (this.isRunning && this.processors.get(queueName) === processor) {
       try {
@@ -546,11 +623,16 @@ class RedisQueue extends EventEmitter {
         }
 
         const job: QueueJob = JSON.parse(jobStr);
-        if (job.processAfter && Date.now() < job.processAfter) {
-          await redisService.lPush(queueKey, JSON.stringify(job));
-          await this.sleep(Math.min(200, Math.max(10, job.processAfter - Date.now())));
-          continue;
-        }
+
+        // Bug #3 fix: processAfter check is no longer needed here.
+        // Delayed jobs now sit in a Redis Sorted Set and are only moved to the
+        // main queue when ready. Any residual processAfter jobs (from before
+        // this fix was deployed) are handled gracefully — just process them.
+
+        // Bug #2 fix: Save to processing hash BEFORE processing.
+        // If ECS crashes after BRPOP but before completion, this job
+        // will be recovered from the processing hash on next startup.
+        await redisService.hSet(processingKey, job.id, jobStr).catch(() => {});
 
         this.processing.add(job.id);
         this.incrementInFlight(queueName);
@@ -601,15 +683,22 @@ class RedisQueue extends EventEmitter {
     job: QueueJob,
     processor: JobProcessor
   ): Promise<void> {
+    const processingKey = this.getProcessingKey(queueName);
     try {
       job.attempts++;
       await processor(job);
+
+      // Bug #2 fix: Remove from processing hash on success
+      await redisService.hDel(processingKey, job.id).catch(() => {});
 
       this.emit('job:completed', { queueName, job });
       logger.debug(`Redis Queue: Job ${job.id} completed (${queueName})`);
 
     } catch (error: any) {
       job.error = error.message;
+
+      // Bug #2 fix: Remove from processing hash on failure too (will be re-enqueued or DLQ'd)
+      await redisService.hDel(processingKey, job.id).catch(() => {});
 
       if (job.attempts >= job.maxAttempts) {
         // Max retries reached - move to dead letter queue
@@ -619,13 +708,14 @@ class RedisQueue extends EventEmitter {
         this.emit('job:failed', { queueName, job, error: error.message });
         logger.error(`Redis Queue: Job ${job.id} failed permanently, moved to DLQ`);
       } else {
-        // Re-queue with exponential backoff
+        // Bug #3 fix: Re-queue with exponential backoff via Sorted Set (not LPUSH)
+        // This prevents the retry from being busy-polled in the main queue.
         job.processAfter = Date.now() + Math.pow(2, job.attempts) * 1000;
-        const queueKey = this.getQueueKey(queueName);
-        await redisService.lPush(queueKey, JSON.stringify(job));
+        const delayedKey = this.getDelayedKey(queueName);
+        await redisService.zAdd(delayedKey, job.processAfter, JSON.stringify(job));
 
         this.emit('job:retry', { queueName, job, attempt: job.attempts });
-        logger.warn(`Redis Queue: Job ${job.id} failed, retry ${job.attempts}/${job.maxAttempts}`);
+        logger.warn(`Redis Queue: Job ${job.id} failed, retry ${job.attempts}/${job.maxAttempts} at ${new Date(job.processAfter).toISOString()}`);
       }
     } finally {
       this.processing.delete(job.id);
@@ -642,6 +732,8 @@ class RedisQueue extends EventEmitter {
     for (const queueName of this.processors.keys()) {
       this.startWorkersForQueue(queueName);
     }
+    // Bug #3 fix: Start the delay poller that moves ready jobs from sorted sets to main queues
+    this.startDelayPoller();
     logger.info('🚀 Redis Queue processor started');
   }
 
@@ -651,8 +743,55 @@ class RedisQueue extends EventEmitter {
   stop(): void {
     this.isRunning = false;
     this.queueWorkers.clear();
-
+    if (this.delayPollerInterval) {
+      clearInterval(this.delayPollerInterval);
+      this.delayPollerInterval = null;
+    }
     logger.info('⏹️ Redis Queue processor stopped');
+  }
+
+  /**
+   * Bug #3 fix: Delay Poller — moves ready delayed jobs to main queue.
+   * Industry pattern (Bull/Celery): Delayed jobs sit in a Redis Sorted Set
+   * with score = processAfter timestamp. Every 1 second, this poller runs
+   * ZRANGEBYSCORE to find ready jobs and RPUSH them to the main LIST queue.
+   * Workers pick them up via BRPOP as normal — zero busy-polling.
+   */
+  private startDelayPoller(): void {
+    if (this.delayPollerInterval) return;
+
+    this.delayPollerInterval = setInterval(async () => {
+      if (!this.isRunning) return;
+
+      for (const queueName of this.processors.keys()) {
+        try {
+          const delayedKey = this.getDelayedKey(queueName);
+          const now = Date.now();
+
+          // Find all jobs whose processAfter timestamp has passed
+          const readyJobs = await redisService.zRangeByScore(delayedKey, 0, now);
+          if (readyJobs.length === 0) continue;
+
+          // Move each ready job to the main queue
+          const queueKey = this.getQueueKey(queueName);
+          for (const jobStr of readyJobs) {
+            await redisService.lPush(queueKey, jobStr);
+          }
+
+          // Remove moved jobs from the sorted set
+          await redisService.zRemRangeByScore(delayedKey, 0, now);
+
+          if (readyJobs.length > 0) {
+            logger.debug(`[DelayPoller] Moved ${readyJobs.length} ready job(s) from delayed:${queueName} to queue`);
+          }
+        } catch (err: any) {
+          // Non-fatal — jobs stay in sorted set, will be picked up next iteration
+          logger.warn(`[DelayPoller] Error for ${queueName}: ${err.message}`);
+        }
+      }
+    }, 1000); // Poll every 1 second — lightweight, just a ZRANGEBYSCORE per queue
+
+    this.delayPollerInterval.unref(); // Don't prevent Node.js from exiting
   }
 
   /**
