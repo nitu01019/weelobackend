@@ -1249,12 +1249,15 @@ class QueueService {
     // =========================================================================
     this.queue.process(QueueService.QUEUES.ASSIGNMENT_RECONCILIATION, async (job) => {
       const lockKey = 'lock:assignment-reconciliation';
-      const lock = await redisService.acquireLock(lockKey, 'reconciler', 60);
+      const lock = await redisService.acquireLock(lockKey, 'reconciler', 120);
       if (!lock.acquired) {
         return; // Another instance is processing
       }
 
       try {
+        // =====================================================================
+        // PHASE 1: Orphaned PENDING assignments (ECS restart during 30s timer)
+        // =====================================================================
         // assignedAt is String (ISO), so compare as string — ISO strings sort lexicographically
         const threeMinutesAgoISO = new Date(Date.now() - 3 * 60 * 1000).toISOString();
         const orphaned = await prismaClient.assignment.findMany({
@@ -1265,34 +1268,120 @@ class QueueService {
           take: 100
         });
 
-        if (orphaned.length === 0) return;
+        if (orphaned.length > 0) {
+          logger.warn(`[RECONCILIATION] Found ${orphaned.length} orphaned pending assignments`);
 
-        logger.warn(`[RECONCILIATION] Found ${orphaned.length} orphaned pending assignments`);
+          // Use the FULL handleAssignmentTimeout pipeline (same as normal timeout).
+          // This includes: status update, vehicle release, booking decrement,
+          // transporter notification, driver notification, booking room emit, FCM push.
+          // Industry pattern (Uber uTask): reconciliation uses same cleanup path as normal flow.
+          const { assignmentService } = require('../../modules/assignment/assignment.service');
 
-        // Use the FULL handleAssignmentTimeout pipeline (same as normal timeout).
-        // This includes: status update, vehicle release, booking decrement,
-        // transporter notification, driver notification, booking room emit, FCM push.
-        // Industry pattern (Uber uTask): reconciliation uses same cleanup path as normal flow.
-        const { assignmentService } = require('../../modules/assignment/assignment.service');
+          for (const assignment of orphaned) {
+            try {
+              await assignmentService.handleAssignmentTimeout({
+                assignmentId: assignment.id,
+                driverId: assignment.driverId,
+                driverName: assignment.driverName || '',
+                transporterId: assignment.transporterId,
+                vehicleId: assignment.vehicleId,
+                vehicleNumber: assignment.vehicleNumber || '',
+                bookingId: assignment.bookingId || '',
+                orderId: assignment.orderId || '',
+                truckRequestId: assignment.truckRequestId || '',
+                tripId: assignment.tripId || '',
+                createdAt: assignment.assignedAt
+              });
+              logger.info(`[RECONCILIATION] Processed orphaned pending: ${assignment.id}`);
+            } catch (err: any) {
+              logger.error(`[RECONCILIATION] Failed pending: ${assignment.id}`, { error: err.message });
+            }
+          }
+        }
 
-        for (const assignment of orphaned) {
-          try {
-            await assignmentService.handleAssignmentTimeout({
-              assignmentId: assignment.id,
-              driverId: assignment.driverId,
-              driverName: assignment.driverName || '',
-              transporterId: assignment.transporterId,
-              vehicleId: assignment.vehicleId,
-              vehicleNumber: assignment.vehicleNumber || '',
-              bookingId: assignment.bookingId || '',
-              orderId: assignment.orderId || '',
-              truckRequestId: assignment.truckRequestId || '',
-              tripId: assignment.tripId || '',
-              createdAt: assignment.assignedAt
-            });
-            logger.info(`[RECONCILIATION] Processed orphaned: ${assignment.id}`);
-          } catch (err: any) {
-            logger.error(`[RECONCILIATION] Failed: ${assignment.id}`, { error: err.message });
+        // =====================================================================
+        // PHASE 2: Abandoned IN-TRANSIT trucks (driver disappeared mid-trip)
+        // =====================================================================
+        // TRUCK-SPECIFIC: Freight trips can legitimately last 12-24 hours.
+        // But a truck in active status for >48 hours with NO completion is
+        // definitely abandoned (driver phone died, app crashed, driver went AWOL).
+        //
+        // This replaces the old STALE_VEHICLE_WATCHDOG with a lightweight check
+        // inside the existing reconciliation — same Uber pattern, no separate scanner.
+        //
+        // Threshold: 48 hours (configurable via env var)
+        // =====================================================================
+        const STALE_ACTIVE_HOURS = parseInt(process.env.STALE_ACTIVE_TRIP_HOURS || '48', 10);
+        const staleActiveThresholdISO = new Date(Date.now() - STALE_ACTIVE_HOURS * 60 * 60 * 1000).toISOString();
+
+        const abandonedTrips = await prismaClient.assignment.findMany({
+          where: {
+            status: { in: ['driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit', 'arrived_at_drop'] },
+            assignedAt: { lt: staleActiveThresholdISO }
+          },
+          include: {
+            vehicle: { select: { id: true, vehicleKey: true, transporterId: true, status: true } }
+          },
+          take: 50
+        });
+
+        if (abandonedTrips.length > 0) {
+          logger.warn(`[RECONCILIATION] 🚛 Found ${abandonedTrips.length} abandoned active trip(s) (>${STALE_ACTIVE_HOURS}h old)`);
+
+          const { liveAvailabilityService } = require('./live-availability.service');
+
+          for (const assignment of abandonedTrips) {
+            try {
+              const ageHours = Math.round((Date.now() - new Date(assignment.assignedAt).getTime()) / (60 * 60 * 1000));
+
+              // 1. Cancel the assignment (system-level — no user context needed)
+              await prismaClient.assignment.updateMany({
+                where: { id: assignment.id, status: { in: ['driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit', 'arrived_at_drop'] } },
+                data: { status: 'cancelled' }
+              });
+
+              // 2. Release the vehicle back to available
+              if (assignment.vehicleId) {
+                const prevStatus = assignment.vehicle?.status || 'in_transit';
+                await prismaClient.vehicle.updateMany({
+                  where: { id: assignment.vehicleId, status: { not: 'available' } },
+                  data: {
+                    status: 'available',
+                    currentTripId: null,
+                    assignedDriverId: null,
+                    lastStatusChange: new Date().toISOString()
+                  }
+                });
+
+                // 3. Update Redis availability (hot path sync)
+                const vehicleKey = assignment.vehicle?.vehicleKey;
+                const transporterId = assignment.vehicle?.transporterId || assignment.transporterId;
+                if (vehicleKey && transporterId) {
+                  await liveAvailabilityService.onVehicleStatusChange(
+                    transporterId,
+                    vehicleKey,
+                    prevStatus,
+                    'available'
+                  ).catch((err: any) => logger.warn('[RECONCILIATION] Redis update failed', err));
+                }
+              }
+
+              // 4. Decrement trucks filled on booking/order
+              if (assignment.bookingId) {
+                const { bookingService } = require('../../modules/booking/booking.service');
+                await bookingService.decrementTrucksFilled(assignment.bookingId).catch(() => {});
+              } else if (assignment.orderId) {
+                await prismaClient.order.update({
+                  where: { id: assignment.orderId },
+                  data: { trucksFilled: { decrement: 1 } }
+                }).catch(() => {});
+              }
+
+              logger.warn(`[RECONCILIATION] 🚛 Released abandoned truck: ${assignment.vehicleNumber || 'unknown'} ` +
+                `(assignment ${assignment.id}, status was '${assignment.status}', ${ageHours}h old)`);
+            } catch (err: any) {
+              logger.error(`[RECONCILIATION] Failed abandoned: ${assignment.id}`, { error: err.message });
+            }
           }
         }
       } finally {
