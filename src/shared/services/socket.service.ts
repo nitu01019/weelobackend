@@ -478,8 +478,9 @@ export function initializeSocket(server: HttpServer): Server {
           });
 
           if (pendingAssignment) {
-            // Calculate remaining seconds from the 60s timeout
-            const ASSIGNMENT_TIMEOUT_MS = 60 * 1000;
+            // Calculate remaining seconds — must match the setTimeout timer in queue.service.ts
+            // ASSIGNMENT_TIMEOUT_MS defaults to 30s (same as scheduleAssignmentTimeout)
+            const ASSIGNMENT_TIMEOUT_MS = parseInt(process.env.ASSIGNMENT_TIMEOUT_MS || '30000', 10);
             const assignedAtMs = new Date(pendingAssignment.assignedAt || '').getTime();
             const elapsedMs = Date.now() - assignedAtMs;
             const remainingMs = ASSIGNMENT_TIMEOUT_MS - elapsedMs;
