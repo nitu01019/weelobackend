@@ -1572,6 +1572,68 @@ class RedisService {
   }
 
   // ===========================================================================
+  // CACHE STAMPEDE PROTECTION (Singleflight Pattern)
+  // ===========================================================================
+
+  /**
+   * Process-local inflight map for singleflight deduplication.
+   * When N concurrent requests ask for the same cache key, only 1 runs backingFn.
+   * The other N-1 await the same Promise. Map clears after Promise resolves.
+   */
+  private inflightRequests: Map<string, Promise<any>> = new Map();
+
+  /**
+   * Get-or-Set with singleflight cache stampede protection.
+   *
+   * 1. Cache HIT → return cached value immediately (0 DB queries)
+   * 2. Cache MISS with no inflight → run backingFn, cache result, return
+   * 3. Cache MISS with inflight → await existing Promise (0 additional DB queries)
+   *
+   * @param key - Redis cache key
+   * @param ttlSeconds - Cache TTL in seconds
+   * @param backingFn - Function to call on cache miss (e.g., DB query)
+   * @returns Cached or freshly computed value
+   */
+  async getOrSet<T>(key: string, ttlSeconds: number, backingFn: () => Promise<T>): Promise<T> {
+    // Step 1: Try cache
+    try {
+      const cached = await this.getJSON<T>(key);
+      if (cached !== null) {
+        return cached;
+      }
+    } catch {
+      // Redis down — fall through to backing function
+    }
+
+    // Step 2: Singleflight — deduplicate concurrent cache misses
+    const inflight = this.inflightRequests.get(key);
+    if (inflight) {
+      // Another request is already fetching this key — await its result
+      return inflight as Promise<T>;
+    }
+
+    // Step 3: We're the first — execute backing function
+    const promise = (async () => {
+      try {
+        const result = await backingFn();
+        // Cache the result (including null — negative caching)
+        try {
+          await this.setJSON(key, result, ttlSeconds);
+        } catch {
+          // Cache write failed — still return the result
+        }
+        return result;
+      } finally {
+        // Always clean up inflight map
+        this.inflightRequests.delete(key);
+      }
+    })();
+
+    this.inflightRequests.set(key, promise);
+    return promise;
+  }
+
+  // ===========================================================================
   // RATE LIMITING
   // ===========================================================================
 

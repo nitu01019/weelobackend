@@ -11,6 +11,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { assignmentService } from './assignment.service';
 import { authMiddleware, roleGuard } from '../../shared/middleware/auth.middleware';
+import { transporterRateLimit } from '../../shared/middleware/transporter-rate-limit.middleware';
 import { validateRequest } from '../../shared/utils/validation.utils';
 import {
   createAssignmentSchema,
@@ -277,9 +278,10 @@ router.get(
         }
       }
 
-      // Calculate timeout at (60 seconds from assignment) - Industry Standard
+      // Calculate timeout using the centralized config (ASSIGNMENT_TIMEOUT_MS, default 30s)
+      const ASSIGNMENT_TIMEOUT_MS = parseInt(process.env.ASSIGNMENT_TIMEOUT_MS || '30000', 10);
       const assignedAt = new Date(assignment.assignedAt);
-      const timeoutAt = new Date(assignedAt.getTime() + 60000).toISOString();
+      const timeoutAt = new Date(assignedAt.getTime() + ASSIGNMENT_TIMEOUT_MS).toISOString();
 
       res.json({
         success: true,
@@ -303,6 +305,7 @@ router.patch(
   '/:id/accept',
   authMiddleware,
   roleGuard(['driver']),
+  transporterRateLimit('driverAcceptDecline'),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const assignment = await assignmentService.acceptAssignment(
@@ -329,6 +332,7 @@ router.patch(
   '/:id/decline',
   authMiddleware,
   roleGuard(['driver']),
+  transporterRateLimit('driverAcceptDecline'),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       // Driver explicitly declines → notify transporter for reassignment

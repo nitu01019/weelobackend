@@ -29,7 +29,7 @@ import { CreateAssignmentInput, UpdateStatusInput, GetAssignmentsQuery } from '.
 // BEFORE: setInterval(5000ms) on EVERY ECS instance → Redis SCAN for expired keys
 //   → 50 instances × SCAN every 5s = 600 Redis ops/minute even at 3am
 //
-// NOW: Queue delayed job fires exactly at 60s → ONE worker processes it
+// NOW: In-process setTimeout fires at ASSIGNMENT_TIMEOUT_MS (default 30s)
 //   → Zero polling, zero wasted CPU, sub-second accuracy
 //
 // Processor registered in: queue.service.ts → registerDefaultProcessors()
@@ -245,11 +245,11 @@ class AssignmentService {
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable, timeoutMs: 8000 });
 
     // =========================================================================
-    // START 60-SECOND TIMEOUT TIMER (Queue-based delayed job)
+    // START ASSIGNMENT TIMEOUT TIMER (In-process self-destruct)
     // =========================================================================
-    // SCALABILITY: Queue job fires exactly at 60s — zero polling, one worker
-    // EASY UNDERSTANDING: Driver has 60s to accept/decline, then auto-expires
-    // SAFETY: If driver accepts before 60s, job fires but no-ops (idempotent)
+    // SCALABILITY: setTimeout fires at ASSIGNMENT_TIMEOUT_MS (default 30s) — zero polling
+    // EASY UNDERSTANDING: Driver has 30s to accept/decline, then auto-expires
+    // SAFETY: If driver accepts before timeout, timer fires but no-ops (idempotent)
     // =========================================================================
     const timerData: AssignmentTimerData = {
       assignmentId: assignment.id,
@@ -480,7 +480,14 @@ class AssignmentService {
     // Even if assignment was created, driver might have accepted another
     // trip in the meantime. This is the final safety check.
     // =================================================================
-    const activeAssignment = await db.getActiveAssignmentByDriver(driverId);
+    // Negative caching: cache 'no active assignment' state for 15s
+    // Prevents redundant DB queries when driver has no active trip (majority of time)
+    const cacheKey = `driver:active-assignment:${driverId}`;
+    const activeAssignment = await redisService.getOrSet<AssignmentRecord | null>(
+      cacheKey,
+      15,  // 15s TTL — short enough to not stale on accept
+      () => db.getActiveAssignmentByDriver(driverId)
+    );
     if (activeAssignment && activeAssignment.id !== assignmentId) {
       logger.warn(`⚠️ Driver ${driverId} tried to accept ${assignmentId} but already has active trip: ${activeAssignment.tripId}`);
       throw new AppError(400, 'DRIVER_BUSY',
@@ -488,7 +495,7 @@ class AssignmentService {
     }
 
     // Queue job is idempotent: handleAssignmentTimeout() uses updateMany({ where: { status: 'pending' }})
-    // so if driver accepted first, the queue job no-ops when it fires at 60s.
+    // so if driver accepted first, the timer no-ops when it fires.
     // No explicit cancellation needed.
 
     // =====================================================================
@@ -675,6 +682,10 @@ class AssignmentService {
     }
 
     logger.info(`Assignment accepted: ${assignmentId} by driver ${driverId}`);
+
+    // Invalidate negative cache — driver now has an active assignment
+    await redisService.del(`driver:active-assignment:${driverId}`).catch(() => {});
+
     return updated!;
   }
 
@@ -727,6 +738,23 @@ class AssignmentService {
 
     const updated = await db.updateAssignment(assignmentId, updates);
 
+    // =====================================================================
+    // FIX: Release vehicle back to available on trip completion
+    // =====================================================================
+    // BEFORE: Only set completedAt — vehicle stayed in_transit forever
+    //   until the 48-hour reconciliation sweep caught it.
+    // NOW: Release vehicle immediately so it's available for new trips.
+    // Same releaseVehicleIfBusy() used by cancel/decline/timeout.
+    // =====================================================================
+    if (data.status === 'completed') {
+      await this.releaseVehicleIfBusy(
+        assignment.vehicleId,
+        assignment.transporterId,
+        'tripCompleted'
+      );
+      logger.info(`[ASSIGNMENT] Vehicle released on trip completion: ${assignment.vehicleNumber}`);
+    }
+
     // Notify booking room
     const updateStreamId = this.resolveAssignmentStreamId(assignment);
     if (updateStreamId) {
@@ -736,6 +764,67 @@ class AssignmentService {
         status: data.status,
         vehicleNumber: assignment.vehicleNumber
       });
+    }
+
+    // =====================================================================
+    // FIX: Direct notifications on trip completion
+    // =====================================================================
+    // BEFORE: Only emitted to booking room. Transporter/customer may not
+    //   be in that room → they never learn the trip finished.
+    // NOW: Direct WebSocket + FCM push (same pattern as cancel/decline).
+    // =====================================================================
+    if (data.status === 'completed') {
+      // Notify transporter directly
+      emitToUser(assignment.transporterId, SocketEvent.ASSIGNMENT_STATUS_CHANGED, {
+        assignmentId,
+        tripId: assignment.tripId,
+        status: 'completed',
+        vehicleNumber: assignment.vehicleNumber,
+        driverName: assignment.driverName,
+        message: `${assignment.driverName} completed the trip (${assignment.vehicleNumber})`
+      });
+
+      queueService.queuePushNotification(assignment.transporterId, {
+        title: '✅ Trip Completed',
+        body: `${assignment.driverName} completed the trip (${assignment.vehicleNumber})`,
+        data: {
+          type: 'assignment_update',
+          assignmentId,
+          tripId: assignment.tripId,
+          status: 'completed'
+        }
+      }).catch(err => {
+        logger.warn(`FCM: Failed to notify transporter of completion`, err);
+      });
+
+      // Notify customer if booking exists
+      const booking = assignment.bookingId
+        ? await db.getBookingById(assignment.bookingId)
+        : undefined;
+      if (booking?.customerId) {
+        emitToUser(booking.customerId, SocketEvent.ASSIGNMENT_STATUS_CHANGED, {
+          assignmentId,
+          tripId: assignment.tripId,
+          bookingId: assignment.bookingId,
+          status: 'completed',
+          vehicleNumber: assignment.vehicleNumber,
+          message: `Your delivery has been completed (${assignment.vehicleNumber})`
+        });
+
+        queueService.queuePushNotification(booking.customerId, {
+          title: '📦 Delivery Completed',
+          body: `Your delivery has arrived! Vehicle: ${assignment.vehicleNumber}`,
+          data: {
+            type: 'assignment_update',
+            assignmentId,
+            tripId: assignment.tripId,
+            bookingId: assignment.bookingId,
+            status: 'completed'
+          }
+        }).catch(err => {
+          logger.warn(`FCM: Failed to notify customer of completion`, err);
+        });
+      }
     }
 
     logger.info(`Assignment status updated: ${assignmentId} -> ${data.status}`);
@@ -760,6 +849,9 @@ class AssignmentService {
     // Queue job is idempotent: if assignment is cancelled, handleAssignmentTimeout() no-ops.
 
     await db.updateAssignment(assignmentId, { status: 'cancelled' });
+
+    // Invalidate negative cache on cancel
+    await redisService.del(`driver:active-assignment:${assignment.driverId}`).catch(() => {});
 
     // Decrement trucks filled
     if (assignment.bookingId) {
@@ -859,12 +951,15 @@ class AssignmentService {
       throw new AppError(400, 'INVALID_STATUS', 'Assignment cannot be declined');
     }
 
-    // Queue job fires at 60s but handleAssignmentTimeout() no-ops if assignment is no longer pending.
+    // Timer fires at ASSIGNMENT_TIMEOUT_MS but handleAssignmentTimeout() no-ops if assignment is no longer pending.
     // No explicit cancellation needed.
 
     // 2. Update status to driver_declined
     await db.updateAssignment(assignmentId, { status: 'driver_declined' });
     await this.persistAssignmentReason(assignmentId, 'declined');
+
+    // Invalidate negative cache on decline
+    await redisService.del(`driver:active-assignment:${driverId}`).catch(() => {});
 
     // 3. Release vehicle back to available
     await this.releaseVehicleIfBusy(
@@ -926,14 +1021,14 @@ class AssignmentService {
   }
 
   // ==========================================================================
-  // HANDLE ASSIGNMENT TIMEOUT (Driver didn't respond in 60s)
+  // HANDLE ASSIGNMENT TIMEOUT (Driver didn't respond in time)
   // ==========================================================================
   // 
-  // Called by the queue processor in queue.service.ts when the delayed job fires.
+  // Called by setTimeout in queue.service.ts when the self-destruct timer fires.
   // Safe to call even if driver already accepted/declined — updateMany no-ops.
   // 
-  // SCALABILITY: Distributed lock in queue processor prevents duplicate handling
-  // EASY UNDERSTANDING: No response in 60s → same as decline + timeout reason
+  // SCALABILITY: In-process timer — zero Redis hops, guaranteed to fire
+  // EASY UNDERSTANDING: No response in ASSIGNMENT_TIMEOUT_MS → same as decline + timeout reason
   // MODULARITY: Uses same vehicle release + notification pattern as decline
   // ==========================================================================
 

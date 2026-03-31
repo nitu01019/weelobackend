@@ -52,6 +52,7 @@ if [ -n "$DATABASE_URL" ] && echo "$DATABASE_URL" | grep -q "^postgres"; then
         npx prisma migrate resolve --applied "20260228_phase2_reliability_core" 2>&1 || true
         npx prisma migrate resolve --applied "20260228_phase4_hold_reliability" 2>&1 || true
         npx prisma migrate resolve --applied "20260228_phase5_cancel_reliability" 2>&1 || true
+        npx prisma migrate resolve --applied "20260321_hold_phase_system" 2>&1 || true
         npx prisma migrate resolve --applied "20260329_add_on_hold_status_and_vehicle_index" 2>&1 || true
         echo "✅ Baseline complete — existing migrations marked as applied"
     fi

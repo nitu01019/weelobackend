@@ -845,6 +845,47 @@ class DriverService {
   }
 
   /**
+   * Batch check if multiple drivers are online.
+   * Uses parallel Redis exists + single DB findMany instead of N sequential isDriverOnline calls.
+   *
+   * @returns Map<driverId, boolean>
+   */
+  async areDriversOnline(driverIds: string[]): Promise<Map<string, boolean>> {
+    const result = new Map<string, boolean>();
+    if (driverIds.length === 0) return result;
+
+    try {
+      // Parallel: Redis presence checks + single batch DB query
+      const [presenceResults, dbResults] = await Promise.all([
+        // Redis: parallel existence checks (N concurrent, not sequential)
+        Promise.all(driverIds.map(id => redisService.exists(PRESENCE_KEY(id)))),
+        // DB: single batch query instead of N individual findUnique calls
+        prismaClient.user.findMany({
+          where: { id: { in: driverIds } },
+          select: { id: true, isAvailable: true }
+        })
+      ]);
+
+      const dbAvailability = new Map(dbResults.map(u => [u.id, u.isAvailable === true]));
+
+      for (let i = 0; i < driverIds.length; i++) {
+        const redisOnline = presenceResults[i];
+        const dbAvailable = dbAvailability.get(driverIds[i]) ?? false;
+        result.set(driverIds[i], redisOnline && dbAvailable);
+      }
+    } catch (error: any) {
+      logger.warn(`[Driver] Batch online check failed, falling back to individual: ${error.message}`);
+      // Fallback: check individually (guaranteed correctness)
+      for (const driverId of driverIds) {
+        const online = await this.isDriverOnline(driverId);
+        result.set(driverId, online);
+      }
+    }
+
+    return result;
+  }
+
+  /**
    * Get online driver IDs for a transporter
    *
    * Uses Redis SET for fast O(1) membership check.

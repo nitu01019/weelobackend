@@ -968,7 +968,7 @@ class TruckHoldService {
    * 2. Validate each vehicle is AVAILABLE (not in another trip)
    * 3. Validate each driver is AVAILABLE (not on another trip)
    * 4. Create assignment records
-   * 5. Update vehicle status to 'in_transit'
+   * 5. Update vehicle status to 'on_hold' (stays on_hold until driver accepts)
    * 6. Notify drivers & customer
    * 7. Broadcast availability update
    * 
@@ -1097,6 +1097,10 @@ class TruckHoldService {
       const activeDriverMap = new Map(activeDriverAssignments.map((assignment) => [assignment.driverId, assignment]));
       const activeVehicleMap = new Map(activeVehicleAssignments.map((assignment) => [assignment.vehicleId, assignment]));
 
+      // Batch driver online check: 1 DB query + N parallel Redis instead of N sequential (DB + Redis)
+      const uniqueDriverIdsForOnlineCheck = [...new Set(assignments.map(a => a.driverId))];
+      const driverOnlineMap = await driverService.areDriversOnline(uniqueDriverIdsForOnlineCheck);
+
       for (let i = 0; i < assignments.length; i++) {
         const { vehicleId, driverId } = assignments[i];
         const truckRequestId = hold.truckRequestIds[i];
@@ -1175,6 +1179,22 @@ class TruckHoldService {
           failedAssignments.push({
             vehicleId,
             reason: `Driver ${driver.name} is already on trip ${activeAssignment.tripId}`
+          });
+          continue;
+        }
+
+        // =====================================================================
+        // LAYER 2: Reject offline driver BEFORE creating anything
+        // Industry standard (Uber/Ola/Porter): Fail-fast at validation time.
+        // Prevents silent waste: no assignment, no timer, no vehicle on_hold.
+        // Transporter gets immediate actionable error instead of 30s timeout.
+        // Atomic: if ANY driver offline, entire batch fails (all-or-nothing).
+        // =====================================================================
+        const isOnline = driverOnlineMap.get(driverId) ?? false;
+        if (!isOnline) {
+          failedAssignments.push({
+            vehicleId,
+            reason: `Driver ${driver.name} is offline. Please select an online driver.`
           });
           continue;
         }
@@ -1467,56 +1487,54 @@ class TruckHoldService {
           message: `New trip assigned! ${order.pickup.address} → ${order.drop.address}`
         };
 
-        // Industry Standard: Check driver is online before assigning trip
-        // Uber/Ola Pattern: Verify driver presence to avoid failed notifications
-        const isDriverOnline = await driverService.isDriverOnline(assignment.driver.id);
-        if (!isDriverOnline) {
-          logger.warn(`⚠️  Driver online check failed: ${assignment.driver.id} (${assignment.driver.name}) is offline - skipping trip_assigned notification`);
-          // Continue to next driver - don't emit to offline driver
-          continue;
-        }
-
         // Individual emit for backward compatibility with current Android app
         socketService.emitToUser(assignment.driver.id, SocketEvent.TRIP_ASSIGNED, driverNotification);
       }
       logger.info(`   📢 Individual trip_assigned events sent to ${assignmentsData.length} driver(s) (backward compatible)`);
 
-      // OPTIMIZATION 2: Batch FCM push (up to 500 tokens per request)
-      // Get FCM tokens for all drivers in one batch operation
-      const driverFcmtTokenIds = confirmedAssignments.assignments.map((a) => a.driver.id);
-      const allFcmTokens: string[] = [];
+      // =====================================================================
+      // LAYER 3: Individual per-driver FCM push (backup when Socket.IO is down)
+      // =====================================================================
+      // Industry standard: Send both Socket.IO (real-time) AND FCM (backup).
+      // Key fixes from previous batch FCM:
+      //   1. type: 'trip_assigned'     — matches WeeloFirebaseService.TYPE_TRIP_ASSIGNED
+      //   2. Full assignment payload   — all fields WeeloNavigation.kt:259-287 expects
+      //   3. Per-driver push           — each driver gets their own assignment data
+      // queuePushNotification resolves tokens internally (no manual token fetch needed).
+      // =====================================================================
+      for (const assignment of confirmedAssignments.assignments) {
+        const driverNotificationFcm = {
+          type: 'trip_assigned',
+          assignmentId: assignment.assignmentId,
+          tripId: assignment.tripId,
+          orderId: order.id,
+          truckRequestId: assignment.truckRequestId,
+          pickupAddress: order.pickup.address,
+          pickupCity: order.pickup.city || '',
+          pickupLat: String(order.pickup.lat ?? order.pickup.latitude ?? 0),
+          pickupLng: String(order.pickup.lng ?? order.pickup.longitude ?? 0),
+          dropAddress: order.drop.address,
+          dropCity: order.drop.city || '',
+          dropLat: String(order.drop.lat ?? order.drop.latitude ?? 0),
+          dropLng: String(order.drop.lng ?? order.drop.longitude ?? 0),
+          vehicleNumber: assignment.vehicle.vehicleNumber,
+          fare: String(assignment.farePerTruck ?? 0),
+          distanceKm: String(order.distanceKm ?? 0),
+          customerName: order.customerName || '',
+          customerPhone: order.customerPhone || '',
+          assignedAt: now,
+          expiresAt: new Date(Date.now() + DRIVER_TIMEOUT_MS).toISOString()
+        };
 
-      // Parallel fetch of tokens for all drivers
-      await Promise.all(driverFcmtTokenIds.map(async (driverId) => {
-        try {
-          const tokens = await fcmService.getTokens(driverId);
-          allFcmTokens.push(...tokens);
-        } catch (err: any) {
-          logger.warn(`FCM: Failed to get tokens for driver ${driverId}: ${err?.message || err}`);
-        }
-      }));
-
-      // Single batch FCM push for all drivers
-      if (allFcmTokens.length > 0) {
-        await queueService.queueBatchPush(allFcmTokens, {
-          title: `🚛 ${assignmentsData.length} New Trip(s) Assigned!`,
-          body: `${assignmentsData.length === 1
-            ? `${order.pickup.address} → ${order.drop.address}`
-            : `${assignmentsData.length} trip(s) ready. Tap to view.`
-          }`,
-          data: {
-            type: 'trips_assigned_batch',
-            transporterId,
-            orderId: order.id,
-            assignmentCount: String(assignmentsData.length)
-          }
+        queueService.queuePushNotification(assignment.driver.id, {
+          title: '🚛 New Trip Assigned!',
+          body: `${order.pickup.address} → ${order.drop.address}`,
+          data: driverNotificationFcm
         }).catch(err => {
-          logger.warn(`FCM: Failed to queue batch push for ${allFcmTokens.length} tokens`, err);
+          logger.warn(`FCM: trip_assigned push failed for driver ${assignment.driver.id}`, err);
         });
-        logger.info(`   📱 Batch FCM pushed to ${allFcmTokens.length} device(s) across ${driverFcmtTokenIds.length} driver(s)`);
-      } else {
-        logger.warn(`   ⚠️ No FCM tokens found for ${driverFcmtTokenIds.length} driver(s) - WebSocket delivery only`);
       }
+      logger.info(`   📱 Individual FCM pushed to ${confirmedAssignments.assignments.length} driver(s)`);
 
       // OPTIMIZATION 3: Schedule timeout jobs for each driver (kept separate for correctness)
       // Each driver needs independent timeout (env-configurable, default 30s)
@@ -2130,6 +2148,17 @@ class TruckHoldService {
   private startCleanupJob(): void {
     this.cleanupInterval = setInterval(async () => {
       try {
+        // Distributed lock: only ONE instance runs cleanup per interval
+        const cleanupLock = await redisService.acquireLock(
+          'hold-cleanup-job',
+          `cleanup-${process.pid}`,
+          60  // 60s lock TTL — cleanup should complete well within this
+        );
+        if (!cleanupLock.acquired) {
+          return; // Another instance is handling cleanup
+        }
+
+        try {
         const now = new Date();
         let cleanupReleasedCount = 0;
         const expiredHolds = await prismaClient.truckHoldLedger.findMany({
@@ -2166,17 +2195,35 @@ class TruckHoldService {
 
         const nowMs = Date.now();
         if (nowMs - this.lastIdempotencyPurgeAtMs >= HOLD_IDEMPOTENCY_PURGE_INTERVAL_MS) {
-          this.lastIdempotencyPurgeAtMs = nowMs;
-          const cutoff = new Date(nowMs - (HOLD_IDEMPOTENCY_RETENTION_HOURS * 60 * 60 * 1000));
-          const purged = await prismaClient.truckHoldIdempotency.deleteMany({
-            where: {
-              createdAt: { lt: cutoff }
+          // Distributed lock: only ONE instance runs purge per interval
+          const purgeLock = await redisService.acquireLock(
+            'hold-idempotency-purge',
+            `purge-${process.pid}`,
+            30  // 30s lock TTL — purge should complete well within this
+          );
+          if (!purgeLock.acquired) {
+            // Another instance is handling purge — skip
+          } else {
+            try {
+              this.lastIdempotencyPurgeAtMs = nowMs;
+              const cutoff = new Date(nowMs - (HOLD_IDEMPOTENCY_RETENTION_HOURS * 60 * 60 * 1000));
+              const purged = await prismaClient.truckHoldIdempotency.deleteMany({
+                where: {
+                  createdAt: { lt: cutoff }
+                }
+              });
+              if (purged.count > 0) {
+                logger.info(`[TruckHold] Purged ${purged.count} old hold idempotency row(s)`);
+                metrics.incrementCounter('hold.idempotency.purged_total', {}, purged.count);
+              }
+            } finally {
+              await redisService.releaseLock('hold-idempotency-purge', `purge-${process.pid}`).catch(() => {});
             }
-          });
-          if (purged.count > 0) {
-            logger.info(`[TruckHold] Purged ${purged.count} old hold idempotency row(s)`);
-            metrics.incrementCounter('hold.idempotency.purged_total', {}, purged.count);
           }
+        }
+        } finally {
+          // Release the cleanup lock (auto-expires after 60s if we crash)
+          await redisService.releaseLock('hold-cleanup-job', `cleanup-${process.pid}`).catch(() => {});
         }
       } catch (error: any) {
         logger.error(`[TruckHold] Cleanup job error: ${error.message}`);

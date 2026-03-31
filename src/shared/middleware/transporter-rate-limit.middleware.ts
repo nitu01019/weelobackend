@@ -62,6 +62,14 @@ const RATE_LIMITS: Record<string, RateLimitConfig> = {
     max: 100,
     window: 60,
     blockDuration: 180
+  },
+
+  // Driver accept/decline assignment: Max 10 per 60 seconds
+  // Tight limit — accept/decline is once-per-assignment action
+  driverAcceptDecline: {
+    max: 10,
+    window: 60,
+    blockDuration: 60  // 1 minute (short — don't lock driver out for long)
   }
 };
 

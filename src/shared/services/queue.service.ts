@@ -309,6 +309,27 @@ class InMemoryQueue extends EventEmitter {
 
         this.emit('job:failed', { queueName, job, error: error.message });
         logger.error(`Job ${job.id} failed permanently: ${error.message}`);
+
+        // Persist to Redis DLQ for observability and potential recovery
+        try {
+          const dlqKey = `dlq:${queueName}`;
+          const dlqEntry = JSON.stringify({
+            jobId: job.id,
+            type: job.type,
+            data: job.data,
+            error: error.message,
+            attempts: job.attempts,
+            failedAt: new Date().toISOString()
+          });
+          await redisService.lPush(dlqKey, dlqEntry);
+          // Cap at 1000 entries to prevent unbounded growth
+          await redisService.lTrim(dlqKey, 0, 999);
+          // 7-day TTL — old DLQ entries auto-expire
+          await redisService.expire(dlqKey, 7 * 24 * 60 * 60);
+        } catch (dlqErr: any) {
+          // DLQ persistence is best-effort — don't break the failure handler
+          logger.warn(`[DLQ] Failed to persist dead letter for ${job.id}: ${dlqErr.message}`);
+        }
       } else {
         // Schedule retry with exponential backoff
         job.processAfter = Date.now() + Math.pow(2, job.attempts) * 1000;
@@ -1152,78 +1173,99 @@ class QueueService {
     });
 
     // Push notification processor
+    // Circuit breaker wraps FCM — when open, skips push (Socket.IO is primary delivery)
     this.queue.process(QueueService.QUEUES.PUSH_NOTIFICATION, async (job) => {
       const { sendPushNotification } = require('./fcm.service');
+      const { fcmCircuit } = require('./circuit-breaker.service');
       const { userId, notification } = job.data;
-      await sendPushNotification(userId, notification);
+
+      await fcmCircuit.tryWithFallback(
+        async () => {
+          await sendPushNotification(userId, notification);
+        },
+        async () => {
+          // Circuit open — skip FCM push (Socket.IO is primary delivery channel)
+          logger.info(`[FCM] Circuit open — skipping push for user ${userId} (Socket.IO primary)`);
+        }
+      );
     });
 
     // FCM batch processor - sends to up to 500 drivers in ONE API call
+    // Circuit breaker wraps entire batch — when open, skips batch FCM entirely
     this.queue.process(QueueService.QUEUES.FCM_BATCH, async (job) => {
+      const { fcmCircuit } = require('./circuit-breaker.service');
       const { tokens, notification } = job.data;
 
-      // Import fcmService
-      const fcmService = (await import('./fcm.service')).fcmService;
+      await fcmCircuit.tryWithFallback(
+        async () => {
+          // Import fcmService
+          const fcmService = (await import('./fcm.service')).fcmService;
 
-      // Get FCM SDK
-      let admin: any;
-      try {
-        admin = require('firebase-admin');
-      } catch (error) {
-        logger.warn('[FCM_BATCH] Firebase Admin not available, falling back to individual sends');
-        // Fallback: Send one-by-one using fcmService
-        for (const token of tokens) {
+          // Get FCM SDK
+          let admin: any;
           try {
-            await fcmService.sendToTokens([token], {
+            admin = require('firebase-admin');
+          } catch (error) {
+            logger.warn('[FCM_BATCH] Firebase Admin not available, falling back to individual sends');
+            // Fallback: Send one-by-one using fcmService
+            for (const token of tokens) {
+              try {
+                await fcmService.sendToTokens([token], {
+                  type: notification.data?.type || 'general',
+                  title: notification.title,
+                  body: notification.body,
+                  priority: 'high',
+                  data: notification.data
+                });
+              } catch (err) {
+                if (err?.code === 'messaging/registration-token-not-registered') {
+                  // Token invalid, remove from Redis
+                  await redisService.del(`fcm_token:${token}`);
+                }
+              }
+            }
+            return;
+          }
+
+          // Use Firebase Admin SDK multicast for batch send
+          // FCM supports up to 500 tokens per request
+          if (tokens.length === 1) {
+            await fcmService.sendToTokens(tokens, {
               type: notification.data?.type || 'general',
               title: notification.title,
               body: notification.body,
               priority: 'high',
               data: notification.data
             });
-          } catch (err) {
-            if (err?.code === 'messaging/registration-token-not-registered') {
-              // Token invalid, remove from Redis
-              await redisService.del(`fcm_token:${token}`);
+          } else {
+            const batchResponse = await admin.messaging().sendMulticast({
+              tokens: tokens.slice(0, 500),  // FCM limit: 500
+              notification: {
+                title: notification.title,
+                body: notification.body
+              },
+              data: notification.data || {}
+            });
+
+            const successCount = batchResponse.successCount || 0;
+            const failureCount = (tokens.length || 1) - successCount;
+
+            logger.info(`[FCM_BATCH] Sent to ${tokens.length} drivers: ${successCount} succeeded, ${failureCount} failed`);
+
+            // Remove invalid tokens from Redis
+            for (const token of tokens) {
+              const index = batchResponse.responses.findIndex(r => r.success === false);
+              if (index !== -1 && batchResponse.responses[index].error?.code === 'messaging/registration-token-not-registered') {
+                await redisService.del(`fcm_token:${token}`);
+              }
             }
           }
+        },
+        async () => {
+          // Circuit open — skip batch FCM (Socket.IO is primary delivery channel)
+          logger.info(`[FCM_BATCH] Circuit open — skipping batch push for ${tokens.length} tokens (Socket.IO primary)`);
         }
-        return;
-      }
-
-      // Use Firebase Admin SDK multicast for batch send
-      // FCM supports up to 500 tokens per request
-      if (tokens.length === 1) {
-        await fcmService.sendToTokens(tokens, {
-          type: notification.data?.type || 'general',
-          title: notification.title,
-          body: notification.body,
-          priority: 'high',
-          data: notification.data
-        });
-      } else {
-        const batchResponse = await admin.messaging().sendMulticast({
-          tokens: tokens.slice(0, 500),  // FCM limit: 500
-          notification: {
-            title: notification.title,
-            body: notification.body
-          },
-          data: notification.data || {}
-        });
-
-        const successCount = batchResponse.successCount || 0;
-        const failureCount = (tokens.length || 1) - successCount;
-
-        logger.info(`[FCM_BATCH] Sent to ${tokens.length} drivers: ${successCount} succeeded, ${failureCount} failed`);
-
-        // Remove invalid tokens from Redis
-        for (const token of tokens) {
-          const index = batchResponse.responses.findIndex(r => r.success === false);
-          if (index !== -1 && batchResponse.responses[index].error?.code === 'messaging/registration-token-not-registered') {
-            await redisService.del(`fcm_token:${token}`);
-          }
-        }
-      }
+      );
     });
 
     // Tracking stream processor (sink pluggable via env/integration service).

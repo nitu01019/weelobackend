@@ -79,6 +79,7 @@ router.post(
   '/hold',
   authMiddleware,
   roleGuard(['transporter']),
+  transporterRateLimit('holdTrucks'),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const transporterId = req.user!.userId;
@@ -680,6 +681,7 @@ router.put(
   '/driver/:assignmentId/accept',
   authMiddleware,
   roleGuard(['driver']),
+  transporterRateLimit('driverAcceptDecline'),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const driverId = req.user!.userId;
@@ -714,6 +716,7 @@ router.put(
   '/driver/:assignmentId/decline',
   authMiddleware,
   roleGuard(['driver']),
+  transporterRateLimit('driverAcceptDecline'),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const driverId = req.user!.userId;
