@@ -39,25 +39,21 @@ if [ -n "$DATABASE_URL" ] && echo "$DATABASE_URL" | grep -q "^postgres"; then
     # - Tracks applied migrations in _prisma_migrations table
     # - Idempotent: skips already-applied migrations
     # - Does NOT drop data (unlike db push)
-    # - If DB has no _prisma_migrations table yet → baseline first, then deploy
+    # - Always baseline all known migrations first (resolve --applied is idempotent)
+    #   This handles: empty _prisma_migrations table, P3005, or fresh DB scenarios
 
-    # Step 1: Check if _prisma_migrations table exists (first-time setup)
-    MIGRATION_TABLE_EXISTS=$(npx prisma migrate status 2>&1 | grep -c "No migration" || true)
+    # Step 1: Always baseline all known migrations (safe — idempotent, skips if already recorded)
+    echo "📋 Baselining all known migrations (idempotent)..."
+    npx prisma migrate resolve --applied "20260219_add_broadcast_lifecycle_states" 2>&1 || true
+    npx prisma migrate resolve --applied "20260225_add_truckrequest_notified_transporters_gin_index" 2>&1 || true
+    npx prisma migrate resolve --applied "20260228_phase2_reliability_core" 2>&1 || true
+    npx prisma migrate resolve --applied "20260228_phase4_hold_reliability" 2>&1 || true
+    npx prisma migrate resolve --applied "20260228_phase5_cancel_reliability" 2>&1 || true
+    npx prisma migrate resolve --applied "20260321_hold_phase_system" 2>&1 || true
+    npx prisma migrate resolve --applied "20260329_add_on_hold_status_and_vehicle_index" 2>&1 || true
+    echo "✅ Baseline complete — all known migrations marked as applied"
 
-    if echo "$(npx prisma migrate status 2>&1)" | grep -q "P3005\|The database schema is not empty"; then
-        echo "📋 Existing DB detected — baselining previous migrations..."
-        # Mark all pre-existing migrations as already applied (they were done via db push)
-        npx prisma migrate resolve --applied "20260219_add_broadcast_lifecycle_states" 2>&1 || true
-        npx prisma migrate resolve --applied "20260225_add_truckrequest_notified_transporters_gin_index" 2>&1 || true
-        npx prisma migrate resolve --applied "20260228_phase2_reliability_core" 2>&1 || true
-        npx prisma migrate resolve --applied "20260228_phase4_hold_reliability" 2>&1 || true
-        npx prisma migrate resolve --applied "20260228_phase5_cancel_reliability" 2>&1 || true
-        npx prisma migrate resolve --applied "20260321_hold_phase_system" 2>&1 || true
-        npx prisma migrate resolve --applied "20260329_add_on_hold_status_and_vehicle_index" 2>&1 || true
-        echo "✅ Baseline complete — existing migrations marked as applied"
-    fi
-
-    # Step 2: Deploy any NEW migrations (e.g. 20260321_hold_phase_system)
+    # Step 2: Deploy any NEW migrations added after the baseline
     npx prisma migrate deploy 2>&1 || {
         echo "❌ Prisma migrate deploy failed — aborting startup to prevent broken state"
         exit 1
