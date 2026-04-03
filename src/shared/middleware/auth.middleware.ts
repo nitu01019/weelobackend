@@ -92,12 +92,12 @@ export function authMiddleware(
     req.user = {
       userId: decoded.userId,
       role: decoded.role,
-      phone: (decoded as Record<string, unknown>).phone as string || ''
+      phone: decoded.phone || ''
     };
     // Legacy format for existing controllers
     req.userId = decoded.userId;
     req.userRole = decoded.role;
-    req.userPhone = (decoded as Record<string, unknown>).phone as string || '';
+    req.userPhone = decoded.phone || '';
 
     next();
   } catch (error: unknown) {
@@ -188,12 +188,12 @@ export function optionalAuthMiddleware(
     req.user = {
       userId: decoded.userId,
       role: decoded.role,
-      phone: (decoded as Record<string, unknown>).phone as string || ''
+      phone: decoded.phone || ''
     };
     // Legacy format for existing controllers
     req.userId = decoded.userId;
     req.userRole = decoded.role;
-    req.userPhone = (decoded as Record<string, unknown>).phone as string || '';
+    req.userPhone = decoded.phone || '';
 
     next();
   } catch {

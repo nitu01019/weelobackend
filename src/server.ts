@@ -449,7 +449,7 @@ if (config.isDevelopment) {
           socketId: socket.id,
           userId: socket.data.userId,
           role: socket.data.role,
-          phone: socket.data.phone
+          phone: socket.data.phone ? `***${String(socket.data.phone).slice(-4)}` : ''
         });
       });
     }

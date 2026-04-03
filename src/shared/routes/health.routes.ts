@@ -56,8 +56,12 @@ function getIsShuttingDown(): boolean {
  * Requires HEALTH_ADMIN_TOKEN env var to be set.
  */
 const healthAuthCheck = (req: Request, res: Response, next: NextFunction) => {
+  const expected = process.env.HEALTH_ADMIN_TOKEN;
+  if (!expected) {
+    return res.status(503).json({ error: 'Health auth not configured' });
+  }
   const token = req.headers['x-health-token'];
-  if (!token || token !== process.env.HEALTH_ADMIN_TOKEN) {
+  if (!token || token !== expected) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   next();

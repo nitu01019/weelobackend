@@ -342,7 +342,7 @@ const ENV_VARS: EnvVar[] = [
   // CORS
   // ==========================================================================
   {
-    name: 'CORS_ORIGINS',
+    name: 'CORS_ORIGIN',
     required: false,
     default: '*',
     description: 'Allowed CORS origins (comma-separated)'

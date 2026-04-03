@@ -192,9 +192,8 @@ class ConsoleProvider implements SmsProvider {
     console.log(`Valid for: ${config.otp.expiryMinutes} minutes`);
     console.log('===========================================\n');
     
-    logger.warn('SMS sent via CONSOLE (development mode)', { 
-      phone: phone.slice(-4),
-      otp 
+    logger.warn('SMS sent via CONSOLE (development mode)', {
+      phone: phone.slice(-4)
     });
   }
 }

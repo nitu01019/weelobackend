@@ -150,7 +150,7 @@ export function transporterRateLimit(action: keyof typeof RATE_LIMITS) {
       // Proceed with request
       next();
 
-    } catch (error: any) {
+    } catch (error: unknown) {
       // If Redis fails, reject the request (fail closed) to prevent abuse
       logger.error(`[RateLimit] Redis error, denying request for safety`, {
         action,
@@ -202,8 +202,8 @@ export async function getRateLimitStatus(
       isBlocked: !!blocked,
       blockTimeRemaining: blocked ? await redisService.ttl(blockKey) : null
     };
-  } catch (error: any) {
-    logger.error('[RateLimit] Error checking status:', error);
+  } catch (error: unknown) {
+    logger.error('[RateLimit] Error checking status:', { error: error instanceof Error ? error.message : String(error) });
     return {
       current: 0,
       max: limit.max,

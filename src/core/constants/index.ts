@@ -202,9 +202,9 @@ export const OTP_CONFIG = {
   MAX_ATTEMPTS: 3,
   RESEND_COOLDOWN_SECONDS: 30,
 
-  // Development mode (bypass SMS) - disabled in production
-  DEV_OTP: process.env.NODE_ENV !== 'production' ? '123456' : '',
-  DEV_PHONES: process.env.NODE_ENV !== 'production' ? ['9999999999', '8888888888', '7777777777'] : [] as string[],
+  // Development mode (bypass SMS) - only enabled in dev/test, never staging or production
+  DEV_OTP: (process.env.NODE_ENV === 'development' || process.env.NODE_ENV === 'test') ? '123456' : '',
+  DEV_PHONES: (process.env.NODE_ENV === 'development' || process.env.NODE_ENV === 'test') ? ['9999999999', '8888888888', '7777777777'] : [] as string[],
 };
 
 // =============================================================================

@@ -399,8 +399,8 @@ export async function withDbTimeout<T>(
           timeout: timeoutMs + 2000
         }
       );
-    } catch (error: any) {
-      const prismaCode = error?.code || '';
+    } catch (error: unknown) {
+      const prismaCode = error instanceof Error && 'code' in error ? (error as { code?: string }).code ?? '' : '';
       const isRetryable = RETRYABLE_CODES.has(prismaCode);
 
       if (isRetryable && attempt <= maxRetries) {
@@ -416,7 +416,7 @@ export async function withDbTimeout<T>(
         logger.error(`[withDbTimeout] Serializable conflict persisted after ${maxRetries} retries`, {
           error: error instanceof Error ? sanitizeDbError(error.message) : String(error),
         });
-        const { AppError } = require('../../shared/errors/app-error');
+        const { AppError } = require('../types/error.types');
         throw new AppError(
           409,
           'TRANSACTION_CONFLICT',
@@ -603,7 +603,11 @@ class PrismaDatabaseService {
       const { redisService } = require('../services/redis.service');
       const cacheKey = `user:profile:${id}`;
       const cached = await redisService.get(cacheKey);
-      if (cached) return JSON.parse(cached);
+      if (cached) {
+        const { safeJsonParse } = require('../utils/safe-json.utils');
+        const parsed = safeJsonParse(cached, null, 'user-profile-cache');
+        if (parsed) return parsed;
+      }
     } catch (error) {
       logger.warn('User profile cache read failed', { error: error instanceof Error ? error.message : String(error) });
     }
@@ -747,7 +751,9 @@ class PrismaDatabaseService {
     try {
       const cached = await redisService.get(cacheKey);
       if (cached) {
-        return JSON.parse(cached) as VehicleRecord[];
+        const { safeJsonParse } = require('../utils/safe-json.utils');
+        const parsed = safeJsonParse(cached, null, 'vehicle-cache') as VehicleRecord[] | null;
+        if (parsed) return parsed;
       }
     } catch (error) {
       // Redis unavailable — fall through to DB (graceful degradation)
@@ -1282,10 +1288,10 @@ class PrismaDatabaseService {
         transporterId,
         activeVehiclePairs
       );
-    } catch (error: any) {
+    } catch (error: unknown) {
       logger.warn('[DB] Indexed transporter request query failed, falling back to in-memory filter', {
         transporterId,
-        error: error?.message || 'unknown'
+        error: error instanceof Error ? error.message : 'unknown'
       });
     }
 
