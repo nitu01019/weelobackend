@@ -1,6 +1,6 @@
 import { prismaClient } from '../../shared/database/prisma.service';
 import { redisService } from '../../shared/services/redis.service';
-import { AppError } from '../../core/errors/AppError';
+import { AppError } from '../../shared/types/error.types';
 import { logger } from '../../shared/services/logger.service';
 import type { SubmitRatingInput } from './rating.schema';
 
@@ -42,17 +42,17 @@ export const ratingService = {
     });
 
     if (!assignment) {
-      throw new AppError('Trip not found', 404, 'ASSIGNMENT_NOT_FOUND');
+      throw new AppError(404, 'ASSIGNMENT_NOT_FOUND', 'Trip not found');
     }
 
     if (assignment.status !== 'completed') {
-      throw new AppError('You can only rate completed trips', 400, 'TRIP_NOT_COMPLETED');
+      throw new AppError(400, 'TRIP_NOT_COMPLETED', 'You can only rate completed trips');
     }
 
     // 2. Validate customer owns the booking/order (role isolation at data level)
     const bookingCustomerId = assignment.booking?.customerId || assignment.order?.customerId;
     if (!bookingCustomerId || bookingCustomerId !== customerId) {
-      throw new AppError('You can only rate your own trips', 403, 'NOT_AUTHORIZED');
+      throw new AppError(403, 'NOT_AUTHORIZED', 'You can only rate your own trips');
     }
 
     // 3. Check for duplicate (idempotent — return existing on conflict)

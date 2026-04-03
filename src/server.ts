@@ -92,11 +92,13 @@ import { healthRoutes } from './shared/routes/health.routes';
 import { metricsMiddleware } from './shared/monitoring/metrics.service';
 import { fcmService } from './shared/services/fcm.service';
 import { redisService } from './shared/services/redis.service';
+import { startBookingExpiryChecker } from './modules/booking/booking.service';
 
 // =============================================================================
 // Phase 10: SHUTDOWN STATE (shared with health.routes.ts)
 // =============================================================================
-export let isShuttingDown = false;
+let _isShuttingDown = false;
+export function isShuttingDown(): boolean { return _isShuttingDown; }
 
 // =============================================================================
 // ENVIRONMENT VALIDATION (Fail fast if config is invalid)
@@ -104,65 +106,13 @@ export let isShuttingDown = false;
 validateAndLogEnvironment();
 
 // =============================================================================
-// REDIS INITIALIZATION (CRITICAL for OTP and scaling)
+// REDIS + SERVER BOOTSTRAP (async — ensures Redis is ready before traffic)
 // =============================================================================
-// Initialize Redis connection for production OTP storage
-// Without this call, redisService stays in in-memory mode!
-redisService.initialize().then(() => {
-  logger.info('✅ RedisService initialized');
-
-  // Cache warming: Rebuild H3 geo index from existing Redis data on startup
-  // Without this, H3 cells are empty after restart until transporters heartbeat in (~60s gap)
-  if (process.env.FF_H3_INDEX_ENABLED === 'true') {
-    (async () => {
-      try {
-        const { h3GeoIndexService } = await import('./shared/services/h3-geo-index.service');
-        // Get all active vehicle keys from GEO index
-        const geoKeys = await redisService.keys('geo:transporters:*');
-        const vehicleKeys = geoKeys.map(k => k.replace('geo:transporters:', '')).filter(Boolean);
-
-        if (vehicleKeys.length === 0) {
-          logger.info('[CacheWarm] H3 rebuild skipped — no online transporters in Redis yet');
-          return;
-        }
-
-        const count = await h3GeoIndexService.rebuildFromGeoIndex(
-          vehicleKeys,
-          async (transporterId: string) => {
-            const raw = await redisService.hGetAll(`transporter:details:${transporterId}`);
-            if (!raw?.latitude || !raw?.longitude) return null;
-            return {
-              latitude: parseFloat(raw.latitude),
-              longitude: parseFloat(raw.longitude),
-              vehicleKeys: raw.vehicleKeys || ''
-            };
-          }
-        );
-        logger.info(`🔥 [CacheWarm] H3 index rebuilt: ${count} transporters indexed`);
-      } catch (err: any) {
-        logger.warn(`[CacheWarm] H3 rebuild failed (heartbeats will fill index): ${err.message}`);
-      }
-    })();
-  }
-
-  // Live availability: rebuild Redis sets + hashes from database on startup
-  (async () => {
-    try {
-      const { liveAvailabilityService } = await import('./shared/services/live-availability.service');
-      await liveAvailabilityService.rebuildFromDatabase();
-
-      // Periodic reconciliation: compare Redis with DB every 5 minutes as a safety net
-      setInterval(() => {
-        liveAvailabilityService.reconcile()
-          .catch(err => logger.warn('[LiveAvail] Reconciliation failed:', (err as Error).message));
-      }, 5 * 60 * 1000);
-    } catch (err: any) {
-      logger.warn(`[LiveAvail] Bootstrap failed: ${err.message}`);
-    }
-  })();
-}).catch((err) => {
-  logger.error('❌ RedisService initialization failed:', err);
-});
+// Moved into bootstrap() so the server does NOT accept traffic until Redis
+// is connected and caches are warm. See Fix 2 / Fix 3 in REVIEW-REPORT.
+// bootstrap() is invoked at the bottom of this file after all synchronous
+// middleware and route registration.
+// =============================================================================
 
 // =============================================================================
 // EXPRESS APP INITIALIZATION
@@ -314,7 +264,7 @@ app.use(cors({
 }));
 
 // Parse JSON bodies with size limit
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '1mb' }));
 
 // Block suspicious requests (XSS, SQL injection, etc.)
 app.use(blockSuspiciousRequests);
@@ -490,22 +440,96 @@ app.use((_req, res) => {
 app.use(errorHandler);
 
 // =============================================================================
-// START SERVER
+// START SERVER (via async bootstrap)
 // =============================================================================
 
 const PORT = config.port || 3000;
 
-server.listen(PORT, '0.0.0.0', async () => {
-  // ==========================================================================
-  // SERVER TIMEOUTS - Prevent stalled request accumulation
-  // ==========================================================================
-  // keepAliveTimeout MUST be > ALB idle timeout (60s) to prevent 502 errors.
-  // headersTimeout MUST be > keepAliveTimeout for proper sequencing.
-  // timeout = max time for a single request to complete.
+async function bootstrap(): Promise<void> {
+  // -------------------------------------------------------------------------
+  // 1. Redis must be ready before we accept traffic
+  // -------------------------------------------------------------------------
+  try {
+    await redisService.initialize();
+    logger.info('RedisService initialized');
+  } catch (err) {
+    logger.error('RedisService initialization failed:', err);
+    // Continue — redisService falls back to in-memory mode
+  }
+
+  // -------------------------------------------------------------------------
+  // 2. Cache warming (non-blocking — failures are tolerable)
+  // -------------------------------------------------------------------------
+  // H3 geo index rebuild
+  if (process.env.FF_H3_INDEX_ENABLED === 'true') {
+    try {
+      const { h3GeoIndexService } = await import('./shared/services/h3-geo-index.service');
+      const geoKeys = await redisService.keys('geo:transporters:*');
+      const vehicleKeys = geoKeys.map(k => k.replace('geo:transporters:', '')).filter(Boolean);
+
+      if (vehicleKeys.length > 0) {
+        const count = await h3GeoIndexService.rebuildFromGeoIndex(
+          vehicleKeys,
+          async (transporterId: string) => {
+            const raw = await redisService.hGetAll(`transporter:details:${transporterId}`);
+            if (!raw?.latitude || !raw?.longitude) return null;
+            return {
+              latitude: parseFloat(raw.latitude),
+              longitude: parseFloat(raw.longitude),
+              vehicleKeys: raw.vehicleKeys || ''
+            };
+          }
+        );
+        logger.info(`[CacheWarm] H3 index rebuilt: ${count} transporters indexed`);
+      } else {
+        logger.info('[CacheWarm] H3 rebuild skipped — no online transporters in Redis yet');
+      }
+    } catch (err: any) {
+      logger.warn(`[CacheWarm] H3 rebuild failed (heartbeats will fill index): ${err.message}`);
+    }
+  }
+
+  // Live availability rebuild
+  try {
+    const { liveAvailabilityService } = await import('./shared/services/live-availability.service');
+    await liveAvailabilityService.rebuildFromDatabase();
+
+    // Periodic reconciliation: compare Redis with DB every 5 minutes as a safety net
+    setInterval(() => {
+      liveAvailabilityService.reconcile()
+        .catch(err => logger.warn('[LiveAvail] Reconciliation failed:', (err as Error).message));
+    }, 5 * 60 * 1000);
+  } catch (err: any) {
+    logger.warn(`[LiveAvail] Bootstrap failed: ${err.message}`);
+  }
+
+  // -------------------------------------------------------------------------
+  // 3. Start background jobs that depend on Redis
+  // -------------------------------------------------------------------------
+  startBookingExpiryChecker();
+
+  // -------------------------------------------------------------------------
+  // 4. Start listening for HTTP traffic
+  // -------------------------------------------------------------------------
+  await new Promise<void>((resolve) => {
+    server.listen(PORT, '0.0.0.0', () => {
+      resolve();
+    });
+  });
+
+  // Server timeouts — set after listen
   server.timeout = 30000;           // 30s max request time
   server.keepAliveTimeout = 65000;  // 65s > ALB idle timeout (60s)
   server.headersTimeout = 66000;    // 66s > keepAliveTimeout
 
+  // Start cleanup job for expired orders (runs every 2 minutes)
+  import('./shared/jobs/cleanup-expired-orders.job').then(({ startCleanupJob }) => {
+    startCleanupJob();
+  });
+
+  // -------------------------------------------------------------------------
+  // 5. Startup banner
+  // -------------------------------------------------------------------------
   let stats: Awaited<ReturnType<typeof db.getStats>> = {
     users: 0,
     customers: 0,
@@ -527,12 +551,6 @@ server.listen(PORT, '0.0.0.0', async () => {
   }
   const protocol = isHttps ? 'https' : 'http';
   const securityStatus = isHttps ? '🔒 SECURE (TLS 1.2+)' : '⚠️  HTTP (dev only)';
-
-  // CRITICAL FIX: Start cleanup job for expired orders (runs every 2 minutes)
-  // SCALABILITY: Prevents database bloat and ensures users can create new orders
-  import('./shared/jobs/cleanup-expired-orders.job').then(({ startCleanupJob }) => {
-    startCleanupJob();
-  });
 
   console.log('');
   console.log('╔════════════════════════════════════════════════════════════════════╗');
@@ -575,6 +593,11 @@ server.listen(PORT, '0.0.0.0', async () => {
   console.log('');
 
   logger.info(`Server started on port ${PORT}`);
+}
+
+bootstrap().catch((err) => {
+  console.error('Bootstrap failed:', err);
+  process.exit(1);
 });
 
 // Handle uncaught errors
@@ -609,7 +632,7 @@ const gracefulShutdown = async (signal: string) => {
   logger.info(`${signal} received. Starting graceful shutdown...`);
 
   // Phase 10: Set shutdown flag — middleware returns 503, health returns 503
-  isShuttingDown = true;
+  _isShuttingDown = true;
 
   // Stop all background intervals first (prevents new work during shutdown)
   try {

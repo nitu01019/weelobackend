@@ -201,11 +201,11 @@ export const OTP_CONFIG = {
   EXPIRY_MINUTES: 5,
   MAX_ATTEMPTS: 3,
   RESEND_COOLDOWN_SECONDS: 30,
-  
-  // Development mode (bypass SMS)
-  DEV_OTP: '123456',
-  DEV_PHONES: ['9999999999', '8888888888', '7777777777']
-} as const;
+
+  // Development mode (bypass SMS) - disabled in production
+  DEV_OTP: process.env.NODE_ENV !== 'production' ? '123456' : '',
+  DEV_PHONES: process.env.NODE_ENV !== 'production' ? ['9999999999', '8888888888', '7777777777'] : [] as string[],
+};
 
 // =============================================================================
 // JWT CONFIGURATION

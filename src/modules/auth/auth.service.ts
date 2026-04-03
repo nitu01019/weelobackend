@@ -268,22 +268,12 @@ class AuthService {
           isActive: true
         });
       } catch (err: any) {
-        logger.warn('Error creating user in DB, using fallback', { error: err.message });
+        logger.error('Error creating user in DB', { error: err.message });
+        throw new AppError(503, 'DB_UNAVAILABLE', 'Unable to create user account. Please try again.');
       }
 
-      // If dbUser is still null/undefined, create a fallback object
       if (!dbUser || !dbUser.id) {
-        dbUser = {
-          id: newUserId,
-          phone: phone,
-          role: role,
-          name: '',
-          email: null,
-          isVerified: false,
-          isActive: true,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString()
-        };
+        throw new AppError(503, 'DB_UNAVAILABLE', 'Unable to create user account. Please try again.');
       }
       isNewUser = true;
 

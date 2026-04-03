@@ -754,6 +754,8 @@ router.put(
  */
 router.post(
   '/order-timeout/initialize',
+  authMiddleware,
+  roleGuard(['transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { orderId, totalTrucks } = req.body;
@@ -796,6 +798,8 @@ router.post(
  */
 router.post(
   '/order-timeout/extend',
+  authMiddleware,
+  roleGuard(['transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { orderId, driverId, driverName, assignmentId, truckRequestId, isFirstDriver, reason } = req.body;

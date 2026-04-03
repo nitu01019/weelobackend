@@ -323,6 +323,11 @@ export interface TrackingRecord {
 // =============================================================================
 
 // Prisma Database - the ONLY database for this backend
+// NOTE: Typed as `any` intentionally. Many modules access private/dynamic
+// properties (db.prisma, db.orders, etc.) that are not part of the public
+// PrismaDatabaseService interface. Properly typing this would require
+// refactoring ~15+ consumer files. Tracked for future cleanup.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 let prismaDbInstance: any = null;
 
 // Check if DATABASE_URL is configured

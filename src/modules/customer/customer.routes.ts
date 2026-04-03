@@ -22,7 +22,7 @@
 
 import { Router, Request, Response, NextFunction } from 'express';
 import { customerService } from './customer.service';
-import { authMiddleware } from '../../shared/middleware/auth.middleware';
+import { authMiddleware, roleGuard } from '../../shared/middleware/auth.middleware';
 
 const router = Router();
 
@@ -36,6 +36,7 @@ const router = Router();
 router.get(
   '/wallet',
   authMiddleware,
+  roleGuard(['customer']),
   async (req: Request, res: Response, _next: NextFunction) => {
     try {
       const userId = req.userId!;
@@ -65,6 +66,7 @@ router.get(
 router.get(
   '/trips',
   authMiddleware,
+  roleGuard(['customer']),
   async (req: Request, res: Response, _next: NextFunction) => {
     try {
       const userId = req.userId!;
@@ -94,6 +96,7 @@ router.get(
 router.get(
   '/settings',
   authMiddleware,
+  roleGuard(['customer']),
   async (req: Request, res: Response, _next: NextFunction) => {
     try {
       const userId = req.userId!;
@@ -123,6 +126,7 @@ router.get(
 router.put(
   '/settings',
   authMiddleware,
+  roleGuard(['customer']),
   async (req: Request, res: Response, _next: NextFunction) => {
     try {
       const userId = req.userId!;

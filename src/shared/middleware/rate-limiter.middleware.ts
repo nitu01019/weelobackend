@@ -339,7 +339,7 @@ export const profileRateLimiter = rateLimit({
   max: 30,
   keyGenerator: (req) => {
     // Rate limit by user ID for authenticated requests
-    return `profile:${(req as any).user?.userId || req.ip || 'unknown'}`;
+    return `profile:${req.user?.userId || req.ip || 'unknown'}`;
   },
   handler: throttleHandler(
     'PROFILE_RATE_LIMIT_EXCEEDED',
@@ -361,7 +361,7 @@ export const trackingRateLimiter = rateLimit({
   max: 120, // 2 per second
   keyGenerator: (req) => {
     // Rate limit by user ID for authenticated requests
-    return `tracking:${(req as any).user?.userId || req.ip || 'unknown'}`;
+    return `tracking:${req.user?.userId || req.ip || 'unknown'}`;
   },
   handler: throttleHandler(
     'TRACKING_RATE_LIMIT_EXCEEDED',

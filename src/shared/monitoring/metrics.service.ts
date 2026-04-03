@@ -246,6 +246,72 @@ class MetricsService {
     });
 
     // =========================================================================
+    // Truck Hold Metrics
+    // =========================================================================
+
+    this.counters.set('hold.request.total', {
+      name: 'hold.request.total',
+      help: 'Total truck hold requests',
+      labels: {}
+    });
+
+    this.counters.set('hold.success.total', {
+      name: 'hold.success.total',
+      help: 'Total successful truck holds',
+      labels: {}
+    });
+
+    this.counters.set('hold.conflict.total', {
+      name: 'hold.conflict.total',
+      help: 'Total truck hold conflicts',
+      labels: {}
+    });
+
+    this.counters.set('hold.idempotent_replay.total', {
+      name: 'hold.idempotent_replay.total',
+      help: 'Total idempotent hold replays',
+      labels: {}
+    });
+
+    this.counters.set('hold.release.total', {
+      name: 'hold.release.total',
+      help: 'Total truck hold releases',
+      labels: {}
+    });
+
+    this.counters.set('hold.cleanup.released_total', {
+      name: 'hold.cleanup.released_total',
+      help: 'Total holds released by cleanup',
+      labels: {}
+    });
+
+    this.counters.set('hold.idempotency.purged_total', {
+      name: 'hold.idempotency.purged_total',
+      help: 'Total idempotency keys purged',
+      labels: {}
+    });
+
+    this.histograms.set('hold.latency_ms', {
+      name: 'hold.latency_ms',
+      help: 'Truck hold request latency in milliseconds',
+      buckets: this.latencyBuckets,
+      values: new Map(),
+      bucketCounts: new Map(),
+      sum: new Map(),
+      count: new Map()
+    });
+
+    this.histograms.set('confirm.latency_ms', {
+      name: 'confirm.latency_ms',
+      help: 'Truck hold confirm latency in milliseconds',
+      buckets: this.latencyBuckets,
+      values: new Map(),
+      bucketCounts: new Map(),
+      sum: new Map(),
+      count: new Map()
+    });
+
+    // =========================================================================
     // Phase 6: Dispatch Pipeline Metrics
     // =========================================================================
 

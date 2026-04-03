@@ -103,7 +103,7 @@ router.get(
   roleGuard(['customer']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const user = (req as any).user;
+      const user = req.user;
       const activeOrder = await db.getActiveOrderByCustomer(user.userId);
 
       res.json({
@@ -143,7 +143,7 @@ router.post(
   bookingQueue.middleware({ priority: Priority.HIGH, timeout: 15000 }),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const user = (req as any).user;
+      const user = req.user;
 
       // =================================================================
       // DISTRIBUTED LOCK - Prevent concurrent order creation
@@ -341,7 +341,7 @@ router.get(
   roleGuard(['customer']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const user = (req as any).user;
+      const user = req.user;
 
       const orders = await orderService.getOrdersByCustomer(user.userId);
 
@@ -373,7 +373,7 @@ router.get(
   roleGuard(['transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const user = (req as any).user;
+      const user = req.user;
 
       const requests = await orderService.getActiveRequestsForTransporter(user.userId);
 
@@ -471,7 +471,7 @@ router.post(
       }
 
       const { truckRequestId, vehicleId, driverId } = validationResult.data;
-      const user = (req as any).user;
+      const user = req.user;
 
       // Accept the request
       const result = await orderService.acceptTruckRequest(
@@ -526,7 +526,7 @@ router.post(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { id: orderId } = req.params;
-      const user = (req as any).user;
+      const user = req.user;
       const { reason } = req.body;
       const idempotencyKey = req.header('X-Idempotency-Key') || req.header('x-idempotency-key') || undefined;
 
@@ -936,7 +936,7 @@ router.delete(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { orderId } = req.params;
-      const user = (req as any).user;
+      const user = req.user;
       const idempotencyKey = req.header('X-Idempotency-Key') || req.header('x-idempotency-key') || undefined;
 
       logger.info(`📛 Cancel request: Order ${orderId} by customer ${user.phone}`);
@@ -996,7 +996,7 @@ router.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { orderId } = req.params;
-      const user = (req as any).user;
+      const user = req.user;
       const reason = typeof req.query.reason === 'string' ? req.query.reason : undefined;
       const preview = await orderService.getCancelPreview(orderId, user.userId, reason);
       if (!preview.success) {
@@ -1037,7 +1037,7 @@ router.post(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { orderId } = req.params;
-      const user = (req as any).user;
+      const user = req.user;
       const reasonCode = typeof req.body?.reasonCode === 'string' ? req.body.reasonCode : undefined;
       const notes = typeof req.body?.notes === 'string' ? req.body.notes : undefined;
       const dispute = await orderService.createCancelDispute(orderId, user.userId, reasonCode, notes);
@@ -1224,7 +1224,7 @@ router.get('/pending-settlements',
   roleGuard(['customer']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const user = (req as any).user;
+      const user = req.user;
       const dues = await (orderService as any).prisma.customerPenaltyDue.findMany({
         where: {
           customerId: user.userId,

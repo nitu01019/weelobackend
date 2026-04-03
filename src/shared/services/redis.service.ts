@@ -817,6 +817,7 @@ class RealRedisClient implements IRedisClient {
       const isClusterMode = process.env.REDIS_CLUSTER === 'true';
       const clusterNodes = (process.env.REDIS_NODES || '').split(',').filter(Boolean);
       const useTls = this.config.url.startsWith('rediss://');
+      const rejectUnauthorized = process.env.REDIS_TLS_REJECT_UNAUTHORIZED !== 'false';
 
       if (isClusterMode && clusterNodes.length > 0) {
         // Parse cluster nodes: "host1:port1,host2:port2,..."
@@ -833,7 +834,7 @@ class RealRedisClient implements IRedisClient {
             commandTimeout: this.config.commandTimeoutMs,
             enableOfflineQueue: false,
             keepAlive: 1000,
-            tls: useTls ? { rejectUnauthorized: false } : undefined,
+            tls: useTls ? { rejectUnauthorized } : undefined,
             password: process.env.REDIS_PASSWORD || undefined,
           },
           clusterRetryStrategy: (times: number) => {
@@ -855,7 +856,7 @@ class RealRedisClient implements IRedisClient {
         // Subscriber in cluster mode — same cluster client works for pub/sub
         this.subscriber = new Redis.Cluster(nodes, {
           redisOptions: {
-            tls: useTls ? { rejectUnauthorized: false } : undefined,
+            tls: useTls ? { rejectUnauthorized } : undefined,
             password: process.env.REDIS_PASSWORD || undefined,
           },
         });
@@ -896,7 +897,7 @@ class RealRedisClient implements IRedisClient {
           // on ElastiCache Serverless which has a 20s idle connection timeout.
           keepAlive: 1000,
           // TLS required for ElastiCache Serverless
-          tls: useTls ? { rejectUnauthorized: false } : undefined,
+          tls: useTls ? { rejectUnauthorized } : undefined,
         });
 
         // Subscriber client for pub/sub (needs separate connection)
@@ -904,7 +905,7 @@ class RealRedisClient implements IRedisClient {
           maxRetriesPerRequest: this.config.maxRetries,
           connectTimeout: this.config.connectionTimeoutMs,
           // TLS required for ElastiCache Serverless
-          tls: useTls ? { rejectUnauthorized: false } : undefined,
+          tls: useTls ? { rejectUnauthorized } : undefined,
         });
       }
 

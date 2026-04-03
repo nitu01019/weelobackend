@@ -24,10 +24,10 @@
  * =============================================================================
  */
 
-import { db } from '../../shared/database/db';
 import { prismaClient } from '../../shared/database/prisma.service';
 import { cacheService } from '../../shared/services/cache.service';
 import { logger } from '../../shared/services/logger.service';
+import { AppError } from '../../shared/types/error.types';
 
 class CustomerService {
   // Cache TTL in seconds (10 minutes)
@@ -39,33 +39,8 @@ class CustomerService {
    * SCALABILITY: Cached in Redis for fast access
    * EASY UNDERSTANDING: Returns wallet object or creates if not exists
    */
-  async getWallet(userId: string) {
-    const cacheKey = `wallet:${userId}`;
-    
-    // SCALABILITY: Check cache first
-    const cached = await cacheService.get(cacheKey);
-    if (cached) {
-      logger.debug('[CUSTOMER] Wallet cache hit', { userId });
-      return cached;
-    }
-    
-    // TODO: Implement real wallet in database
-    // Returns stub data — clearly marked as not yet implemented
-    logger.warn('[CUSTOMER] Wallet endpoint is a stub — returning placeholder data', { userId });
-    const wallet = {
-      id: `wallet-${userId}`,
-      userId,
-      balance: 0,
-      currency: 'INR',
-      _stub: true, // Signals to client this is placeholder data
-      createdAt: new Date(),
-      updatedAt: new Date()
-    };
-    
-    // SCALABILITY: Cache for next time
-    await cacheService.set(cacheKey, wallet, this.CACHE_TTL);
-    
-    return wallet;
+  async getWallet(userId: string): Promise<never> {
+    throw new AppError(501, 'NOT_IMPLEMENTED', 'This feature is not yet available');
   }
 
   /**
@@ -97,37 +72,8 @@ class CustomerService {
    * SCALABILITY: Cached in Redis
    * MODULARITY: Separate settings model
    */
-  async getSettings(userId: string) {
-    const cacheKey = `settings:${userId}`;
-    
-    // Check cache
-    const cached = await cacheService.get(cacheKey);
-    if (cached) {
-      logger.debug('[CUSTOMER] Settings cache hit', { userId });
-      return cached;
-    }
-    
-    // TODO: Store in database or preferences
-    // Returns stub data — clearly marked as not yet implemented
-    logger.warn('[CUSTOMER] Settings endpoint is a stub — returning placeholder data', { userId });
-    const settings = {
-      id: `settings-${userId}`,
-      userId,
-      pushNotifications: true,
-      smsNotifications: true,
-      emailNotifications: false,
-      language: 'en',
-      theme: 'light',
-      preferredVehicleTypes: ['truck', 'tractor', 'jcb', 'tempo'],
-      _stub: true, // Signals to client this is placeholder data
-      createdAt: new Date(),
-      updatedAt: new Date()
-    };
-    
-    // Cache
-    await cacheService.set(cacheKey, settings, this.CACHE_TTL);
-    
-    return settings;
+  async getSettings(userId: string): Promise<never> {
+    throw new AppError(501, 'NOT_IMPLEMENTED', 'This feature is not yet available');
   }
 
   /**
@@ -135,21 +81,8 @@ class CustomerService {
    * 
    * MODULARITY: Clear function responsibility
    */
-  async updateSettings(userId: string, data: any) {
-    // TODO: Store updated settings in database — currently returns stub
-    logger.warn('[CUSTOMER] updateSettings is a stub — changes are NOT persisted', { userId });
-    const updated = {
-      id: `settings-${userId}`,
-      userId,
-      ...data,
-      _stub: true, // Signals to client this is placeholder data
-      updatedAt: new Date()
-    };
-    
-    // SCALABILITY: Invalidate cache
-    await cacheService.delete(`settings:${userId}`);
-    
-    return updated;
+  async updateSettings(userId: string, _data: unknown): Promise<never> {
+    throw new AppError(501, 'NOT_IMPLEMENTED', 'This feature is not yet available');
   }
 }
 

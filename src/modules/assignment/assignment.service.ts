@@ -337,12 +337,26 @@ class AssignmentService {
         return { assignments: [], total: 0, hasMore: false };
       }
 
-      // Industry Standard: Netflix WHERE IN pattern - single query instead of N queries
-      // 50 bookings = 1 query (was: 1 + 50 queries)
-      const rawAssignments = await prismaClient.assignment.findMany({
-        where: { bookingId: { in: bookingIds } },
-        orderBy: { assignedAt: 'desc' }
-      });
+      // Build where clause for optional status/booking filters
+      const where: Record<string, unknown> = { bookingId: { in: bookingIds } };
+      if (query.status) {
+        where.status = query.status;
+      }
+      if (query.bookingId) {
+        where.bookingId = query.bookingId;
+      }
+
+      // DB-level pagination: count + paginated fetch in parallel
+      const skip = (query.page - 1) * query.limit;
+      const [total, rawAssignments] = await Promise.all([
+        prismaClient.assignment.count({ where }),
+        prismaClient.assignment.findMany({
+          where,
+          orderBy: { assignedAt: 'desc' },
+          skip,
+          take: query.limit
+        })
+      ]);
 
       // Convert Prisma result to AssignmentRecord format using existing helper
       assignments = rawAssignments.map(a => ({
@@ -365,7 +379,10 @@ class AssignmentService {
         status: a.status as any,
         startedAt: (a as any).startedAt || '',
         completedAt: (a as any).completedAt || ''
-      } as AssignmentRecord)); // Fix: Double closing brace for map function
+      } as AssignmentRecord));
+
+      const hasMore = skip + assignments.length < total;
+      return { assignments, total, hasMore };
     } else {
       assignments = [];
     }

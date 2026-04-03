@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import { ratingService } from './rating.service';
 import { submitRatingSchema, driverRatingsQuerySchema } from './rating.schema';
 import { authenticate } from '../../shared/middleware/auth.middleware';
-import { AppError } from '../../core/errors/AppError';
+import { AppError } from '../../shared/types/error.types';
 import { logger } from '../../shared/services/logger.service';
 import { emitToUser } from '../../shared/services/socket.service';
 import { redisService } from '../../shared/services/redis.service';
@@ -21,9 +21,9 @@ async function ratingRateLimit(userId: string): Promise<void> {
     const result = await redisService.checkRateLimit(`ratelimit:rating:${userId}`, 10, 60);
     if (!result.allowed) {
       throw new AppError(
-        'Too many rating submissions. Please try again later.',
         429,
-        'RATE_LIMITED'
+        'RATE_LIMITED',
+        'Too many rating submissions. Please try again later.'
       );
     }
   } catch (error: any) {
@@ -39,15 +39,15 @@ async function ratingRateLimit(userId: string): Promise<void> {
 // =============================================================================
 router.post('/', async (req: Request, res: Response) => {
   try {
-    const userId = (req as any).userId;
-    const userRole = (req as any).userRole;
+    const userId = req.userId;
+    const userRole = req.userRole;
     if (!userId) {
-      throw new AppError('Authentication required', 401, 'UNAUTHORIZED');
+      throw new AppError(401, 'UNAUTHORIZED', 'Authentication required');
     }
 
     // Role isolation: Only customers can submit ratings
     if (userRole && userRole !== 'customer') {
-      throw new AppError('Only customers can submit ratings', 403, 'ROLE_NOT_ALLOWED');
+      throw new AppError(403, 'ROLE_NOT_ALLOWED', 'Only customers can submit ratings');
     }
 
     // Rate limit check
@@ -57,7 +57,7 @@ router.post('/', async (req: Request, res: Response) => {
     const parsed = submitRatingSchema.safeParse(req.body);
     if (!parsed.success) {
       const firstError = parsed.error.errors[0];
-      throw new AppError(firstError.message, 400, 'VALIDATION_ERROR');
+      throw new AppError(400, 'VALIDATION_ERROR', firstError.message);
     }
 
     const result = await ratingService.submitRating(userId, parsed.data);
@@ -110,15 +110,15 @@ router.post('/', async (req: Request, res: Response) => {
 // =============================================================================
 router.get('/pending', async (req: Request, res: Response) => {
   try {
-    const userId = (req as any).userId;
-    const userRole = (req as any).userRole;
+    const userId = req.userId;
+    const userRole = req.userRole;
     if (!userId) {
-      throw new AppError('Authentication required', 401, 'UNAUTHORIZED');
+      throw new AppError(401, 'UNAUTHORIZED', 'Authentication required');
     }
 
     // Role isolation: Only customers have pending ratings
     if (userRole && userRole !== 'customer') {
-      throw new AppError('Only customers can view pending ratings', 403, 'ROLE_NOT_ALLOWED');
+      throw new AppError(403, 'ROLE_NOT_ALLOWED', 'Only customers can view pending ratings');
     }
 
     const result = await ratingService.getPendingRatings(userId);
@@ -145,15 +145,15 @@ router.get('/pending', async (req: Request, res: Response) => {
 // =============================================================================
 router.get('/driver', async (req: Request, res: Response) => {
   try {
-    const userId = (req as any).userId;
-    const userRole = (req as any).userRole;
+    const userId = req.userId;
+    const userRole = req.userRole;
     if (!userId) {
-      throw new AppError('Authentication required', 401, 'UNAUTHORIZED');
+      throw new AppError(401, 'UNAUTHORIZED', 'Authentication required');
     }
 
     // Role isolation: Only drivers can view their own ratings
     if (userRole && userRole !== 'driver') {
-      throw new AppError('Only drivers can view their rating history', 403, 'ROLE_NOT_ALLOWED');
+      throw new AppError(403, 'ROLE_NOT_ALLOWED', 'Only drivers can view their rating history');
     }
 
     const parsed = driverRatingsQuerySchema.safeParse(req.query);

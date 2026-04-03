@@ -19,7 +19,7 @@
  * =============================================================================
  */
 
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import os from 'os';
 import { metrics, metricsHandler } from '../monitoring/metrics.service';
 import { circuitBreakerRegistry } from '../resilience/circuit-breaker';
@@ -41,13 +41,27 @@ const STARTUP_GRACE_MS = 15_000;
 
 // Phase 10: Import shutdown flag from server.ts
 // Uses lazy require to avoid circular dependency
+// Handles both variable (boolean) and function (() => boolean) exports
 function getIsShuttingDown(): boolean {
   try {
-    return require('../../server').isShuttingDown === true;
+    const val = require('../../server').isShuttingDown;
+    return typeof val === 'function' ? val() : val === true;
   } catch {
     return false;
   }
 }
+
+/**
+ * Token-based auth for sensitive health endpoints.
+ * Requires HEALTH_ADMIN_TOKEN env var to be set.
+ */
+const healthAuthCheck = (req: Request, res: Response, next: NextFunction) => {
+  const token = req.headers['x-health-token'];
+  if (!token || token !== process.env.HEALTH_ADMIN_TOKEN) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+};
 
 /**
  * Basic health check - for load balancers
@@ -187,7 +201,7 @@ router.get('/health/slo', (req: Request, res: Response) => {
  * Detailed health - full system status
  * Internal use only, provides comprehensive diagnostics
  */
-router.get('/health/detailed', async (_req: Request, res: Response) => {
+router.get('/health/detailed', healthAuthCheck, async (_req: Request, res: Response) => {
   const memUsage = process.memoryUsage();
   const cpuUsage = process.cpuUsage();
 
@@ -266,7 +280,7 @@ router.get('/health/detailed', async (_req: Request, res: Response) => {
 /**
  * Prometheus metrics endpoint
  */
-router.get('/metrics', metricsHandler);
+router.get('/metrics', healthAuthCheck, metricsHandler);
 
 /**
  * Version endpoint
@@ -286,7 +300,7 @@ router.get('/version', (_req: Request, res: Response) => {
  * WebSocket debug endpoint - shows connected users
  * CRITICAL for debugging broadcast issues!
  */
-router.get('/health/websocket', (_req: Request, res: Response) => {
+router.get('/health/websocket', healthAuthCheck, (_req: Request, res: Response) => {
   const io = getIO();
   const stats = getConnectionStats();
   const adapterStatus = getRedisAdapterStatus();

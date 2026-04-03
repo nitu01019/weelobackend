@@ -17,6 +17,7 @@ export class AppError extends Error {
   public readonly code: string;
   public readonly details?: Record<string, unknown>;
   public readonly isOperational: boolean = true;
+  public readonly timestamp: string;
 
   constructor(
     statusCode: number,
@@ -28,9 +29,29 @@ export class AppError extends Error {
     this.statusCode = statusCode;
     this.code = code;
     this.details = details;
-    
+    this.timestamp = new Date().toISOString();
+
     // Maintains proper stack trace
     Error.captureStackTrace(this, this.constructor);
+
+    // Set prototype explicitly (TypeScript issue with extending Error)
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+
+  /**
+   * Convert error to JSON response format
+   */
+  toJSON() {
+    return {
+      success: false as const,
+      error: {
+        code: this.code,
+        message: this.message,
+        details: this.details,
+        timestamp: this.timestamp,
+        ...(process.env.NODE_ENV === 'development' && { stack: this.stack })
+      }
+    };
   }
 }
 

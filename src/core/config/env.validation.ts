@@ -484,45 +484,34 @@ export function validateEnvironment(): ValidationResult {
  * Exits process if validation fails in production
  */
 export function validateAndLogEnvironment(): void {
-  console.log('');
-  console.log('╔════════════════════════════════════════════════════════════════════╗');
-  console.log('║                   ENVIRONMENT VALIDATION                           ║');
-  console.log('╚════════════════════════════════════════════════════════════════════╝');
-  
+  logger.info('--- ENVIRONMENT VALIDATION ---');
+
   const result = validateEnvironment();
   const isProduction = process.env.NODE_ENV === 'production';
 
   // Log errors
   if (result.errors.length > 0) {
-    console.log('');
-    console.log('❌ ERRORS:');
     result.errors.forEach(error => {
-      console.log(`   • ${error}`);
       logger.error(`Environment validation error: ${error}`);
     });
   }
 
   // Log warnings
   if (result.warnings.length > 0) {
-    console.log('');
-    console.log('⚠️  WARNINGS:');
     result.warnings.forEach(warning => {
-      console.log(`   • ${warning}`);
       logger.warn(`Environment validation warning: ${warning}`);
     });
   }
 
   // Log success
   if (result.valid) {
-    console.log('');
-    console.log('✅ Environment validation passed');
-    console.log(`   Mode: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`   Port: ${process.env.PORT || '3000'}`);
-    console.log(`   Redis: ${process.env.REDIS_ENABLED === 'true' ? 'Enabled' : 'Disabled'}`);
-    console.log(`   SMS Provider: ${process.env.SMS_PROVIDER || 'mock'}`);
+    logger.info('Environment validation passed', {
+      mode: process.env.NODE_ENV || 'development',
+      port: process.env.PORT || '3000',
+      redis: process.env.REDIS_ENABLED === 'true' ? 'Enabled' : 'Disabled',
+      smsProvider: process.env.SMS_PROVIDER || 'mock'
+    });
   }
-
-  console.log('');
 
   // Exit in production if validation failed
   if (!result.valid && isProduction) {

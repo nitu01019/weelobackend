@@ -38,6 +38,7 @@ declare global {
         userId: string;
         role: string;
         phone: string;
+        name?: string;
       };
       userId?: string;
       userRole?: string;

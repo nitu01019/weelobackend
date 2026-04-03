@@ -35,7 +35,7 @@ export function errorHandler(
     path: req.path,
     method: req.method,
     ip: req.ip,
-    userId: (req as any).userId || 'anonymous'
+    userId: req.userId || 'anonymous'
   });
 
   // Determine if this is a known operational error

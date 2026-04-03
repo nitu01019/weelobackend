@@ -86,7 +86,7 @@ router.put(
   authMiddleware,
   roleGuard(['transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
-    const user = (req as any).user;
+    const user = req.user;
     const transporterId = user.userId;
     const { isAvailable } = req.body;
 
@@ -448,7 +448,7 @@ router.get(
   roleGuard(['transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const user = (req as any).user;
+      const user = req.user;
       const transporterId = user.userId;
 
       const transporter = await prismaClient.user.findUnique({
@@ -518,7 +518,7 @@ router.post(
   roleGuard(['transporter', 'driver']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const user = (req as any).user;
+      const user = req.user;
       const { latitude, longitude, vehicleId, isOnTrip } = req.body;
 
       // Validate coordinates
@@ -679,7 +679,7 @@ router.delete(
   roleGuard(['transporter', 'driver']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const user = (req as any).user;
+      const user = req.user;
 
       // Remove from availability service
       availabilityService.setOffline(user.userId);
@@ -738,7 +738,7 @@ router.get(
   roleGuard(['transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const user = (req as any).user;
+      const user = req.user;
 
       const transporter = await db.getUserById(user.userId);
 
@@ -795,7 +795,7 @@ router.put(
   roleGuard(['transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const user = (req as any).user;
+      const user = req.user;
       const { name, businessName, email, gstNumber } = req.body;
 
       const updates: any = {};
@@ -848,7 +848,7 @@ router.get(
   roleGuard(['transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const user = (req as any).user;
+      const user = req.user;
       const transporterId = user.userId;
 
       // =====================================================================
@@ -957,7 +957,7 @@ router.get(
   roleGuard(['transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const user = (req as any).user;
+      const user = req.user;
       const transporterId: string = user.userId;
 
       // ─── Rate limit: max 1 call per 3s per transporter ─────────────────

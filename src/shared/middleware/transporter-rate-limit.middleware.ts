@@ -145,7 +145,7 @@ export function transporterRateLimit(action: keyof typeof RATE_LIMITS) {
       const remaining = Math.max(0, limit.max - current);
       res.setHeader('X-RateLimit-Limit', limit.max.toString());
       res.setHeader('X-RateLimit-Remaining', remaining.toString());
-      res.setHeader('X-RateLimit-Reset', await redisService.ttl(counterKey).toString());
+      res.setHeader('X-RateLimit-Reset', (await redisService.ttl(counterKey)).toString());
 
       // Proceed with request
       next();

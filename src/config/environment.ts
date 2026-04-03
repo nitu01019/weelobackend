@@ -45,11 +45,13 @@ function getRequired(key: string, devDefault?: string): string {
   // In development, use default or generate secure value
   if (process.env.NODE_ENV !== 'production') {
     if (devDefault) {
+      // console used intentionally — runs before logger initialization
       console.warn(`⚠️  [CONFIG] ${key} not set, using development default`);
       return devDefault;
     }
     // Auto-generate secure secret for development
     const generated = randomBytes(32).toString('hex');
+    // console used intentionally — runs before logger initialization
     console.warn(`⚠️  [CONFIG] ${key} not set, auto-generated for development`);
     return generated;
   }
@@ -236,6 +238,7 @@ function validateConfig(): void {
 
   // Log warnings
   if (warnings.length > 0) {
+    // console used intentionally — runs before logger initialization
     console.warn('\n⚠️  Configuration Warnings:');
     warnings.forEach(w => console.warn(`   - ${w}`));
     console.warn('');

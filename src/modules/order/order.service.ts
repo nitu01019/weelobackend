@@ -4385,12 +4385,22 @@ class OrderService {
           // Vehicle will be set to 'in_transit' in assignment.acceptAssignment()
 
           // Parse JSON fields for notification use outside the transaction
-          const pickup = typeof order.pickup === 'string'
-            ? JSON.parse(order.pickup as string)
-            : order.pickup;
-          const drop = typeof order.drop === 'string'
-            ? JSON.parse(order.drop as string)
-            : order.drop;
+          let pickup: unknown;
+          try {
+            pickup = typeof order.pickup === 'string'
+              ? JSON.parse(order.pickup as string)
+              : order.pickup;
+          } catch {
+            pickup = order.pickup;
+          }
+          let drop: unknown;
+          try {
+            drop = typeof order.drop === 'string'
+              ? JSON.parse(order.drop as string)
+              : order.drop;
+          } catch {
+            drop = order.drop;
+          }
 
           return {
             assignmentId,

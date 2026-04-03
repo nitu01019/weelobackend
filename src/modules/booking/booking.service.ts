@@ -171,8 +171,8 @@ async function processExpiredBookings(): Promise<void> {
   }
 }
 
-// Start expiry checker when module loads
-startBookingExpiryChecker();
+// Exported so server.ts can call it after Redis is ready (no auto-start on import).
+export { startBookingExpiryChecker };
 
 /** Stop the booking expiry checker (for graceful shutdown) */
 export function stopBookingExpiryChecker(): void {

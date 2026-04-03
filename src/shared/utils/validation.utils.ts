@@ -205,13 +205,6 @@ export function validateRequest<T extends z.ZodSchema>(schema: T) {
           message: e.message
         }));
 
-        // Log validation errors for debugging
-        console.log('=== VALIDATION ERROR ===');
-        console.log('Path:', req.path);
-        console.log('Request body:', JSON.stringify(req.body, null, 2));
-        console.log('Validation errors:', JSON.stringify(details, null, 2));
-        console.log('========================');
-
         next(new AppError(400, 'VALIDATION_ERROR', 'Invalid request data', { fields: details }));
       } else {
         next(error);

@@ -161,7 +161,7 @@ class OtpChallengeService {
 
     try {
       try {
-        const lockResult = await (redisService as any).client.eval(
+        const lockResult = await redisService.eval(
           `
           if redis.call('set', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then
             return 1
@@ -444,7 +444,7 @@ class OtpChallengeService {
 
   private async releaseRedisVerifyLock(lockKey: string, lockToken: string, logContext: Record<string, unknown>): Promise<void> {
     try {
-      await (redisService as any).client.eval(
+      await redisService.eval(
         `
         if redis.call('get', KEYS[1]) == ARGV[1] then
           return redis.call('del', KEYS[1])

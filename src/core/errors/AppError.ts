@@ -2,78 +2,27 @@
  * =============================================================================
  * APPLICATION ERROR CLASSES
  * =============================================================================
- * 
- * Standardized error handling for the entire application.
- * 
+ *
+ * Re-exports AppError from shared/types/error.types.ts (single source of truth)
+ * and defines domain-specific error subclasses.
+ *
  * USAGE:
  * ```typescript
  * // In service
  * throw new NotFoundError('Booking not found', ErrorCode.BOOKING_NOT_FOUND);
- * 
+ *
  * // In route handler
  * throw new ValidationError('Invalid phone number', { field: 'phone' });
  * ```
- * 
- * BENEFITS:
- * - Consistent error responses across all endpoints
- * - Proper HTTP status codes automatically
- * - Error codes for client-side handling
- * - Stack traces in development, clean messages in production
- * 
+ *
  * =============================================================================
  */
 
 import { ErrorCode, HTTP_STATUS } from '../constants';
 
-/**
- * Base Application Error
- * All custom errors extend this class
- */
-export class AppError extends Error {
-  public readonly statusCode: number;
-  public readonly code: ErrorCode | string;
-  public readonly isOperational: boolean;
-  public readonly details?: Record<string, unknown>;
-  public readonly timestamp: string;
-
-  constructor(
-    message: string,
-    statusCode: number = HTTP_STATUS.INTERNAL_ERROR,
-    code: ErrorCode | string = ErrorCode.INTERNAL_ERROR,
-    isOperational: boolean = true,
-    details?: Record<string, unknown>
-  ) {
-    super(message);
-    
-    this.statusCode = statusCode;
-    this.code = code;
-    this.isOperational = isOperational;
-    this.details = details;
-    this.timestamp = new Date().toISOString();
-
-    // Capture stack trace
-    Error.captureStackTrace(this, this.constructor);
-    
-    // Set prototype explicitly (TypeScript issue with extending Error)
-    Object.setPrototypeOf(this, new.target.prototype);
-  }
-
-  /**
-   * Convert error to JSON response format
-   */
-  toJSON(): ErrorResponse {
-    return {
-      success: false,
-      error: {
-        code: this.code,
-        message: this.message,
-        details: this.details,
-        timestamp: this.timestamp,
-        ...(process.env.NODE_ENV === 'development' && { stack: this.stack })
-      }
-    };
-  }
-}
+// Re-export AppError from the canonical shared location
+export { AppError } from '../../shared/types/error.types';
+import { AppError } from '../../shared/types/error.types';
 
 /**
  * Error response format
@@ -102,7 +51,7 @@ export class BadRequestError extends AppError {
     code: ErrorCode | string = ErrorCode.VALIDATION_ERROR,
     details?: Record<string, unknown>
   ) {
-    super(message, HTTP_STATUS.BAD_REQUEST, code, true, details);
+    super(HTTP_STATUS.BAD_REQUEST, code, message, details);
   }
 }
 
@@ -117,7 +66,7 @@ export class ValidationError extends AppError {
     errors: ValidationErrorDetail[] = [],
     code: ErrorCode | string = ErrorCode.VALIDATION_ERROR
   ) {
-    super(message, HTTP_STATUS.BAD_REQUEST, code, true, { errors });
+    super(HTTP_STATUS.BAD_REQUEST, code, message, { errors });
     this.errors = errors;
   }
 
@@ -144,7 +93,7 @@ export class UnauthorizedError extends AppError {
     message: string = 'Unauthorized',
     code: ErrorCode | string = ErrorCode.AUTH_TOKEN_INVALID
   ) {
-    super(message, HTTP_STATUS.UNAUTHORIZED, code, true);
+    super(HTTP_STATUS.UNAUTHORIZED, code, message);
   }
 }
 
@@ -156,7 +105,7 @@ export class ForbiddenError extends AppError {
     message: string = 'Access forbidden',
     code: ErrorCode | string = 'FORBIDDEN'
   ) {
-    super(message, HTTP_STATUS.FORBIDDEN, code, true);
+    super(HTTP_STATUS.FORBIDDEN, code, message);
   }
 }
 
@@ -169,7 +118,7 @@ export class NotFoundError extends AppError {
     code: ErrorCode | string = 'NOT_FOUND',
     details?: Record<string, unknown>
   ) {
-    super(message, HTTP_STATUS.NOT_FOUND, code, true, details);
+    super(HTTP_STATUS.NOT_FOUND, code, message, details);
   }
 }
 
@@ -182,7 +131,7 @@ export class ConflictError extends AppError {
     code: ErrorCode | string = 'CONFLICT',
     details?: Record<string, unknown>
   ) {
-    super(message, HTTP_STATUS.CONFLICT, code, true, details);
+    super(HTTP_STATUS.CONFLICT, code, message, details);
   }
 }
 
@@ -195,7 +144,7 @@ export class UnprocessableError extends AppError {
     code: ErrorCode | string = 'UNPROCESSABLE',
     details?: Record<string, unknown>
   ) {
-    super(message, HTTP_STATUS.UNPROCESSABLE, code, true, details);
+    super(HTTP_STATUS.UNPROCESSABLE, code, message, details);
   }
 }
 
@@ -209,7 +158,7 @@ export class RateLimitError extends AppError {
     message: string = 'Too many requests',
     retryAfter: number = 60
   ) {
-    super(message, HTTP_STATUS.TOO_MANY_REQUESTS, ErrorCode.RATE_LIMIT_EXCEEDED, true, { retryAfter });
+    super(HTTP_STATUS.TOO_MANY_REQUESTS, ErrorCode.RATE_LIMIT_EXCEEDED, message, { retryAfter });
     this.retryAfter = retryAfter;
   }
 }
@@ -223,7 +172,7 @@ export class InternalError extends AppError {
     code: ErrorCode | string = ErrorCode.INTERNAL_ERROR,
     details?: Record<string, unknown>
   ) {
-    super(message, HTTP_STATUS.INTERNAL_ERROR, code, false, details);
+    super(HTTP_STATUS.INTERNAL_ERROR, code, message, details);
   }
 }
 
@@ -236,7 +185,7 @@ export class ServiceUnavailableError extends AppError {
     code: ErrorCode | string = ErrorCode.SERVICE_UNAVAILABLE,
     details?: Record<string, unknown>
   ) {
-    super(message, HTTP_STATUS.SERVICE_UNAVAILABLE, code, true, details);
+    super(HTTP_STATUS.SERVICE_UNAVAILABLE, code, message, details);
   }
 }
 
