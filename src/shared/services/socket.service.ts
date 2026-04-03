@@ -36,10 +36,12 @@ import {
 } from './transporter-online.service';
 
 // Lazy import to avoid circular dependency (socket.service ↔ driver.service)
-let _driverService: any = null;
+// H18 FIX: Add type annotation to preserve type safety across lazy require()
+let _driverService: typeof import('../../modules/driver/driver.service')['driverService'] | null = null;
 function getDriverService() {
   if (!_driverService) {
-    _driverService = require('../../modules/driver/driver.service').driverService;
+    const mod: typeof import('../../modules/driver/driver.service') = require('../../modules/driver/driver.service');
+    _driverService = mod.driverService;
   }
   return _driverService;
 }

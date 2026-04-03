@@ -345,8 +345,10 @@ export function startStaleTransporterCleanup(): void {
       logger.error(`[TransporterOnline] Stale cleanup error: ${error.message}`);
     }
   }, CLEANUP_INTERVAL_MS);
+  // L1 FIX: unref() so this non-critical timer doesn't block process exit
+  staleCleanupInterval.unref();
 
-  logger.info('🧹 [TransporterOnline] Stale transporter cleanup started (every 30s, cluster-safe)');
+  logger.info('[TransporterOnline] Stale transporter cleanup started (every 30s, cluster-safe)');
 }
 
 export function stopStaleTransporterCleanup(): void {
@@ -356,5 +358,6 @@ export function stopStaleTransporterCleanup(): void {
   }
 }
 
-// Auto-start when module is imported
-startStaleTransporterCleanup();
+// M12 FIX: Removed auto-start side effect — caller must invoke startStaleTransporterCleanup()
+// explicitly (e.g., from server.ts bootstrap). This prevents timers from firing on import
+// during tests or when the module is imported for type-only purposes.

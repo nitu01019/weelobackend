@@ -48,6 +48,20 @@ declare global {
 }
 
 /**
+ * Type guard: validates that a JWT payload has the expected shape.
+ */
+function isValidJwtPayload(p: unknown): p is { userId: string; role: string; phone?: string } {
+  return (
+    typeof p === 'object' &&
+    p !== null &&
+    'userId' in p &&
+    typeof (p as Record<string, unknown>).userId === 'string' &&
+    'role' in p &&
+    typeof (p as Record<string, unknown>).role === 'string'
+  );
+}
+
+/**
  * Auth middleware - validates JWT token
  * Must be applied to all protected routes
  */
@@ -59,7 +73,7 @@ export function authMiddleware(
   try {
     // Get token from header
     const authHeader = req.headers.authorization;
-    
+
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       throw new AppError(401, 'UNAUTHORIZED', 'Authentication required');
     }
@@ -67,25 +81,26 @@ export function authMiddleware(
     const token = authHeader.substring(7); // Remove 'Bearer '
 
     // Verify token
-    const decoded = jwt.verify(token, config.jwt.secret) as {
-      userId: string;
-      role: string;
-      phone: string;
-    };
+    const decoded = jwt.verify(token, config.jwt.secret);
+
+    // Runtime validation of JWT payload shape
+    if (!isValidJwtPayload(decoded)) {
+      throw new AppError(401, 'INVALID_TOKEN', 'Invalid token payload');
+    }
 
     // Attach user to request (both formats for compatibility)
     req.user = {
       userId: decoded.userId,
       role: decoded.role,
-      phone: decoded.phone
+      phone: (decoded as Record<string, unknown>).phone as string || ''
     };
     // Legacy format for existing controllers
     req.userId = decoded.userId;
     req.userRole = decoded.role;
-    req.userPhone = decoded.phone;
+    req.userPhone = (decoded as Record<string, unknown>).phone as string || '';
 
     next();
-  } catch (error) {
+  } catch (error: unknown) {
     if (error instanceof jwt.TokenExpiredError) {
       next(new AppError(401, 'TOKEN_EXPIRED', 'Token has expired'));
     } else if (error instanceof jwt.JsonWebTokenError) {
@@ -93,7 +108,8 @@ export function authMiddleware(
     } else if (error instanceof AppError) {
       next(error);
     } else {
-      logger.error('Auth middleware error', error);
+      const msg = error instanceof Error ? error.message : String(error);
+      logger.error('Auth middleware error', { error: msg });
       next(new AppError(401, 'UNAUTHORIZED', 'Authentication failed'));
     }
   }
@@ -161,24 +177,26 @@ export function optionalAuthMiddleware(
 
     const token = authHeader.substring(7);
     
-    const decoded = jwt.verify(token, config.jwt.secret) as {
-      userId: string;
-      role: string;
-      phone: string;
-    };
+    const decoded = jwt.verify(token, config.jwt.secret);
+
+    // Runtime validation of JWT payload shape
+    if (!isValidJwtPayload(decoded)) {
+      next();
+      return;
+    }
 
     req.user = {
       userId: decoded.userId,
       role: decoded.role,
-      phone: decoded.phone
+      phone: (decoded as Record<string, unknown>).phone as string || ''
     };
     // Legacy format for existing controllers
     req.userId = decoded.userId;
     req.userRole = decoded.role;
-    req.userPhone = decoded.phone;
+    req.userPhone = (decoded as Record<string, unknown>).phone as string || '';
 
     next();
-  } catch (error) {
+  } catch {
     // Invalid token - continue without user (don't fail)
     next();
   }

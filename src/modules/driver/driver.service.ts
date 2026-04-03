@@ -14,6 +14,7 @@ import { logger } from '../../shared/services/logger.service';
 import { socketService } from '../../shared/services/socket.service';
 import { fleetCacheService } from '../../shared/services/fleet-cache.service';
 import { redisService } from '../../shared/services/redis.service';
+import { safeJsonParse } from '../../shared/utils/safe-json.utils';
 import { CreateDriverInput } from './driver.schema';
 import { prismaClient } from '../../shared/database/prisma.service';
 
@@ -149,7 +150,7 @@ class DriverService {
       const cacheKey = `driver:rating:${driverId}`;
       const cached = await redisService.get(cacheKey);
       if (cached) {
-        const parsed = JSON.parse(cached);
+        const parsed = safeJsonParse<{ avg?: number; count?: number }>(cached, { avg: 0, count: 0 });
         return { avg: parsed.avg || 0, count: parsed.count || 0 };
       }
 

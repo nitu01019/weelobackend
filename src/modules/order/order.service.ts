@@ -18,7 +18,7 @@
  * MODULARITY:
  * - Clear separation: Order → TruckRequests → Assignments
  * - Easy to extend for new vehicle types
- * - AWS-ready with message queue support (TODO)
+ * - AWS-ready with message queue support (TODO(LEO-L2): add SQS/SNS integration)
  * =============================================================================
  */
 
@@ -45,6 +45,7 @@ import { PROGRESSIVE_RADIUS_STEPS, progressiveRadiusMatcher } from './progressiv
 import { candidateScorerService } from '../../shared/services/candidate-scorer.service';
 import { metrics } from '../../shared/monitoring/metrics.service';
 import { truckHoldService } from '../truck-hold/truck-hold.service';
+import { roundCoord } from '../../shared/utils/geo.utils';
 
 // =============================================================================
 // CACHE KEYS & TTL (Optimized for fast lookups)
@@ -457,9 +458,10 @@ class OrderService {
       this.outboxWorkerRunning = true;
       try {
         await this.processDispatchOutboxBatch();
-      } catch (error: any) {
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'unknown';
         logger.error('Order dispatch outbox worker tick failed', {
-          error: error?.message || 'unknown'
+          error: message
         });
       } finally {
         this.outboxWorkerRunning = false;
@@ -796,7 +798,8 @@ class OrderService {
       };
       await this.persistOrderDispatchSnapshot(order, outcome);
       return outcome;
-    } catch (error: any) {
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'DISPATCH_FAILED';
       const retryable = attemptNumber < row.maxAttempts;
       const reasonCode = retryable ? 'DISPATCH_RETRYING' : 'DISPATCH_FAILED';
       const updateData: any = retryable
@@ -804,14 +807,14 @@ class OrderService {
           status: 'retrying',
           attempts: attemptNumber,
           nextRetryAt: new Date(Date.now() + this.calculateDispatchRetryDelayMs(attemptNumber)),
-          lastError: error?.message || 'DISPATCH_FAILED',
+          lastError: message,
           lockedAt: null
         }
         : {
           status: 'failed',
           attempts: attemptNumber,
           processedAt: new Date(),
-          lastError: error?.message || 'DISPATCH_FAILED',
+          lastError: message,
           lockedAt: null
         };
 
@@ -838,11 +841,12 @@ class OrderService {
     for (const row of rows) {
       try {
         await this.processDispatchOutboxRow(row);
-      } catch (error: any) {
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'unknown';
         logger.error('Order dispatch outbox row processing failed', {
           outboxId: row.id,
           orderId: row.orderId,
-          error: error?.message || 'unknown'
+          error: message
         });
       }
     }
@@ -934,9 +938,10 @@ class OrderService {
       this.lifecycleOutboxWorkerRunning = true;
       try {
         await this.processLifecycleOutboxBatch();
-      } catch (error: any) {
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'unknown';
         logger.error('Order lifecycle outbox worker tick failed', {
-          error: error?.message || 'unknown'
+          error: message
         });
       } finally {
         this.lifecycleOutboxWorkerRunning = false;
@@ -1167,7 +1172,8 @@ class OrderService {
           dlqReason: null
         }
       });
-    } catch (error: any) {
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'CANCEL_LIFECYCLE_EMIT_FAILED';
       const retryable = nextAttempt < row.maxAttempts;
       metrics.incrementCounter('cancel_emit_retry_total', {
         channel: 'lifecycle_outbox',
@@ -1181,7 +1187,7 @@ class OrderService {
             attempts: nextAttempt,
             nextRetryAt: new Date(Date.now() + this.calculateLifecycleRetryDelayMs(nextAttempt)),
             lockedAt: null,
-            lastError: error?.message || 'CANCEL_LIFECYCLE_EMIT_FAILED'
+            lastError: message
           }
         });
       } else {
@@ -1192,7 +1198,7 @@ class OrderService {
             attempts: nextAttempt,
             processedAt: new Date(),
             lockedAt: null,
-            lastError: error?.message || 'CANCEL_LIFECYCLE_EMIT_FAILED',
+            lastError: message,
             dlqReason: 'RETRY_EXHAUSTED'
           }
         });
@@ -1212,12 +1218,13 @@ class OrderService {
     for (const row of rows) {
       try {
         await this.processLifecycleOutboxRow(row);
-      } catch (error: any) {
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'unknown';
         logger.error('Order lifecycle outbox row processing failed', {
           outboxId: row.id,
           orderId: row.orderId,
           eventType: row.eventType,
-          error: error?.message || 'unknown'
+          error: message
         });
       }
     }
@@ -1350,8 +1357,9 @@ class OrderService {
           responseJson: response as unknown as Prisma.InputJsonValue
         }
       });
-    } catch (error: any) {
-      if (error?.code !== 'P2002') {
+    } catch (error: unknown) {
+      const prismaError = error as { code?: string };
+      if (prismaError?.code !== 'P2002') {
         throw error;
       }
       const existing = await this.getDbIdempotentResponse(customerId, idempotencyKey, payloadHash);
@@ -1447,9 +1455,10 @@ class OrderService {
         await cacheService.set(cacheKey, transporterIds, CACHE_TTL.TRANSPORTERS);
         logger.debug(`Cache SET: ${cacheKey} (${transporterIds.length} transporters)`);
       }
-    } catch (error: any) {
+    } catch (error: unknown) {
       // If cache fails, fall back to database
-      logger.warn(`Cache error for ${cacheKey}: ${error.message}. Falling back to DB.`);
+      const message = error instanceof Error ? error.message : String(error);
+      logger.warn(`Cache error for ${cacheKey}: ${message}. Falling back to DB.`);
       transporterIds = await db.getTransportersWithVehicleType(vehicleType, vehicleSubtype);
     }
 
@@ -1528,11 +1537,12 @@ class OrderService {
       }
       // Set debounce key — auto-expires after 3 seconds
       await redisService.set(debounceKey, '1', DEBOUNCE_SECONDS);
-    } catch (error: any) {
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
       // If error is our debounce error, rethrow it
-      if (error.message.includes('Please wait')) throw error;
+      if (message.includes('Please wait')) throw error;
       // If Redis fails, skip debounce (don't block orders)
-      logger.warn(`⚠️ Debounce check failed: ${error.message}. Proceeding without debounce.`);
+      logger.warn(`⚠️ Debounce check failed: ${message}. Proceeding without debounce.`);
     }
 
     // ==========================================================================
@@ -1553,8 +1563,9 @@ class OrderService {
           return cachedResponse;
         }
         logger.debug(`🔍 Idempotency MISS: Processing new order for key ${request.idempotencyKey.substring(0, 8)}...`);
-      } catch (error: any) {
-        logger.warn(`⚠️ Idempotency cache error: ${error.message}. Proceeding with order creation.`);
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        logger.warn(`⚠️ Idempotency cache error: ${message}. Proceeding with order creation.`);
         // Continue with order creation even if cache fails
       }
 
@@ -1603,7 +1614,6 @@ class OrderService {
       // ========================================
       // SERVER-GENERATED IDEMPOTENCY (double-tap / retry protection)
       // ========================================
-      const roundCoord = (n: number) => Math.round(n * 1000) / 1000;
       // Extract pickup/drop coords from routePoints or legacy fields
       const idemPickup = request.routePoints?.[0] || request.pickup;
       const idemDrop = request.routePoints?.[request.routePoints?.length ? request.routePoints.length - 1 : 0] || request.drop;
@@ -1768,8 +1778,9 @@ class OrderService {
             logger.info(`ℹ️ Price variance: ${req.vehicleType}/${req.vehicleSubtype} ` +
               `client=₹${clientPrice} vs server=₹${serverPrice} (diff=${(priceDiff * 100).toFixed(1)}%)`);
           }
-        } catch (error: any) {
-          logger.warn(`⚠️ Price validation failed for ${req.vehicleType}: ${error.message}. Using client price.`);
+        } catch (error: unknown) {
+          const message = error instanceof Error ? error.message : String(error);
+          logger.warn(`⚠️ Price validation failed for ${req.vehicleType}: ${message}. Using client price.`);
           // If pricing service fails, allow client price to avoid blocking orders
         }
       }
@@ -1838,7 +1849,7 @@ class OrderService {
         // EASY UNDERSTANDING: Clear validation error message
         // MODULARITY: Consistent with other validation errors
         // CODING STANDARDS: REST API error response pattern
-        throw new Error('Either routePoints OR both pickup and drop must be provided'); // TODO: Replace with ValidationError when imported
+        throw new Error('Either routePoints OR both pickup and drop must be provided'); // TODO(LEO-L2): Replace with ValidationError when imported
       }
 
       const stopsCount = routePoints.filter(p => p.type === 'STOP').length;
@@ -3520,8 +3531,9 @@ class OrderService {
           responseJson: response as unknown as Prisma.InputJsonValue
         }
       });
-    } catch (error: any) {
-      if (error?.code !== 'P2002') throw error;
+    } catch (error: unknown) {
+      const prismaError = error as { code?: string };
+      if (prismaError?.code !== 'P2002') throw error;
       const replay = await this.getCancelIdempotentResponse(customerId, idempotencyKey, payloadHash);
       if (!replay) {
         throw new AppError(409, 'IDEMPOTENCY_CONFLICT', 'Idempotency key conflict');
@@ -3546,10 +3558,11 @@ class OrderService {
           await redisService.set(cooldownKey, '15', 15);
         }
       }
-    } catch (error: any) {
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'unknown';
       logger.warn('Failed to update cancel rebook churn counter', {
         customerId,
-        error: error?.message || 'unknown'
+        error: message
       });
     }
   }
@@ -4155,11 +4168,12 @@ class OrderService {
       if (FF_CANCEL_OUTBOX_ENABLED && lifecycleOutboxId) {
         try {
           await this.processLifecycleOutboxImmediately(lifecycleOutboxId);
-        } catch (error: any) {
+        } catch (error: unknown) {
+          const message = error instanceof Error ? error.message : 'unknown';
           logger.warn('[CANCEL OUTBOX] immediate dispatch failed; worker will retry', {
             orderId,
             outboxId: lifecycleOutboxId,
-            error: error?.message || 'unknown'
+            error: message
           });
         }
       } else if (lifecyclePayload) {
@@ -4429,27 +4443,30 @@ class OrderService {
 
         // Transaction succeeded, break out of retry loop
         break;
-      } catch (error: any) {
+      } catch (error: unknown) {
+        const errMessage = error instanceof Error ? error.message : String(error);
+        const errCode = (error as { code?: string })?.code;
+
         // Handle EARLY_RETURN errors (validation failures — no retry)
-        if (error?.message?.startsWith('EARLY_RETURN:')) {
+        if (errMessage.startsWith('EARLY_RETURN:')) {
           return {
             success: false,
-            message: error.message.replace('EARLY_RETURN:', '')
+            message: errMessage.replace('EARLY_RETURN:', '')
           };
         }
 
         // Handle retryable serialization conflicts (P2034 / 40001)
         const isRetryableContention =
-          error?.code === 'P2034' ||
-          error?.code === '40001' ||
-          error?.message?.startsWith('RETRY:');
+          errCode === 'P2034' ||
+          errCode === '40001' ||
+          errMessage.startsWith('RETRY:');
 
         if (!isRetryableContention || attempt >= MAX_RETRIES) {
           logger.error(`acceptTruckRequest failed after ${attempt} attempt(s)`, {
             truckRequestId,
             vehicleId,
             driverId,
-            error: error.message
+            error: errMessage
           });
           throw error;
         }
@@ -4460,7 +4477,7 @@ class OrderService {
           driverId,
           attempt,
           maxAttempts: MAX_RETRIES,
-          code: error.code || 'RETRY'
+          code: errCode || 'RETRY'
         });
       }
     }

@@ -93,6 +93,7 @@ import { metricsMiddleware } from './shared/monitoring/metrics.service';
 import { fcmService } from './shared/services/fcm.service';
 import { redisService } from './shared/services/redis.service';
 import { startBookingExpiryChecker } from './modules/booking/booking.service';
+import { startStaleTransporterCleanup } from './shared/services/transporter-online.service';
 
 // =============================================================================
 // Phase 10: SHUTDOWN STATE (shared with health.routes.ts)
@@ -249,8 +250,19 @@ app.use(securityResponseHeaders);
 
 // CORS - Configure based on environment
 // Uses config.cors.origin from environment.ts for consistency
+// H6 FIX: In production, if CORS_ORIGIN is not explicitly set, use restrictive default
+// (empty array = block all cross-origin) instead of wildcard '*'.
+const resolvedCorsOrigin = (() => {
+  if (config.isDevelopment) return '*';
+  if (config.cors.origin === '*' && config.isProduction) {
+    logger.warn('[CORS] CORS_ORIGIN not set in production — defaulting to restrictive (no cross-origin). Set CORS_ORIGIN env var to allow specific origins.');
+    return [] as string[];
+  }
+  return config.cors.origin;
+})();
+
 app.use(cors({
-  origin: config.isDevelopment ? '*' : config.cors.origin,
+  origin: resolvedCorsOrigin,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
   allowedHeaders: [
     'Content-Type',
@@ -419,6 +431,37 @@ if (config.isDevelopment) {
       data: await db.getStats()
     });
   });
+
+  // L6 FIX: Moved from after 404 handler to here (before it) so it's reachable
+  // DEBUG: Socket connections endpoint
+  // SECURITY: Only available in development — exposes connected user data
+  app.get(`${API_PREFIX}/debug/sockets`, (_req, res) => {
+    const { getConnectionStats: getConnStats }: typeof import('./shared/services/socket.service') = require('./shared/services/socket.service');
+    const debugStats = getConnStats();
+
+    // Get all connected user IDs
+    const connectedUsers: any[] = [];
+    const socketMod: typeof import('./shared/services/socket.service') = require('./shared/services/socket.service');
+    const ioInstance = socketMod.getIO();
+    if (ioInstance) {
+      ioInstance.sockets.sockets.forEach((socket: any) => {
+        connectedUsers.push({
+          socketId: socket.id,
+          userId: socket.data.userId,
+          role: socket.data.role,
+          phone: socket.data.phone
+        });
+      });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        stats: debugStats,
+        connectedUsers
+      }
+    });
+  });
 }
 
 // =============================================================================
@@ -495,10 +538,11 @@ async function bootstrap(): Promise<void> {
     await liveAvailabilityService.rebuildFromDatabase();
 
     // Periodic reconciliation: compare Redis with DB every 5 minutes as a safety net
+    // L1 FIX: unref() so this non-critical timer doesn't block process exit
     setInterval(() => {
       liveAvailabilityService.reconcile()
         .catch(err => logger.warn('[LiveAvail] Reconciliation failed:', (err as Error).message));
-    }, 5 * 60 * 1000);
+    }, 5 * 60 * 1000).unref();
   } catch (err: any) {
     logger.warn(`[LiveAvail] Bootstrap failed: ${err.message}`);
   }
@@ -507,6 +551,11 @@ async function bootstrap(): Promise<void> {
   // 3. Start background jobs that depend on Redis
   // -------------------------------------------------------------------------
   startBookingExpiryChecker();
+  // M12 FIX: Explicitly start stale transporter cleanup (was auto-started on import)
+  startStaleTransporterCleanup();
+  // M12 FIX: Explicitly start driver offline checker (was auto-started on import)
+  const { trackingService: trackingSvc } = await import('./modules/tracking/tracking.service');
+  trackingSvc.startDriverOfflineChecker();
 
   // -------------------------------------------------------------------------
   // 4. Start listening for HTTP traffic
@@ -552,50 +601,23 @@ async function bootstrap(): Promise<void> {
   const protocol = isHttps ? 'https' : 'http';
   const securityStatus = isHttps ? '🔒 SECURE (TLS 1.2+)' : '⚠️  HTTP (dev only)';
 
-  console.log('');
-  console.log('╔════════════════════════════════════════════════════════════════════╗');
-  console.log('║                                                                    ║');
-  console.log('║   🚛  WEELO UNIFIED BACKEND STARTED                                ║');
-  console.log('║   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━     ║');
-  console.log('║   Serving: 📱 Customer App  +  🚛 Captain App                      ║');
-  console.log('║                                                                    ║');
-  console.log('╠════════════════════════════════════════════════════════════════════╣');
-  console.log(`║   📍 Server:      ${protocol}://localhost:${PORT}                           ║`);
-  console.log(`║   📍 Environment: ${config.nodeEnv.padEnd(46)}║`);
-  console.log(`║   🔐 Security:    ${securityStatus.padEnd(46)}║`);
-  console.log('║                                                                    ║');
-  console.log('║   📊 Database Stats:                                               ║');
-  console.log(`║      • Users:       ${String(stats.users).padEnd(44)}║`);
-  console.log(`║      • Vehicles:    ${String(stats.vehicles).padEnd(44)}║`);
-  console.log(`║      • Bookings:    ${String(stats.bookings).padEnd(44)}║`);
-  console.log('║                                                                    ║');
-  console.log('║   🔗 Connect Apps:                                                 ║');
-  console.log('║      • Android Emulator:  http://10.0.2.2:3000                     ║');
-  console.log('║      • Physical Device:   http://<your-mac-ip>:3000               ║');
-  console.log('║                                                                    ║');
-  console.log('║   📚 API Modules:                                                  ║');
-  console.log('║      • /api/v1/auth       - Login, OTP, JWT (Transporter/Customer) ║');
-  console.log('║      • /api/v1/driver-auth- Driver Login (OTP to Transporter)      ║');
-  console.log('║      • /api/v1/profile    - User profiles (all roles)              ║');
-  console.log('║      • /api/v1/vehicles   - Vehicle management                     ║');
-  console.log('║      • /api/v1/bookings   - Customer bookings                      ║');
-  console.log('║      • /api/v1/assignments- Truck assignments                      ║');
-  console.log('║      • /api/v1/tracking   - Real-time GPS                          ║');
-  console.log('║      • /api/v1/pricing    - Fare estimation                        ║');
-  console.log('║      • /api/v1/driver     - Driver dashboard                       ║');
-  console.log('║      • /api/v1/broadcasts - Booking notifications                  ║');
-  console.log('║                                                                    ║');
-  console.log('║   📱 OTPs are logged to this console when requested               ║');
-  console.log('║                                                                    ║');
-  console.log('║   ❤️  Health Check: /health                                        ║');
-  console.log('║                                                                    ║');
-  console.log('╚════════════════════════════════════════════════════════════════════╝');
-  console.log('');
+  // M1-R FIX: Use logger instead of console.log for startup banner
+  const banner = [
+    '',
+    'WEELO UNIFIED BACKEND STARTED',
+    `  Server:      ${protocol}://localhost:${PORT}`,
+    `  Environment: ${config.nodeEnv}`,
+    `  Security:    ${securityStatus}`,
+    `  Database:    Users=${stats.users} Vehicles=${stats.vehicles} Bookings=${stats.bookings}`,
+    ''
+  ].join('\n');
+  logger.info(banner);
 
   logger.info(`Server started on port ${PORT}`);
 }
 
 bootstrap().catch((err) => {
+  // console.error used intentionally — logger may not be initialized if bootstrap() failed early
   console.error('Bootstrap failed:', err);
   process.exit(1);
 });
@@ -636,13 +658,14 @@ const gracefulShutdown = async (signal: string) => {
 
   // Stop all background intervals first (prevents new work during shutdown)
   try {
-    const { stopBookingExpiryChecker } = require('./modules/booking/booking.service');
-    const { stopOrderExpiryChecker } = require('./modules/booking/order.service');
-    const { stopOrderTimerChecker } = require('./modules/order/order.service');
+    // H18 FIX: Add type annotations to lazy require() calls for type safety
+    const { stopBookingExpiryChecker }: typeof import('./modules/booking/booking.service') = require('./modules/booking/booking.service');
+    const { stopOrderExpiryChecker }: typeof import('./modules/booking/order.service') = require('./modules/booking/order.service');
+    const { stopOrderTimerChecker }: typeof import('./modules/order/order.service') = require('./modules/order/order.service');
     // Assignment timeouts now use queue-based delayed jobs (no polling to stop)
-    const { broadcastService } = require('./modules/broadcast/broadcast.service');
-    const { stopStaleTransporterCleanup } = require('./shared/services/transporter-online.service');
-    const { trackingService } = require('./modules/tracking/tracking.service');
+    const { broadcastService }: typeof import('./modules/broadcast/broadcast.service') = require('./modules/broadcast/broadcast.service');
+    const { stopStaleTransporterCleanup }: typeof import('./shared/services/transporter-online.service') = require('./shared/services/transporter-online.service');
+    const { trackingService }: typeof import('./modules/tracking/tracking.service') = require('./modules/tracking/tracking.service');
     stopBookingExpiryChecker();
     stopOrderExpiryChecker();
     stopOrderTimerChecker();
@@ -658,7 +681,7 @@ const gracefulShutdown = async (signal: string) => {
   // Tell all connected clients "reconnect NOW" instead of silently dropping.
   // Clients already have reconnect logic — this triggers it immediately.
   try {
-    const { getIO } = require('./shared/services/socket.service');
+    const { getIO }: typeof import('./shared/services/socket.service') = require('./shared/services/socket.service');
     const io = getIO();
     if (io) {
       const socketCount = io.sockets.sockets.size;
@@ -687,7 +710,7 @@ const gracefulShutdown = async (signal: string) => {
 
     // Close Prisma/database connection pool
     try {
-      const { prismaClient } = require('./shared/database/prisma.service');
+      const { prismaClient }: typeof import('./shared/database/prisma.service') = require('./shared/database/prisma.service');
       await prismaClient.$disconnect();
       logger.info('Database connection closed');
     } catch (err) {
@@ -699,42 +722,14 @@ const gracefulShutdown = async (signal: string) => {
   });
 
   // Force shutdown after 30 seconds
+  // L1 FIX: unref() so this doesn't prevent Node.js from exiting if everything else is done
   setTimeout(() => {
     logger.error('Forced shutdown after timeout');
     process.exit(1);
-  }, 30000);
+  }, 30000).unref();
 };
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-// DEBUG: Socket connections endpoint
-// SECURITY: Only available in development — exposes connected user data
-if (config.isDevelopment) {
-  app.get('/api/v1/debug/sockets', (req, res) => {
-    const { getConnectionStats } = require('./shared/services/socket.service');
-    const stats = getConnectionStats();
-
-    // Get all connected user IDs
-    const connectedUsers: any[] = [];
-    const io = require('./shared/services/socket.service').getIO();
-    if (io) {
-      io.sockets.sockets.forEach((socket: any) => {
-        connectedUsers.push({
-          socketId: socket.id,
-          userId: socket.data.userId,
-          role: socket.data.role,
-          phone: socket.data.phone
-        });
-      });
-    }
-
-    res.json({
-      success: true,
-      data: {
-        stats,
-        connectedUsers
-      }
-    });
-  });
-}
+// L6 FIX: Debug socket route was here AFTER 404 handler — moved BEFORE it (see above)

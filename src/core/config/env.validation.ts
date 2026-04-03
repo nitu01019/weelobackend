@@ -431,7 +431,9 @@ export function validateEnvironment(): ValidationResult {
       // Store loaded value
       result.loaded[envVar.name] = finalValue;
 
-      // Set default in process.env if not already set
+      // NOTE: process.env mutation — kept because downstream code may read process.env
+      // directly (e.g., Prisma, Redis clients). The config object in environment.ts
+      // also provides these defaults, but removing this could break third-party libs.
       if (!value && envVar.default) {
         process.env[envVar.name] = envVar.default;
       }
@@ -459,6 +461,13 @@ export function validateEnvironment(): ValidationResult {
     if (!process.env.AWS_SNS_REGION && !process.env.AWS_REGION) {
       result.warnings.push('AWS_SNS_REGION not set, defaulting to ap-south-1');
     }
+  }
+
+  // Critical environment variables that must always be present — halt startup if missing
+  const criticalVars = ['DATABASE_URL', 'JWT_SECRET'];
+  const missing = criticalVars.filter(v => !process.env[v]);
+  if (missing.length > 0) {
+    throw new Error(`FATAL: Missing critical env vars: ${missing.join(', ')}`);
   }
 
   const trackingStreamEnabled = process.env.TRACKING_STREAM_ENABLED === 'true';

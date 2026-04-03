@@ -31,6 +31,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { AppError } from '../types/error.types';
 import { logger } from './logger.service';
 import * as fs from 'fs';
+import * as fsPromises from 'fs/promises';
 import * as path from 'path';
 
 interface UploadConfig {
@@ -102,17 +103,15 @@ class S3UploadService {
       // Create uploads directory structure
       const uploadsDir = path.join(process.cwd(), 'uploads', folder);
       
-      // Ensure directory exists
-      if (!fs.existsSync(uploadsDir)) {
-        fs.mkdirSync(uploadsDir, { recursive: true });
-      }
+      // Ensure directory exists (async — avoids blocking event loop)
+      await fsPromises.mkdir(uploadsDir, { recursive: true });
 
       // Generate unique filename
       const uniqueFileName = `${Date.now()}_${fileName}`;
       const filePath = path.join(uploadsDir, uniqueFileName);
 
       // Write file
-      fs.writeFileSync(filePath, fileBuffer);
+      await fsPromises.writeFile(filePath, fileBuffer);
 
       // Return local URL
       const localUrl = `/uploads/${folder}/${uniqueFileName}`;
@@ -128,8 +127,9 @@ class S3UploadService {
         key: `${folder}/${uniqueFileName}`,
         bucket: 'local'
       };
-    } catch (error: any) {
-      logger.error('Failed to save file locally', { error: error.message });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error('Failed to save file locally', { error: message });
       throw new AppError(500, 'FILE_SAVE_ERROR', 'Failed to save file locally');
     }
   }

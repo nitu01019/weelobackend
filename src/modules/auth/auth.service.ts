@@ -159,10 +159,12 @@ class AuthService {
     // Fire-and-forget: don't await SMS delivery
     smsService.sendOtp(phone, otp).then(() => {
       logger.info('OTP SMS sent successfully', { phone: maskedPhone, role });
-    }).catch(async (smsError: any) => {
-      logger.error('❌ Failed to send OTP SMS', {
-        error: smsError.message,
-        errorCode: smsError.code || 'UNKNOWN',
+    }).catch(async (smsError: unknown) => {
+      const smsErrMsg = smsError instanceof Error ? smsError.message : String(smsError);
+      const smsErrCode = smsError instanceof Error && 'code' in smsError ? (smsError as { code?: string }).code : 'UNKNOWN';
+      logger.error('Failed to send OTP SMS', {
+        error: smsErrMsg,
+        errorCode: smsErrCode || 'UNKNOWN',
         phone: maskedPhone,
         role,
         otpStored: true,
@@ -173,8 +175,9 @@ class AuthService {
           redisKey: key,
           dbKey: { phone, role },
           logContext: { phone: maskedPhone, role, reason: 'sms_send_failed' }
-        }).catch((cleanupErr: any) => {
-          logger.error('Failed to clean up OTP after SMS failure', { error: cleanupErr.message });
+        }).catch((cleanupErr: unknown) => {
+          const cleanupMsg = cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr);
+          logger.error('Failed to clean up OTP after SMS failure', { error: cleanupMsg });
         });
       }
     });
@@ -253,8 +256,9 @@ class AuthService {
 
     try {
       dbUser = await db.getUserByPhone(phone, role);
-    } catch (err: any) {
-      logger.warn('Error fetching user, will create new', { error: err.message });
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      logger.warn('Error fetching user, will create new', { error: errMsg });
     }
 
     if (!dbUser) {
@@ -267,8 +271,9 @@ class AuthService {
           isVerified: false,
           isActive: true
         });
-      } catch (err: any) {
-        logger.error('Error creating user in DB', { error: err.message });
+      } catch (err: unknown) {
+        const createErrMsg = err instanceof Error ? err.message : String(err);
+        logger.error('Error creating user in DB', { error: createErrMsg });
         throw new AppError(503, 'DB_UNAVAILABLE', 'Unable to create user account. Please try again.');
       }
 
@@ -285,15 +290,11 @@ class AuthService {
 
       // Development only: Show user creation details
       if (config.isDevelopment) {
-        console.log('\n');
-        console.log('╔══════════════════════════════════════════════════════════════╗');
-        console.log('║                  👤 NEW USER CREATED                         ║');
-        console.log('╠══════════════════════════════════════════════════════════════╣');
-        console.log(`║  User ID: ${dbUser.id.padEnd(50)}║`);
-        console.log(`║  Phone:   ${maskForLogging(phone, 2, 4).padEnd(50)}║`);
-        console.log(`║  Role:    ${role.padEnd(50)}║`);
-        console.log('╚══════════════════════════════════════════════════════════════╝');
-        console.log('\n');
+        logger.debug('New user created (dev)', {
+          userId: dbUser.id,
+          phone: maskForLogging(phone, 2, 4),
+          role
+        });
       }
     }
 
@@ -322,16 +323,12 @@ class AuthService {
 
     // Development only: Show login details
     if (config.isDevelopment) {
-      console.log('\n');
-      console.log('╔══════════════════════════════════════════════════════════════╗');
-      console.log('║                  ✅ LOGIN SUCCESSFUL                         ║');
-      console.log('╠══════════════════════════════════════════════════════════════╣');
-      console.log(`║  User ID:  ${user.id.substring(0, 36).padEnd(49)}║`);
-      console.log(`║  Phone:    ${maskForLogging(phone, 2, 4).padEnd(49)}║`);
-      console.log(`║  Role:     ${role.padEnd(49)}║`);
-      console.log(`║  New User: ${(isNewUser ? 'Yes' : 'No').padEnd(49)}║`);
-      console.log('╚══════════════════════════════════════════════════════════════╝');
-      console.log('\n');
+      logger.debug('Login successful (dev)', {
+        userId: user.id,
+        phone: maskForLogging(phone, 2, 4),
+        role,
+        isNewUser
+      });
     }
 
     return {
@@ -492,13 +489,15 @@ class AuthService {
       expiresAt: expiresAt.toISOString()
     };
 
-    redisService.setJSON(REDIS_KEYS.REFRESH_TOKEN(tokenId), entry, ttlSeconds).catch(err => {
-      logger.error(`Failed to store refresh token: ${err.message}`);
+    redisService.setJSON(REDIS_KEYS.REFRESH_TOKEN(tokenId), entry, ttlSeconds).catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error('Failed to store refresh token', { error: msg });
     });
 
     // Track token ID for user (for logout all devices)
-    redisService.sAdd(REDIS_KEYS.USER_TOKENS(user.id), tokenId).catch(err => {
-      logger.error(`Failed to track user token: ${err.message}`);
+    redisService.sAdd(REDIS_KEYS.USER_TOKENS(user.id), tokenId).catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error('Failed to track user token', { error: msg });
     });
 
     return token;

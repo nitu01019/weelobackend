@@ -484,26 +484,29 @@ class FCMService {
     tokens: string[],
     topic?: string
   ): void {
-    console.log('');
-    console.log('╔════════════════════════════════════════════════════════════╗');
-    console.log('║  📱 PUSH NOTIFICATION (Mock Mode)                          ║');
-    console.log('╠════════════════════════════════════════════════════════════╣');
-    console.log(`║  Type:    ${notification.type.padEnd(47)}║`);
-    console.log(`║  Title:   ${notification.title.substring(0, 47).padEnd(47)}║`);
-    console.log(`║  Body:    ${notification.body.substring(0, 47).padEnd(47)}║`);
+    const lines: string[] = [
+      '',
+      '╔════════════════════════════════════════════════════════════╗',
+      '║  PUSH NOTIFICATION (Mock Mode)                             ║',
+      '╠════════════════════════════════════════════════════════════╣',
+      `║  Type:    ${notification.type.padEnd(47)}║`,
+      `║  Title:   ${notification.title.substring(0, 47).padEnd(47)}║`,
+      `║  Body:    ${notification.body.substring(0, 47).padEnd(47)}║`,
+    ];
     if (topic) {
-      console.log(`║  Topic:   ${topic.padEnd(47)}║`);
+      lines.push(`║  Topic:   ${topic.padEnd(47)}║`);
     } else {
-      console.log(`║  Tokens:  ${tokens.length} device(s)`.padEnd(59) + '║');
+      lines.push(`║  Tokens:  ${tokens.length} device(s)`.padEnd(59) + '║');
     }
-    console.log('║                                                            ║');
-    console.log('║  Data:                                                     ║');
+    lines.push('║                                                            ║');
+    lines.push('║  Data:                                                     ║');
     Object.entries(notification.data || {}).forEach(([key, value]) => {
       const line = `    ${key}: ${String(value).substring(0, 40)}`;
-      console.log(`║  ${line.padEnd(56)}║`);
+      lines.push(`║  ${line.padEnd(56)}║`);
     });
-    console.log('╚════════════════════════════════════════════════════════════╝');
-    console.log('');
+    lines.push('╚════════════════════════════════════════════════════════════╝');
+    lines.push('');
+    logger.info(lines.join('\n'));
   }
 
   // ============================================================================

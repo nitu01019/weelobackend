@@ -10,7 +10,7 @@
  */
 
 import { v4 as uuidv4 } from 'uuid';
-import { Prisma } from '@prisma/client';
+import { Prisma, AssignmentStatus } from '@prisma/client';
 import { db, BookingRecord, AssignmentRecord } from '../../shared/database/db';
 import { AppError } from '../../shared/types/error.types';
 import { logger } from '../../shared/services/logger.service';
@@ -18,6 +18,7 @@ import { emitToUser, emitToUsers, emitToRoom, emitToAllTransporters, emitToAll, 
 import { sendPushNotification } from '../../shared/services/fcm.service';
 import { redisService } from '../../shared/services/redis.service';
 import { prismaClient, withDbTimeout } from '../../shared/database/prisma.service';
+import { safeJsonParse } from '../../shared/utils/safe-json.utils';
 
 // =============================================================================
 // BROADCAST EXPIRY EVENTS - For real-time timeout handling
@@ -162,8 +163,11 @@ class BroadcastService {
     try {
       const cached = await redisService.get(cacheKey) as string | null;
       if (cached) {
-        logger.debug(`[BroadcastCompat] Cache HIT for transporter ${transporterId}`);
-        return JSON.parse(cached);
+        const parsed = safeJsonParse<unknown[]>(cached, []);
+        if (parsed.length > 0) {
+          logger.debug(`[BroadcastCompat] Cache HIT for transporter ${transporterId}`);
+          return parsed;
+        }
       }
     } catch {
       // Redis down — fall through to DB query (graceful degradation)
@@ -411,12 +415,13 @@ class BroadcastService {
             replayed: true
           };
         }
-      } catch (error: any) {
+      } catch (error: unknown) {
+        const msg = error instanceof Error ? error.message : String(error);
         logger.warn('[BroadcastAccept] Idempotency cache read failed', {
           broadcastId,
           vehicleId,
           driverId,
-          error: error.message
+          error: msg
         });
       }
     }
@@ -438,20 +443,45 @@ class BroadcastService {
         throw new AppError(429, 'LOCK_CONTENTION',
           'Another accept is being processed for this broadcast. Please retry in 2 seconds.');
       }
-    } catch (error: any) {
+    } catch (error: unknown) {
       if (error instanceof AppError) throw error;  // Re-throw intentional 429
+      const lockMsg = error instanceof Error ? error.message : String(error);
       logger.warn('[BroadcastAccept] Lock acquisition failed, proceeding with transactional safety', {
         broadcastId,
         vehicleId,
         driverId,
-        error: error.message
+        error: lockMsg
       });
     }
 
     try {
-      const activeStatuses = ['pending', 'driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit'] as const;
+      const activeStatuses: AssignmentStatus[] = ['pending', 'driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit'];
       const maxTransactionAttempts = 3;
-      let txResult: any = null;
+      let txResult: {
+        replayed: boolean;
+        assignmentId: string;
+        tripId: string;
+        trucksConfirmed: number;
+        totalTrucksNeeded: number;
+        isFullyFilled: boolean;
+        booking: {
+          customerId: string;
+          trucksNeeded: number;
+          trucksFilled: number;
+          status: string;
+          pricePerTruck: number;
+          distanceKm: number;
+          customerName: string;
+          customerPhone: string;
+          vehicleType: string;
+          vehicleSubtype?: string;
+          pickup?: unknown;
+          drop?: unknown;
+        };
+        driver: { name?: string; phone?: string; transporterId?: string };
+        vehicle: { vehicleNumber?: string; vehicleType?: string; vehicleSubtype?: string };
+        transporter: { name?: string; businessName?: string; phone?: string };
+      } | null = null;
 
       for (let attempt = 1; attempt <= maxTransactionAttempts; attempt += 1) {
         try {
@@ -507,7 +537,7 @@ class BroadcastService {
                 bookingId: broadcastId,
                 driverId,
                 vehicleId,
-                status: { in: activeStatuses as any }
+                status: { in: activeStatuses }
               },
               orderBy: { assignedAt: 'desc' }
             });
@@ -540,7 +570,7 @@ class BroadcastService {
             const activeAssignment = await tx.assignment.findFirst({
               where: {
                 driverId,
-                status: { in: activeStatuses as any }
+                status: { in: activeStatuses }
               },
               orderBy: { assignedAt: 'desc' }
             });
@@ -634,8 +664,11 @@ class BroadcastService {
             };
           }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable, timeoutMs: 8000 });
           break;
-        } catch (transactionError: any) {
-          const isRetryableContention = transactionError?.code === 'P2034' || transactionError?.code === '40001';
+        } catch (transactionError: unknown) {
+          const txCode = transactionError instanceof Error && 'code' in transactionError
+            ? (transactionError as { code?: string }).code
+            : undefined;
+          const isRetryableContention = txCode === 'P2034' || txCode === '40001';
           if (!isRetryableContention || attempt >= maxTransactionAttempts) {
             throw transactionError;
           }
@@ -646,7 +679,7 @@ class BroadcastService {
             driverId,
             attempt,
             maxAttempts: maxTransactionAttempts,
-            code: transactionError.code
+            code: txCode
           });
         }
       }
@@ -676,13 +709,13 @@ class BroadcastService {
         });
       } else {
         this.incrementAcceptMetric('success');
-        const booking = txResult.booking as any;
-        const driver = txResult.driver as any;
-        const vehicle = txResult.vehicle as any;
-        const transporter = txResult.transporter as any;
+        const booking = txResult.booking;
+        const driver = txResult.driver;
+        const vehicle = txResult.vehicle;
+        const transporter = txResult.transporter;
         const now = new Date().toISOString();
-        const pickup = (booking.pickup || {}) as any;
-        const drop = (booking.drop || {}) as any;
+        const pickup = (booking.pickup || {}) as Record<string, unknown>;
+        const drop = (booking.drop || {}) as Record<string, unknown>;
 
         logger.info('[BroadcastAccept] Success', {
           broadcastId,
@@ -722,8 +755,9 @@ class BroadcastService {
             assignmentId: result.assignmentId,
             bookingId: broadcastId
           }
-        }).catch(err => {
-          logger.warn(`FCM to driver ${driverId} failed: ${err.message}`);
+        }).catch((err: unknown) => {
+          const fcmMsg = err instanceof Error ? err.message : String(err);
+          logger.warn(`FCM to driver ${driverId} failed: ${fcmMsg}`);
         });
 
         const customerNotification = {
@@ -768,8 +802,9 @@ class BroadcastService {
             trucksConfirmed: result.trucksConfirmed,
             totalTrucks: booking.trucksNeeded
           }
-        }).catch(err => {
-          logger.warn(`FCM to customer ${booking.customerId} failed: ${err.message}`);
+        }).catch((err: unknown) => {
+          const custFcmMsg = err instanceof Error ? err.message : String(err);
+          logger.warn(`FCM to customer ${booking.customerId} failed: ${custFcmMsg}`);
         });
       }
 
@@ -784,38 +819,41 @@ class BroadcastService {
             isFullyFilled: result.isFullyFilled
           };
           await redisService.setJSON(idempotencyCacheKey, cachePayload, 24 * 60 * 60);
-        } catch (error: any) {
+        } catch (error: unknown) {
+          const cacheMsg = error instanceof Error ? error.message : String(error);
           logger.warn('[BroadcastAccept] Idempotency cache write failed', {
             broadcastId,
             vehicleId,
             driverId,
-            error: error.message
+            error: cacheMsg
           });
         }
       }
 
       return result;
-    } catch (error: any) {
+    } catch (error: unknown) {
       const code = error instanceof AppError ? error.code : 'INVALID_ASSIGNMENT_STATE';
       this.incrementAcceptFailureMetric(code);
+      const failMsg = error instanceof Error ? error.message : 'Unknown error';
       logger.warn('[BroadcastAccept] Failed', {
         broadcastId,
         vehicleId,
         driverId,
         resultCode: code,
-        message: error?.message || 'Unknown error'
+        message: failMsg
       });
       throw error;
     } finally {
       if (lockAcquired) {
         try {
           await redisService.releaseLock(lockKey, lockHolder);
-        } catch (error: any) {
+        } catch (error: unknown) {
+          const releaseMsg = error instanceof Error ? error.message : String(error);
           logger.warn('[BroadcastAccept] Lock release failed', {
             broadcastId,
             vehicleId,
             driverId,
-            error: error.message
+            error: releaseMsg
           });
         }
       }
@@ -831,8 +869,9 @@ class BroadcastService {
     // FIX #7: Track decline in Redis SET for analytics + re-broadcast prevention
     // TTL = 1 hour (matches booking max lifetime)
     const declineKey = `broadcast:declined:${broadcastId}`;
-    await redisService.sAdd(declineKey, actorId).catch((err: any) => {
-      logger.warn('[declineBroadcast] Redis sAdd failed', { broadcastId, actorId, error: err.message });
+    await redisService.sAdd(declineKey, actorId).catch((err: unknown) => {
+      const declineMsg = err instanceof Error ? err.message : String(err);
+      logger.warn('[declineBroadcast] Redis sAdd failed', { broadcastId, actorId, error: declineMsg });
     });
     await redisService.expire(declineKey, 3600).catch(() => {});
 
@@ -1001,10 +1040,11 @@ class BroadcastService {
 
             expiredCount++;
             logger.info(`⏰ Order ${order.id} expired - notified all transporters`);
-          } catch (error: any) {
+          } catch (error: unknown) {
+            const expiryMsg = error instanceof Error ? error.message : String(error);
             logger.error('Failed to process expired order broadcast', {
               orderId: order.id,
-              error: error.message
+              error: expiryMsg
             });
           } finally {
             await redisService.releaseLock(lockKey, 'broadcast-expiry-checker').catch(() => { });
@@ -1151,8 +1191,9 @@ class BroadcastService {
         type: 'booking_expired',
         bookingId: booking.id
       }
-    }).catch(err => {
-      logger.warn(`FCM to customer ${booking.customerId} failed: ${err.message}`);
+    }).catch((err: unknown) => {
+      const notifyMsg = err instanceof Error ? err.message : String(err);
+      logger.warn(`FCM to customer ${booking.customerId} failed: ${notifyMsg}`);
     });
   }
 
@@ -1170,8 +1211,9 @@ class BroadcastService {
     this.expiryCheckerInterval = setInterval(async () => {
       try {
         await this.checkAndExpireBroadcasts();
-      } catch (error: any) {
-        logger.error(`Expiry checker error: ${error.message}`);
+      } catch (error: unknown) {
+        const checkerMsg = error instanceof Error ? error.message : String(error);
+        logger.error(`Expiry checker error: ${checkerMsg}`);
       }
     }, 5000);
 

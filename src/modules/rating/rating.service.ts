@@ -2,6 +2,7 @@ import { prismaClient } from '../../shared/database/prisma.service';
 import { redisService } from '../../shared/services/redis.service';
 import { AppError } from '../../shared/types/error.types';
 import { logger } from '../../shared/services/logger.service';
+import { safeJsonParse } from '../../shared/utils/safe-json.utils';
 import type { SubmitRatingInput } from './rating.schema';
 
 // =============================================================================
@@ -167,7 +168,7 @@ export const ratingService = {
     // Try Redis cache first
     try {
       const cached = await redisService.get(PENDING_RATINGS_KEY(customerId));
-      if (cached) return JSON.parse(cached);
+      if (cached) return safeJsonParse(cached, null);
     } catch (_) { /* cache miss, continue */ }
 
     // completedAt is stored as ISO string (not DateTime) — filter in-memory after fetch
@@ -283,7 +284,7 @@ export const ratingService = {
     // Try Redis cache
     try {
       const cached = await redisService.get(DRIVER_RATING_DIST_KEY(driverId));
-      if (cached) return JSON.parse(cached);
+      if (cached) return safeJsonParse<Record<string, number>>(cached, defaultDist);
     } catch (_) { /* cache miss, fall through to DB */ }
 
     // Single DB query (no double call on Redis failure)
@@ -315,7 +316,7 @@ export const ratingService = {
     try {
       const cached = await redisService.get(DRIVER_RATING_KEY(driverId));
       if (cached) {
-        const parsed = JSON.parse(cached);
+        const parsed = safeJsonParse<{ avg?: number; count?: number }>(cached, { avg: 0, count: 0 });
         return { avg: parsed.avg || 0, count: parsed.count || 0 };
       }
     } catch (_) { /* cache miss */ }

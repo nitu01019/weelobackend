@@ -31,11 +31,12 @@ import { logger } from './logger.service';
 // Lazy import of main PrismaClient singleton — avoids circular deps with prisma.service.ts
 // Reuses the managed connection pool (connection_limit=20, pool_timeout=5)
 // instead of creating a separate uncontrolled pool.
-let _prisma: any = null;
+// H18 FIX: Add type annotation to preserve type safety across lazy require()
+let _prisma: typeof import('../database/prisma.service')['prismaClient'] | null = null;
 function getLazyPrisma() {
   if (!_prisma) {
-    const { prismaClient } = require('../database/prisma.service');
-    _prisma = prismaClient;
+    const mod: typeof import('../database/prisma.service') = require('../database/prisma.service');
+    _prisma = mod.prismaClient;
   }
   return _prisma;
 }

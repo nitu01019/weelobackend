@@ -40,6 +40,7 @@ import { queueService } from '../../shared/services/queue.service';
 import { liveAvailabilityService } from '../../shared/services/live-availability.service';
 import { generateVehicleKey } from '../../shared/services/vehicle-key.service';
 import { haversineDistanceMeters } from '../../shared/utils/geospatial.utils';
+import { safeJsonParse } from '../../shared/utils/safe-json.utils';
 import { prismaClient } from '../../shared/database/prisma.service';
 import { googleMapsService } from '../../shared/services/google-maps.service';
 import {
@@ -156,6 +157,8 @@ export interface FleetTrackingResponse {
 }
 
 class TrackingService {
+  // WARNING: In-memory state — lost on ECS restart. TODO: migrate to Redis.
+  // KNOWN_ISSUE(H2): history persist state resets on restart; harmless (next GPS update re-seeds it)
   private readonly historyPersistStateByTrip = new Map<string, HistoryPersistState>();
 
   /**
@@ -824,9 +827,9 @@ class TrackingService {
         );
         if (driverLocation?.latitude && driverLocation?.longitude) {
           const pickupSource = assignment.order?.pickup || assignment.booking?.pickup;
-          const pickupData = typeof pickupSource === 'string'
-            ? JSON.parse(pickupSource as string)
-            : pickupSource;
+          const pickupData = (typeof pickupSource === 'string'
+            ? safeJsonParse<Record<string, unknown>>(pickupSource, {})
+            : pickupSource) as Record<string, unknown> | undefined;
           const pickupLat = pickupData?.latitude || pickupData?.lat;
           const pickupLng = pickupData?.longitude || pickupData?.lng;
           if (pickupLat && pickupLng) {
@@ -1275,13 +1278,9 @@ class TrackingService {
     await assertTripTrackingAccess(tripId, userId, userRole);
     const historyKey = REDIS_KEYS.TRIP_HISTORY(tripId);
     const rawHistory = await redisService.lRange(historyKey, 0, -1);
-    let history: LocationHistoryEntry[] = rawHistory.map((entry) => {
-      try {
-        return JSON.parse(entry) as LocationHistoryEntry;
-      } catch {
-        return null;
-      }
-    }).filter((entry): entry is LocationHistoryEntry => entry !== null);
+    let history: LocationHistoryEntry[] = rawHistory
+      .map((entry) => safeJsonParse<LocationHistoryEntry | null>(entry, null))
+      .filter((entry): entry is LocationHistoryEntry => entry !== null);
 
     // Backward compatibility for pre-list history keys.
     if (history.length === 0) {
@@ -1418,8 +1417,8 @@ class TrackingService {
 
     const pickupSource = assignment.order?.pickup || assignment.booking?.pickup;
     const pickupData = typeof pickupSource === 'string'
-      ? JSON.parse(pickupSource as string)
-      : pickupSource as any;
+      ? safeJsonParse<Record<string, unknown>>(pickupSource, {})
+      : pickupSource as Record<string, unknown> | undefined;
 
     pickupLat = Number(pickupData?.latitude || pickupData?.lat);
     pickupLng = Number(pickupData?.longitude || pickupData?.lng);
@@ -1653,8 +1652,10 @@ class TrackingService {
         logger.warn('[OFFLINE CHECKER] Error (non-fatal)', { error: error.message });
       }
     }, 30_000); // Every 30 seconds
+    // L1 FIX: unref() so this non-critical timer doesn't block process exit
+    this.offlineCheckerInterval.unref();
 
-    logger.info('🔍 Driver offline checker started (30s interval, 2min threshold)');
+    logger.info('Driver offline checker started (30s interval, 2min threshold)');
   }
 
   stopDriverOfflineChecker(): void {
@@ -1901,5 +1902,6 @@ class TrackingService {
 
 export const trackingService = new TrackingService();
 
-// Start driver offline checker when module loads
-trackingService.startDriverOfflineChecker();
+// M12 FIX: Removed auto-start side effect — caller must invoke
+// trackingService.startDriverOfflineChecker() explicitly (e.g., from server.ts bootstrap).
+// This prevents timers from firing on import during tests or type-only imports.

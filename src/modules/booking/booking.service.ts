@@ -47,6 +47,7 @@ import { distanceMatrixService } from '../../shared/services/distance-matrix.ser
 import { ErrorCode } from '../../core/constants';
 import { buildBroadcastPayload, getRemainingTimeoutSeconds } from './booking-payload.helper';
 import { googleMapsService } from '../../shared/services/google-maps.service';
+import { roundCoord } from '../../shared/utils/geo.utils';
 
 // =============================================================================
 // CONFIGURATION - Easy to adjust for testing vs production
@@ -297,7 +298,6 @@ class BookingService {
       // ========================================
       // SERVER-GENERATED IDEMPOTENCY (double-tap / retry protection)
       // ========================================
-      const roundCoord = (n: number) => Math.round(n * 1000) / 1000;
       const idempotencyFingerprint = [
         customerId,
         data.vehicleType,

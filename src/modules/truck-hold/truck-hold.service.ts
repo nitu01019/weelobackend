@@ -306,8 +306,9 @@ class HoldStore {
       logger.info(`[HoldStore] ✅ Hold ${hold.holdId} stored with ${hold.truckRequestIds.length} truck locks`);
       return true;
 
-    } catch (error: any) {
-      logger.error(`[HoldStore] Failed to add hold: ${error.message}`);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error(`[HoldStore] Failed to add hold: ${message}`);
       return false;
     }
   }
@@ -350,8 +351,9 @@ class HoldStore {
       const ttl = await redisService.ttl(REDIS_KEYS.HOLD(holdId));
       await redisService.setJSON(REDIS_KEYS.HOLD(holdId), holdData, ttl > 0 ? ttl : 60);
 
-    } catch (error: any) {
-      logger.error(`[HoldStore] Failed to update status: ${error.message}`);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error(`[HoldStore] Failed to update status: ${message}`);
     }
   }
 
@@ -380,8 +382,9 @@ class HoldStore {
 
       logger.info(`[HoldStore] Hold ${holdId} removed, locks released`);
 
-    } catch (error: any) {
-      logger.error(`[HoldStore] Failed to remove hold: ${error.message}`);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error(`[HoldStore] Failed to remove hold: ${message}`);
     }
   }
 
@@ -791,8 +794,8 @@ class TruckHoldService {
 
       this.broadcastAvailabilityUpdate(orderId);
       logger.info(`[TruckHold] ✅ Held ${heldCount} trucks. Hold ID: ${holdId}, Expires: ${expiresAt.toISOString()}`);
-    } catch (error: any) {
-      const message = String(error?.message || 'HOLD_FAILED');
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'HOLD_FAILED';
       if (message.startsWith('NOT_ENOUGH_AVAILABLE')) {
         const available = parseInt(message.split(':')[1] || '0', 10);
         response = {
@@ -935,14 +938,15 @@ class TruckHoldService {
         assignedTrucks: hold.truckRequestIds
       };
 
-    } catch (error: any) {
-      if (String(error?.message || '') === 'ORDER_INACTIVE') {
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message === 'ORDER_INACTIVE') {
         return { success: false, message: 'This request is no longer active.' };
       }
-      if (String(error?.message || '') === 'TRUCK_STATE_CHANGED') {
+      if (message === 'TRUCK_STATE_CHANGED') {
         return { success: false, message: 'Some held trucks changed state. Please retry.' };
       }
-      logger.error(`[TruckHold] Error confirming hold: ${error.message}`, error);
+      logger.error(`[TruckHold] Error confirming hold: ${message}`, error);
       return { success: false, message: 'Failed to confirm. Please try again.' };
     } finally {
       metrics.observeHistogram('confirm.latency_ms', Math.max(0, Date.now() - confirmStartedAtMs));
@@ -1601,13 +1605,14 @@ class TruckHoldService {
         tripIds
       };
 
-    } catch (error: any) {
-      const msg = String(error?.message || '');
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : String(error);
+      const prismaError = error as { code?: string; meta?: { target?: string[] } };
       logger.error(`[TruckHold] Error confirming with assignments: ${msg}`, error);
 
       // Prisma unique constraint violation (P2002) — driver already has an active assignment
-      if (error?.code === 'P2002') {
-        const target = Array.isArray(error?.meta?.target) ? error.meta.target.join(', ') : '';
+      if (prismaError?.code === 'P2002') {
+        const target = Array.isArray(prismaError?.meta?.target) ? prismaError.meta.target.join(', ') : '';
         if (target.includes('driverId')) {
           return { success: false, message: 'This driver already has an active assignment. Please choose a different driver.' };
         }
@@ -1615,7 +1620,7 @@ class TruckHoldService {
       }
 
       // Prisma serialization failure (P2034) — concurrent transaction conflict
-      if (error?.code === 'P2034') {
+      if (prismaError?.code === 'P2034') {
         return { success: false, message: 'Another transaction is in progress. Please try again in a moment.' };
       }
 
@@ -1768,8 +1773,9 @@ class TruckHoldService {
       statusCode = 200;
       return response;
 
-    } catch (error: any) {
-      logger.error(`[TruckHold] Error releasing hold: ${error.message}`, error);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error(`[TruckHold] Error releasing hold: ${message}`, error);
       response = { success: false, message: 'Failed to release hold', error: 'INTERNAL_ERROR' };
       return response;
     } finally {
@@ -1861,8 +1867,9 @@ class TruckHoldService {
         isFullyAssigned
       };
 
-    } catch (error: any) {
-      logger.error(`[TruckHold] Error getting availability: ${error.message}`, error);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error(`[TruckHold] Error getting availability: ${message}`, error);
       return null;
     }
   }
@@ -2225,8 +2232,9 @@ class TruckHoldService {
           // Release the cleanup lock (auto-expires after 60s if we crash)
           await redisService.releaseLock('hold-cleanup-job', `cleanup-${process.pid}`).catch(() => {});
         }
-      } catch (error: any) {
-        logger.error(`[TruckHold] Cleanup job error: ${error.message}`);
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        logger.error(`[TruckHold] Cleanup job error: ${message}`);
       }
     }, CONFIG.CLEANUP_INTERVAL_MS);
 

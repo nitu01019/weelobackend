@@ -16,6 +16,15 @@ import { redisService } from '../services/redis.service';
 import { liveAvailabilityService } from '../services/live-availability.service';
 
 // =============================================================================
+// DB ERROR SANITIZER — Prevents leaking hostnames/credentials in logs
+// =============================================================================
+function sanitizeDbError(msg: string): string {
+  return msg
+    .replace(/(?:postgresql|mysql|mongodb):\/\/[^\s]+/gi, '[DB_URL_REDACTED]')
+    .replace(/\.rds\.amazonaws\.com\S*/g, '.[RDS_REDACTED]');
+}
+
+// =============================================================================
 // PAGINATION SAFETY — Prevents unbounded queries from exhausting memory
 // =============================================================================
 // All list queries use this as a default limit when no explicit limit is provided.
@@ -373,6 +382,11 @@ export async function withDbTimeout<T>(
 
   for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
     try {
+      // Guard against SQL injection via timeoutMs — must be a safe positive integer
+      if (typeof timeoutMs !== 'number' || timeoutMs <= 0 || !Number.isInteger(timeoutMs)) {
+        throw new Error('Invalid timeout value');
+      }
+
       return await prismaClient.$transaction(
         async (tx) => {
           // SET LOCAL — applies only within this transaction, zero global impact
@@ -399,7 +413,9 @@ export async function withDbTimeout<T>(
 
       // All retries exhausted OR non-retryable error — throw friendly error
       if (isRetryable) {
-        logger.error(`[withDbTimeout] Serializable conflict persisted after ${maxRetries} retries`);
+        logger.error(`[withDbTimeout] Serializable conflict persisted after ${maxRetries} retries`, {
+          error: error instanceof Error ? sanitizeDbError(error.message) : String(error),
+        });
         const { AppError } = require('../../shared/errors/app-error');
         throw new AppError(
           409,
@@ -435,7 +451,7 @@ class PrismaDatabaseService {
       await this.prisma.$connect();
       logger.info('✅ PostgreSQL connected via Prisma');
     } catch (error) {
-      logger.error('❌ PostgreSQL connection failed:', error);
+      logger.error('❌ PostgreSQL connection failed:', sanitizeDbError(error instanceof Error ? error.message : String(error)));
     }
   }
 
@@ -588,7 +604,9 @@ class PrismaDatabaseService {
       const cacheKey = `user:profile:${id}`;
       const cached = await redisService.get(cacheKey);
       if (cached) return JSON.parse(cached);
-    } catch (_) { /* cache miss or Redis down — fall through to DB */ }
+    } catch (error) {
+      logger.warn('User profile cache read failed', { error: error instanceof Error ? error.message : String(error) });
+    }
 
     const user = await this.prisma.user.findUnique({ where: { id } });
     const record = user ? this.toUserRecord(user) : undefined;
@@ -598,7 +616,9 @@ class PrismaDatabaseService {
       try {
         const { redisService } = require('../services/redis.service');
         redisService.set(`user:profile:${id}`, JSON.stringify(record), 60).catch(() => {});
-      } catch (_) { /* graceful degradation */ }
+      } catch (error) {
+        logger.warn('User profile cache write failed', { error: error instanceof Error ? error.message : String(error) });
+      }
     }
     return record;
   }
@@ -632,10 +652,13 @@ class PrismaDatabaseService {
       try {
         const { redisService } = require('../services/redis.service');
         await redisService.del(`user:profile:${id}`);
-      } catch (_) { /* cache invalidation failure is non-fatal */ }
+      } catch (error) {
+        logger.warn('User profile cache invalidation failed', { error: error instanceof Error ? error.message : String(error) });
+      }
 
       return this.toUserRecord(updated);
-    } catch {
+    } catch (error) {
+      logger.error('DB operation failed', { error: error instanceof Error ? sanitizeDbError(error.message) : String(error) });
       return undefined;
     }
   }
@@ -726,8 +749,9 @@ class PrismaDatabaseService {
       if (cached) {
         return JSON.parse(cached) as VehicleRecord[];
       }
-    } catch {
+    } catch (error) {
       // Redis unavailable — fall through to DB (graceful degradation)
+      logger.warn('Vehicle cache read failed', { error: error instanceof Error ? error.message : String(error) });
     }
 
     // Cache miss — fetch from DB
@@ -875,7 +899,8 @@ class PrismaDatabaseService {
         ).catch(err => logger.warn('[LiveAvail] updateVehicle hook failed:', (err as Error).message));
       }
       return this.toVehicleRecord(updated);
-    } catch {
+    } catch (error) {
+      logger.error('DB operation failed', { error: error instanceof Error ? sanitizeDbError(error.message) : String(error) });
       return undefined;
     }
   }
@@ -897,7 +922,8 @@ class PrismaDatabaseService {
           .catch(err => logger.warn('[LiveAvail] deleteVehicle hook failed:', (err as Error).message));
       }
       return true;
-    } catch {
+    } catch (error) {
+      logger.error('DB operation failed', { error: error instanceof Error ? sanitizeDbError(error.message) : String(error) });
       return false;
     }
   }
@@ -989,7 +1015,8 @@ class PrismaDatabaseService {
         }
       });
       return this.toBookingRecord(updated);
-    } catch {
+    } catch (error) {
+      logger.error('DB operation failed', { error: error instanceof Error ? sanitizeDbError(error.message) : String(error) });
       return undefined;
     }
   }
@@ -1117,7 +1144,8 @@ class PrismaDatabaseService {
         }
       });
       return this.toOrderRecord(updated);
-    } catch {
+    } catch (error) {
+      logger.error('DB operation failed', { error: error instanceof Error ? sanitizeDbError(error.message) : String(error) });
       return undefined;
     }
   }
@@ -1336,7 +1364,8 @@ class PrismaDatabaseService {
         }
       });
       return this.toTruckRequestRecord(updated);
-    } catch {
+    } catch (error) {
+      logger.error('DB operation failed', { error: error instanceof Error ? sanitizeDbError(error.message) : String(error) });
       return undefined;
     }
   }
@@ -1437,7 +1466,8 @@ class PrismaDatabaseService {
         }
       });
       return this.toAssignmentRecord(updated);
-    } catch {
+    } catch (error) {
+      logger.error('DB operation failed', { error: error instanceof Error ? sanitizeDbError(error.message) : String(error) });
       return undefined;
     }
   }
@@ -1537,7 +1567,9 @@ class PrismaDatabaseService {
         logger.debug(`[AvailSnapshot] Live Redis: ${redisResult.length} transporters for ${vehicleKey}`);
         return redisResult;
       }
-    } catch { /* Redis down — fall through to DB */ }
+    } catch (error) {
+      logger.warn('Redis availability snapshot failed, falling back to DB', { error: error instanceof Error ? error.message : String(error) });
+    }
 
     // Fallback: DB queries (unchanged)
 

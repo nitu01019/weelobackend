@@ -228,6 +228,8 @@ class InMemoryQueue extends EventEmitter {
 
     this.isRunning = true;
     this.processInterval = setInterval(() => this.tick(), this.pollInterval);
+    // L1 FIX: unref() so queue polling doesn't block process exit
+    this.processInterval.unref();
     logger.info('🚀 Queue processor started');
   }
 
@@ -931,8 +933,9 @@ class QueueService {
    */
   private registerDefaultProcessors(): void {
     // Broadcast processor
+    // H18 FIX: Add type annotations to lazy require() calls for type safety
     this.queue.process(QueueService.QUEUES.BROADCAST, async (job) => {
-      const { emitToUser } = require('./socket.service');
+      const { emitToUser }: typeof import('./socket.service') = require('./socket.service');
       const { transporterId, event, data } = job.data;
 
       if (
@@ -1114,7 +1117,7 @@ class QueueService {
       // Phase 6: Measure delivery latency from enqueue to completion
       const deliveryStart = Date.now();
       if (FF_DUAL_CHANNEL_DELIVERY) {
-        const { sendPushNotification } = require('./fcm.service');
+        const { sendPushNotification }: typeof import('./fcm.service') = require('./fcm.service');
         // Fire both channels in parallel — neither blocks the other
         const results = await Promise.allSettled([
           // Channel A: Socket.IO (primary, foreground)
@@ -1125,7 +1128,7 @@ class QueueService {
           // Channel B: FCM Push (fallback, background/offline)
           // Phase 5: fcmCircuit wraps FCM — when open, skips FCM entirely
           (async () => {
-            const { fcmCircuit } = require('./circuit-breaker.service');
+            const { fcmCircuit }: typeof import('./circuit-breaker.service') = require('./circuit-breaker.service');
             return fcmCircuit.tryWithFallback(
               async () => {
                 await sendPushNotification(transporterId, {
@@ -1175,8 +1178,8 @@ class QueueService {
     // Push notification processor
     // Circuit breaker wraps FCM — when open, skips push (Socket.IO is primary delivery)
     this.queue.process(QueueService.QUEUES.PUSH_NOTIFICATION, async (job) => {
-      const { sendPushNotification } = require('./fcm.service');
-      const { fcmCircuit } = require('./circuit-breaker.service');
+      const { sendPushNotification }: typeof import('./fcm.service') = require('./fcm.service');
+      const { fcmCircuit }: typeof import('./circuit-breaker.service') = require('./circuit-breaker.service');
       const { userId, notification } = job.data;
 
       await fcmCircuit.tryWithFallback(
@@ -1193,7 +1196,7 @@ class QueueService {
     // FCM batch processor - sends to up to 500 drivers in ONE API call
     // Circuit breaker wraps entire batch — when open, skips batch FCM entirely
     this.queue.process(QueueService.QUEUES.FCM_BATCH, async (job) => {
-      const { fcmCircuit } = require('./circuit-breaker.service');
+      const { fcmCircuit }: typeof import('./circuit-breaker.service') = require('./circuit-breaker.service');
       const { tokens, notification } = job.data;
 
       await fcmCircuit.tryWithFallback(
@@ -1317,7 +1320,7 @@ class QueueService {
           // This includes: status update, vehicle release, booking decrement,
           // transporter notification, driver notification, booking room emit, FCM push.
           // Industry pattern (Uber uTask): reconciliation uses same cleanup path as normal flow.
-          const { assignmentService } = require('../../modules/assignment/assignment.service');
+          const { assignmentService }: typeof import('../../modules/assignment/assignment.service') = require('../../modules/assignment/assignment.service');
 
           for (const assignment of orphaned) {
             try {
@@ -1370,7 +1373,7 @@ class QueueService {
         if (abandonedTrips.length > 0) {
           logger.warn(`[RECONCILIATION] 🚛 Found ${abandonedTrips.length} abandoned active trip(s) (>${STALE_ACTIVE_HOURS}h old)`);
 
-          const { liveAvailabilityService } = require('./live-availability.service');
+          const { liveAvailabilityService }: typeof import('./live-availability.service') = require('./live-availability.service');
 
           for (const assignment of abandonedTrips) {
             try {
@@ -1410,7 +1413,7 @@ class QueueService {
 
               // 4. Decrement trucks filled on booking/order
               if (assignment.bookingId) {
-                const { bookingService } = require('../../modules/booking/booking.service');
+                const { bookingService }: typeof import('../../modules/booking/booking.service') = require('../../modules/booking/booking.service');
                 await bookingService.decrementTrucksFilled(assignment.bookingId).catch(() => {});
               } else if (assignment.orderId) {
                 await prismaClient.order.update({
@@ -1432,6 +1435,7 @@ class QueueService {
     });
 
     // Self-scheduling reconciliation: enqueue every 5 minutes via setInterval
+    // L1 FIX: unref() so this non-critical timer doesn't block process exit
     setInterval(async () => {
       try {
         await this.queue.add(
@@ -1443,7 +1447,7 @@ class QueueService {
       } catch (err) {
         logger.warn('[RECONCILIATION] Failed to schedule reconciliation job');
       }
-    }, 5 * 60 * 1000);
+    }, 5 * 60 * 1000).unref();
 
     // =========================================================================
     // STALE VEHICLE WATCHDOG — REMOVED (Uber/Ola Pattern)
@@ -1682,7 +1686,7 @@ class QueueService {
     // Cannot be lost by Redis, BRPOP, or ECS connection blips.
     setTimeout(async () => {
       try {
-        const { assignmentService } = require('../../modules/assignment/assignment.service');
+        const { assignmentService }: typeof import('../../modules/assignment/assignment.service') = require('../../modules/assignment/assignment.service');
         await assignmentService.handleAssignmentTimeout(data);
         logger.info(`[TIMER] ⏰ Self-destruct fired: ${data.assignmentId} (${data.driverName})`);
       } catch (err: any) {

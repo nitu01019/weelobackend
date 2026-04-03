@@ -118,6 +118,8 @@ const REDIS_KEYS = {
 
 class SmartTimeoutService {
   private config: SmartTimeoutConfig;
+  // KNOWN_ISSUE(H2): extension counters reset on restart — lost on ECS restart.
+  // WARNING: In-memory state — lost on ECS restart. TODO: migrate to Redis.
   private extensionCountByOrder: Map<string, number> = new Map();
 
   constructor(config: Partial<SmartTimeoutConfig> = {}) {
@@ -629,9 +631,10 @@ class SmartTimeoutService {
    * Start expiry checker interval
    */
   startExpiryChecker(): void {
+    // L1 FIX: unref() so this non-critical timer doesn't block process exit
     setInterval(async () => {
       await this.checkAndMarkExpired();
-    }, 15000); // Check every 15 seconds
+    }, 15000).unref(); // Check every 15 seconds
 
     logger.info('[SMART TIMEOUT] Expiry checker started');
   }

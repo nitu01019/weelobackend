@@ -151,9 +151,16 @@ export function transporterRateLimit(action: keyof typeof RATE_LIMITS) {
       next();
 
     } catch (error: any) {
-      // If Redis fails, allow the request (fail open)
-      logger.error(`[RateLimit] Redis error, allowing request:`, error);
-      next();
+      // If Redis fails, reject the request (fail closed) to prevent abuse
+      logger.error(`[RateLimit] Redis error, denying request for safety`, {
+        action,
+        transporterId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return res.status(503).json({
+        success: false,
+        error: 'Rate limiting unavailable',
+      });
     }
   };
 }
