@@ -82,7 +82,8 @@ router.get('/health', (_req: Request, res: Response) => {
 
   res.status(200).json({
     status: 'healthy',
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    redis: redisService.isDegraded ? 'degraded' : 'connected'
   });
 });
 

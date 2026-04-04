@@ -35,6 +35,7 @@ import { redisService } from '../../shared/services/redis.service';
 import { socketService } from '../../shared/services/socket.service';
 import { queueService } from '../../shared/services/queue.service';
 import { holdExpiryCleanupService } from '../hold-expiry/hold-expiry-cleanup.service';
+import { releaseVehicle } from '../../shared/services/vehicle-lifecycle.service';
 
 // =============================================================================
 // TYPES & INTERFACES
@@ -253,7 +254,7 @@ class ConfirmedHoldService {
       try {
         // Update assignment status
         const assignment = await prismaClient.assignment.update({
-          where: { tripId: assignmentId },
+          where: { id: assignmentId },
           data: {
             status: AssignmentStatus.driver_accepted,
           },
@@ -261,7 +262,7 @@ class ConfirmedHoldService {
 
         // Update confirmed hold state
         const holdRecord = await prismaClient.truckRequest.findFirst({
-          where: { tripId: assignmentId },
+          where: { id: assignmentId },
           select: {
             id: true,
             orderId: true,
@@ -358,7 +359,7 @@ class ConfirmedHoldService {
       try {
         // Update assignment status
         const assignment = await prismaClient.assignment.update({
-          where: { tripId: assignmentId },
+          where: { id: assignmentId },
           data: {
             status: AssignmentStatus.driver_declined,
           },
@@ -366,7 +367,7 @@ class ConfirmedHoldService {
 
         // Update truck request to searching (back to pool)
         const truckRequest = await prismaClient.truckRequest.findFirst({
-          where: { tripId: assignmentId },
+          where: { id: assignmentId },
         });
 
         if (truckRequest) {
@@ -407,6 +408,27 @@ class ConfirmedHoldService {
               });
             }
           }
+        }
+
+        // P6 fix: Release vehicle back to available (Saga compensation)
+        if (assignment.vehicleId) {
+          await releaseVehicle(assignment.vehicleId, 'confirmedHoldDecline').catch((err: any) => {
+            logger.warn('[CONFIRMED HOLD] Vehicle release on decline failed (non-fatal)', {
+              vehicleId: assignment.vehicleId, error: err?.message,
+            });
+          });
+        }
+
+        // P6 fix: Decrement trucksFilled with floor at 0
+        if (assignment.orderId) {
+          await prismaClient.$executeRaw`
+            UPDATE "Order" SET "trucksFilled" = GREATEST(0, "trucksFilled" - 1), "updatedAt" = NOW()
+            WHERE "id" = ${assignment.orderId}
+          `.catch((err: any) => {
+            logger.warn('[CONFIRMED HOLD] trucksFilled decrement on decline failed (non-fatal)', {
+              orderId: assignment.orderId, error: err?.message,
+            });
+          });
         }
 
         logger.info('[CONFIRMED HOLD] Driver declined', {

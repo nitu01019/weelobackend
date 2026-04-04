@@ -894,7 +894,8 @@ class QueueService {
     CLEANUP: 'cleanup',               // Cleanup/maintenance tasks
     CUSTOM_BOOKING: 'custom-booking',  // Custom booking events
     ASSIGNMENT_RECONCILIATION: 'assignment-reconciliation',  // Periodic orphaned assignment cleanup
-    HOLD_EXPIRY: 'hold-expiry'  // Periodic hold expiry cleanup jobs
+    HOLD_EXPIRY: 'hold-expiry',  // Periodic hold expiry cleanup jobs
+    VEHICLE_RELEASE: 'vehicle-release'  // Retry queue for failed vehicle releases
   };
 
   constructor() {
@@ -1278,6 +1279,17 @@ class QueueService {
     });
 
     // =========================================================================
+    // VEHICLE_RELEASE queue processor — retries failed vehicle releases
+    // Max 5 retries with exponential backoff (2s, 4s, 8s, 16s, 32s)
+    // =========================================================================
+    this.queue.process(QueueService.QUEUES.VEHICLE_RELEASE, async (job) => {
+      const { vehicleId, context } = job.data;
+      const { releaseVehicle }: typeof import('./vehicle-lifecycle.service') = require('./vehicle-lifecycle.service');
+      await releaseVehicle(vehicleId, `retry:${context}`);
+      logger.info(`[VEHICLE_RELEASE] Successfully released vehicle ${vehicleId} on retry attempt ${job.attempts}`);
+    });
+
+    // =========================================================================
     // ASSIGNMENT_TIMEOUT queue processor REMOVED (Uber/Ola pattern)
     // Self-destruct timers now use setTimeout directly in scheduleAssignmentTimeout().
     // Zero Redis hops. Timer lives in V8 process memory — guaranteed to fire.
@@ -1429,6 +1441,43 @@ class QueueService {
             }
           }
         }
+        // =====================================================================
+        // PHASE 3: Reverse vehicle reconciliation — find vehicles stuck
+        //          with no active assignment (orphaned vehicles)
+        // =====================================================================
+        // Catches vehicles stuck in 'in_transit' or 'on_hold' where the
+        // assignment was cancelled/completed but vehicle release failed silently.
+        // Uses raw SQL for index-friendly query (Vehicle.status + updatedAt).
+        // =====================================================================
+        try {
+          const orphanedVehicles = await prismaClient.$queryRaw<
+            Array<{ id: string; status: string; transporterId: string; vehicleKey: string }>
+          >`
+            SELECT v."id", v."status", v."transporterId", v."vehicleKey"
+            FROM "Vehicle" v
+            WHERE v."status" IN ('in_transit', 'on_hold')
+            AND v."updatedAt" < NOW() - INTERVAL '10 minutes'
+            AND NOT EXISTS (
+              SELECT 1 FROM "Assignment" a
+              WHERE a."vehicleId" = v."id"
+              AND a."status" IN ('pending', 'driver_accepted', 'in_transit', 'en_route_pickup', 'at_pickup', 'arrived_at_drop')
+            )
+            LIMIT 50
+          `;
+
+          for (const v of orphanedVehicles) {
+            const { releaseVehicle: releaseOrphaned }: typeof import('./vehicle-lifecycle.service') = require('./vehicle-lifecycle.service');
+            await releaseOrphaned(v.id, 'reconciliation:orphaned').catch((err: any) => {
+              logger.warn('[RECONCILIATION] Failed to release orphaned vehicle', { vehicleId: v.id, error: err.message });
+            });
+          }
+
+          if (orphanedVehicles.length > 0) {
+            logger.info(`[RECONCILIATION] Released ${orphanedVehicles.length} orphaned vehicles`);
+          }
+        } catch (orphanErr: any) {
+          logger.warn('[RECONCILIATION] Orphaned vehicle scan failed (non-fatal)', { error: orphanErr.message });
+        }
       } finally {
         await redisService.releaseLock(lockKey, 'reconciler').catch(() => {});
       }
@@ -1467,7 +1516,52 @@ class QueueService {
     //      as the broken timers it was meant to catch
     // =========================================================================
 
-    logger.info(`📋 Queue processors registered (including reconciliation — self-destruct timers handle assignment timeouts)`);
+    // Assignment timeout poller (Problem 16 fix)
+    this.startAssignmentTimeoutPoller();
+
+    logger.info('Queue processors registered (including reconciliation + Redis-based assignment timeouts)');
+  }
+
+
+  /**
+   * FIX Problem 16: Poll for expired assignment-timeout timers every 5 seconds.
+   */
+  private startAssignmentTimeoutPoller(): void {
+    const poller = setInterval(async () => {
+      try {
+        const expiredTimers = await redisService.getExpiredTimers<{
+          assignmentId: string;
+          driverId: string;
+          driverName: string;
+          transporterId: string;
+          vehicleId: string;
+          vehicleNumber: string;
+          bookingId?: string;
+          tripId: string;
+          createdAt: string;
+          orderId?: string;
+          truckRequestId?: string;
+        }>('timer:assignment-timeout:');
+
+        for (const timer of expiredTimers) {
+          try {
+            const { assignmentService }: typeof import('../../modules/assignment/assignment.service') = require('../../modules/assignment/assignment.service');
+            await assignmentService.handleAssignmentTimeout(timer.data);
+            logger.info(`[TIMER] Assignment timeout fired: ${timer.data.assignmentId} (${timer.data.driverName})`);
+          } catch (err: any) {
+            logger.error('[TIMER] Assignment timeout handler failed', {
+              key: timer.key,
+              assignmentId: timer.data?.assignmentId,
+              error: err?.message
+            });
+          }
+        }
+      } catch (pollErr: any) {
+        logger.warn(`[TIMER] Assignment timeout poll error: ${pollErr?.message}`);
+      }
+    }, 5000);
+
+    poller.unref();
   }
 
   private resolveBroadcastOrderId(data: any): string {
@@ -1651,21 +1745,16 @@ class QueueService {
   }
 
   /**
-   * Schedule a self-destruct timer for an assignment (Uber/Cadence pattern).
+   * Schedule an assignment timeout using Redis sorted-set timers.
    *
-   * BEFORE: Redis ZADD → DelayPoller → BRPOP → Worker (4 failure points)
-   * AFTER:  setTimeout in V8 process memory (0 failure points)
-   *
-   * WHY setTimeout:
-   *   - Lives in V8 heap — cannot be lost by Redis, BRPOP, or connection blips
-   *   - Exactly how Uber's Cadence/Temporal works under the hood
-   *   - Node.js GC keeps the timer alive until it fires or process exits
+   * FIX Problem 16: Replaced in-memory setTimeout with Redis-backed timer.
+   * BEFORE: setTimeout in V8 process memory - lost on ECS restart.
+   * AFTER:  Redis sorted-set timer (setTimer/getExpiredTimers infrastructure)
+   *         - survives restarts, shared across ECS instances.
    *
    * SAFETY:
-   *   - handleAssignmentTimeout() is 100% idempotent:
-   *     updateMany({ where: { status: 'pending' }}) returns 0 if driver already accepted
-   *   - ECS restart during 30s window (0.01% chance): caught by
-   *     ASSIGNMENT_RECONCILIATION job (runs every 5 min, finds pending > 3 min)
+   *   - handleAssignmentTimeout() is 100% idempotent
+   *   - ASSIGNMENT_RECONCILIATION (every 5 min) is the backstop
    */
   async scheduleAssignmentTimeout(data: {
     assignmentId: string;
@@ -1680,25 +1769,44 @@ class QueueService {
     orderId?: string;      // Optional for multi-truck system
     truckRequestId?: string; // Optional for multi-truck system
   }, delayMs: number): Promise<string> {
-    const jobId = `timeout:${data.assignmentId}:${Date.now()}`;
+    const timerKey = `timer:assignment-timeout:${data.assignmentId}`;
+    const expiresAt = new Date(Date.now() + delayMs);
 
-    // Uber/Cadence pattern: In-process timer. Lives in V8 heap.
-    // Cannot be lost by Redis, BRPOP, or ECS connection blips.
-    setTimeout(async () => {
-      try {
-        const { assignmentService }: typeof import('../../modules/assignment/assignment.service') = require('../../modules/assignment/assignment.service');
-        await assignmentService.handleAssignmentTimeout(data);
-        logger.info(`[TIMER] ⏰ Self-destruct fired: ${data.assignmentId} (${data.driverName})`);
-      } catch (err: any) {
-        logger.error('[TIMER] Self-destruct handler failed', {
-          assignmentId: data.assignmentId,
-          error: err?.message
-        });
-      }
-    }, delayMs);
+    try {
+      await redisService.setTimer(timerKey, data, expiresAt);
+      logger.info(`[TIMER] Assignment timeout set via Redis: ${data.assignmentId} fires in ${delayMs / 1000}s`);
+    } catch (err: any) {
+      // Fallback: use in-process setTimeout if Redis is unavailable
+      logger.warn(`[TIMER] Redis setTimer failed, falling back to setTimeout: ${err?.message}`);
+      setTimeout(async () => {
+        try {
+          const { assignmentService }: typeof import('../../modules/assignment/assignment.service') = require('../../modules/assignment/assignment.service');
+          await assignmentService.handleAssignmentTimeout(data);
+          logger.info(`[TIMER] setTimeout fallback fired: ${data.assignmentId} (${data.driverName})`);
+        } catch (timeoutErr: any) {
+          logger.error('[TIMER] setTimeout fallback handler failed', {
+            assignmentId: data.assignmentId,
+            error: timeoutErr?.message
+          });
+        }
+      }, delayMs);
+    }
 
-    logger.info(`[TIMER] Self-destruct armed: ${data.assignmentId} fires in ${delayMs / 1000}s`);
-    return jobId;
+    return timerKey;
+  }
+
+  /**
+   * Cancel a scheduled assignment timeout (driver accepted or assignment cancelled).
+   * FIX Problem 16: Replaces old clearTimeout pattern with Redis cancelTimer.
+   */
+  async cancelAssignmentTimeout(assignmentId: string): Promise<void> {
+    const timerKey = `timer:assignment-timeout:${assignmentId}`;
+    try {
+      await redisService.cancelTimer(timerKey);
+      logger.info(`[TIMER] Assignment timeout cancelled: ${assignmentId}`);
+    } catch (err: any) {
+      logger.warn(`[TIMER] Failed to cancel assignment timeout: ${assignmentId} - ${err?.message}`);
+    }
   }
 
   /**
@@ -1785,6 +1893,20 @@ class QueueService {
 
     await this.broadcastDepthSampleInFlight;
     this.broadcastDepthSampleInFlight = null;
+  }
+
+  /**
+   * Enqueue a job to a named queue with sensible defaults.
+   * Convenience method used by callers that need retry semantics
+   * (e.g., VEHICLE_RELEASE with maxAttempts=5, exponential backoff).
+   */
+  async enqueue<T>(
+    queueName: string,
+    data: T,
+    options?: { priority?: number; delay?: number; maxAttempts?: number }
+  ): Promise<string> {
+    const maxAttempts = options?.maxAttempts ?? (queueName === QueueService.QUEUES.VEHICLE_RELEASE ? 5 : 3);
+    return this.queue.add(queueName, queueName, data, { ...options, maxAttempts });
   }
 
   /**

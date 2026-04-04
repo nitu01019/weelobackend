@@ -46,6 +46,7 @@ import { candidateScorerService } from '../../shared/services/candidate-scorer.s
 import { metrics } from '../../shared/monitoring/metrics.service';
 import { truckHoldService } from '../truck-hold/truck-hold.service';
 import { roundCoord } from '../../shared/utils/geo.utils';
+import { releaseVehicle } from '../../shared/services/vehicle-lifecycle.service';
 
 // =============================================================================
 // CACHE KEYS & TTL (Optimized for fast lookups)
@@ -3243,26 +3244,11 @@ class OrderService {
                 .filter((id): id is string => Boolean(id))
             )
           );
-          if (vehicleIdsToRelease.length > 0) {
-            await prismaClient.vehicle.updateMany({
-              where: {
-                id: { in: vehicleIdsToRelease }
-              },
-              data: {
-                status: VehicleStatus.available,
-                currentTripId: null,
-                assignedDriverId: null
-              }
-            }).catch(() => { });
-            // Live availability: vehicles released back to available (bypass path)
-            for (const assignment of cancelledAssignments) {
-              if (assignment.vehicleId && assignment.transporterId) {
-                const vKey = generateVehicleKey(assignment.vehicleType || '', assignment.vehicleSubtype || '');
-                liveAvailabilityService.onVehicleStatusChange(
-                  assignment.transporterId, vKey, 'in_transit', 'available'
-                ).catch(() => { });
-              }
-            }
+          // Use centralized releaseVehicle() for validated transition + Redis sync
+          for (const vId of vehicleIdsToRelease) {
+            await releaseVehicle(vId, 'orderExpiry').catch((err: any) => {
+              logger.warn('[ORDER_EXPIRY] Vehicle release failed', { vehicleId: vId, error: err.message });
+            });
           }
 
           for (const assignment of cancelledAssignments) {

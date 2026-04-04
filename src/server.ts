@@ -93,7 +93,7 @@ import { metricsMiddleware } from './shared/monitoring/metrics.service';
 import { fcmService } from './shared/services/fcm.service';
 import { redisService } from './shared/services/redis.service';
 import { startBookingExpiryChecker } from './modules/booking/booking.service';
-import { startStaleTransporterCleanup } from './shared/services/transporter-online.service';
+import { startStaleTransporterCleanup, transporterOnlineService } from './shared/services/transporter-online.service';
 
 // =============================================================================
 // Phase 10: SHUTDOWN STATE (shared with health.routes.ts)
@@ -495,6 +495,20 @@ async function bootstrap(): Promise<void> {
   try {
     await redisService.initialize();
     logger.info('RedisService initialized');
+
+    // Wire up reconnect grace period: when Redis reconnects after a drop,
+    // skip stale transporter cleanup for 60s so heartbeats can repopulate.
+    const rawClient = redisService.getClient();
+    if (rawClient && typeof rawClient.on === 'function') {
+      rawClient.on('connect', () => {
+        // Only trigger grace period on RE-connections (not initial connect)
+        if (redisService.isDegraded) {
+          redisService.isDegraded = false;
+          transporterOnlineService.setReconnectGracePeriod(60000);
+          logger.info('[Redis] Reconnected — grace period activated for stale cleanup');
+        }
+      });
+    }
   } catch (err) {
     logger.error('RedisService initialization failed:', err);
     // Continue — redisService falls back to in-memory mode

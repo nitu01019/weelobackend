@@ -39,6 +39,7 @@ import { redisService } from '../../shared/services/redis.service';
 import { queueService } from '../../shared/services/queue.service';
 import { liveAvailabilityService } from '../../shared/services/live-availability.service';
 import { generateVehicleKey } from '../../shared/services/vehicle-key.service';
+import { releaseVehicle } from '../../shared/services/vehicle-lifecycle.service';
 import { haversineDistanceMeters } from '../../shared/utils/geospatial.utils';
 import { safeJsonParse } from '../../shared/utils/safe-json.utils';
 import { prismaClient } from '../../shared/database/prisma.service';
@@ -981,34 +982,15 @@ class TrackingService {
           // =================================================================
           if (assignment.vehicleId) {
             try {
-              const { db: dbService } = await import('../../shared/database/db');
-              await dbService.updateVehicle(assignment.vehicleId, {
-                status: 'available',
-                currentTripId: undefined,
-                assignedDriverId: undefined,
-                lastStatusChange: new Date().toISOString()
-              });
-              logger.info('[TRACKING] Vehicle released on completion', {
-                vehicleId: assignment.vehicleId, tripId
-              });
-
-              // Update Redis availability so DB and Redis stay in sync
-              const vehicleKey = generateVehicleKey(
-                assignment.vehicleType || '',
-                assignment.vehicleSubtype || ''
-              );
-              if (vehicleKey && assignment.transporterId) {
-                await liveAvailabilityService.onVehicleStatusChange(
-                  assignment.transporterId,
-                  vehicleKey,
-                  'in_transit',    // Vehicle was in transit
-                  'available'       // Now available again after trip completion
-                ).catch(err => logger.warn('[TRACKING] Redis update failed', err));
-              }
+              await releaseVehicle(assignment.vehicleId, 'tripCompletion');
             } catch (vehErr: any) {
-              logger.warn('[TRACKING] Vehicle release failed on completion (non-fatal)', {
+              logger.error('[TRACKING] releaseVehicle failed, enqueueing retry', {
                 vehicleId: assignment.vehicleId, tripId, error: vehErr.message
               });
+              queueService.enqueue('vehicle-release', {
+                vehicleId: assignment.vehicleId,
+                context: 'tripCompletion'
+              }).catch(() => {});
             }
           }
 

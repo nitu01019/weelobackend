@@ -65,6 +65,19 @@ export const PRESENCE_TTL_SECONDS = 60; // 6× normal heartbeat interval — gen
 
 class TransporterOnlineService {
 
+  /** Grace period: skip stale cleanup while Redis reconnects to avoid mass-offlining */
+  private reconnectGraceUntil: number = 0;
+
+  /**
+   * Set a reconnect grace period during which stale cleanup is skipped.
+   * Call this when Redis reconnects so heartbeats have time to repopulate.
+   * @param ms Grace period in milliseconds (default 60s)
+   */
+  setReconnectGracePeriod(ms: number = 60000): void {
+    this.reconnectGraceUntil = Date.now() + ms;
+    logger.info(`[TransporterOnline] Reconnect grace period set for ${ms}ms`);
+  }
+
   // =========================================================================
   // CORE API — Used by broadcast services
   // =========================================================================
@@ -188,6 +201,11 @@ class TransporterOnlineService {
    * @returns Number of stale transporters removed
    */
   async cleanStaleTransporters(): Promise<number> {
+    if (Date.now() < this.reconnectGraceUntil) {
+      logger.info('[TransporterOnline] Skipping stale cleanup during reconnect grace');
+      return 0;
+    }
+
     const lockKey = 'lock:clean-stale-transporters';
     let staleCount = 0;
 

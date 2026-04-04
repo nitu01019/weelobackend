@@ -41,6 +41,7 @@ import { progressiveRadiusMatcher } from '../order/progressive-radius-matcher';
 import { transporterOnlineService } from '../../shared/services/transporter-online.service';
 import { redisService } from '../../shared/services/redis.service';
 import { liveAvailabilityService } from '../../shared/services/live-availability.service';
+import { releaseVehicle } from '../../shared/services/vehicle-lifecycle.service';
 import { haversineDistanceKm } from '../../shared/utils/geospatial.utils';
 import { distanceMatrixService } from '../../shared/services/distance-matrix.service';
 // 4 PRINCIPLES: Import production-grade error codes
@@ -328,29 +329,12 @@ class BookingService {
       const customer = await db.getUserById(customerId);
       const customerName = customer?.name || 'Customer';
 
-      // ========================================
-      // SERVER-SIDE FARE SANITY CHECK
-      // ========================================
-      // Prevents financial exploits (e.g., ₹1 per truck for 200km)
-      // Uses env-configurable floor: MIN_FARE_PER_KM (default ₹8/km)
-      // Tolerance: FARE_TOLERANCE (default 0.5 = 50% below estimate)
-      // Formula: reject if pricePerTruck < max(500, distKm × minRate × tolerance)
-      const MIN_FARE_PER_KM = parseInt(process.env.MIN_FARE_PER_KM || '8', 10);
-      const FARE_TOLERANCE = parseFloat(process.env.FARE_TOLERANCE || '0.5');
-      const estimatedMinFare = Math.max(500, Math.round(data.distanceKm * MIN_FARE_PER_KM * FARE_TOLERANCE));
-      if (data.pricePerTruck < estimatedMinFare) {
-        throw new AppError(400, 'FARE_TOO_LOW',
-          `Price ₹${data.pricePerTruck} is below minimum ₹${estimatedMinFare} for ${data.distanceKm}km trip`);
-      }
-
-      // Calculate expiry based on config timeout
-      const expiresAt = new Date(Date.now() + BOOKING_CONFIG.TIMEOUT_MS).toISOString();
-
       // ==========================================================================
       // SERVER-SIDE ROUTE DISTANCE (Google Directions API)
       // ==========================================================================
-      // Recalculate pickup→drop distance using Google Directions for accurate
-      // road distance. The customer app may send Haversine (straight-line).
+      // FIX P7: Moved BEFORE fare check so we validate against server-authoritative
+      // distance (Google-verified), not the client-supplied distance which could be
+      // manipulated or inaccurate (Haversine instead of road distance).
       // Falls back to customer value if Google fails — never blocks bookings.
       // ==========================================================================
       const clientDistanceKm = data.distanceKm;
@@ -406,6 +390,27 @@ class BookingService {
           reason: routeError?.message || 'unknown'
         });
       }
+
+      // ========================================
+      // SERVER-SIDE FARE SANITY CHECK (uses server-verified distance)
+      // ========================================
+      // FIX P7: Now runs AFTER Google distance calc so we use the server-authoritative
+      // distance (data.distanceKm is now Google-verified or client fallback).
+      // Prevents financial exploits (e.g., ₹1 per truck for 200km)
+      // Uses env-configurable floor: MIN_FARE_PER_KM (default ₹8/km)
+      // Tolerance: FARE_TOLERANCE (default 0.5 = 50% below estimate)
+      // Formula: reject if pricePerTruck < max(500, distKm × minRate × tolerance)
+      const MIN_FARE_PER_KM = parseInt(process.env.MIN_FARE_PER_KM || '8', 10);
+      const FARE_TOLERANCE = parseFloat(process.env.FARE_TOLERANCE || '0.5');
+      const fareCheckDistanceKm = data.distanceKm; // Google-verified or client fallback
+      const estimatedMinFare = Math.max(500, Math.round(fareCheckDistanceKm * MIN_FARE_PER_KM * FARE_TOLERANCE));
+      if (data.pricePerTruck < estimatedMinFare) {
+        throw new AppError(400, 'FARE_TOO_LOW',
+          `Price ₹${data.pricePerTruck} is below minimum ₹${estimatedMinFare} for ${fareCheckDistanceKm}km trip`);
+      }
+
+      // Calculate expiry based on config timeout
+      const expiresAt = new Date(Date.now() + BOOKING_CONFIG.TIMEOUT_MS).toISOString();
 
       // ========================================
       // PROGRESSIVE RADIUS SEARCH (Requirement 6)
@@ -1405,12 +1410,12 @@ class BookingService {
    * Already-cancelled bookings return success (idempotent).
    */
   async cancelBooking(bookingId: string, customerId: string): Promise<BookingRecord> {
-    // Delete timers BEFORE the status update so a racing expiry timer cannot
-    // fire in the window between the DB write and our own timer cleanup.
-    // Idempotent — safe to call even if timers don't exist yet.
-    await this.clearBookingTimers(bookingId).catch(() => { });
+    // FIX P8: Moved clearBookingTimers AFTER the updateMany ownership check succeeds.
+    // Previously timers were cleared before verifying the caller owns the booking,
+    // violating Authorize-Before-Act (OWASP API1:2023). If cancel fails (wrong
+    // customer or invalid state), timers are never touched.
 
-    // ATOMIC cancel: only succeeds if status is still cancellable
+    // ATOMIC cancel: only succeeds if status is still cancellable AND customerId matches
     const updated = await prismaClient.booking.updateMany({
       where: {
         id: bookingId,
@@ -1446,7 +1451,8 @@ class BookingService {
 
     // === CANCEL WON: Full cleanup ===
 
-    // 1. Timers already cleared above (before DB update) — skip duplicate call
+    // 1. FIX P8: Clear booking timers AFTER ownership verified (updateMany succeeded)
+    await this.clearBookingTimers(bookingId).catch(() => { });
 
     // 2. Clear customer active broadcast key + idempotency keys
     await this.clearCustomerActiveBroadcast(customerId);
@@ -1505,34 +1511,76 @@ class BookingService {
     });
 
     // 7. Revert active assignments — release vehicles and notify drivers
+    // FIX P20: Stage-Aware Cancellation (Uber/Gojek pattern) — includes ALL
+    // non-terminal assignment stages: in_transit, at_pickup, arrived_at_drop.
+    // Previously only pending/driver_accepted/en_route_pickup were handled,
+    // silently leaving drivers mid-trip with no cancellation notice.
     try {
+      const cancellableStatuses = [
+        AssignmentStatus.pending,
+        AssignmentStatus.driver_accepted,
+        AssignmentStatus.en_route_pickup,
+        AssignmentStatus.at_pickup,
+        AssignmentStatus.in_transit,
+        AssignmentStatus.arrived_at_drop,
+      ];
       const activeAssignments = await prismaClient.assignment.findMany({
-        where: { bookingId, status: { in: [AssignmentStatus.pending, AssignmentStatus.driver_accepted, AssignmentStatus.en_route_pickup] } }
+        where: { bookingId, status: { in: cancellableStatuses } }
       });
       if (activeAssignments.length > 0) {
         await prismaClient.assignment.updateMany({
-          where: { bookingId, status: { in: [AssignmentStatus.pending, AssignmentStatus.driver_accepted, AssignmentStatus.en_route_pickup] } },
+          where: { bookingId, status: { in: cancellableStatuses } },
           data: { status: AssignmentStatus.cancelled }
         });
         for (const assignment of activeAssignments) {
+          const isInProgressTrip = ['in_transit', 'at_pickup', 'arrived_at_drop'].includes(assignment.status);
+
           if (assignment.vehicleId) {
-            await prismaClient.vehicle.update({
-              where: { id: assignment.vehicleId },
-              data: { status: VehicleStatus.available, currentTripId: null, assignedDriverId: null }
-            }).catch(() => { });
-            // Live availability: vehicle released back to available (bypass path — not through db.updateVehicle)
-            const vKey = generateVehicleKey(assignment.vehicleType || booking.vehicleType, assignment.vehicleSubtype || booking.vehicleSubtype || '');
-            liveAvailabilityService.onVehicleStatusChange(
-              assignment.transporterId, vKey, 'in_transit', 'available'
-            ).catch(() => { });
+            // Use centralized releaseVehicle() for validated transition + Redis sync
+            await releaseVehicle(assignment.vehicleId, 'bookingCancellation').catch((err: any) => {
+              logger.warn('[BOOKING_CANCEL] Vehicle release failed', { vehicleId: assignment.vehicleId, error: err.message });
+            });
           }
           if (assignment.driverId) {
+            // Socket: real-time cancellation notice with stage context
             emitToUser(assignment.driverId, 'trip_cancelled', {
-              bookingId, tripId: assignment.tripId, message: 'Trip cancelled by customer'
+              assignmentId: assignment.id,
+              bookingId,
+              tripId: assignment.tripId,
+              reason: 'booking_cancelled_by_customer',
+              wasInProgress: isInProgressTrip,
+              previousStatus: assignment.status,
+              message: isInProgressTrip
+                ? 'Trip cancelled by customer while in progress. Please stop and return.'
+                : 'Trip cancelled by customer'
+            });
+
+            // FCM push: driver gets notification even if app is backgrounded
+            queueService.queuePushNotificationBatch(
+              [assignment.driverId],
+              {
+                title: isInProgressTrip ? 'Trip Cancelled (In Progress)' : 'Trip Cancelled',
+                body: isInProgressTrip
+                  ? `Customer cancelled the trip while ${assignment.status.replace(/_/g, ' ')}. Please stop and contact support if needed.`
+                  : `${booking.customerName} cancelled the booking`,
+                data: {
+                  type: 'trip_cancelled',
+                  assignmentId: assignment.id,
+                  bookingId,
+                  tripId: assignment.tripId,
+                  reason: 'booking_cancelled_by_customer',
+                  wasInProgress: String(isInProgressTrip)
+                }
+              }
+            ).catch((fcmErr: any) => {
+              logger.warn(`[CANCEL] FCM to driver ${assignment.driverId} failed`, { error: fcmErr.message });
             });
           }
         }
-        logger.info(`[CANCEL] Reverted ${activeAssignments.length} assignments, released vehicles`);
+        const inProgressCount = activeAssignments.filter(a =>
+          ['in_transit', 'at_pickup', 'arrived_at_drop'].includes(a.status)
+        ).length;
+        logger.info(`[CANCEL] Reverted ${activeAssignments.length} assignments (${inProgressCount} in-progress), released vehicles`);
       }
     } catch (err: any) {
       logger.warn(`[CANCEL] Failed to revert assignments (non-critical)`, { error: err.message });
@@ -1555,23 +1603,31 @@ class BookingService {
       throw new AppError(404, 'BOOKING_NOT_FOUND', 'Booking not found');
     }
 
+
+    // Problem 10 fix: Idempotency guard - skip if already fully filled
+    if (booking.trucksFilled >= booking.trucksNeeded || booking.status === 'fully_filled') {
+      logger.warn(`[incrementTrucksFilled] Booking ${bookingId} already at capacity (${booking.trucksFilled}/${booking.trucksNeeded}), skipping`);
+      return booking;
+    }
+
     // =====================================================================
-    // ATOMIC INCREMENT — Industry standard (Uber, Airbnb, Booking.com)
-    // Old code: read trucksFilled → add 1 in JS → write back (RACE CONDITION)
-    //   Two concurrent assigns both read 1, both write 2 → count = 2 (should be 3)
-    // New code: single SQL SET "trucksFilled" = "trucksFilled" + 1 (NO RACE)
-    //   Database guarantees atomicity — impossible to lose an increment
+    // ATOMIC INCREMENT with idempotency WHERE clause (Problem 10 fix)
+    // Added: AND "trucksFilled" < "trucksNeeded" to prevent over-counting
     // =====================================================================
     const atomicResult = await prismaClient.$queryRaw<Array<{ trucksFilled: number; trucksNeeded: number }>>`
       UPDATE "Booking"
       SET "trucksFilled" = "trucksFilled" + 1,
           "stateChangedAt" = NOW()
       WHERE id = ${bookingId}
+        AND "trucksFilled" < "trucksNeeded"
       RETURNING "trucksFilled", "trucksNeeded"
     `;
 
     if (!atomicResult || atomicResult.length === 0) {
-      throw new AppError(500, 'INCREMENT_FAILED', 'Failed to increment trucks filled');
+      // Problem 10: 0 rows = already at capacity, not an error
+      logger.warn(`[incrementTrucksFilled] Atomic increment returned 0 rows for ${bookingId} - already at capacity`);
+      const currentBooking = await db.getBookingById(bookingId);
+      return currentBooking || booking;
     }
 
     const newFilled = atomicResult[0].trucksFilled;

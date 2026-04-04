@@ -72,6 +72,11 @@ class AssignmentService {
     return assignment.bookingId || assignment.orderId;
   }
 
+  // NOTE: This legacy function should eventually be migrated to use the centralized
+  // releaseVehicle() from vehicle-lifecycle.service.ts. However, it is currently
+  // called outside of Prisma transactions where the post-TX Redis sync happens separately.
+  // The Redis sync in releaseVehicleIfBusy already reads the ACTUAL vehicle status
+  // (vehicle.status) rather than hardcoding, so it is correct as-is.
   private async releaseVehicleIfBusy(
     vehicleId: string | undefined,
     transporterId: string | undefined,
@@ -561,6 +566,11 @@ class AssignmentService {
       throw new AppError(500, 'ACCEPT_FAILED', 'Failed to accept assignment');
     }
 
+    // Problem 16 fix: Cancel Redis-backed assignment timeout (driver accepted)
+    queueService.cancelAssignmentTimeout(assignmentId).catch((cancelErr: any) => {
+      logger.warn(`[acceptAssignment] Failed to cancel timeout timer: ${cancelErr?.message}`);
+    });
+
     // =====================================================================
     // Post-transaction: Update Redis availability (non-fatal)
     // =====================================================================
@@ -867,6 +877,11 @@ class AssignmentService {
 
     await db.updateAssignment(assignmentId, { status: 'cancelled' });
 
+    // Problem 16 fix: Cancel Redis-backed assignment timeout (assignment cancelled)
+    queueService.cancelAssignmentTimeout(assignmentId).catch((cancelErr: any) => {
+      logger.warn(`[cancelAssignment] Failed to cancel timeout timer: ${cancelErr?.message}`);
+    });
+
     // Invalidate negative cache on cancel
     await redisService.del(`driver:active-assignment:${assignment.driverId}`).catch(() => {});
 
@@ -968,8 +983,10 @@ class AssignmentService {
       throw new AppError(400, 'INVALID_STATUS', 'Assignment cannot be declined');
     }
 
-    // Timer fires at ASSIGNMENT_TIMEOUT_MS but handleAssignmentTimeout() no-ops if assignment is no longer pending.
-    // No explicit cancellation needed.
+    // Problem 16 fix: Cancel Redis-backed assignment timeout (driver declined)
+    queueService.cancelAssignmentTimeout(assignmentId).catch((cancelErr: any) => {
+      logger.warn(`[declineAssignment] Failed to cancel timeout timer: ${cancelErr?.message}`);
+    });
 
     // 2. Update status to driver_declined
     await db.updateAssignment(assignmentId, { status: 'driver_declined' });

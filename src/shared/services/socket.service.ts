@@ -52,6 +52,21 @@ let io: Server | null = null;
 const userSockets = new Map<string, Set<string>>();  // userId -> Set of socketIds
 const socketUsers = new Map<string, string>();        // socketId -> userId
 
+// Per-connection rate limiter (Problem 17 fix)
+const eventCounts = new Map<string, { count: number; resetAt: number }>();
+const MAX_EVENTS_PER_SECOND = 30;
+
+function checkRateLimit(socketId: string): boolean {
+  const now = Date.now();
+  const entry = eventCounts.get(socketId);
+  if (!entry || now > entry.resetAt) {
+    eventCounts.set(socketId, { count: 1, resetAt: now + 1000 });
+    return true;
+  }
+  entry.count++;
+  return entry.count <= MAX_EVENTS_PER_SECOND;
+}
+
 // Industry Standard: DoorDash O(1) role counters
 // Updated atomically on connect/disconnect - eliminates O(n) forEach traversal
 const roleCounters = {
@@ -210,7 +225,7 @@ export function initializeSocket(server: HttpServer): Server {
   }
 
   // Authentication middleware
-  io.use((socket, next) => {
+  io.use(async (socket, next) => {
     const token = socket.handshake.auth.token;
 
     if (!token) {
@@ -227,6 +242,22 @@ export function initializeSocket(server: HttpServer): Server {
       socket.data.userId = decoded.userId;
       socket.data.role = decoded.role;
       socket.data.phone = decoded.phone;
+
+      // Problem 13 fix: Set transporterId for drivers during auth
+      if (decoded.role === 'driver') {
+        try {
+          const { prismaClient: pc } = require('../database/prisma.service');
+          const driverRecord = await pc.driver.findFirst({
+            where: { id: decoded.userId },
+            select: { transporterId: true }
+          });
+          socket.data.transporterId = driverRecord?.transporterId || null;
+        } catch (dbErr: any) {
+          logger.warn(`[Socket] transporterId lookup failed for driver ${decoded.userId}: ${dbErr?.message}`);
+          socket.data.transporterId = null;
+        }
+      }
+
       next();
     } catch (error) {
       next(new Error('Invalid token'));
@@ -307,22 +338,23 @@ export function initializeSocket(server: HttpServer): Server {
     });
 
     // Handle joining transporter room - for driver notifications
+    // Problem 13 fix: enforce ownership check (transporterId now set during auth)
     socket.on('join_transporter', async ({ transporterId }: { transporterId: string }) => {
-      // Verify driver belongs to this transporter
-      const driverId = socket.data.userId;
-      const driverTransporterId = socket.data.transporterId;
-
       if (!transporterId) {
         return socket.emit('error', { message: 'Transporter ID required' });
       }
 
-      // Verify the user is a driver and belongs to this transporter
-      if (driverTransporterId && driverTransporterId !== transporterId) {
-        logger.warn(`Socket ${socket.id} rejected: driver ${driverId} trying to join transporter ${transporterId} (doesn't belong)`);
-        return socket.emit('error', { message: 'Access denied' });
+      // Drivers can only join their own transporter's room
+      if (socket.data.role === 'driver' && socket.data.transporterId !== transporterId) {
+        logger.warn('[Socket] Driver tried to join unauthorized transporter room', {
+          driverId: socket.data.userId,
+          requestedTransporter: transporterId,
+          actualTransporter: socket.data.transporterId || 'none'
+        });
+        socket.emit('error', { message: 'Unauthorized: you do not belong to this transporter' });
+        return;
       }
 
-      // Join transporter room
       await socket.join(`transporter:${transporterId}`);
       logger.debug(`Socket ${socket.id} joined transporter:${transporterId}`);
     });
@@ -333,7 +365,7 @@ export function initializeSocket(server: HttpServer): Server {
       logger.debug(`User ${userId} left booking room: ${bookingId}`);
     });
 
-    // Handle location updates (from drivers)
+    // Handle location updates (from drivers) - rate limited (Problem 17)
     socket.on(SocketEvent.UPDATE_LOCATION, (data: {
       tripId: string;
       latitude: number;
@@ -341,6 +373,10 @@ export function initializeSocket(server: HttpServer): Server {
       speed?: number;
       bearing?: number;
     }) => {
+      if (!checkRateLimit(socket.id)) {
+        logger.warn(`[Socket] Rate limited update_location from ${socket.id}`);
+        return;
+      }
       if (role !== 'driver') {
         socket.emit(SocketEvent.ERROR, { message: 'Only drivers can update location' });
         return;
@@ -361,6 +397,7 @@ export function initializeSocket(server: HttpServer): Server {
     // Handle disconnect
     socket.on('disconnect', (reason) => {
       logger.info(`Socket disconnected: ${socket.id} (Reason: ${reason})`);
+      eventCounts.delete(socket.id); // Problem 17: clean up rate limit entry
 
       // Remove from tracking
       const userId = socketUsers.get(socket.id);
@@ -400,6 +437,10 @@ export function initializeSocket(server: HttpServer): Server {
     // → key doesn't exist → heartbeat ignored → stays offline ✅
     // ================================================================
     socket.on(SocketEvent.HEARTBEAT, (data: any) => {
+      if (!checkRateLimit(socket.id)) {
+        logger.warn(`[Socket] Rate limited heartbeat from ${socket.id}`);
+        return;
+      }
       if (role === 'driver') {
         // Driver heartbeat → extends driver:presence:{id}
         try {
@@ -421,7 +462,8 @@ export function initializeSocket(server: HttpServer): Server {
             const presenceKey = TRANSPORTER_PRESENCE_KEY(userId);
             const presenceExists = await redisService.exists(presenceKey);
             if (!presenceExists) {
-              // No presence key — transporter is offline, ignore stale heartbeat
+              // No presence key — transporter toggled OFFLINE, ignore stale heartbeat
+              // This guard prevents ghost-online: OFF → DEL key → heartbeat arrives → must NOT recreate
               return;
             }
 
@@ -576,8 +618,9 @@ export function initializeSocket(server: HttpServer): Server {
       })();
     }
 
-    // Handle ping from client (for connection quality)
+    // Handle ping from client (for connection quality) - rate limited
     socket.on('ping', () => {
+      if (!checkRateLimit(socket.id)) return;
       socket.emit('pong');
     });
 

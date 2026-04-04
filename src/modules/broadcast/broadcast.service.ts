@@ -17,7 +17,7 @@ import { logger } from '../../shared/services/logger.service';
 import { emitToUser, emitToUsers, emitToRoom, emitToAllTransporters, emitToAll, SocketEvent } from '../../shared/services/socket.service';
 import { sendPushNotification } from '../../shared/services/fcm.service';
 import { redisService } from '../../shared/services/redis.service';
-import { prismaClient, withDbTimeout } from '../../shared/database/prisma.service';
+import { prismaClient, withDbTimeout, VehicleStatus } from '../../shared/database/prisma.service';
 import { safeJsonParse } from '../../shared/utils/safe-json.utils';
 
 // =============================================================================
@@ -580,6 +580,18 @@ class BroadcastService {
                 'DRIVER_BUSY',
                 'Driver already has an active trip. Assign a different driver.'
               );
+            }
+
+            // FIX P9: Atomically lock vehicle to on_hold inside Serializable TX.
+            // Prevents two concurrent accepts from assigning the same vehicle.
+            // Uses updateMany with status='available' precondition (CAS pattern).
+            // If the vehicle was already taken, the accept fails cleanly with 409.
+            const vehicleLock = await tx.vehicle.updateMany({
+              where: { id: vehicleId, status: VehicleStatus.available },
+              data: { status: VehicleStatus.on_hold }
+            });
+            if (vehicleLock.count === 0) {
+              throw new AppError(409, 'VEHICLE_UNAVAILABLE', 'Vehicle is no longer available');
             }
 
             const bookingUpdate = await tx.booking.updateMany({

@@ -1349,6 +1349,7 @@ class RedisService {
   private client: IRedisClient;
   private initialized = false;
   private useRedis = false;
+  public isDegraded: boolean = false;
 
   constructor() {
     // Initialize with in-memory by default
@@ -1391,6 +1392,7 @@ class RedisService {
 
         this.client = realClient;
         this.useRedis = true;
+        this.isDegraded = false;
 
         logger.info('✅ [Redis] Production Redis connected successfully');
 
@@ -1407,6 +1409,7 @@ class RedisService {
         logger.warn('⚠️  [Redis] Fix Redis connectivity for full production functionality');
         this.client = new InMemoryRedisClient();
         this.useRedis = false;
+        this.isDegraded = true;
         // Don't throw - allow app to start with limited functionality
       }
     } else {
@@ -1473,7 +1476,12 @@ class RedisService {
   }
 
   async keys(pattern: string): Promise<string[]> {
-    return this.client.keys(pattern);
+    // Use SCAN instead of KEYS to avoid blocking Redis on large datasets
+    const keys: string[] = [];
+    for await (const key of this.client.scanIterator(pattern)) {
+      keys.push(key);
+    }
+    return keys;
   }
 
   /**
@@ -1888,8 +1896,11 @@ class RedisService {
         }
       }
     } catch (e) {
-      // Fallback: scan keys matching prefix
-      const keys = await this.client.keys(`${timerPrefix}*`);
+      // Fallback: scan keys matching prefix (uses SCAN, not KEYS)
+      const keys: string[] = [];
+      for await (const k of this.client.scanIterator(`${timerPrefix}*`)) {
+        keys.push(k);
+      }
       for (const key of keys) {
         const timerJson = await this.client.get(key);
         if (timerJson) {
