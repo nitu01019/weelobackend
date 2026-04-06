@@ -95,6 +95,10 @@ const REDIS_KEYS = {
   /** Driver online status: driver:status:{driverId}
    *  Values: ONLINE | OFFLINE | UNKNOWN */
   DRIVER_STATUS: (driverId: string) => `driver:status:${driverId}`,
+
+  /** History persist state per trip: tracking:persist-state:{tripId}
+   *  Stores last persisted point info to avoid redundant history writes */
+  HISTORY_PERSIST_STATE: (tripId: string) => `tracking:persist-state:${tripId}`,
 };
 
 // TTL values (in seconds)
@@ -245,7 +249,7 @@ class TrackingService {
       ]);
 
       // 4. Add to history (fire-and-forget), but sample to reduce hot-path write load.
-      if (this.shouldPersistHistoryPoint(data.tripId, historyEntry, locationData.status)) {
+      if (await this.shouldPersistHistoryPoint(data.tripId, historyEntry, locationData.status)) {
         this.addToHistory(data.tripId, historyEntry);
       }
 
@@ -507,7 +511,7 @@ class TrackingService {
           emitToUser(existing.transporterId, SocketEvent.LOCATION_UPDATED, broadcastPayload);
         }
 
-        this.rememberHistoryPersistState(tripId, {
+        await this.setHistoryPersistState(tripId, {
           latitude: newestValidPoint.latitude,
           longitude: newestValidPoint.longitude,
           timestampMs: new Date(newestValidPoint.timestamp).getTime(),
@@ -683,7 +687,7 @@ class TrackingService {
 
     // Initialize empty history
     await redisService.del(REDIS_KEYS.TRIP_HISTORY(tripId));
-    this.historyPersistStateByTrip.delete(tripId);
+    await this.deleteHistoryPersistState(tripId);
 
     logger.info('🚀 Tracking initialized', { tripId, driverId, bookingId });
   }
@@ -1326,7 +1330,7 @@ class TrackingService {
       });
     }
 
-    this.historyPersistStateByTrip.delete(tripId);
+    await this.deleteHistoryPersistState(tripId);
 
     logger.info('✅ Tracking completed', { tripId });
   }
@@ -1469,13 +1473,13 @@ class TrackingService {
     });
   }
 
-  private shouldPersistHistoryPoint(tripId: string, entry: LocationHistoryEntry, status: string): boolean {
+  private async shouldPersistHistoryPoint(tripId: string, entry: LocationHistoryEntry, status: string): Promise<boolean> {
     const timestampMs = new Date(entry.timestamp).getTime();
     if (!Number.isFinite(timestampMs)) return false;
 
-    const previous = this.historyPersistStateByTrip.get(tripId);
+    const previous = await this.getHistoryPersistState(tripId);
     if (!previous) {
-      this.rememberHistoryPersistState(tripId, {
+      await this.setHistoryPersistState(tripId, {
         latitude: entry.latitude,
         longitude: entry.longitude,
         timestampMs,
@@ -1501,7 +1505,7 @@ class TrackingService {
       movedMeters >= HISTORY_PERSIST_MIN_MOVEMENT_METERS;
 
     if (shouldPersist) {
-      this.rememberHistoryPersistState(tripId, {
+      await this.setHistoryPersistState(tripId, {
         latitude: entry.latitude,
         longitude: entry.longitude,
         timestampMs,
@@ -1521,6 +1525,53 @@ class TrackingService {
       if (oldestKey) {
         this.historyPersistStateByTrip.delete(oldestKey);
       }
+    }
+  }
+
+  // ===========================================================================
+  // REDIS-BACKED HISTORY PERSIST STATE (FIX A4#20)
+  // ===========================================================================
+  // Replaces in-memory-only Map with Redis-backed storage (48h TTL).
+  // In-memory Map kept as fallback if Redis read/write fails.
+  // ===========================================================================
+
+  private async getHistoryPersistState(tripId: string): Promise<HistoryPersistState | null> {
+    try {
+      const redisState = await redisService.getJSON<HistoryPersistState>(REDIS_KEYS.HISTORY_PERSIST_STATE(tripId));
+      if (redisState) {
+        // Sync in-memory fallback
+        this.historyPersistStateByTrip.set(tripId, redisState);
+        return redisState;
+      }
+    } catch (err: any) {
+      logger.debug('[TRACKING] Redis persist state read failed, using in-memory fallback', {
+        tripId, error: err?.message
+      });
+    }
+    // Fallback to in-memory Map
+    return this.historyPersistStateByTrip.get(tripId) || null;
+  }
+
+  private async setHistoryPersistState(tripId: string, state: HistoryPersistState): Promise<void> {
+    // Always update in-memory fallback
+    this.rememberHistoryPersistState(tripId, state);
+    // Write to Redis with 48h TTL (fire-and-forget — non-critical)
+    const TTL_48H = 48 * 60 * 60; // 172800 seconds
+    try {
+      await redisService.setJSON(REDIS_KEYS.HISTORY_PERSIST_STATE(tripId), state, TTL_48H);
+    } catch (err: any) {
+      logger.debug('[TRACKING] Redis persist state write failed (in-memory fallback active)', {
+        tripId, error: err?.message
+      });
+    }
+  }
+
+  private async deleteHistoryPersistState(tripId: string): Promise<void> {
+    this.historyPersistStateByTrip.delete(tripId);
+    try {
+      await redisService.del(REDIS_KEYS.HISTORY_PERSIST_STATE(tripId));
+    } catch {
+      // Non-critical — key will expire via TTL
     }
   }
 
@@ -1841,31 +1892,46 @@ class TrackingService {
           const booking = await dbService.getBookingById(bookingId);
 
           if (booking) {
-            // Only update if not already completed (idempotent)
-            if (booking.status !== 'completed') {
+            // Only update if not already completed or cancelled (idempotent)
+            if (booking.status !== 'completed' && booking.status !== 'cancelled') {
               await dbService.updateBooking(bookingId, { status: 'completed' });
-            }
 
-            if (booking.customerId) {
-              // WebSocket
-              emitToUser(booking.customerId, 'booking_completed', {
-                bookingId,
-                totalTrucks: assignments.length,
-                message: `All ${assignments.length} deliveries complete!`
-              });
-
-              // FCM push
-              queueService.queuePushNotification(booking.customerId, {
-                title: '✅ All Deliveries Complete!',
-                body: `All ${assignments.length} truck(s) have completed delivery. Rate your experience!`,
-                data: {
-                  type: 'booking_completed',
+              // Notifications inside guard to prevent duplicates (QA-4 fix)
+              if (booking.customerId) {
+                emitToUser(booking.customerId, SocketEvent.BOOKING_UPDATED, {
                   bookingId,
-                  totalTrucks: String(assignments.length)
-                }
-              }).catch(err => {
-                logger.warn('[BOOKING COMPLETION] FCM push failed', { error: err.message });
+                  status: 'completed',
+                  totalTrucks: assignments.length,
+                  message: `All ${assignments.length} deliveries complete!`
+                });
+
+                queueService.queuePushNotification(booking.customerId, {
+                  title: 'All Deliveries Complete!',
+                  body: `All ${assignments.length} truck(s) have completed delivery.`,
+                  data: {
+                    type: 'booking_status_changed',
+                    bookingId,
+                    status: 'completed',
+                    totalTrucks: String(assignments.length)
+                  }
+                }).catch(err => {
+                  logger.warn('[BOOKING COMPLETION] FCM push failed', { error: err.message });
+                });
+              }
+
+              // Cascade: check if parent order is fully completed
+              // Booking model has no orderId — look it up via assignment (QA-4 CRITICAL fix)
+              const orderAssignment = await prismaClient.assignment.findFirst({
+                where: { bookingId, orderId: { not: null } },
+                select: { orderId: true }
               });
+              if (orderAssignment?.orderId) {
+                this.checkOrderCompletion(orderAssignment.orderId).catch(err =>
+                  logger.warn('[ORDER COMPLETION] Check failed (non-fatal)', { orderId: orderAssignment.orderId, error: err.message })
+                );
+              }
+            } else if (booking.status === 'cancelled') {
+              logger.info('[BOOKING COMPLETION] Booking already cancelled, skipping completion', { bookingId });
             }
           }
         } else {
@@ -1878,6 +1944,124 @@ class TrackingService {
     } catch (error: any) {
       // Non-critical — individual trip completion already succeeded
       logger.warn('[BOOKING COMPLETION] Check failed (non-fatal)', { bookingId, error: error.message });
+    }
+  }
+
+  // ===========================================================================
+  // ORDER COMPLETION CHECK (FIX A4#33)
+  // ===========================================================================
+  //
+  // When a booking completes, check if ALL bookings/assignments for the parent
+  // order are now terminal. If all completed (or mix of completed+cancelled
+  // with at least one completed) → mark order 'completed'.
+  // If ALL cancelled → mark order 'cancelled'.
+  // Uses distributed lock to prevent duplicate updates across ECS instances.
+  // ===========================================================================
+
+  async checkOrderCompletion(orderId: string): Promise<void> {
+    const lockKey = `order-completion:${orderId}`;
+    const holderId = `order-completion:${process.pid}:${Date.now()}`;
+    const lock = await redisService.acquireLock(lockKey, holderId, 10);
+    if (!lock.acquired) {
+      logger.debug('[ORDER COMPLETION] Lock not acquired (another instance handling)', { orderId });
+      return;
+    }
+
+    try {
+      // Get all assignments for this order
+      const assignments = await prismaClient.assignment.findMany({
+        where: { orderId },
+        select: { id: true, status: true }
+      });
+
+      if (assignments.length === 0) return;
+
+      const terminalStatuses = new Set(['completed', 'cancelled']);
+      const allTerminal = assignments.every(a => terminalStatuses.has(a.status));
+
+      if (!allTerminal) {
+        const completedCount = assignments.filter(a => a.status === 'completed').length;
+        const cancelledCount = assignments.filter(a => a.status === 'cancelled').length;
+        logger.info(`[ORDER COMPLETION] Not all terminal: ${completedCount} completed, ${cancelledCount} cancelled, ${assignments.length} total`, { orderId });
+        return;
+      }
+
+      const hasCompleted = assignments.some(a => a.status === 'completed');
+      const allCancelled = assignments.every(a => a.status === 'cancelled');
+
+      let newOrderStatus: 'completed' | 'cancelled';
+      if (allCancelled) {
+        newOrderStatus = 'cancelled';
+      } else if (hasCompleted) {
+        newOrderStatus = 'completed';
+      } else {
+        return; // Should not happen, but guard
+      }
+
+      // Fetch current order to check idempotency and get customerId
+      const order = await prismaClient.order.findUnique({
+        where: { id: orderId },
+        select: { id: true, status: true, customerId: true }
+      });
+
+      if (!order) {
+        logger.warn('[ORDER COMPLETION] Order not found', { orderId });
+        return;
+      }
+
+      if (order.status === 'completed' || order.status === 'cancelled') {
+        logger.info('[ORDER COMPLETION] Order already terminal, skipping', { orderId, status: order.status });
+        return;
+      }
+
+      // CAS: only update if order is still active (prevents duplicate notifications)
+      const updateResult = await prismaClient.order.updateMany({
+        where: { id: orderId, status: { notIn: ['completed', 'cancelled'] } },
+        data: { status: newOrderStatus }
+      });
+
+      if (updateResult.count === 0) {
+        logger.info('[ORDER COMPLETION] Order already updated by concurrent process', { orderId });
+        return;
+      }
+
+      logger.info(`[ORDER COMPLETION] Order marked as ${newOrderStatus}`, {
+        orderId,
+        totalAssignments: assignments.length,
+        completedCount: assignments.filter(a => a.status === 'completed').length,
+        cancelledCount: assignments.filter(a => a.status === 'cancelled').length
+      });
+
+      // Notify customer
+      if (order.customerId) {
+        if (newOrderStatus === 'completed') {
+          emitToUser(order.customerId, SocketEvent.ORDER_STATUS_UPDATE, {
+            orderId,
+            totalAssignments: assignments.length,
+            message: `All deliveries for your order are complete!`
+          });
+
+          queueService.queuePushNotification(order.customerId, {
+            title: '✅ Order Complete!',
+            body: `All ${assignments.length} delivery(ies) for your order are done. Rate your experience!`,
+            data: {
+              type: 'order_completed',
+              orderId,
+              totalAssignments: String(assignments.length)
+            }
+          }).catch(err => {
+            logger.warn('[ORDER COMPLETION] FCM push failed', { orderId, error: err.message });
+          });
+        } else {
+          emitToUser(order.customerId, SocketEvent.ORDER_STATUS_UPDATE, {
+            orderId,
+            totalAssignments: assignments.length,
+            message: `Your order has been cancelled.`
+          });
+        }
+      }
+    } finally {
+      await redisService.releaseLock(lockKey, holderId).catch(() => {});
     }
   }
 }

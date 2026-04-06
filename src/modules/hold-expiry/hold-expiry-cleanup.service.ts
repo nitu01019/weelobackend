@@ -194,6 +194,19 @@ class HoldExpiryCleanupService {
         return;
       }
 
+      // M-8 FIX: Check if cleanup was cancelled (hold confirmed/released before expiry)
+      try {
+        const cancelKey = `hold:cleanup:cancelled:${holdId}`;
+        const cancelled = await redisService.get(cancelKey);
+        if (cancelled) {
+          logger.debug(`[HoldExpiry] Skipping cancelled cleanup for ${holdId}`);
+          await redisService.del(cancelKey).catch(() => {});
+          return;
+        }
+      } catch {
+        // Redis unavailable — fall through to process (idempotency guard above is the safety net)
+      }
+
       // Phase mismatch check (safety guard)
       const holdPhase = (hold.phase as string).toLowerCase();
       if (holdPhase !== phase) {
@@ -225,6 +238,10 @@ class HoldExpiryCleanupService {
       // Notify transporter
       await this.notifyTransporterExpiry(updatedHold, phase);
 
+      // H-16 FIX: Notify customer when transporter's hold expires
+      // so customer app can update UI (e.g. "trucks returned to search pool")
+      await this.notifyCustomerHoldExpiry(updatedHold, phase);
+
       logger.info(`[HoldExpiry] Successfully processed expired hold`, { holdId, phase });
 
     } catch (error: any) {
@@ -252,10 +269,19 @@ class HoldExpiryCleanupService {
     logger.info(`[HoldExpiry] Releasing vehicles for confirmed hold`, { holdId, transporterId });
 
     try {
-      // Find assignments for this hold with pending/accepted status
+      // Safety check: hold must have an orderId to find its assignments
+      if (!hold.orderId) {
+        logger.error('[HoldExpiry] CRITICAL: Hold has no orderId, cannot release vehicles', {
+          holdId,
+          transporterId,
+        });
+        return;
+      }
+
+      // Find assignments for this hold's ORDER with pending/accepted status
       const assignments = await prismaClient.assignment.findMany({
         where: {
-          orderId: holdId,
+          orderId: hold.orderId,   // FIX C1: Use hold.orderId (Order PK), not holdId (Hold PK)
           status: {
             in: Array.from(RELEASE_ASSIGNMENT_STATUSES),
           },
@@ -274,27 +300,58 @@ class HoldExpiryCleanupService {
 
         const oldStatus = vehicle.status;
 
-        // Update vehicle to available
-        await prismaClient.vehicle.update({
-          where: { id: vehicle.id },
-          data: {
-            status: 'available',
-            currentTripId: null,
-            assignedDriverId: null,
-            lastStatusChange: new Date().toISOString(),
-          },
+        // FIX C3+QA: Wrap CAS cancel + vehicle release in a transaction.
+        // Without this, a crash between assignment cancel and vehicle release
+        // would leave the vehicle stuck in 'on_hold' with a cancelled assignment.
+        const [cancelResult, vehicleUpdated] = await prismaClient.$transaction(async (tx) => {
+          // CAS guard -- only cancel assignments in releasable states.
+          // Whitelist approach: only cancel 'pending' and 'driver_declined' assignments.
+          // 'driver_accepted' assignments are NOT cancelled -- the driver has committed.
+          const txCancelResult = await tx.assignment.updateMany({
+            where: {
+              id: assignment.id,
+              status: { in: ['pending', 'driver_declined'] },
+            },
+            data: { status: 'cancelled' },
+          });
+
+          if (txCancelResult.count === 0) {
+            // Assignment was already accepted or in another terminal state -- skip vehicle release
+            return [txCancelResult, { count: 0 }];
+          }
+
+          // Update vehicle to available — with status guard to prevent double-release
+          const txVehicleUpdated = await tx.vehicle.updateMany({
+            where: { id: vehicle.id, status: { not: 'available' } },
+            data: {
+              status: 'available',
+              currentTripId: null,
+              assignedDriverId: null,
+              lastStatusChange: new Date().toISOString(),
+            },
+          });
+
+          return [txCancelResult, txVehicleUpdated];
         });
 
-        // Update assignment status to cancelled (expired via hold)
-        await prismaClient.assignment.update({
-          where: { id: assignment.id },
-          data: {
-            status: 'cancelled',
-          },
-        });
+        if (cancelResult.count === 0) {
+          // Assignment was already accepted or in another terminal state -- skip vehicle release
+          logger.info('[HoldExpiry] Assignment not cancelled -- driver may have already accepted', {
+            holdId,
+            assignmentId: assignment.id,
+          });
+          continue;  // DO NOT release this vehicle -- driver has it
+        }
 
-        // Update Redis availability
-        if (vehicle.vehicleKey) {
+        if (vehicleUpdated.count === 0) {
+          logger.info(`[HoldExpiry] Vehicle already available, skipping release`, {
+            holdId,
+            vehicleId: vehicle.id,
+          });
+        }
+
+        // Redis availability update (outside transaction -- Redis is not transactional)
+        if (vehicleUpdated.count > 0 && vehicle.vehicleKey) {
           await liveAvailabilityService.onVehicleStatusChange(
             transporterId,
             vehicle.vehicleKey,
@@ -309,7 +366,7 @@ class HoldExpiryCleanupService {
           vehicleId: vehicle.id,
           vehicleNumber: vehicle.vehicleNumber,
           oldStatus,
-          newStatus: 'available',
+          newStatus: vehicleUpdated.count > 0 ? 'available' : oldStatus,
         });
       }
 
@@ -356,23 +413,79 @@ class HoldExpiryCleanupService {
   }
 
   /**
-   * Remove scheduled cleanup job for a hold
-   * Useful when hold is confirmed or cancelled before expiry
+   * H-16 FIX: Notify customer when a transporter's hold expires
+   * so the customer app can reflect that trucks are back in the search pool.
    *
-   * Note: Currently the queue doesn't support direct job cancellation.
-   * The idempotent nature of processExpiredHold will handle duplicate processing.
+   * Fail-open: errors are logged but never crash the hold expiry flow.
+   *
+   * @param hold - The expired hold record
+   * @param phase - The phase that expired
+   */
+  private async notifyCustomerHoldExpiry(hold: any, phase: 'flex' | 'confirmed'): Promise<void> {
+    try {
+      if (!hold.orderId) {
+        logger.debug('[HoldExpiry] No orderId on hold — skipping customer notification', { holdId: hold.holdId });
+        return;
+      }
+
+      const order = await prismaClient.order.findUnique({
+        where: { id: hold.orderId },
+        select: { customerId: true },
+      });
+
+      if (!order?.customerId) {
+        logger.debug('[HoldExpiry] Order not found or no customerId — skipping customer notification', {
+          holdId: hold.holdId,
+          orderId: hold.orderId,
+        });
+        return;
+      }
+
+      const { emitToUser } = await import('../../shared/services/socket.service');
+      emitToUser(order.customerId, 'hold_expired', {
+        orderId: hold.orderId,
+        transporterId: hold.transporterId,
+        phase,
+        message: "A transporter's hold has expired. Trucks are back in the search pool.",
+        expiredAt: new Date().toISOString(),
+      });
+
+      logger.info('[HoldExpiry] Notified customer of hold expiry', {
+        customerId: order.customerId,
+        holdId: hold.holdId,
+        orderId: hold.orderId,
+        phase,
+      });
+    } catch (notifyErr: any) {
+      // Fail-open: never crash the hold expiry flow for a notification failure
+      logger.warn('[HoldExpiry] Failed to notify customer of hold expiry', {
+        holdId: hold.holdId,
+        error: notifyErr?.message,
+      });
+    }
+  }
+
+  /**
+   * M-8 FIX: Mark hold cleanup as cancelled via Redis so the processor skips it.
+   *
+   * The queue service does not support direct job cancellation. Instead of a
+   * true no-op, we write a short-lived Redis marker. When the cleanup job
+   * fires, processExpiredHold checks for this marker and skips processing.
+   * This is more reliable than trying to cancel queue jobs and keeps the
+   * existing idempotency guarantee as a safety net.
    *
    * @param holdId - The hold ID
    * @param phase - The phase of the hold
    */
   async cancelScheduledCleanup(holdId: string, phase: 'flex' | 'confirmed'): Promise<void> {
-    const jobType = phase === 'flex' ? JOB_TYPES.FLEX_HOLD_EXPIRED : JOB_TYPES.CONFIRMED_HOLD_EXPIRED;
-
-    logger.info(`[HoldExpiry] Cancel requested for hold cleanup (will be skipped idempotently)`, {
-      holdId,
-      phase,
-      jobType,
-    });
+    try {
+      // 5-minute TTL — well beyond any cleanup job delay
+      await redisService.set(`hold:cleanup:cancelled:${holdId}`, '1', 300);
+      logger.debug(`[HoldExpiry] Marked hold ${holdId} for cleanup skip`, { holdId, phase });
+    } catch (err: any) {
+      // Fail-open: the existing idempotency check (TERMINAL_STATUSES) is the safety net
+      logger.warn(`[HoldExpiry] Failed to mark cleanup skip for ${holdId}`, { error: err?.message });
+    }
   }
 
   // =============================================================================

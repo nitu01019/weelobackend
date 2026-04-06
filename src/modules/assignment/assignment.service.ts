@@ -18,26 +18,28 @@ import { emitToUser, emitToBooking, SocketEvent } from '../../shared/services/so
 import { queueService } from '../../shared/services/queue.service';
 import { redisService } from '../../shared/services/redis.service';
 import { liveAvailabilityService } from '../../shared/services/live-availability.service';
-import { bookingService } from '../booking/booking.service';
+// Fix H-A1: Lazy require() to break inverted dependency (assignment→booking circular)
+// bookingService is imported at call sites via require() to avoid module load cycle.
 import { trackingService } from '../tracking/tracking.service';
 import { CreateAssignmentInput, UpdateStatusInput, GetAssignmentsQuery } from './assignment.schema';
+import { HOLD_CONFIG } from '../../core/config/hold-config';
 
 // =============================================================================
 // ASSIGNMENT TIMEOUT — Queue-based (replaces setInterval polling)
 // =============================================================================
-// 
+//
 // BEFORE: setInterval(5000ms) on EVERY ECS instance → Redis SCAN for expired keys
 //   → 50 instances × SCAN every 5s = 600 Redis ops/minute even at 3am
 //
-// NOW: In-process setTimeout fires at ASSIGNMENT_TIMEOUT_MS (default 30s)
+// NOW: In-process setTimeout fires at HOLD_CONFIG.driverAcceptTimeoutMs
 //   → Zero polling, zero wasted CPU, sub-second accuracy
 //
 // Processor registered in: queue.service.ts → registerDefaultProcessors()
 // =============================================================================
 
 const ASSIGNMENT_CONFIG = {
-  /** How long driver has to respond. Default 30s (industry standard: Uber/Ola/Porter) */
-  TIMEOUT_MS: parseInt(process.env.ASSIGNMENT_TIMEOUT_MS || '30000', 10),
+  /** How long driver has to respond. Fix H-X1: centralized via HOLD_CONFIG */
+  TIMEOUT_MS: HOLD_CONFIG.driverAcceptTimeoutMs,
 };
 
 /** Timer data — used by both queue processor and createAssignment */
@@ -89,12 +91,20 @@ class AssignmentService {
       select: { vehicleKey: true, transporterId: true, status: true }
     });
 
-    await db.updateVehicle(vehicleId, {
-      status: 'available',
-      currentTripId: undefined,
-      assignedDriverId: undefined,
-      lastStatusChange: new Date().toISOString()
+    const result = await prismaClient.vehicle.updateMany({
+      where: { id: vehicleId, status: { not: 'available' } },
+      data: {
+        status: 'available',
+        currentTripId: null,
+        assignedDriverId: null,
+        lastStatusChange: new Date().toISOString()
+      }
     });
+
+    if (result.count === 0) {
+      logger.info(`[${contextLabel}] Vehicle ${vehicleId} already available, skipping release`);
+      return;
+    }
 
     if (vehicle?.vehicleKey && transporterId && vehicle.status !== 'available') {
       await liveAvailabilityService.onVehicleStatusChange(
@@ -268,11 +278,21 @@ class AssignmentService {
       createdAt: new Date().toISOString()
     };
 
-    await queueService.scheduleAssignmentTimeout(timerData, ASSIGNMENT_CONFIG.TIMEOUT_MS);
-    logger.info(`⏱️ Assignment timeout started: ${assignment.id} (${ASSIGNMENT_CONFIG.TIMEOUT_MS / 1000}s)`);
+    try {
+      await queueService.scheduleAssignmentTimeout(timerData, ASSIGNMENT_CONFIG.TIMEOUT_MS);
+      logger.info(`⏱️ Assignment timeout started: ${assignment.id} (${ASSIGNMENT_CONFIG.TIMEOUT_MS / 1000}s)`);
+    } catch (timeoutErr) {
+      logger.error('[CRITICAL] Failed to schedule assignment timeout — manual intervention needed', {
+        assignmentId: assignment.id,
+        error: timeoutErr instanceof Error ? timeoutErr.message : String(timeoutErr)
+      });
+    }
 
-    // Update booking trucks filled
-    await bookingService.incrementTrucksFilled(data.bookingId);
+    // Update booking trucks filled (Fix H-A1: lazy require to break circular dep)
+    if (data.bookingId) {
+      const { bookingService }: typeof import('../booking/booking.service') = require('../booking/booking.service');
+      await bookingService.incrementTrucksFilled(data.bookingId);
+    }
 
     // Notify customer
     emitToBooking(data.bookingId, SocketEvent.TRUCK_ASSIGNED, {
@@ -774,12 +794,20 @@ class AssignmentService {
     // Same releaseVehicleIfBusy() used by cancel/decline/timeout.
     // =====================================================================
     if (data.status === 'completed') {
-      await this.releaseVehicleIfBusy(
-        assignment.vehicleId,
-        assignment.transporterId,
-        'tripCompleted'
-      );
-      logger.info(`[ASSIGNMENT] Vehicle released on trip completion: ${assignment.vehicleNumber}`);
+      if (assignment.vehicleId) {
+        try {
+          // Lazy require to avoid circular imports
+          const { releaseVehicle } = require('../../shared/services/vehicle-lifecycle.service');
+          await releaseVehicle(assignment.vehicleId, 'tripCompleted');
+          logger.info(`[ASSIGNMENT] Vehicle released on trip completion: ${assignment.vehicleNumber}`);
+        } catch (err: any) {
+          logger.error('[ASSIGNMENT] Failed to release vehicle on trip completion', {
+            vehicleId: assignment.vehicleId,
+            assignmentId,
+            error: err?.message
+          });
+        }
+      }
     }
 
     // Notify booking room
@@ -875,7 +903,42 @@ class AssignmentService {
 
     // Queue job is idempotent: if assignment is cancelled, handleAssignmentTimeout() no-ops.
 
-    await db.updateAssignment(assignmentId, { status: 'cancelled' });
+    // =====================================================================
+    // FIX M-2: Atomic transaction — cancel assignment + release vehicle
+    // BEFORE: Two separate DB writes; vehicle release could fail after
+    //   assignment already cancelled → vehicle stuck in non-available state.
+    // NOW: Single Prisma transaction — both succeed or both roll back.
+    // =====================================================================
+    await prismaClient.$transaction(async (tx) => {
+      await tx.assignment.update({
+        where: { id: assignmentId },
+        data: { status: 'cancelled' }
+      });
+      if (assignment.vehicleId) {
+        await tx.vehicle.updateMany({
+          where: { id: assignment.vehicleId, status: { not: 'available' } },
+          data: {
+            status: 'available',
+            currentTripId: null,
+            assignedDriverId: null,
+            lastStatusChange: new Date().toISOString()
+          }
+        });
+      }
+    });
+
+    // Post-transaction: Redis cache sync (non-transactional, fail-safe)
+    if (assignment.vehicleId) {
+      const vehicle = await prismaClient.vehicle.findUnique({
+        where: { id: assignment.vehicleId },
+        select: { vehicleKey: true, transporterId: true }
+      });
+      if (vehicle?.vehicleKey && assignment.transporterId) {
+        liveAvailabilityService.onVehicleStatusChange(
+          assignment.transporterId, vehicle.vehicleKey, 'in_transit', 'available'
+        ).catch(err => logger.warn('[cancelAssignment] Redis sync failed', err));
+      }
+    }
 
     // Problem 16 fix: Cancel Redis-backed assignment timeout (assignment cancelled)
     queueService.cancelAssignmentTimeout(assignmentId).catch((cancelErr: any) => {
@@ -885,23 +948,23 @@ class AssignmentService {
     // Invalidate negative cache on cancel
     await redisService.del(`driver:active-assignment:${assignment.driverId}`).catch(() => {});
 
-    // Decrement trucks filled
+    // Decrement trucks filled (Fix H-A1: lazy require to break circular dep)
+    // DB migration needed: ALTER TABLE "Order" ADD CONSTRAINT chk_order_trucks_filled_nonneg CHECK ("trucksFilled" >= 0);
     if (assignment.bookingId) {
+      const { bookingService }: typeof import('../booking/booking.service') = require('../booking/booking.service');
       await bookingService.decrementTrucksFilled(assignment.bookingId);
     } else if (assignment.orderId) {
-      await prismaClient.order.update({
-        where: { id: assignment.orderId },
-        data: { trucksFilled: { decrement: 1 } }
-      });
+      // Floor guard: GREATEST(0, ...) prevents negative trucksFilled on concurrent cancels
+      // Order status guard: skip decrement on already-cancelled/completed orders
+      await prismaClient.$executeRaw`
+        UPDATE "Order"
+        SET "trucksFilled" = GREATEST(0, "trucksFilled" - 1),
+            "updatedAt" = NOW()
+        WHERE "id" = ${assignment.orderId}
+          AND "status" NOT IN ('cancelled', 'completed')
+      `;
       await this.restoreOrderTruckRequest(assignment);
     }
-
-    // Release vehicle back to available
-    await this.releaseVehicleIfBusy(
-      assignment.vehicleId,
-      assignment.transporterId,
-      'cancelAssignment'
-    );
 
     // Notify booking room
     const cancelStreamId = this.resolveAssignmentStreamId(assignment);
@@ -988,28 +1051,62 @@ class AssignmentService {
       logger.warn(`[declineAssignment] Failed to cancel timeout timer: ${cancelErr?.message}`);
     });
 
-    // 2. Update status to driver_declined
-    await db.updateAssignment(assignmentId, { status: 'driver_declined' });
+    // =====================================================================
+    // FIX M-2: Atomic transaction — decline assignment + release vehicle
+    // BEFORE: Two separate DB writes; vehicle release could fail after
+    //   assignment already declined → vehicle stuck in non-available state.
+    // NOW: Single Prisma transaction — both succeed or both roll back.
+    // =====================================================================
+    await prismaClient.$transaction(async (tx) => {
+      await tx.assignment.update({
+        where: { id: assignmentId },
+        data: { status: 'driver_declined' }
+      });
+      if (assignment.vehicleId) {
+        await tx.vehicle.updateMany({
+          where: { id: assignment.vehicleId, status: { not: 'available' } },
+          data: {
+            status: 'available',
+            currentTripId: null,
+            assignedDriverId: null,
+            lastStatusChange: new Date().toISOString()
+          }
+        });
+      }
+    });
     await this.persistAssignmentReason(assignmentId, 'declined');
+
+    // Post-transaction: Redis cache sync (non-transactional, fail-safe)
+    if (assignment.vehicleId) {
+      const vehicle = await prismaClient.vehicle.findUnique({
+        where: { id: assignment.vehicleId },
+        select: { vehicleKey: true, transporterId: true }
+      });
+      if (vehicle?.vehicleKey && assignment.transporterId) {
+        liveAvailabilityService.onVehicleStatusChange(
+          assignment.transporterId, vehicle.vehicleKey, 'in_transit', 'available'
+        ).catch(err => logger.warn('[declineAssignment] Redis sync failed', err));
+      }
+    }
 
     // Invalidate negative cache on decline
     await redisService.del(`driver:active-assignment:${driverId}`).catch(() => {});
 
-    // 3. Release vehicle back to available
-    await this.releaseVehicleIfBusy(
-      assignment.vehicleId,
-      assignment.transporterId,
-      'declineAssignment'
-    );
-
-    // 4. Decrement trucks filled
+    // 3. Decrement trucks filled (Fix H-A1: lazy require to break circular dep)
+    // DB migration needed: ALTER TABLE "Order" ADD CONSTRAINT chk_order_trucks_filled_nonneg CHECK ("trucksFilled" >= 0);
     if (assignment.bookingId) {
+      const { bookingService }: typeof import('../booking/booking.service') = require('../booking/booking.service');
       await bookingService.decrementTrucksFilled(assignment.bookingId);
     } else if (assignment.orderId) {
-      await prismaClient.order.update({
-        where: { id: assignment.orderId },
-        data: { trucksFilled: { decrement: 1 } }
-      });
+      // Floor guard: GREATEST(0, ...) prevents negative trucksFilled on concurrent declines
+      // Order status guard: skip decrement on already-cancelled/completed orders
+      await prismaClient.$executeRaw`
+        UPDATE "Order"
+        SET "trucksFilled" = GREATEST(0, "trucksFilled" - 1),
+            "updatedAt" = NOW()
+        WHERE "id" = ${assignment.orderId}
+          AND "status" NOT IN ('cancelled', 'completed')
+      `;
       await this.restoreOrderTruckRequest(assignment);
     }
 
@@ -1096,16 +1193,23 @@ class AssignmentService {
     // 2. Release vehicle back to available
     await this.releaseVehicleIfBusy(vehicleId, transporterId, 'timeout');
 
-    // 3. Decrement trucks filled
+    // 3. Decrement trucks filled (Fix H-A1: lazy require to break circular dep)
     // For multi-truck system: use orderId instead of bookingId
     if (bookingId) {
+      const { bookingService }: typeof import('../booking/booking.service') = require('../booking/booking.service');
       await bookingService.decrementTrucksFilled(bookingId);
     } else if (orderId) {
       // Multi-truck system: decrement trucksFilled on Order
-      await prismaClient.order.update({
-        where: { id: orderId },
-        data: { trucksFilled: { decrement: 1 } }
-      });
+      // Floor guard: GREATEST(0, ...) prevents negative trucksFilled on concurrent timeouts
+      // Order status guard: skip decrement on already-cancelled/completed orders
+      // DB migration needed: ALTER TABLE "Order" ADD CONSTRAINT chk_order_trucks_filled_nonneg CHECK ("trucksFilled" >= 0);
+      await prismaClient.$executeRaw`
+        UPDATE "Order"
+        SET "trucksFilled" = GREATEST(0, "trucksFilled" - 1),
+            "updatedAt" = NOW()
+        WHERE "id" = ${orderId}
+          AND "status" NOT IN ('cancelled', 'completed')
+      `;
       // Also update TruckRequest status back to held
       await this.restoreOrderTruckRequest({ orderId, truckRequestId });
     }

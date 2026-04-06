@@ -30,19 +30,15 @@ import { safeJsonParse } from '../../shared/utils/safe-json.utils';
 
 /**
  * Socket events for broadcast lifecycle
- * These MUST match the events in captain app's SocketIOService.kt
+ * Fix E1: BroadcastEvents now references SocketEvent where string values match.
+ * All string values remain IDENTICAL to before -- only the source of truth changes.
  */
 export const BroadcastEvents = {
-  // Broadcast expired (timeout) - remove from all transporters
-  BROADCAST_EXPIRED: 'broadcast_expired',
-  // Broadcast fully filled - no more trucks needed
-  BROADCAST_FULLY_FILLED: 'booking_fully_filled',
-  // Broadcast cancelled by customer
-  BROADCAST_CANCELLED: 'order_cancelled',
-  // Real-time truck count update
-  TRUCKS_REMAINING_UPDATE: 'trucks_remaining_update',
-  // New broadcast notification
-  NEW_BROADCAST: 'new_broadcast',
+  BROADCAST_EXPIRED: SocketEvent.BROADCAST_EXPIRED,             // 'broadcast_expired'
+  BROADCAST_FULLY_FILLED: SocketEvent.BOOKING_FULLY_FILLED,     // 'booking_fully_filled'
+  BROADCAST_CANCELLED: SocketEvent.BROADCAST_CANCELLED,         // 'order_cancelled'
+  TRUCKS_REMAINING_UPDATE: SocketEvent.TRUCKS_REMAINING_UPDATE, // 'trucks_remaining_update'
+  NEW_BROADCAST: SocketEvent.NEW_BROADCAST,                     // 'new_broadcast'
 };
 
 interface GetActiveBroadcastsParams {
@@ -300,7 +296,7 @@ class BroadcastService {
         broadcastId: order.id,
         customerId: order.customerId,
         customerName: order.customerName || 'Customer',
-        customerMobile: order.customerPhone || '',
+        customerMobile: '',  // FIX F-4-6: PII redacted — phone revealed only after accept (OWASP API3:2023)
         pickupLocation: {
           latitude: order.pickup.latitude,
           longitude: order.pickup.longitude,
@@ -729,6 +725,12 @@ class BroadcastService {
         const pickup = (booking.pickup || {}) as Record<string, unknown>;
         const drop = (booking.drop || {}) as Record<string, unknown>;
 
+        // FIX F-5-7: Manual cache invalidation — $use middleware doesn't fire inside $transaction
+        // Pattern matches order.service.ts:4162 (proven fix)
+        if (driver?.transporterId) {
+          redisService.del(`cache:vehicles:transporter:${driver.transporterId}`).catch(() => {});
+        }
+
         logger.info('[BroadcastAccept] Success', {
           broadcastId,
           vehicleId,
@@ -830,7 +832,9 @@ class BroadcastService {
             totalTrucksNeeded: result.totalTrucksNeeded,
             isFullyFilled: result.isFullyFilled
           };
-          await redisService.setJSON(idempotencyCacheKey, cachePayload, 24 * 60 * 60);
+          // L-14 FIX: Accept idempotency cache — 1hr is sufficient (retries happen in seconds, not hours)
+          const ACCEPT_IDEMPOTENCY_TTL = parseInt(process.env.ACCEPT_IDEMPOTENCY_TTL || '3600', 10);
+          await redisService.setJSON(idempotencyCacheKey, cachePayload, ACCEPT_IDEMPOTENCY_TTL);
         } catch (error: unknown) {
           const cacheMsg = error instanceof Error ? error.message : String(error);
           logger.warn('[BroadcastAccept] Idempotency cache write failed', {
@@ -881,18 +885,49 @@ class BroadcastService {
     // FIX #7: Track decline in Redis SET for analytics + re-broadcast prevention
     // TTL = 1 hour (matches booking max lifetime)
     const declineKey = `broadcast:declined:${broadcastId}`;
-    await redisService.sAdd(declineKey, actorId).catch((err: unknown) => {
+    let isReplay = false;
+    try {
+      const added = await redisService.sAdd(declineKey, actorId);
+      isReplay = added === 0; // 0 means already a member (duplicate decline)
+    } catch (err: unknown) {
       const declineMsg = err instanceof Error ? err.message : String(err);
       logger.warn('[declineBroadcast] Redis sAdd failed', { broadcastId, actorId, error: declineMsg });
-    });
+    }
     await redisService.expire(declineKey, 3600).catch(() => {});
+
+    // M-4 FIX: Persist decline to DB for durability (Redis is cache, DB is truth)
+    // Booking model does not have a dedicated declinedTransporters column.
+    // Use notifiedTransporters as the source of "who was notified" and store
+    // declines in a separate Redis hash keyed by booking for durable cross-restart
+    // analytics. Full DB persistence requires a schema migration (tracked below).
+    // TODO: Add `declinedTransporters String[] @default([])` to Booking model
+    //       via direct SQL: ALTER TABLE "Booking" ADD COLUMN "declinedTransporters" TEXT[] DEFAULT '{}';
+    //       Then replace the Redis hash below with:
+    //       prismaClient.booking.update({ where: { id: bookingId }, data: { declinedTransporters: { push: actorId } } });
+    try {
+      const declineHashKey = `broadcast:decline_log:${broadcastId}`;
+      const declineEntry = JSON.stringify({
+        transporterId: actorId,
+        reason,
+        notes: notes || null,
+        declinedAt: new Date().toISOString(),
+      });
+      await redisService.hSet(declineHashKey, actorId, declineEntry);
+      // 24h TTL — longer than booking lifetime for post-mortem analytics
+      await redisService.expire(declineHashKey, 86400);
+    } catch (dbErr: unknown) {
+      // Non-fatal: Redis SET has the decline, hash is best-effort durability layer
+      const dbMsg = dbErr instanceof Error ? dbErr.message : String(dbErr);
+      logger.warn('[Broadcast] Decline durable persist failed', { broadcastId, transporterId: actorId, error: dbMsg });
+    }
 
     logger.info(`Broadcast ${broadcastId} declined by ${actorId}. Reason: ${reason}`, {
       notes,
-      declineTracked: true
+      declineTracked: true,
+      replayed: isReplay
     });
 
-    return { success: true };
+    return { success: true, replayed: isReplay };
   }
 
   /**
@@ -948,7 +983,7 @@ class BroadcastService {
       id: broadcastId,
       customerId: params.customerId,
       customerName: customer?.name || 'Customer',
-      customerPhone: customer?.phone || '',
+      customerPhone: '',  // FIX F-4-6: PII redacted — phone revealed only after accept
       pickup: {
         latitude: params.pickupLocation.latitude,
         longitude: params.pickupLocation.longitude,
@@ -1033,7 +1068,8 @@ class BroadcastService {
         const expiresAt = new Date(order.expiresAt);
         if (expiresAt < now) {
           // Distributed lock: prevent duplicate processing across ECS instances
-          const lockKey = `lock:broadcast-order-expiry:${order.id}`;
+          // Standardized: lock: prefix added by acquireLock automatically
+          const lockKey = `broadcast-order-expiry:${order.id}`;
           const lock = await redisService.acquireLock(lockKey, 'broadcast-expiry-checker', 15);
 
           if (!lock.acquired) {
@@ -1109,9 +1145,10 @@ class BroadcastService {
       logger.info(`📢 Targeted expiry event: ${broadcastId} (${reason}) → ${targets.length} transporters`);
       emitToUsers(targets, BroadcastEvents.BROADCAST_EXPIRED, payload);
     } else {
-      // Fallback: no targets found (order record missing) → broadcast to all
-      logger.warn(`📢 Fallback expiry event: ${broadcastId} (${reason}) → ALL transporters (no notified list found)`);
-      emitToAllTransporters(BroadcastEvents.BROADCAST_EXPIRED, payload);
+      // Fix E2: Degrade gracefully -- do NOT fan-out to ALL transporters
+      logger.warn('[Broadcast] No target transporters found for expiry notification, skipping emit', {
+        broadcastId, reason
+      });
     }
 
     // Also emit to the specific booking/order room (for any listeners)
@@ -1164,8 +1201,10 @@ class BroadcastService {
       logger.info(`📢 Targeted trucks update: ${broadcastId} - ${remaining}/${total} (${vehicleType}) → ${targets.length} transporters`);
       emitToUsers(targets, BroadcastEvents.TRUCKS_REMAINING_UPDATE, payload);
     } else {
-      logger.warn(`📢 Fallback trucks update: ${broadcastId} - ${remaining}/${total} → ALL transporters`);
-      emitToAllTransporters(BroadcastEvents.TRUCKS_REMAINING_UPDATE, payload);
+      // Fix E2: Degrade gracefully -- do NOT fan-out to ALL transporters
+      logger.warn('[Broadcast] No target transporters found for trucks-remaining update, skipping emit', {
+        broadcastId, remaining, total
+      });
     }
 
     // Also emit to booking/order room
@@ -1176,37 +1215,6 @@ class BroadcastService {
     if (remaining === 0) {
       await this.emitBroadcastExpired(broadcastId, 'fully_filled');
     }
-  }
-
-  /**
-   * Notify customer that their broadcast expired without being filled
-   */
-  private notifyCustomerBroadcastExpired(booking: BookingRecord): void {
-    const payload = {
-      type: 'booking_expired',
-      bookingId: booking.id,
-      trucksNeeded: booking.trucksNeeded,
-      trucksFilled: booking.trucksFilled,
-      message: booking.trucksFilled > 0
-        ? `Your booking expired with ${booking.trucksFilled}/${booking.trucksNeeded} trucks assigned`
-        : 'Your booking expired. No transporters accepted in time.'
-    };
-
-    // WebSocket to customer
-    emitToUser(booking.customerId, 'booking_expired', payload);
-
-    // Push notification
-    sendPushNotification(booking.customerId, {
-      title: '⏰ Booking Expired',
-      body: payload.message,
-      data: {
-        type: 'booking_expired',
-        bookingId: booking.id
-      }
-    }).catch((err: unknown) => {
-      const notifyMsg = err instanceof Error ? err.message : String(err);
-      logger.warn(`FCM to customer ${booking.customerId} failed: ${notifyMsg}`);
-    });
   }
 
   /**
@@ -1266,7 +1274,7 @@ class BroadcastService {
       broadcastId: booking.id,
       customerId: booking.customerId,
       customerName: booking.customerName || 'Customer',
-      customerMobile: booking.customerPhone || '',
+      customerMobile: '',  // FIX F-4-6: PII redacted — phone revealed only after accept (OWASP API3:2023)
       pickupLocation: booking.pickup,
       dropLocation: booking.drop,
       distance: booking.distanceKm || 0,

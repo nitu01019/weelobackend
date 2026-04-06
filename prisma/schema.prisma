@@ -494,6 +494,10 @@ model Order {
   @@index([customerId, status]) // Customer's active orders
   @@index([expiresAt])          // Expiring orders cleanup
   @@index([dispatchState, createdAt])
+  // M-9: Composite index for active order lookups by customer (getActiveOrderByCustomer)
+  @@index([customerId, status, expiresAt])
+  // L-1: Composite index for expiry sweep queries (cleanup-expired-orders.job)
+  @@index([status, expiresAt])
 }
 
 // =============================================================================
@@ -985,8 +989,10 @@ model Assignment {
   @@index([transporterId, status]) // Transporter's active assignments
   @@index([vehicleId, status])  // Phase 3: Watchdog — find active assignments per vehicle
 
-  // DB-level guarantee: one active trip per driver
-  // Service logic already checks this, but this prevents edge-case concurrency bypasses
+  // DB-level guarantee: one active trip per driver (partial index)
+  // Allows multiple completed/cancelled rows, but only ONE active assignment
+  // NOTE: Applied via direct SQL. Prisma schema reflects the partial index for documentation.
+  // The actual DB constraint is: UNIQUE(driverId) WHERE status NOT IN ('completed','cancelled','driver_declined')
   @@unique([driverId, status], map: "assignment_driver_active_unique")
 }
 

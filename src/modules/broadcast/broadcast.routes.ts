@@ -73,8 +73,9 @@ router.get(
   roleGuard(['driver', 'transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const { driverId, transporterId, vehicleType, maxDistance } = req.query;
-      const actorId = (transporterId as string) || (driverId as string) || req.user!.userId;
+      // H-S3 FIX: Use authenticated user ID — never trust client-supplied actor IDs
+      const { vehicleType, maxDistance } = req.query;
+      const actorId = req.user!.userId;
 
       logger.info('[OrderIngress] active_broadcast_feed_request', {
         route_path: '/api/v1/broadcasts/active',
@@ -83,17 +84,27 @@ router.get(
         actorId
       });
 
-      const broadcasts = await broadcastService.getActiveBroadcasts({
+      // Fix E9: Add limit/offset pagination with max cap of 100
+      const limit = Math.min(parseInt(req.query.limit as string) || 50, 100);
+      const offset = Math.max(parseInt(req.query.offset as string) || 0, 0);
+
+      const allBroadcasts = await broadcastService.getActiveBroadcasts({
         actorId,
         vehicleType: vehicleType as string,
         maxDistance: maxDistance ? parseFloat(maxDistance as string) : undefined
       });
+      const total = allBroadcasts.length;
+      const broadcasts = allBroadcasts.slice(offset, offset + limit);
       const syncCursor = new Date().toISOString();
 
       res.json({
         success: true,
         broadcasts,
         count: broadcasts.length,
+        total,
+        limit,
+        offset,
+        hasMore: offset + broadcasts.length < total,
         syncCursor
       });
     } catch (error) {
@@ -190,12 +201,13 @@ router.post(
   roleGuard(['driver', 'transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const { driverId, reason, notes } = req.body;
+      // H-S3 FIX: Use authenticated user ID — never trust client-supplied driverId
+      const { reason, notes } = req.body;
 
       await broadcastService.declineBroadcast(
         req.params.broadcastId,
         {
-          actorId: driverId || req.user!.userId,
+          actorId: req.user!.userId,
           reason,
           notes
         }
@@ -223,10 +235,11 @@ router.get(
   roleGuard(['driver', 'transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const { driverId, page = '1', limit = '20', status } = req.query;
+      // H-S3 FIX: Use authenticated user ID — never trust client-supplied driverId
+      const { page = '1', limit = '20', status } = req.query;
 
       const result = await broadcastService.getBroadcastHistory({
-        actorId: driverId as string || req.user!.userId,
+        actorId: req.user!.userId,
         page: parseInt(page as string),
         limit: parseInt(limit as string),
         status: status as string

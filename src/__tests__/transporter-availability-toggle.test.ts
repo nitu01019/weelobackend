@@ -768,6 +768,19 @@ describe('Edge Cases: Comprehensive Scenarios', () => {
         { id: TRANSPORTER_ID_3 },  // ID_3 online in DB
       ]);
 
+      // FIX: DB fallback now also checks presence keys for recency.
+      // Set presence keys so the recency check passes.
+      await redisService.set(
+        TRANSPORTER_PRESENCE_KEY(TRANSPORTER_ID_1),
+        JSON.stringify({ transporterId: TRANSPORTER_ID_1 }),
+        PRESENCE_TTL_SECONDS
+      );
+      await redisService.set(
+        TRANSPORTER_PRESENCE_KEY(TRANSPORTER_ID_3),
+        JSON.stringify({ transporterId: TRANSPORTER_ID_3 }),
+        PRESENCE_TTL_SECONDS
+      );
+
       const input = [TRANSPORTER_ID_1, TRANSPORTER_ID_2, TRANSPORTER_ID_3];
       const result = await transporterOnlineService.filterOnline(input);
 
@@ -790,7 +803,7 @@ describe('Edge Cases: Comprehensive Scenarios', () => {
 
     it('cleanStaleTransporters should handle distributed lock failure gracefully', async () => {
       // Pre-acquire the cleanup lock (simulates another instance running cleanup)
-      await redisService.acquireLock('lock:clean-stale-transporters', 'other-instance', 30);
+      await redisService.acquireLock('clean-stale-transporters', 'other-instance', 30);
 
       // Add a stale transporter
       await redisService.sAdd(ONLINE_TRANSPORTERS_SET, TRANSPORTER_ID_1);
@@ -803,7 +816,7 @@ describe('Edge Cases: Comprehensive Scenarios', () => {
       expect(await redisService.sIsMember(ONLINE_TRANSPORTERS_SET, TRANSPORTER_ID_1)).toBe(true);
 
       // Release lock for cleanup
-      await redisService.releaseLock('lock:clean-stale-transporters', 'other-instance');
+      await redisService.releaseLock('clean-stale-transporters', 'other-instance');
     });
   });
 

@@ -1,8 +1,22 @@
 /**
+ * TRUCK HOLD SERVICE — Single-phase hold system (LEGACY)
+ *
+ * Hold duration: 180 seconds (configurable via HOLD_CONFIG)
+ * Used by: Booking path (POST /hold)
+ *
+ * NOTE: A newer two-phase hold system exists:
+ *   - flex-hold.service.ts (Phase 1: 90s flex hold)
+ *   - confirmed-hold.service.ts (Phase 2: 180s confirmed hold)
+ *
+ * TODO: Migrate booking path to the two-phase hold system
+ * and deprecate single-phase holds.
+ */
+
+/**
  * =============================================================================
  * TRUCK HOLD SERVICE - Race Condition Prevention for Million-User Scale
  * =============================================================================
- * 
+ *
  * Handles the "BookMyShow-style" truck holding system for broadcast orders.
  * 
  * ⭐ GOLDEN RULE (NEVER FORGET):
@@ -72,6 +86,11 @@
  * =============================================================================
  */
 
+// SCALE NOTE: TruckHoldLedger rows are never deleted (audit trail).
+// At 100k+ holds, add a scheduled job to archive rows older than 90 days
+// to a separate TruckHoldLedgerArchive table or cold storage (S3/Glacier).
+// The idempotency purge job (7 days) already exists — extend pattern for holds.
+
 import { v4 as uuidv4 } from 'uuid';
 import crypto from 'crypto';
 import { Prisma } from '@prisma/client';
@@ -85,6 +104,7 @@ import { queueService } from '../../shared/services/queue.service';
 import { metrics } from '../../shared/monitoring/metrics.service';
 import { fcmService } from '../../shared/services/fcm.service';
 import { driverService } from '../driver/driver.service';
+import { HOLD_CONFIG } from '../../core/config/hold-config';
 
 // =============================================================================
 // TYPES & INTERFACES
@@ -203,6 +223,7 @@ const HOLD_IDEMPOTENCY_PURGE_INTERVAL_MS = Math.max(
   60_000,
   parseInt(process.env.HOLD_IDEMPOTENCY_PURGE_INTERVAL_MS || String(30 * 60 * 1000), 10) || (30 * 60 * 1000)
 );
+const HOLD_CLEANUP_BATCH_SIZE = parseInt(process.env.HOLD_CLEANUP_BATCH_SIZE || '500', 10);
 
 // =============================================================================
 // REDIS KEYS - Distributed Locking for Truck Holds
@@ -221,13 +242,14 @@ const HOLD_IDEMPOTENCY_PURGE_INTERVAL_MS = Math.max(
  * - hold:{holdId}                    → Hold data (JSON, TTL: 180s / 3 min)
  * - hold:order:{orderId}             → Set of holdIds for this order
  * - hold:transporter:{transporterId} → Set of holdIds for this transporter
- * - lock:truck:{truckRequestId}      → Lock for specific truck (SETNX)
+ * - lock:truck:{truckRequestId}      → Lock for specific truck (lock: prefix added by acquireLock)
  */
 const REDIS_KEYS = {
   HOLD: (holdId: string) => `hold:${holdId}`,
   HOLDS_BY_ORDER: (orderId: string) => `hold:order:${orderId}`,
   HOLDS_BY_TRANSPORTER: (transporterId: string) => `hold:transporter:${transporterId}`,
-  TRUCK_LOCK: (truckRequestId: string) => `lock:truck:${truckRequestId}`,
+  // Standardized: lock: prefix for all distributed locks (added by acquireLock automatically)
+  TRUCK_LOCK: (truckRequestId: string) => `truck:${truckRequestId}`,
 };
 
 // =============================================================================
@@ -259,7 +281,7 @@ class HoldStore {
       for (const truckId of sortedTruckIds) {
         const lockKey = REDIS_KEYS.TRUCK_LOCK(truckId);
         const lockResult = await redisService.acquireLock(
-          lockKey.replace('lock:', ''), // acquireLock adds 'lock:' prefix
+          lockKey, // Standardized: lock: prefix for all distributed locks
           hold.transporterId,
           CONFIG.HOLD_DURATION_SECONDS
         );
@@ -270,7 +292,7 @@ class HoldStore {
           for (let i = 0; i < lockResults.length - 1; i++) {
             if (lockResults[i]) {
               await redisService.releaseLock(
-                REDIS_KEYS.TRUCK_LOCK(sortedTruckIds[i]).replace('lock:', ''),
+                REDIS_KEYS.TRUCK_LOCK(sortedTruckIds[i]),
                 hold.transporterId
               );
             }
@@ -368,7 +390,7 @@ class HoldStore {
       // Release all truck locks
       for (const truckId of hold.truckRequestIds) {
         await redisService.releaseLock(
-          REDIS_KEYS.TRUCK_LOCK(truckId).replace('lock:', ''),
+          REDIS_KEYS.TRUCK_LOCK(truckId),
           hold.transporterId
         );
       }
@@ -407,16 +429,6 @@ class HoldStore {
     } catch (error) {
       return [];
     }
-  }
-
-  /**
-   * Get all expired holds (for cleanup)
-   * Note: With Redis TTL, this is mostly for manual cleanup
-   */
-  async getExpiredHolds(): Promise<TruckHold[]> {
-    // Redis TTL handles expiration automatically
-    // This method is kept for compatibility but returns empty
-    return [];
   }
 
   /**
@@ -1441,8 +1453,8 @@ class TruckHoldService {
         );
       }
 
-      // Driver response timeout — matches assignment.service.ts config
-      const DRIVER_TIMEOUT_MS = parseInt(process.env.ASSIGNMENT_TIMEOUT_MS || '30000', 10);
+      // Driver response timeout — Fix H-X1: centralized via HOLD_CONFIG
+      const DRIVER_TIMEOUT_MS = HOLD_CONFIG.driverAcceptTimeoutMs;
 
       // OPTIMIZATION 1: Single room broadcast to all drivers
       // All drivers receive their assignment in one message and filter by driverId
@@ -2044,6 +2056,17 @@ class TruckHoldService {
         }
       }
 
+      // H-19 FIX: Cap notified transporters to prevent latency spikes on availability updates
+      const MAX_BROADCAST_TRANSPORTERS_HOLD = parseInt(process.env.MAX_BROADCAST_TRANSPORTERS || '100', 10);
+      if (notifiedTransporterIds.size > MAX_BROADCAST_TRANSPORTERS_HOLD) {
+        const allIds = Array.from(notifiedTransporterIds);
+        logger.info(`[TruckHold] Capping availability update ${notifiedTransporterIds.size} -> ${MAX_BROADCAST_TRANSPORTERS_HOLD} transporters`);
+        notifiedTransporterIds.clear();
+        for (let i = 0; i < MAX_BROADCAST_TRANSPORTERS_HOLD; i++) {
+          notifiedTransporterIds.add(allIds[i]);
+        }
+      }
+
       // For each vehicle type in the order, calculate personalized updates
       for (const truckType of availability.trucks) {
         const { vehicleType, vehicleSubtype, available: trucksStillSearching } = truckType;
@@ -2153,19 +2176,37 @@ class TruckHoldService {
    * and to clean up database state for trucks that were held but lock expired.
    */
   private startCleanupJob(): void {
-    this.cleanupInterval = setInterval(async () => {
-      try {
-        // Distributed lock: only ONE instance runs cleanup per interval
-        const cleanupLock = await redisService.acquireLock(
-          'hold-cleanup-job',
-          `cleanup-${process.pid}`,
-          60  // 60s lock TTL — cleanup should complete well within this
-        );
-        if (!cleanupLock.acquired) {
-          return; // Another instance is handling cleanup
-        }
+    // FIX #8: Immediate catch-up on startup — process anything expired during downtime.
+    // Fire-and-forget so it never blocks server startup.
+    this.processExpiredHoldsOnce().catch(err =>
+      logger.warn('[HOLD-CLEANUP] Startup catch-up failed', { error: err instanceof Error ? err.message : String(err) })
+    );
 
-        try {
+    // Then start the regular interval
+    this.cleanupInterval = setInterval(async () => {
+      await this.processExpiredHoldsOnce();
+    }, CONFIG.CLEANUP_INTERVAL_MS);
+
+    logger.info(`[TruckHold] Cleanup job started (every ${CONFIG.CLEANUP_INTERVAL_MS / 1000}s)`);
+  }
+
+  /**
+   * FIX #8: Extracted cleanup logic into a named method so it can be called
+   * both on startup (immediate catch-up) and on each interval tick.
+   */
+  private async processExpiredHoldsOnce(): Promise<void> {
+    try {
+      // Distributed lock: only ONE instance runs cleanup per interval
+      const cleanupLock = await redisService.acquireLock(
+        'hold-cleanup-job',
+        `cleanup-${process.pid}`,
+        60  // 60s lock TTL — cleanup should complete well within this
+      );
+      if (!cleanupLock.acquired) {
+        return; // Another instance is handling cleanup
+      }
+
+      try {
         const now = new Date();
         let cleanupReleasedCount = 0;
         const expiredHolds = await prismaClient.truckHoldLedger.findMany({
@@ -2173,7 +2214,7 @@ class TruckHoldService {
             status: 'active',
             expiresAt: { lte: now }
           },
-          take: 200,
+          take: HOLD_CLEANUP_BATCH_SIZE,
           orderBy: { expiresAt: 'asc' },
           select: { holdId: true, orderId: true }
         });
@@ -2184,8 +2225,13 @@ class TruckHoldService {
           if (releaseResult.success) {
             cleanupReleasedCount++;
           }
-          await prismaClient.truckHoldLedger.update({
-            where: { holdId: hold.holdId },
+          // FIX #29: Guard against overwriting terminal states.
+          // Only mark as expired if hold is still in a non-terminal state.
+          await prismaClient.truckHoldLedger.updateMany({
+            where: {
+              holdId: hold.holdId,
+              status: { notIn: ['completed', 'cancelled', 'released', 'expired'] },
+            },
             data: {
               status: 'expired',
               terminalReason: 'HOLD_TTL_EXPIRED',
@@ -2228,17 +2274,14 @@ class TruckHoldService {
             }
           }
         }
-        } finally {
-          // Release the cleanup lock (auto-expires after 60s if we crash)
-          await redisService.releaseLock('hold-cleanup-job', `cleanup-${process.pid}`).catch(() => {});
-        }
-      } catch (error: unknown) {
-        const message = error instanceof Error ? error.message : String(error);
-        logger.error(`[TruckHold] Cleanup job error: ${message}`);
+      } finally {
+        // Release the cleanup lock (auto-expires after 60s if we crash)
+        await redisService.releaseLock('hold-cleanup-job', `cleanup-${process.pid}`).catch(() => {});
       }
-    }, CONFIG.CLEANUP_INTERVAL_MS);
-
-    logger.info(`[TruckHold] Cleanup job started (every ${CONFIG.CLEANUP_INTERVAL_MS / 1000}s)`);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error(`[TruckHold] Cleanup job error: ${message}`);
+    }
   }
 
   /**

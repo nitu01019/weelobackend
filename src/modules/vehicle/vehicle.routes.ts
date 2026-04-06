@@ -612,6 +612,88 @@ router.put(
 );
 
 // =============================================================================
+// VEHICLE RELEASE ROUTE
+// =============================================================================
+
+/**
+ * @route   POST /vehicles/:vehicleId/release
+ * @desc    Force-release a vehicle back to 'available' status
+ * @access  Transporter only (own vehicles)
+ *
+ * USE CASE: Vehicle stuck in on_hold/in_transit due to failed cleanup.
+ * Cancels any active assignments and uses centralized releaseVehicle().
+ *
+ * AUTO-UPDATE CACHE: Invalidates on release
+ */
+router.post(
+  '/:vehicleId/release',
+  authMiddleware,
+  roleGuard(['transporter']),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { vehicleId } = req.params;
+      const transporterId = req.user!.userId;
+
+      // Verify vehicle exists and belongs to the transporter
+      const vehicle = await vehicleService.getVehicleById(vehicleId);
+      if (vehicle.transporterId !== transporterId) {
+        return res.status(403).json({
+          success: false,
+          error: { code: 'FORBIDDEN', message: 'This vehicle does not belong to you' }
+        });
+      }
+
+      const previousStatus = vehicle.status || 'unknown';
+
+      // Release vehicle FIRST (idempotent, uses centralized path with Redis sync)
+      // This ensures vehicle is freed even if assignment cancel fails (QA-8 fix)
+      const { releaseVehicle } = require('../../shared/services/vehicle-lifecycle.service');
+      await releaseVehicle(vehicleId, 'adminVehicleRelease');
+
+      // Then cancel any active assignments for this vehicle (best-effort)
+      try {
+        const { prismaClient } = require('../../shared/database/prisma.service');
+        await prismaClient.assignment.updateMany({
+          where: {
+            vehicleId,
+            status: { in: ['pending', 'driver_accepted', 'en_route_pickup', 'at_pickup'] }
+          },
+          data: {
+            status: 'cancelled',
+            cancelledAt: new Date(),
+            cancelReason: 'Vehicle force-released by transporter'
+          }
+        });
+      } catch (cancelErr: any) {
+        logger.warn(`[Vehicles] Failed to cancel active assignments for ${vehicleId}`, { error: cancelErr.message });
+      }
+
+      // Invalidate cache
+      await onVehicleChange(transporterId, vehicleId);
+
+      logger.info(`[Vehicles] Vehicle ${vehicleId} force-released by transporter ${transporterId}: ${previousStatus} -> available`);
+
+      res.json({
+        success: true,
+        data: {
+          previousStatus,
+          newStatus: 'available'
+        },
+        message: `Vehicle released from ${previousStatus} to available`
+      });
+    } catch (error: any) {
+      if (error.code === 'VEHICLE_NOT_FOUND') {
+        return res.status(404).json({
+          success: false,
+          error: { code: 'NOT_FOUND', message: 'Vehicle not found' }
+        });
+      }
+      next(error);
+    }
+  }
+);
+
+// =============================================================================
 // DRIVER ASSIGNMENT ROUTES
 // =============================================================================
 

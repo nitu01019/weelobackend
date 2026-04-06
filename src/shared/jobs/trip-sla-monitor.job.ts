@@ -95,23 +95,51 @@ export async function scanActiveTrips(): Promise<void> {
   }
 
   try {
-    const activeAssignments = await prismaClient.assignment.findMany({
-      where: {
-        status: { in: [...ACTIVE_TRIP_STATUSES] },
-      },
-      select: {
-        id: true,
-        tripId: true,
-        driverId: true,
-        transporterId: true,
-        driverName: true,
-        vehicleNumber: true,
-        status: true,
-        assignedAt: true,
-        startedAt: true,
-      },
-      take: 500, // Batch limit
-    });
+    // FIX A4#15: Cursor-based pagination replaces take: 500.
+    // Processes all active assignments in batches of 200 using id cursor,
+    // ensuring no assignments are silently skipped when count exceeds batch size.
+    const BATCH_SIZE = 200;
+    const allAssignments: Array<{
+      id: string;
+      tripId: string;
+      driverId: string;
+      transporterId: string;
+      driverName: string | null;
+      vehicleNumber: string | null;
+      status: string;
+      assignedAt: any;
+      startedAt: any;
+    }> = [];
+
+    let cursor: string | undefined;
+    while (true) {
+      const batch = await prismaClient.assignment.findMany({
+        where: {
+          status: { in: [...ACTIVE_TRIP_STATUSES] },
+        },
+        select: {
+          id: true,
+          tripId: true,
+          driverId: true,
+          transporterId: true,
+          driverName: true,
+          vehicleNumber: true,
+          status: true,
+          assignedAt: true,
+          startedAt: true,
+        },
+        orderBy: { id: 'asc' },
+        take: BATCH_SIZE,
+        ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
+      });
+
+      if (batch.length === 0) break;
+      allAssignments.push(...batch);
+      cursor = batch[batch.length - 1].id;
+      if (batch.length < BATCH_SIZE) break; // Last page
+    }
+
+    const activeAssignments = allAssignments;
 
     const now = Date.now();
     let tier1Count = 0;
@@ -197,7 +225,7 @@ export async function scanActiveTrips(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 export function startTripSLAMonitor(): void {
-  if (process.env.FF_TRIP_SLA_MONITOR !== 'true') {
+  if (process.env.FF_TRIP_SLA_MONITOR === 'false') {
     logger.info('[TRIP_SLA] Feature flag FF_TRIP_SLA_MONITOR is off, monitor disabled');
     return;
   }

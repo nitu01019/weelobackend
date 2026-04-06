@@ -60,6 +60,10 @@ export interface TrackingEventPayload {
 }
 
 const TRACKING_QUEUE_HARD_LIMIT = Math.max(1000, parseInt(process.env.TRACKING_QUEUE_HARD_LIMIT || '200000', 10) || 200000);
+
+// M-6 FIX: Configurable DLQ cap (was hardcoded 1000, now defaults to 5000)
+// Higher cap preserves more failed jobs for post-mortem debugging.
+const DLQ_MAX_SIZE = Math.max(100, parseInt(process.env.DLQ_MAX_SIZE || '5000', 10) || 5000);
 const TRACKING_QUEUE_DEPTH_SAMPLE_MS = Math.max(100, parseInt(process.env.TRACKING_QUEUE_DEPTH_SAMPLE_MS || '500', 10) || 500);
 const FF_CANCELLED_ORDER_QUEUE_GUARD = process.env.FF_CANCELLED_ORDER_QUEUE_GUARD !== 'false';
 // FAIL-CLOSED by default: if guard lookup is ambiguous, we prefer dropping stale
@@ -324,8 +328,8 @@ class InMemoryQueue extends EventEmitter {
             failedAt: new Date().toISOString()
           });
           await redisService.lPush(dlqKey, dlqEntry);
-          // Cap at 1000 entries to prevent unbounded growth
-          await redisService.lTrim(dlqKey, 0, 999);
+          // M-6 FIX: Configurable DLQ cap (env: DLQ_MAX_SIZE, default 5000)
+          await redisService.lTrim(dlqKey, 0, DLQ_MAX_SIZE - 1);
           // 7-day TTL — old DLQ entries auto-expire
           await redisService.expire(dlqKey, 7 * 24 * 60 * 60);
         } catch (dlqErr: any) {
@@ -640,8 +644,7 @@ class RedisQueue extends EventEmitter {
       try {
         const jobStr = await redisService.brPop(queueKey, this.blockingPopTimeoutSec);
         if (!jobStr) {
-          // Queue empty — sleep before polling again to avoid busy-spinning
-          await this.sleep(500);
+          // Real BRPOP already waited blockingPopTimeoutSec — no sleep needed
           continue;
         }
 
@@ -1315,12 +1318,15 @@ class QueueService {
         // =====================================================================
         // PHASE 1: Orphaned PENDING assignments (ECS restart during 30s timer)
         // =====================================================================
+        // FIX #9: Tighter reconciliation threshold — 90s instead of 3min.
+        // Env-configurable with Math.max guard to prevent dangerously low values.
         // assignedAt is String (ISO), so compare as string — ISO strings sort lexicographically
-        const threeMinutesAgoISO = new Date(Date.now() - 3 * 60 * 1000).toISOString();
+        const RECONCILE_THRESHOLD_MS = Math.max(30000, parseInt(process.env.ASSIGNMENT_RECONCILE_THRESHOLD_MS || '90000', 10) || 90000);
+        const thresholdAgoISO = new Date(Date.now() - RECONCILE_THRESHOLD_MS).toISOString();
         const orphaned = await prismaClient.assignment.findMany({
           where: {
             status: 'pending',
-            assignedAt: { lt: threeMinutesAgoISO }
+            assignedAt: { lt: thresholdAgoISO }
           },
           take: 100
         });
@@ -1366,36 +1372,74 @@ class QueueService {
         // This replaces the old STALE_VEHICLE_WATCHDOG with a lightweight check
         // inside the existing reconciliation — same Uber pattern, no separate scanner.
         //
-        // Threshold: 48 hours (configurable via env var)
+        // FIX A4#17: Split thresholds — in-transit uses 48h, pre-transit uses 24h.
+        // FIX A4#16: Cursor-based pagination to handle unbounded abandoned trips.
+        // FIX A4#18: Notify driver (FCM) and transporter (WebSocket) on reconciliation cancel.
+        // FIX A4#19: Status-check before decrementing trucksFilled to avoid double-decrement.
         // =====================================================================
-        const STALE_ACTIVE_HOURS = parseInt(process.env.STALE_ACTIVE_TRIP_HOURS || '48', 10);
-        const staleActiveThresholdISO = new Date(Date.now() - STALE_ACTIVE_HOURS * 60 * 60 * 1000).toISOString();
+        const STALE_TRANSIT_HOURS = parseInt(process.env.STALE_ACTIVE_TRIP_HOURS || '48', 10);
+        const STALE_PRE_TRANSIT_HOURS = parseInt(process.env.STALE_PRE_TRANSIT_TRIP_HOURS || '24', 10);
+        const staleTransitCutoff = new Date(Date.now() - STALE_TRANSIT_HOURS * 60 * 60 * 1000).toISOString();
+        const stalePreTransitCutoff = new Date(Date.now() - STALE_PRE_TRANSIT_HOURS * 60 * 60 * 1000).toISOString();
 
-        const abandonedTrips = await prismaClient.assignment.findMany({
-          where: {
-            status: { in: ['driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit', 'arrived_at_drop'] },
-            assignedAt: { lt: staleActiveThresholdISO }
-          },
-          include: {
-            vehicle: { select: { id: true, vehicleKey: true, transporterId: true, status: true } }
-          },
-          take: 50
-        });
+        // FIX A4#16: Cursor-based pagination — process all abandoned trips in batches of 50
+        const BATCH_SIZE = 50;
+        let totalAbandoned = 0;
+        let cursor: string | undefined;
 
-        if (abandonedTrips.length > 0) {
-          logger.warn(`[RECONCILIATION] 🚛 Found ${abandonedTrips.length} abandoned active trip(s) (>${STALE_ACTIVE_HOURS}h old)`);
+        const { liveAvailabilityService }: typeof import('./live-availability.service') = require('./live-availability.service');
+        // FIX A4#18: Lazy require to avoid circular dependency
+        const { emitToUser, SocketEvent }: typeof import('./socket.service') = require('./socket.service');
 
-          const { liveAvailabilityService }: typeof import('./live-availability.service') = require('./live-availability.service');
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+          // FIX A4#17: OR clause — different thresholds for in-transit vs pre-transit
+          const abandonedBatch = await prismaClient.assignment.findMany({
+            where: {
+              OR: [
+                // In-transit trips: use startedAt (48h threshold)
+                {
+                  status: { in: ['in_transit', 'arrived_at_drop'] },
+                  startedAt: { not: null, lt: staleTransitCutoff }
+                },
+                // Pre-transit trips: use assignedAt (24h threshold)
+                {
+                  status: { in: ['driver_accepted', 'en_route_pickup', 'at_pickup'] },
+                  assignedAt: { lt: stalePreTransitCutoff }
+                }
+              ]
+            },
+            include: {
+              vehicle: { select: { id: true, vehicleKey: true, transporterId: true, status: true } }
+            },
+            orderBy: { id: 'asc' },
+            take: BATCH_SIZE,
+            ...(cursor ? { skip: 1, cursor: { id: cursor } } : {})
+          });
 
-          for (const assignment of abandonedTrips) {
+          if (abandonedBatch.length === 0) break;
+
+          totalAbandoned += abandonedBatch.length;
+          cursor = abandonedBatch[abandonedBatch.length - 1].id;
+
+          logger.warn(`[RECONCILIATION] Processing batch of ${abandonedBatch.length} abandoned trip(s) (transit>${STALE_TRANSIT_HOURS}h, pre-transit>${STALE_PRE_TRANSIT_HOURS}h)`);
+
+          for (const assignment of abandonedBatch) {
             try {
               const ageHours = Math.round((Date.now() - new Date(assignment.assignedAt).getTime()) / (60 * 60 * 1000));
 
               // 1. Cancel the assignment (system-level — no user context needed)
-              await prismaClient.assignment.updateMany({
+              // Use updateMany count to detect if another process already cancelled (QA-3 race fix)
+              const cancelResult = await prismaClient.assignment.updateMany({
                 where: { id: assignment.id, status: { in: ['driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit', 'arrived_at_drop'] } },
                 data: { status: 'cancelled' }
               });
+
+              // If count === 0, another process already cancelled this assignment — skip all side effects
+              if (cancelResult.count === 0) {
+                logger.info(`[RECONCILIATION] Assignment ${assignment.id} already cancelled by another process, skipping`);
+                continue;
+              }
 
               // 2. Release the vehicle back to available
               if (assignment.vehicleId) {
@@ -1424,22 +1468,64 @@ class QueueService {
               }
 
               // 4. Decrement trucks filled on booking/order
+              // FIX A4#19: Check parent status before decrementing — avoid double-decrement on already-cancelled/completed
               if (assignment.bookingId) {
-                const { bookingService }: typeof import('../../modules/booking/booking.service') = require('../../modules/booking/booking.service');
-                await bookingService.decrementTrucksFilled(assignment.bookingId).catch(() => {});
+                const booking = await prismaClient.booking.findUnique({
+                  where: { id: assignment.bookingId },
+                  select: { status: true }
+                });
+                if (booking && booking.status !== 'cancelled' && booking.status !== 'completed') {
+                  const { bookingService }: typeof import('../../modules/booking/booking.service') = require('../../modules/booking/booking.service');
+                  await bookingService.decrementTrucksFilled(assignment.bookingId).catch(() => {});
+                }
               } else if (assignment.orderId) {
-                await prismaClient.order.update({
-                  where: { id: assignment.orderId },
-                  data: { trucksFilled: { decrement: 1 } }
-                }).catch(() => {});
+                // FIX A4#19: Floor guard + status check — only decrement if order is still active
+                // DB migration needed: ALTER TABLE "Order" ADD CONSTRAINT chk_order_trucks_filled_nonneg CHECK ("trucksFilled" >= 0);
+                await prismaClient.$executeRaw`
+                  UPDATE "Order"
+                  SET "trucksFilled" = GREATEST(0, "trucksFilled" - 1),
+                      "updatedAt" = NOW()
+                  WHERE "id" = ${assignment.orderId}
+                    AND "status" NOT IN ('cancelled', 'completed')
+                `.catch(() => {});
               }
 
-              logger.warn(`[RECONCILIATION] 🚛 Released abandoned truck: ${assignment.vehicleNumber || 'unknown'} ` +
+              logger.warn(`[RECONCILIATION] Released abandoned truck: ${assignment.vehicleNumber || 'unknown'} ` +
                 `(assignment ${assignment.id}, status was '${assignment.status}', ${ageHours}h old)`);
+
+              // FIX A4#18: Notify driver and transporter after reconciliation cancel
+              if (assignment.driverId) {
+                this.queuePushNotification(assignment.driverId, {
+                  title: 'Trip Cancelled',
+                  body: 'Your trip was auto-cancelled due to inactivity.',
+                  data: { type: 'assignment_cancelled', reason: 'system_reconciliation' }
+                }).catch((err: any) => logger.warn('[RECONCILIATION] FCM notify driver failed', err));
+              }
+              if (assignment.vehicleId) {
+                const transporterId = assignment.vehicle?.transporterId || assignment.transporterId;
+                if (transporterId) {
+                  try {
+                    emitToUser(transporterId, SocketEvent.VEHICLE_STATUS_CHANGED, {
+                      vehicleId: assignment.vehicleId,
+                      status: 'available',
+                      reason: 'system_reconciliation'
+                    });
+                  } catch (socketErr: any) {
+                    logger.warn('[RECONCILIATION] WebSocket notify transporter failed', { error: socketErr?.message });
+                  }
+                }
+              }
             } catch (err: any) {
               logger.error(`[RECONCILIATION] Failed abandoned: ${assignment.id}`, { error: err.message });
             }
           }
+
+          // If batch was smaller than BATCH_SIZE, we've processed all records
+          if (abandonedBatch.length < BATCH_SIZE) break;
+        }
+
+        if (totalAbandoned > 0) {
+          logger.warn(`[RECONCILIATION] Total abandoned trips processed: ${totalAbandoned}`);
         }
         // =====================================================================
         // PHASE 3: Reverse vehicle reconciliation — find vehicles stuck
@@ -1483,8 +1569,10 @@ class QueueService {
       }
     });
 
-    // Self-scheduling reconciliation: enqueue every 5 minutes via setInterval
+    // FIX #9: Tighter reconciliation interval — 2min instead of 5min.
+    // Env-configurable with Math.max guard to prevent dangerously low values.
     // L1 FIX: unref() so this non-critical timer doesn't block process exit
+    const RECONCILE_INTERVAL_MS = Math.max(30000, parseInt(process.env.ASSIGNMENT_RECONCILE_INTERVAL_MS || '120000', 10) || 120000);
     setInterval(async () => {
       try {
         await this.queue.add(
@@ -1496,7 +1584,7 @@ class QueueService {
       } catch (err) {
         logger.warn('[RECONCILIATION] Failed to schedule reconciliation job');
       }
-    }, 5 * 60 * 1000).unref();
+    }, RECONCILE_INTERVAL_MS).unref();
 
     // =========================================================================
     // STALE VEHICLE WATCHDOG — REMOVED (Uber/Ola Pattern)
@@ -1544,6 +1632,16 @@ class QueueService {
         }>('timer:assignment-timeout:');
 
         for (const timer of expiredTimers) {
+          // FIX #22: Per-timer distributed lock prevents duplicate processing across ECS instances.
+          // Handler is already idempotent (checks assignment status before acting), so this is
+          // an efficiency optimization per Kleppmann -- not a correctness requirement.
+          const timerLockKey = `lock:assignment-timeout:${timer.data.assignmentId}`;
+          const timerLock = await redisService.acquireLock(timerLockKey, 'assignment-timeout-poller', 30);
+          if (!timerLock.acquired) {
+            // Another instance is processing this assignment timeout
+            continue;
+          }
+
           try {
             const { assignmentService }: typeof import('../../modules/assignment/assignment.service') = require('../../modules/assignment/assignment.service');
             await assignmentService.handleAssignmentTimeout(timer.data);
@@ -1554,6 +1652,8 @@ class QueueService {
               assignmentId: timer.data?.assignmentId,
               error: err?.message
             });
+          } finally {
+            await redisService.releaseLock(timerLockKey, 'assignment-timeout-poller').catch(() => {});
           }
         }
       } catch (pollErr: any) {
@@ -1611,9 +1711,24 @@ class QueueService {
     await this.refreshBroadcastQueueDepth();
     if (this.broadcastDepthSnapshot.depth >= FF_QUEUE_DEPTH_CAP) {
       metrics.incrementCounter('broadcast_queue_backpressure_rejected', { event });
-      logger.warn('[Phase5] Broadcast queue depth exceeded cap', {
+      logger.error('[Phase5] Broadcast DROPPED due to queue depth cap', {
         transporterId, event, depth: this.broadcastDepthSnapshot.depth, cap: FF_QUEUE_DEPTH_CAP
       });
+
+      // Fix M-7: Store dropped broadcast in Redis DLQ for recovery
+      try {
+        const dlqEntry = JSON.stringify({
+          transporterId, event, data,
+          droppedAt: Date.now(), reason: 'queue_full'
+        });
+        await redisService.lPush('dlq:broadcasts', dlqEntry);
+        // M-6 FIX: Configurable DLQ cap (env: DLQ_MAX_SIZE, default 5000)
+        await redisService.lTrim('dlq:broadcasts', 0, DLQ_MAX_SIZE - 1);
+      } catch {
+        // DLQ write also failed -- log to stdout for CloudWatch
+        logger.error('[CRITICAL] Broadcast dropped AND DLQ write failed', { transporterId, event });
+      }
+
       throw new Error(`Broadcast queue depth ${this.broadcastDepthSnapshot.depth} exceeds cap ${FF_QUEUE_DEPTH_CAP}`);
     }
 

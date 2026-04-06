@@ -27,55 +27,21 @@ import {
   toCreateOrderServiceRequest
 } from './order.contract';
 import { z } from 'zod';
+// FIX F-1-2: Use canonical schema from booking.schema.ts (single source of truth)
+import { createOrderSchema } from '../booking/booking.schema';
+// FIX F-1-4: Use shared utils instead of inline duplicates
+import { normalizeOrderLifecycleState, normalizeOrderStatus } from '../../shared/utils/order-lifecycle.utils';
 
 const router = Router();
 
 const ACTIVE_ORDER_STATUSES = new Set(['created', 'broadcasting', 'active', 'partially_filled']);
 
-function normalizeOrderStatus(status: unknown): string {
-  return typeof status === 'string' ? status.toLowerCase() : '';
-}
-
-function normalizeOrderLifecycleState(status: unknown): 'active' | 'cancelled' | 'expired' | 'accepted' {
-  const normalized = normalizeOrderStatus(status);
-  if (normalized === 'cancelled' || normalized === 'canceled') return 'cancelled';
-  if (normalized === 'expired') return 'expired';
-  if (normalized === 'fully_filled' || normalized === 'completed' || normalized === 'closed') return 'accepted';
-  return 'active';
-}
-
 // =============================================================================
 // VALIDATION SCHEMAS
 // =============================================================================
 
-const locationSchema = z.object({
-  latitude: z.number(),
-  longitude: z.number(),
-  address: z.string().min(1),
-  city: z.string().optional(),
-  state: z.string().optional()
-});
-
-const vehicleRequirementSchema = z.object({
-  vehicleType: z.string().min(1),
-  vehicleSubtype: z.string().min(1),
-  quantity: z.number().int().min(1).max(100),
-  pricePerTruck: z.number().min(0)
-});
-
-const createOrderSchema = z.object({
-  pickup: locationSchema,
-  drop: locationSchema,
-  distanceKm: z.number().min(0),
-  vehicleRequirements: z.array(vehicleRequirementSchema).min(1).max(20).optional(),
-  trucks: z.array(vehicleRequirementSchema).min(1).max(20).optional(),
-  goodsType: z.string().optional(),
-  cargoWeightKg: z.number().optional(),
-  scheduledAt: z.string().optional()
-}).refine(
-  (data) => Array.isArray(data.vehicleRequirements) || Array.isArray(data.trucks),
-  { message: 'Either vehicleRequirements OR trucks must be provided' }
-);
+// Inline locationSchema, vehicleRequirementSchema, createOrderSchema REMOVED
+// — canonical createOrderSchema is imported from booking.schema.ts above
 
 const acceptRequestSchema = z.object({
   truckRequestId: z.string().uuid(),
@@ -146,97 +112,31 @@ router.post(
       const user = req.user;
 
       // =================================================================
-      // DISTRIBUTED LOCK - Prevent concurrent order creation
+      // Fix A3: Validate + rate-limit BEFORE acquiring lock
+      // Fail fast on bad input without holding a distributed lock.
       // =================================================================
-      // SCALABILITY: Redis-based lock works across all server instances
-      // EASY UNDERSTANDING: Only one order creation per customer at a time
-      // MODULARITY: Lock auto-expires after 10s to prevent deadlocks
-      // =================================================================
-      const lockKey = `order:create:${user.userId}`;
-      const lockAcquired = await redisService.acquireLock(lockKey, user.userId, 10);
+      logger.info(`[Orders] POST / - Customer: ${user.userId}`);
+      logger.debug(`[Orders] POST / - Body keys: ${Object.keys(req.body).join(', ')}`);
 
-      logger.info('[OrderIngress] create_order_request', {
-        route_path: '/api/v1/orders',
-        route_alias_used: true,
-        customerId: user.userId
-      });
-
-      if (!lockAcquired.acquired) {
-        logger.warn(`🔒 Concurrent order request blocked for customer ${user.phone}`);
-        res.status(409).json({
+      // Validate request body FIRST (no lock needed)
+      const validationResult = createOrderSchema.safeParse(req.body);
+      if (!validationResult.success) {
+        res.status(400).json({
           success: false,
           error: {
-            code: 'CONCURRENT_REQUEST',
-            message: 'Another order request is being processed. Please wait a moment and try again.',
-            data: {
-              retryAfter: 2
-            }
+            code: 'VALIDATION_ERROR',
+            message: 'Invalid request data',
+            details: validationResult.error.errors
           }
         });
         return;
       }
 
-      logger.debug(`🔓 Lock acquired for customer ${user.phone}, processing order...`);
-
-      // Extract idempotency key — use client-provided UUID if valid, otherwise
-      // generate one server-side. This ensures idempotency works even if the
-      // customer app hasn't been updated to send the header.
-      const clientKey = (req.headers['x-idempotency-key'] as string | undefined)?.trim();
-      const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-      let idempotencyKey: string;
-      if (clientKey && UUID_REGEX.test(clientKey)) {
-        idempotencyKey = clientKey;
-        logger.debug(`🔑 Idempotency key from client: ${idempotencyKey.substring(0, 8)}...`);
-      } else {
-        // Generate server-side key — ensures idempotency even without client header.
-        // Uses uuidv4 so each request gets a unique key (retries from same client
-        // should send the same header; this fallback is for clients that don't).
-        const { v4: uuidv4 } = require('uuid');
-        idempotencyKey = uuidv4();
-        logger.info(`🔑 Idempotency key generated server-side: ${idempotencyKey.substring(0, 8)}... (client did not provide one)`);
-      }
-
-
-
-      // =================================================================
-      // RULE 1: ONE ACTIVE ORDER PER CUSTOMER
-      // Customer must cancel their current order before creating a new one
-      // This ensures clean request handling and prevents spam
-      // EASY UNDERSTANDING: Clear, user-friendly error message
-      // SCALABILITY: Auto-expires old orders to prevent blocking
-      // =================================================================
-      // Only skip active-order check when the CLIENT provided an idempotency key
-      // (= safe retry of the same booking attempt). Server-generated keys still
-      // go through the check to prevent duplicate active orders.
-      if (!clientKey) {
-        const activeOrder = await db.getActiveOrderByCustomer(user.userId);
-        if (activeOrder) {
-          logger.warn(`⚠️ Customer ${user.phone} already has active order: ${activeOrder.id}`);
-          res.status(400).json({
-            success: false,
-            error: {
-              code: 'ACTIVE_ORDER_EXISTS',
-              message: 'You already have an active order. Please wait for it to complete or cancel it first.',
-              data: {
-                activeOrderId: activeOrder.id,
-                createdAt: activeOrder.createdAt,
-                status: normalizeOrderStatus(activeOrder.status)
-              }
-            }
-          });
-          return;
-        }
-      }
-
-      // =================================================================
-      // RULE 2: RATE LIMITING - Max 5 orders per minute per customer
-      // Prevents abuse and ensures fair usage
-      // =================================================================
+      // Rate limit SECOND (no lock needed)
       const rateLimitKey = `order_create:${user.userId}`;
-      const rateLimit = await orderService.checkRateLimit(rateLimitKey, 5, 60); // 5 per minute
+      const rateLimit = await orderService.checkRateLimit(rateLimitKey, 5, 60);
       if (!rateLimit.allowed) {
-        logger.warn(`🚫 Rate limit exceeded for customer ${user.phone}`);
+        logger.warn(`[Orders] Rate limit exceeded for customer ${user.userId}`);
         const retryAfterMs = Math.max(1000, (rateLimit.retryAfter || 1) * 1000);
         res.setHeader('Retry-After', Math.ceil(retryAfterMs / 1000).toString());
         res.status(429).json({
@@ -256,24 +156,89 @@ router.post(
         return;
       }
 
-      try {
-        // Debug: Log raw request body
-        logger.info(`[Orders] POST / - Customer: ${user.phone}`);
-        logger.info(`[Orders] POST / - Body: ${JSON.stringify(req.body, null, 2)}`);
+      // =================================================================
+      // DISTRIBUTED LOCK - Prevent concurrent order creation
+      // =================================================================
+      const lockKey = `order:create:${user.userId}`;
+      const lockAcquired = await redisService.acquireLock(lockKey, user.userId, 10);
 
-        // Validate request body
-        const validationResult = createOrderSchema.safeParse(req.body);
-        if (!validationResult.success) {
-          res.status(400).json({
-            success: false,
-            error: {
-              code: 'VALIDATION_ERROR',
-              message: 'Invalid request data',
-              details: validationResult.error.errors
+      logger.info('[OrderIngress] create_order_request', {
+        route_path: '/api/v1/orders',
+        route_alias_used: true,
+        customerId: user.userId
+      });
+
+      if (!lockAcquired.acquired) {
+        logger.warn(`[Orders] Concurrent order request blocked for customer ${user.userId}`);
+        res.status(409).json({
+          success: false,
+          error: {
+            code: 'CONCURRENT_REQUEST',
+            message: 'Another order request is being processed. Please wait a moment and try again.',
+            data: {
+              retryAfter: 2
             }
-          });
-          return;
-        }
+          }
+        });
+        return;
+      }
+
+      logger.debug(`[Orders] Lock acquired for customer ${user.userId}, processing order...`);
+
+      // M-1 FIX: Idempotency key required (Stripe pattern)
+      // Configurable: set REQUIRE_IDEMPOTENCY_KEY=false during client migration
+      const requireIdempotencyKey = process.env.REQUIRE_IDEMPOTENCY_KEY !== 'false';
+      const clientKey = (req.headers['x-idempotency-key'] as string | undefined)?.trim();
+      const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+      if (requireIdempotencyKey && !clientKey) {
+        res.status(400).json({
+          success: false,
+          error: {
+            code: 'MISSING_IDEMPOTENCY_KEY',
+            message: 'x-idempotency-key header is required for order creation',
+          },
+        });
+        return;
+      }
+
+      let idempotencyKey: string;
+      if (clientKey && UUID_REGEX.test(clientKey)) {
+        idempotencyKey = clientKey;
+        logger.debug(`[Orders] Idempotency key from client: ${idempotencyKey.substring(0, 8)}...`);
+      } else {
+        // Fallback: generate server-side key when REQUIRE_IDEMPOTENCY_KEY=false
+        // The active-order check below is the actual dedup safety net.
+        const { v4: uuidv4 } = require('uuid');
+        idempotencyKey = uuidv4();
+        logger.warn(`[Orders] POST / - No client idempotency key provided. Server-generated key has no dedup value.`, { userId: user.userId });
+      }
+
+      // =================================================================
+      // RULE 1: ONE ACTIVE ORDER PER CUSTOMER
+      // M-2 FIX: Active order guard runs unconditionally (defense in depth)
+      // Previously skipped when client provided idempotency key -- that was wrong
+      // because different keys could create duplicate active orders.
+      // =================================================================
+      const activeOrder = await db.getActiveOrderByCustomer(user.userId);
+      if (activeOrder) {
+        logger.warn(`[Orders] Customer ${user.userId} already has active order: ${activeOrder.id}`);
+        res.status(409).json({
+          success: false,
+          error: {
+            code: 'ACTIVE_ORDER_EXISTS',
+            message: 'You already have an active order. Please wait for it to complete or cancel it first.',
+            data: {
+              activeOrderId: activeOrder.id,
+              createdAt: activeOrder.createdAt,
+              status: normalizeOrderStatus(activeOrder.status)
+            }
+          }
+        });
+        return;
+      }
+
+      try {
 
         const data = validationResult.data;
         const normalizedInput = normalizeCreateOrderInput(data);
@@ -418,6 +383,7 @@ router.get(
     try {
       const { id } = req.params;
 
+      const user = req.user;
       const order = await orderService.getOrderDetails(id);
 
       if (!order) {
@@ -428,6 +394,17 @@ router.get(
             message: 'Order not found'
           }
         });
+        return;
+      }
+
+      // Fix A1: BOLA guard per OWASP -- return 404 (not 403) to prevent info leakage
+      const isCustomer = order.customerId === user.userId;
+      const isTransporter = Array.isArray(order.truckRequests)
+        && order.truckRequests.some((tr: any) => tr.assignedTransporterId === user.userId);
+      const isDriver = Array.isArray(order.truckRequests)
+        && order.truckRequests.some((tr: any) => tr.driverId === user.userId);
+      if (!isCustomer && !isTransporter && !isDriver) {
+        res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Order not found' } });
         return;
       }
 
@@ -639,10 +616,11 @@ router.post(
       const assignments = await db.getAssignmentsByOrder(orderId);
       const driverAssignment = assignments.find(a => a.driverId === driverId);
 
+      // M-S2 FIX: Return 404 (not 403) to prevent confirming order existence to unauthorized users
       if (!driverAssignment) {
-        return res.status(403).json({
+        return res.status(404).json({
           success: false,
-          error: { code: 'NOT_ASSIGNED', message: 'You are not assigned to this order' }
+          error: { code: 'ORDER_NOT_FOUND', message: 'Order not found' }
         });
       }
 
@@ -810,10 +788,11 @@ router.get(
         a => a.driverId === userId || a.transporterId === userId
       );
 
+      // M-S2 FIX: Return 404 (not 403) to prevent confirming order existence to unauthorized users
       if (!isCustomer && !isDriverOrTransporter) {
-        return res.status(403).json({
+        return res.status(404).json({
           success: false,
-          error: { code: 'FORBIDDEN', message: 'You are not involved in this order' }
+          error: { code: 'ORDER_NOT_FOUND', message: 'Order not found' }
         });
       }
 
@@ -874,10 +853,11 @@ router.post(
       const assignments = await db.getAssignmentsByOrder(orderId);
       const driverAssignment = assignments.find(a => a.driverId === driverId);
 
+      // M-S2 FIX: Return 404 (not 403) to prevent confirming order existence to unauthorized users
       if (!driverAssignment) {
-        return res.status(403).json({
+        return res.status(404).json({
           success: false,
-          error: { code: 'NOT_ASSIGNED', message: 'You are not assigned to this order' }
+          error: { code: 'ORDER_NOT_FOUND', message: 'Order not found' }
         });
       }
 
@@ -933,6 +913,7 @@ router.delete(
   '/:orderId/cancel',
   authMiddleware,
   roleGuard(['customer']),
+  bookingQueue.middleware({ priority: Priority.HIGH, timeout: 12000 }),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { orderId } = req.params;
@@ -1085,11 +1066,21 @@ router.get(
 
       logger.debug(`📊 Status check: Order ${orderId}`);
 
-      const order = await db.orders.findUnique({
-        where: { id: orderId }
-      });
+      // H-S1 FIX: Use db.getOrderById() instead of broken db.orders.findUnique()
+      const order = await db.getOrderById(orderId);
 
       if (!order) {
+        return res.status(404).json({
+          success: false,
+          error: {
+            code: 'ORDER_NOT_FOUND',
+            message: 'Order not found'
+          }
+        });
+      }
+
+      // H-S1 FIX: BOLA guard — return 404 (not 403) to prevent info leakage
+      if (order.customerId !== req.user!.userId) {
         return res.status(404).json({
           success: false,
           error: {
@@ -1139,11 +1130,13 @@ router.get(
 router.get(
   '/:orderId/broadcast-snapshot',
   authMiddleware,
-  roleGuard(['customer']),
+  // Fix A4: Allow all roles, aligns with booking.routes.ts:758
+  roleGuard(['customer', 'transporter', 'driver']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { orderId } = req.params;
-      const order = await db.orders.findUnique({ where: { id: orderId } });
+      // H-S1 FIX: Use db.getOrderById() instead of broken db.orders.findUnique()
+      const order = await db.getOrderById(orderId);
       if (!order) {
         return res.status(404).json({
           success: false,
@@ -1154,7 +1147,24 @@ router.get(
         });
       }
 
-      const requests = await db.getTruckRequestsByOrder(orderId);
+      // H-S1 FIX: BOLA guard — verify caller is involved in this order
+      const callerUserId = req.user!.userId;
+      const callerRole = req.user!.role;
+      const allRequests = await db.getTruckRequestsByOrder(orderId);
+      const isOrderCustomer = order.customerId === callerUserId;
+      const isOrderTransporter = allRequests.some((tr: any) => tr.assignedTransporterId === callerUserId);
+      const isOrderDriver = allRequests.some((tr: any) => tr.assignedDriverId === callerUserId);
+      if (!isOrderCustomer && !isOrderTransporter && !isOrderDriver) {
+        return res.status(404).json({
+          success: false,
+          error: {
+            code: 'ORDER_NOT_FOUND',
+            message: 'Order not found'
+          }
+        });
+      }
+
+      const requests = allRequests;
       const nowMs = Date.now();
       const expiresAtMs = new Date(order.expiresAt).getTime();
       const syncCursor = new Date(

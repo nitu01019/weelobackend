@@ -62,7 +62,11 @@ export const vehicleNumberSchema = z.string()
 export const coordinatesSchema = z.object({
   latitude: z.number().min(-90).max(90),
   longitude: z.number().min(-180).max(180)
-});
+}).refine(
+  (coords) => coords.latitude >= 6.5 && coords.latitude <= 37.0 &&
+              coords.longitude >= 68.0 && coords.longitude <= 97.5,
+  { message: 'Coordinates must be within India service area' }
+);
 
 /**
  * Location schema
@@ -99,6 +103,8 @@ export const paginationSchema = z.object({
  * Booking status schema
  */
 export const bookingStatusSchema = z.enum([
+  'created',
+  'broadcasting',
   'active',
   'partially_filled',
   'fully_filled',

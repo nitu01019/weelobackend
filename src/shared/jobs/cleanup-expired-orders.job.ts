@@ -34,7 +34,24 @@ export async function cleanupExpiredOrders(): Promise<void> {
   try {
     const now = new Date();
     logger.info(`🧹 [CleanupJob] Starting expired orders cleanup at ${now.toISOString()}`);
-    
+
+    // F-7-37: Adaptive batch sizing — scale up when backlog detected
+    const BASE_BATCH = 200;
+    const MAX_BATCH = 2000;
+
+    const backlogCount = await prisma.order.count({
+      where: {
+        status: { notIn: ['cancelled', 'completed', 'fully_filled', 'expired'] },
+        expiresAt: { lte: now.toISOString() }
+      }
+    });
+
+    const batchSize = backlogCount > BASE_BATCH ? Math.min(MAX_BATCH, backlogCount) : BASE_BATCH;
+
+    if (backlogCount > BASE_BATCH) {
+      logger.warn(`[CleanupJob] Backlog detected: ${backlogCount} expired orders, using recovery batch size ${batchSize}`);
+    }
+
     // Find all orders that have expired but status is not 'expired'
     const expiredOrders = await prisma.order.findMany({
       where: {
@@ -47,25 +64,25 @@ export async function cleanupExpiredOrders(): Promise<void> {
         expiresAt: true,
         status: true
       },
-      take: 200,  // Batch limit — prevents scanning entire orders table
+      take: batchSize,
       orderBy: { expiresAt: 'asc' }  // Oldest first
     });
-    
+
     if (expiredOrders.length === 0) {
       logger.info(`✅ [CleanupJob] No expired orders found`);
       return;
     }
-    
+
     logger.info(`🔄 [CleanupJob] Found ${expiredOrders.length} expired orders to clean up`);
-    
+
     // Update orders to expired status
     const orderIds = expiredOrders.map(o => o.id);
-    
+
     await prisma.order.updateMany({
       where: { id: { in: orderIds } },
       data: { status: 'expired' }
     });
-    
+
     // Update associated truck requests
     await prisma.truckRequest.updateMany({
       where: {
@@ -74,14 +91,24 @@ export async function cleanupExpiredOrders(): Promise<void> {
       },
       data: { status: 'expired' }
     });
-    
+
     logger.info(`✅ [CleanupJob] Successfully expired ${expiredOrders.length} orders and their truck requests`);
-    
+
     // Log details for debugging
     expiredOrders.forEach(order => {
       logger.info(`   - Order ${order.id}: customer ${order.customerId}, expired at ${order.expiresAt}`);
     });
-    
+
+    // F-7-37: Schedule re-run if backlog remains after this batch
+    if (backlogCount > batchSize) {
+      logger.warn(`[CleanupJob] Backlog remaining: ~${backlogCount - batchSize} orders, scheduling re-run in 5s`);
+      setTimeout(() => {
+        cleanupExpiredOrders().catch(err => {
+          logger.error(`[CleanupJob] Re-run failed: ${err}`);
+        });
+      }, 5000);
+    }
+
   } catch (error) {
     logger.error(`❌ [CleanupJob] Error cleaning up expired orders: ${error}`);
   } finally {

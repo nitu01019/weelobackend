@@ -1,4 +1,14 @@
 /**
+ * FLEX HOLD SERVICE — Phase 1 of two-phase hold system (CURRENT)
+ *
+ * Phase 1 (Flex): 90s base + up to 3 extensions of 30s (max 130s total)
+ * Phase 2 (Confirmed): See confirmed-hold.service.ts (180s with driver windows)
+ *
+ * Used by: Order path (POST /truck-hold/flex-hold)
+ * Industry pattern: BookMyShow seat hold (select -> pay)
+ */
+
+/**
  * =============================================================================
  * FLEX HOLD PHASE 1 SERVICE - Two-Phase Truck Hold System
  * =============================================================================
@@ -128,7 +138,8 @@ const DEFAULT_CONFIG: FlexHoldConfig = {
 
 // Redis keys for distributed locking
 const REDIS_KEYS = {
-  FLEX_HOLD_LOCK: (holdId: string) => `lock:flex-hold:${holdId}`,
+  // Standardized: lock: prefix for all distributed locks (added by acquireLock automatically)
+  FLEX_HOLD_LOCK: (holdId: string) => `flex-hold:${holdId}`,
   FLEX_HOLD_STATE: (holdId: string) => `flex-hold:${holdId}:state`,
   FLEX_HOLD_EXTENSIONS: (holdId: string) => `flex-hold:${holdId}:extensions`,
 };
@@ -153,6 +164,40 @@ class FlexHoldService {
       transporterId: request.transporterId,
       quantity: request.quantity,
     });
+
+    // M-22 FIX: Dedup — return existing active flex hold if one already exists
+    // for this order+transporter combination. Makes the endpoint idempotent at the
+    // service level (was only protected at the API/holdTrucks level).
+    const existingHold = await prismaClient.truckHoldLedger.findFirst({
+      where: {
+        orderId: request.orderId,
+        transporterId: request.transporterId,
+        status: 'active',
+        phase: HoldPhase.FLEX,
+      },
+    });
+
+    if (existingHold) {
+      const now = new Date();
+      const remainingSeconds = Math.max(
+        0,
+        Math.floor((existingHold.expiresAt.getTime() - now.getTime()) / 1000)
+      );
+      logger.info('[FLEX HOLD] Returning existing active hold (dedup)', {
+        holdId: existingHold.holdId,
+        orderId: request.orderId,
+        transporterId: request.transporterId,
+      });
+      return {
+        success: true,
+        holdId: existingHold.holdId,
+        phase: HoldPhase.FLEX,
+        expiresAt: existingHold.expiresAt,
+        remainingSeconds,
+        canExtend: (existingHold.flexExtendedCount || 0) < this.config.maxExtensions,
+        message: `Existing flex hold returned. Expires in ${remainingSeconds} seconds.`,
+      };
+    }
 
     const holdId = uuidv4();
     const now = new Date();
@@ -315,6 +360,16 @@ class FlexHoldService {
       const newExpiresAt = new Date(creationTime.getTime() + newTotalDuration * 1000);
       const addedSeconds = Math.floor(newExpiresAt.getTime() - currentExpiry.getTime()) / 1000;
 
+      // FIX #40: Floor guard — if extension would add 0 seconds (hold already at max), return explicit failure
+      // instead of misleading success with addedSeconds: 0.
+      if (addedSeconds <= 0) {
+        return {
+          success: false,
+          message: 'Hold is already at maximum duration',
+          error: 'MAX_DURATION_REACHED',
+        };
+      }
+
       // Calculate total duration for logging
       const totalDurationSeconds = Math.floor((newExpiresAt.getTime() - creationTime.getTime()) / 1000);
 
@@ -344,12 +399,14 @@ class FlexHoldService {
       });
 
       // Emit socket event to transporter for UI transparency
+      const totalRemainingSeconds = Math.ceil((newExpiresAt.getTime() - now.getTime()) / 1000);
       await socketService.emitToUser(holdLedger.transporterId, 'flex_hold_extended', {
         holdId: request.holdId,
         orderId: holdLedger.orderId,
         newExpiresAt: newExpiresAt.toISOString(),
-        addedSeconds,
-        extendedCount: currentExtendedCount + 1,
+        totalRemainingSeconds,                       // PRIMARY: absolute remaining time
+        extendedCount: currentExtendedCount + 1,     // Total extensions so far
+        addedSeconds,                                // DEPRECATED: delta — use totalRemainingSeconds
         maxExtensions: this.config.maxExtensions,
         canExtend: currentExtendedCount + 1 < this.config.maxExtensions,
         message: `${addedSeconds}s added to hold timer`,

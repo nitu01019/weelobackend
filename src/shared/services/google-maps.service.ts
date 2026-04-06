@@ -44,11 +44,13 @@ const CACHE_TTL_SECONDS = {
 // =============================================================================
 // PERFORMANCE METRICS (for millions of users)
 // =============================================================================
+type MetricCounters = Record<string, number>;
+
 interface GoogleMapsMetrics {
-    apiCalls: { total: number; routes: number; places: number; geocoding: number };
-    cacheHits: { total: number; routes: number; places: number; geocoding: number };
-    errors: { total: number; routes: number; places: number; geocoding: number };
-    avgResponseTimeMs: { routes: number; places: number; geocoding: number };
+    apiCalls: MetricCounters;
+    cacheHits: MetricCounters;
+    errors: MetricCounters;
+    avgResponseTimeMs: MetricCounters;
 }
 
 const metrics: GoogleMapsMetrics = {
@@ -59,7 +61,8 @@ const metrics: GoogleMapsMetrics = {
 };
 
 // Log metrics every 5 minutes for monitoring
-setInterval(() => {
+// A5#30: Store interval handle, unref() so it doesn't block shutdown, export cleanup
+const metricsInterval = setInterval(() => {
     const cacheHitRate = metrics.apiCalls.total > 0
         ? ((metrics.cacheHits.total / (metrics.apiCalls.total + metrics.cacheHits.total)) * 100).toFixed(2)
         : '0.00';
@@ -74,11 +77,16 @@ setInterval(() => {
 
     // Reset counters
     Object.keys(metrics.apiCalls).forEach(key => {
-        (metrics.apiCalls as any)[key] = 0;
-        (metrics.cacheHits as any)[key] = 0;
-        (metrics.errors as any)[key] = 0;
+        metrics.apiCalls[key] = 0;
+        metrics.cacheHits[key] = 0;
+        metrics.errors[key] = 0;
     });
 }, 5 * 60 * 1000);
+metricsInterval.unref();
+
+export function stopGoogleMapsMetrics(): void {
+    clearInterval(metricsInterval);
+}
 
 // =============================================================================
 // TYPES

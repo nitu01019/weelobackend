@@ -184,15 +184,15 @@ const ENV_VARS: EnvVar[] = [
     name: 'ORDER_TRANSPORTER_FANOUT_QUEUE_CHUNK_SIZE',
     required: false,
     default: '500',
-    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 25,
-    description: 'Chunk size for queued transporter fanout batches'
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 25 && parseInt(v) <= 500,
+    description: 'Chunk size for queued transporter fanout batches (25-500)'
   },
   {
     name: 'SOCKET_MULTI_ROOM_EMIT_CHUNK_SIZE',
     required: false,
     default: '300',
-    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 25,
-    description: 'Socket.IO room chunk size for multi-user direct emits'
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 25 && parseInt(v) <= 500,
+    description: 'Socket.IO room chunk size for multi-user direct emits (25-500)'
   },
 
   // ==========================================================================
@@ -357,7 +357,177 @@ const ENV_VARS: EnvVar[] = [
     default: 'info',
     validator: (v) => ['error', 'warn', 'info', 'debug'].includes(v),
     description: 'Logging level'
-  }
+  },
+
+  // ==========================================================================
+  // HOLD SYSTEM (PRD 7777)
+  // ==========================================================================
+  {
+    name: 'DRIVER_ACCEPT_TIMEOUT_SECONDS',
+    required: false,
+    default: '45',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 10 && parseInt(v) <= 120,
+    description: 'Driver accept/decline timeout in seconds (PRD 7777: 45s)'
+  },
+  {
+    name: 'CONFIRMED_HOLD_MAX_SECONDS',
+    required: false,
+    default: '180',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 30 && parseInt(v) <= 600,
+    description: 'Maximum confirmed hold duration in seconds'
+  },
+  {
+    name: 'FLEX_HOLD_DURATION_SECONDS',
+    required: false,
+    default: '90',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 10 && parseInt(v) <= 300,
+    description: 'Flex hold base duration in seconds'
+  },
+
+  // ==========================================================================
+  // ORDER CREATION GUARDS
+  // ==========================================================================
+  {
+    name: 'REQUIRE_IDEMPOTENCY_KEY',
+    required: false,
+    default: 'true',
+    validator: (v) => ['true', 'false'].includes(v),
+    description: 'Require x-idempotency-key header on POST /orders (set false during client migration)'
+  },
+  {
+    name: 'ORDER_MAX_CONCURRENT_CREATES',
+    required: false,
+    default: '200',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 10 && parseInt(v) <= 1000,
+    description: 'Max concurrent order creates (Redis backpressure + in-memory fallback)'
+  },
+
+  // ==========================================================================
+  // FEATURE FLAGS
+  // ==========================================================================
+  {
+    name: 'FF_H3_INDEX_ENABLED',
+    required: false,
+    default: 'false',
+    validator: (v) => ['true', 'false'].includes(v),
+    description: 'Enable H3 geo index for transporter lookup'
+  },
+  {
+    name: 'FF_CIRCUIT_BREAKER_ENABLED',
+    required: false,
+    default: 'true',
+    validator: (v) => ['true', 'false'].includes(v),
+    description: 'Enable circuit breaker for external API calls'
+  },
+  {
+    name: 'FF_SEQUENCE_DELIVERY_ENABLED',
+    required: false,
+    default: 'false',
+    validator: (v) => ['true', 'false'].includes(v),
+    description: 'Enable sequence-numbered socket delivery'
+  },
+  {
+    name: 'FF_DIRECTIONS_API_SCORING_ENABLED',
+    required: false,
+    default: 'false',
+    validator: (v) => ['true', 'false'].includes(v),
+    description: 'Enable Google Directions API for candidate scoring'
+  },
+  {
+    name: 'FF_HOLD_DB_ATOMIC_CLAIM',
+    required: false,
+    default: 'false',
+    validator: (v) => ['true', 'false'].includes(v),
+    description: 'Enable DB-level atomic hold claim'
+  },
+  {
+    name: 'FF_QUEUE_DEPTH_CAP',
+    required: false,
+    default: '10000',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 100,
+    description: 'Queue depth backpressure cap'
+  },
+  {
+    name: 'FF_LEGACY_BOOKING_PROXY_TO_ORDER',
+    required: false,
+    default: 'true',
+    validator: (v) => ['true', 'false'].includes(v),
+    description: 'Proxy legacy booking endpoints to canonical order service'
+  },
+  {
+    name: 'FF_CANCEL_POLICY_TRUCK_V1',
+    required: false,
+    default: 'true',
+    validator: (v) => ['true', 'false'].includes(v),
+    description: 'Enable truck cancellation policy v1'
+  },
+
+  // ==========================================================================
+  // DISPATCH TUNING
+  // ==========================================================================
+  {
+    name: 'DIRECTIONS_API_MAX_QPS',
+    required: false,
+    default: '450',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 10 && parseInt(v) <= 1000,
+    description: 'Google Directions API max QPS per instance'
+  },
+  {
+    name: 'BROADCAST_TIMEOUT_SECONDS',
+    required: false,
+    default: '120',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 30 && parseInt(v) <= 600,
+    description: 'Broadcast timeout for booking expiry'
+  },
+
+  // ==========================================================================
+  // TRACKING THRESHOLDS
+  // ==========================================================================
+  {
+    name: 'MAX_ARRIVAL_DISTANCE_METERS',
+    required: false,
+    default: '200',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 50 && parseInt(v) <= 5000,
+    description: 'Distance threshold for arrival detection'
+  },
+  {
+    name: 'DRIVER_PROXIMITY_NOTIFICATION_KM',
+    required: false,
+    default: '2',
+    validator: (v) => !isNaN(parseFloat(v)) && parseFloat(v) >= 0.1 && parseFloat(v) <= 50,
+    description: 'Distance threshold for driver proximity notifications'
+  },
+
+  // ==========================================================================
+  // FIREBASE
+  // ==========================================================================
+  {
+    name: 'FIREBASE_SERVICE_ACCOUNT_PATH',
+    required: false,
+    description: 'Path to Firebase service account JSON file for FCM push notifications'
+  },
+
+  // ==========================================================================
+  // REDIS
+  // ==========================================================================
+  {
+    name: 'REDIS_PUBSUB_DISABLED',
+    required: false,
+    default: 'false',
+    validator: (v) => ['true', 'false'].includes(v),
+    description: 'Disable Redis pub/sub adapter (single-instance mode)'
+  },
+
+  // ==========================================================================
+  // DEPRECATED (to be removed after H-X1 lands)
+  // ==========================================================================
+  {
+    name: 'ASSIGNMENT_TIMEOUT_MS',
+    required: false,
+    default: '45000',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 5000 && parseInt(v) <= 120000,
+    description: 'DEPRECATED: Use DRIVER_ACCEPT_TIMEOUT_SECONDS via hold-config.ts instead'
+  },
 ];
 
 /**

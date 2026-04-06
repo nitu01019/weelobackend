@@ -16,32 +16,26 @@
 
 import { Router, Request, Response, NextFunction } from 'express';
 import { bookingService } from './booking.service';
-import { orderService as canonicalOrderService } from '../order/order.service';
+import { orderService as canonicalOrderService, ActiveTruckRequestOrderGroup } from '../order/order.service';
 import { authMiddleware, roleGuard } from '../../shared/middleware/auth.middleware';
 import { prismaClient } from '../../shared/database/prisma.service';
 import { logger } from '../../shared/services/logger.service';
 import { redisService } from '../../shared/services/redis.service';
 import { bookingQueue, Priority } from '../../shared/resilience/request-queue';
 import { validateRequest } from '../../shared/utils/validation.utils';
-import { createBookingSchema, createOrderSchema, getBookingsQuerySchema } from './booking.schema';
+import { createBookingSchema, createOrderSchema, getBookingsQuerySchema, acceptTruckRequestSchema } from './booking.schema';
 import {
   buildCreateOrderResponseData,
   normalizeCreateOrderInput,
   toCreateOrderServiceRequest
 } from '../order/order.contract';
+// Fix F1: Import shared normalizer instead of local duplicate
+import { normalizeOrderLifecycleState } from '../../shared/utils/order-lifecycle.utils';
 const router = Router();
 const FF_LEGACY_BOOKING_PROXY_TO_ORDER = process.env.FF_LEGACY_BOOKING_PROXY_TO_ORDER !== 'false';
 
-function normalizeOrderLifecycleState(status: string): 'active' | 'cancelled' | 'expired' | 'accepted' {
-  const normalized = status.toLowerCase();
-  if (normalized === 'cancelled' || normalized === 'canceled') return 'cancelled';
-  if (normalized === 'expired') return 'expired';
-  if (normalized === 'fully_filled' || normalized === 'completed' || normalized === 'closed') return 'accepted';
-  return 'active';
-}
-
 function buildSyncCursorFromOrders(
-  orders: Array<{ order: { updatedAt?: Date | string; stateChangedAt?: Date | string; createdAt?: Date | string } }>
+  orders: ActiveTruckRequestOrderGroup[]
 ): string {
   const latestMs = orders.reduce((acc, item) => {
     const order = item.order;
@@ -69,6 +63,8 @@ router.post(
   '/',
   authMiddleware,
   roleGuard(['customer']),
+  // Fix A7: Rate-limit legacy path to match canonical /orders route
+  bookingQueue.middleware({ priority: Priority.HIGH, timeout: 15000 }),
   validateRequest(createBookingSchema),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
@@ -173,10 +169,12 @@ router.post(
         return;
       }
 
+      const idempotencyKey = req.headers['x-idempotency-key'] as string | undefined;
       const booking = await bookingService.createBooking(
         req.user!.userId,
         req.user!.phone,
-        req.body
+        req.body,
+        idempotencyKey
       );
 
       res.status(201).json({
@@ -353,6 +351,7 @@ router.patch(
   '/:id/cancel',
   authMiddleware,
   roleGuard(['customer']),
+  bookingQueue.middleware({ priority: Priority.HIGH, timeout: 12000 }),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const booking = await bookingService.cancelBooking(
@@ -544,6 +543,7 @@ router.post(
   '/orders/:orderId/cancel',
   authMiddleware,
   roleGuard(['customer']),
+  bookingQueue.middleware({ priority: Priority.HIGH, timeout: 12000 }),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       logger.info('[OrderIngress] cancel_order_request', {
@@ -716,6 +716,14 @@ router.get(
         });
       }
 
+      // H-S2 FIX: BOLA guard — return 404 (not 403) to prevent info leakage
+      if (details.customerId !== req.user!.userId) {
+        return res.status(404).json({
+          success: false,
+          error: { code: 'ORDER_NOT_FOUND', message: 'Order not found' }
+        });
+      }
+
       const nowMs = Date.now();
       const expiresAtMs = new Date(details.expiresAt).getTime();
       const remainingMs = Math.max(0, expiresAtMs - nowMs);
@@ -731,11 +739,11 @@ router.get(
           remainingSeconds,
           isActive,
           expiresAt: details.expiresAt,
-          dispatchState: (details as any).dispatchState || 'queued',
-          dispatchAttempts: Number((details as any).dispatchAttempts || 0),
-          notifiedTransporters: Number((details as any).notifiedCount || 0),
-          onlineCandidates: Number((details as any).onlineCandidatesCount || 0),
-          reasonCode: (details as any).dispatchReasonCode || null,
+          dispatchState: details.dispatchState || 'queued',
+          dispatchAttempts: Number(details.dispatchAttempts || 0),
+          notifiedTransporters: Number(details.notifiedCount || 0),
+          onlineCandidates: Number(details.onlineCandidatesCount || 0),
+          reasonCode: details.dispatchReasonCode || null,
           serverTimeMs: Date.now()
         }
       });
@@ -773,8 +781,8 @@ router.get(
       const syncCursor = new Date(
         Math.max(
           nowMs,
-          new Date((details as any).updatedAt ?? nowMs).getTime(),
-          new Date((details as any).stateChangedAt ?? nowMs).getTime()
+          new Date(details.updatedAt ?? nowMs).getTime(),
+          new Date(details.stateChangedAt ?? nowMs).getTime()
         )
       ).toISOString();
 
@@ -784,9 +792,9 @@ router.get(
           orderId: details.id,
           state: lifecycleState,
           status: details.status,
-          dispatchState: (details as any).dispatchState || 'queued',
-          reasonCode: (details as any).dispatchReasonCode || null,
-          eventVersion: Math.floor(new Date((details as any).updatedAt ?? Date.now()).getTime() / 1000),
+          dispatchState: details.dispatchState || 'queued',
+          reasonCode: details.dispatchReasonCode || null,
+          eventVersion: Math.floor(new Date(details.updatedAt ?? Date.now()).getTime() / 1000),
           serverTimeMs: nowMs,
           expiresAtMs,
           syncCursor,
@@ -843,7 +851,7 @@ router.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const result = await canonicalOrderService.getActiveTruckRequestsForTransporter(req.user!.userId);
-      const syncCursor = buildSyncCursorFromOrders(result as any);
+      const syncCursor = buildSyncCursorFromOrders(result);
       const requestedCursorMs = parseSyncCursorMs(req.query.syncCursor);
       const latestChangeMs = Date.parse(syncCursor);
       const snapshotUnchanged = requestedCursorMs !== null && Number.isFinite(latestChangeMs) && latestChangeMs <= requestedCursorMs;
@@ -878,7 +886,21 @@ router.post(
   '/requests/:id/accept',
   authMiddleware,
   roleGuard(['transporter']),
+  // Fix F5: Zod validation for accept body (vehicleId required UUID, driverId optional UUID)
+  validateRequest(acceptTruckRequestSchema),
   async (req: Request, res: Response, next: NextFunction) => {
+    // A5#1: Distributed lock on truckRequestId to serialize concurrent accepts.
+    // Note: req.params.id is a truckRequestId, not bookingId.
+    // CAS inside the transaction is the real safety net; lock reduces wasted work.
+    const truckRequestId = req.params.id;
+    const lockKey = 'lock:truck-request:' + truckRequestId;
+    let lock = { acquired: false };
+    try {
+      lock = await redisService.acquireLock(lockKey, 'accept-handler', 15);
+    } catch (lockErr: any) {
+      // Redis failure should not block accepts — CAS is the real guard
+      logger.warn('[ACCEPT] Lock acquisition failed, proceeding with CAS only', { error: lockErr?.message });
+    }
     try {
       const { vehicleId, driverId } = req.body;
 
@@ -902,6 +924,11 @@ router.post(
       });
     } catch (error) {
       next(error);
+    } finally {
+      // Release lock if acquired (safe even if not acquired — releaseLock checks holder)
+      if (lock.acquired) {
+        await redisService.releaseLock(lockKey, 'accept-handler').catch(() => { });
+      }
     }
   }
 );

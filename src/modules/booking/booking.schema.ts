@@ -82,7 +82,7 @@ export const truckSelectionSchema = z.object({
   vehicleType: vehicleTypeSchema,
   vehicleSubtype: z.string().min(2).max(50),
   quantity: z.number().int().min(1).max(20),
-  pricePerTruck: z.number().int().min(1)
+  pricePerTruck: z.number().min(1).max(1000000)
 });
 
 /**
@@ -100,9 +100,10 @@ export const createBookingSchema = z.object({
   drop: locationSchema,
   vehicleType: vehicleTypeSchema,
   vehicleSubtype: z.string().min(2).max(50),
-  trucksNeeded: z.number().int().min(1).max(100),
-  distanceKm: z.number().int().min(1),
-  pricePerTruck: z.number().int().min(1),
+  trucksNeeded: z.number().int().min(1).max(20),
+  // Fix A5: Upper bound prevents abuse (max India diagonal ~3500km)
+  distanceKm: z.number().min(0.1).max(5000),
+  pricePerTruck: z.number().min(1).max(1000000),
   goodsType: z.string().max(100).optional(),
   weight: z.string().max(50).optional(),
   cargoWeightKg: z.number().int().min(0).max(100000).optional(),
@@ -112,9 +113,34 @@ export const createBookingSchema = z.object({
     minTonnage: z.number().optional(),
     maxTonnage: z.number().optional()
   }).optional(),
-  scheduledAt: z.string().datetime().optional(),
+  scheduledAt: z.string().datetime().optional().refine(
+    (val) => {
+      if (!val) return true;
+      const scheduled = new Date(val);
+      const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+      return scheduled > fiveMinutesAgo;
+    },
+    { message: 'Scheduled date must not be more than 5 minutes in the past' }
+  ),
   notes: z.string().max(500).optional()
-});
+}).refine(
+  (data) => {
+    const pLat = data.pickup.coordinates?.latitude ?? data.pickup.latitude;
+    const pLon = data.pickup.coordinates?.longitude ?? data.pickup.longitude;
+    const dLat = data.drop.coordinates?.latitude ?? data.drop.latitude;
+    const dLon = data.drop.coordinates?.longitude ?? data.drop.longitude;
+    if (pLat == null || pLon == null || dLat == null || dLon == null) return true;
+    const R = 6371;
+    const dLatR = (dLat - pLat) * Math.PI / 180;
+    const dLonR = (dLon - pLon) * Math.PI / 180;
+    const a = Math.sin(dLatR / 2) * Math.sin(dLatR / 2) +
+      Math.cos(pLat * Math.PI / 180) * Math.cos(dLat * Math.PI / 180) *
+      Math.sin(dLonR / 2) * Math.sin(dLonR / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c >= 0.5;
+  },
+  { message: 'Pickup and drop locations must be at least 500 meters apart' }
+);
 
 /**
  * Create Order Schema (NEW - Multi-truck types with Route Points)
@@ -141,7 +167,8 @@ export const createOrderSchema = z.object({
   drop: locationSchema.optional(),
   
   // Distance - total for all legs combined
-  distanceKm: z.number().int().min(1),
+  // Fix A5: Upper bound prevents abuse (max India diagonal ~3500km)
+  distanceKm: z.number().min(0.1).max(5000),
   
   // Compatibility: allow either legacy `trucks` or canonical `vehicleRequirements`.
   trucks: z.array(truckSelectionSchema).min(1).max(50).optional(),
@@ -153,7 +180,15 @@ export const createOrderSchema = z.object({
   cargoWeightKg: z.number().int().min(0).max(100000).optional(),
   
   // Scheduling
-  scheduledAt: z.string().datetime().optional(),
+  scheduledAt: z.string().datetime().optional().refine(
+    (val) => {
+      if (!val) return true;
+      const scheduled = new Date(val);
+      const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+      return scheduled > fiveMinutesAgo;
+    },
+    { message: 'Scheduled date must not be more than 5 minutes in the past' }
+  ),
   notes: z.string().max(500).optional()
 }).refine(
   // Either routePoints OR (pickup AND drop) must be provided
@@ -167,7 +202,34 @@ export const createOrderSchema = z.object({
   // Payload compatibility guard: one of trucks / vehicleRequirements must exist.
   (data) => Array.isArray(data.trucks) || Array.isArray(data.vehicleRequirements),
   { message: 'Either trucks OR vehicleRequirements must be provided' }
+).refine(
+  (data) => {
+    if (!data.pickup || !data.drop) return true;
+    const pLat = data.pickup.coordinates?.latitude ?? data.pickup.latitude;
+    const pLon = data.pickup.coordinates?.longitude ?? data.pickup.longitude;
+    const dLat = data.drop.coordinates?.latitude ?? data.drop.latitude;
+    const dLon = data.drop.coordinates?.longitude ?? data.drop.longitude;
+    if (pLat == null || pLon == null || dLat == null || dLon == null) return true;
+    const R = 6371;
+    const dLatR = (dLat - pLat) * Math.PI / 180;
+    const dLonR = (dLon - pLon) * Math.PI / 180;
+    const a = Math.sin(dLatR / 2) * Math.sin(dLatR / 2) +
+      Math.cos(pLat * Math.PI / 180) * Math.cos(dLat * Math.PI / 180) *
+      Math.sin(dLonR / 2) * Math.sin(dLonR / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c >= 0.5;
+  },
+  { message: 'Pickup and drop locations must be at least 500 meters apart' }
 );
+
+/**
+ * Fix F5 (F-6-6): Accept truck request Zod schema.
+ * Validates vehicleId (required UUID) and optional driverId (UUID).
+ */
+export const acceptTruckRequestSchema = z.object({
+  vehicleId: z.string().uuid('Invalid vehicle ID format'),
+  driverId: z.string().uuid('Invalid driver ID format').optional(),
+});
 
 /**
  * Get Bookings Query Schema

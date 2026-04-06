@@ -108,7 +108,8 @@ const DEFAULT_CONFIG: SmartTimeoutConfig = {
 
 // Redis keys
 const REDIS_KEYS = {
-  ORDER_TIMEOUT_LOCK: (orderId: string) => `lock:order-timeout:${orderId}`,
+  // Standardized: lock: prefix for all distributed locks (added by acquireLock automatically)
+  ORDER_TIMEOUT_LOCK: (orderId: string) => `order-timeout:${orderId}`,
   ORDER_TIMEOUT_STATE: (orderId: string) => `order-timeout:${orderId}:state`,
 };
 
@@ -329,7 +330,7 @@ class SmartTimeoutService {
       await this.cacheTimeoutState(request.orderId, state);
 
       // Emit socket event to customer for UI transparency
-      await socketService.emitToUser(request.orderId, 'order_timeout_extended', {
+      await socketService.emitToOrder(request.orderId, 'order_timeout_extended', {
         orderId: request.orderId,
         newExpiresAt: updated.expiresAt.toISOString(),
         addedSeconds,

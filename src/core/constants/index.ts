@@ -94,20 +94,8 @@ export enum VehicleStatus {
 // =============================================================================
 // ORDER STATUS (Multi-vehicle orders)
 // =============================================================================
-
-/**
- * Order lifecycle states
- */
-export enum OrderStatus {
-  DRAFT = 'draft',               // Customer creating order
-  PENDING = 'pending',           // Submitted, waiting for matches
-  BROADCASTING = 'broadcasting', // Actively finding transporters
-  PARTIAL = 'partial',           // Some trucks assigned
-  CONFIRMED = 'confirmed',       // All trucks assigned
-  IN_PROGRESS = 'in_progress',   // At least one truck started
-  COMPLETED = 'completed',       // All deliveries complete
-  CANCELLED = 'cancelled'        // Order cancelled
-}
+// REMOVED: OrderStatus enum — use OrderStatus from @prisma/client instead.
+// The Prisma-generated enum is the single source of truth for order statuses.
 
 // =============================================================================
 // ASSIGNMENT STATUS
@@ -535,7 +523,13 @@ export const TIMEOUTS = {
 // =============================================================================
 
 export const CACHE = {
-  // Key prefixes
+  // M-15: Environment-aware key prefix for Redis.
+  // Set REDIS_KEY_PREFIX env var per environment (e.g., "prod", "staging", "dev").
+  // CacheService auto-prefixes with this. Direct redisService callers should
+  // use redisService.prefixKey() for new keys to prevent cross-env collisions.
+  ENV_PREFIX: process.env.REDIS_KEY_PREFIX || 'weelo',
+
+  // Key prefixes (within the env namespace)
   PREFIX: {
     USER: 'user:',
     VEHICLE: 'vehicle:',

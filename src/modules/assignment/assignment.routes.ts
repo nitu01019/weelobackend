@@ -10,6 +10,7 @@
 
 import { Router, Request, Response, NextFunction } from 'express';
 import { assignmentService } from './assignment.service';
+import { HOLD_CONFIG } from '../../core/config/hold-config';
 import { authMiddleware, roleGuard } from '../../shared/middleware/auth.middleware';
 import { transporterRateLimit } from '../../shared/middleware/transporter-rate-limit.middleware';
 import { validateRequest } from '../../shared/utils/validation.utils';
@@ -278,10 +279,9 @@ router.get(
         }
       }
 
-      // Calculate timeout using the centralized config (ASSIGNMENT_TIMEOUT_MS, default 30s)
-      const ASSIGNMENT_TIMEOUT_MS = parseInt(process.env.ASSIGNMENT_TIMEOUT_MS || '30000', 10);
+      // Fix H-X1: Use centralized HOLD_CONFIG instead of local parseInt
       const assignedAt = new Date(assignment.assignedAt);
-      const timeoutAt = new Date(assignedAt.getTime() + ASSIGNMENT_TIMEOUT_MS).toISOString();
+      const timeoutAt = new Date(assignedAt.getTime() + HOLD_CONFIG.driverAcceptTimeoutMs).toISOString();
 
       res.json({
         success: true,

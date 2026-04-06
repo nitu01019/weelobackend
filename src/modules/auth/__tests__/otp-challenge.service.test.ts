@@ -14,9 +14,7 @@ const mockRedisService: any = {
   getJSON: jest.fn(),
   getOtpAttempts: jest.fn(),
   incrementOtpAttempts: jest.fn(),
-  client: {
-    eval: jest.fn()
-  }
+  eval: jest.fn()
 };
 
 const mockDbPrisma: any = {
@@ -65,7 +63,7 @@ function resetMocks() {
     attempts: 1,
     remaining: 2
   });
-  mockRedisService.client.eval.mockResolvedValue(1);
+  mockRedisService.eval.mockResolvedValue(1);
 
   mockDbPrisma.$executeRawUnsafe.mockResolvedValue(1);
   mockDbPrisma.$queryRawUnsafe.mockResolvedValue([]);
@@ -106,7 +104,7 @@ describe('OtpChallengeService', () => {
   });
 
   it('returns OTP_VERIFY_IN_PROGRESS when Redis lock is already held', async () => {
-    mockRedisService.client.eval.mockResolvedValueOnce(0);
+    mockRedisService.eval.mockResolvedValueOnce(0);
 
     const result = await otpChallengeService.verifyChallenge({
       otp: '123456',
@@ -129,7 +127,7 @@ describe('OtpChallengeService', () => {
     });
     const hash = crypto.createHash('sha256').update('123456').digest('hex');
 
-    mockRedisService.client.eval.mockImplementation(async (script: string) => {
+    mockRedisService.eval.mockImplementation(async (script: string) => {
       if (script.includes("'NX'")) {
         if (lockHeld) return 0;
         lockHeld = true;
@@ -189,7 +187,7 @@ describe('OtpChallengeService', () => {
   it('falls back to DB row lock when Redis verify lock is unavailable', async () => {
     const hash = crypto.createHash('sha256').update('654321').digest('hex');
 
-    mockRedisService.client.eval.mockRejectedValueOnce(new Error('eval disabled'));
+    mockRedisService.eval.mockRejectedValueOnce(new Error('eval disabled'));
 
     const txQuery = jest.fn().mockResolvedValue([
       {

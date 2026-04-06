@@ -44,6 +44,10 @@ const mockRedisSetJSON = jest.fn();
 const mockRedisGet = jest.fn();
 const mockRedisSet = jest.fn();
 const mockRedisDel = jest.fn();
+const mockRedisHIncrBy = jest.fn();
+const mockRedisHGetAll = jest.fn();
+const mockRedisHMSet = jest.fn();
+const mockRedisExpire = jest.fn();
 
 jest.mock('../shared/services/redis.service', () => ({
   redisService: {
@@ -54,13 +58,20 @@ jest.mock('../shared/services/redis.service', () => ({
     get: (...args: any[]) => mockRedisGet(...args),
     set: (...args: any[]) => mockRedisSet(...args),
     del: (...args: any[]) => mockRedisDel(...args),
+    hIncrBy: (...args: any[]) => mockRedisHIncrBy(...args),
+    hGetAll: (...args: any[]) => mockRedisHGetAll(...args),
+    hMSet: (...args: any[]) => mockRedisHMSet(...args),
+    expire: (...args: any[]) => mockRedisExpire(...args),
     isConnected: () => true,
   },
 }));
 
 // Prisma mock
 const mockAssignmentUpdate = jest.fn();
+const mockAssignmentUpdateMany = jest.fn();
 const mockAssignmentFindMany = jest.fn();
+const mockAssignmentFindUnique = jest.fn();
+const mockAssignmentFindUniqueOrThrow = jest.fn();
 const mockTruckRequestFindUnique = jest.fn();
 const mockTruckRequestFindFirst = jest.fn();
 const mockTruckRequestUpdate = jest.fn();
@@ -74,7 +85,10 @@ jest.mock('../shared/database/prisma.service', () => ({
   prismaClient: {
     assignment: {
       update: (...args: any[]) => mockAssignmentUpdate(...args),
+      updateMany: (...args: any[]) => mockAssignmentUpdateMany(...args),
       findMany: (...args: any[]) => mockAssignmentFindMany(...args),
+      findUnique: (...args: any[]) => mockAssignmentFindUnique(...args),
+      findUniqueOrThrow: (...args: any[]) => mockAssignmentFindUniqueOrThrow(...args),
     },
     truckRequest: {
       findUnique: (...args: any[]) => mockTruckRequestFindUnique(...args),
@@ -131,6 +145,11 @@ jest.mock('../shared/services/vehicle-lifecycle.service', () => ({
   releaseVehicle: (...args: any[]) => mockReleaseVehicle(...args),
 }));
 
+// Post-accept effects mock
+jest.mock('../modules/assignment/post-accept.effects', () => ({
+  applyPostAcceptSideEffects: jest.fn().mockResolvedValue(undefined),
+}));
+
 // Config mock
 jest.mock('../config/environment', () => ({
   config: { redis: { enabled: true }, isProduction: false, otp: { expiryMinutes: 5 }, sms: {} },
@@ -156,8 +175,15 @@ function resetAllMocks(): void {
   mockRedisGet.mockReset();
   mockRedisSet.mockReset();
   mockRedisDel.mockReset();
+  mockRedisHIncrBy.mockReset();
+  mockRedisHGetAll.mockReset();
+  mockRedisHMSet.mockReset();
+  mockRedisExpire.mockReset();
   mockAssignmentUpdate.mockReset();
+  mockAssignmentUpdateMany.mockReset();
   mockAssignmentFindMany.mockReset();
+  mockAssignmentFindUnique.mockReset();
+  mockAssignmentFindUniqueOrThrow.mockReset();
   mockTruckRequestFindUnique.mockReset();
   mockTruckRequestFindFirst.mockReset();
   mockTruckRequestUpdate.mockReset();
@@ -197,18 +223,30 @@ function setupDeclineHappyPath(assignmentOverrides: Record<string, any> = {}) {
 
   mockRedisAcquireLock.mockResolvedValue({ acquired: true });
   mockRedisReleaseLock.mockResolvedValue(undefined);
+  // C2 CAS: updateMany returns count=1 (CAS success), findUniqueOrThrow returns full record
+  mockAssignmentUpdateMany.mockResolvedValue({ count: 1 });
+  mockAssignmentFindUniqueOrThrow.mockResolvedValue(assignment);
   mockAssignmentUpdate.mockResolvedValue(assignment);
-  // The service uses truckRequest.findFirst (not findUnique)
+  // FK traversal: assignment.findUnique to get truckRequestId
+  mockAssignmentFindUnique.mockResolvedValue({
+    truckRequestId: assignment.truckRequestId,
+    orderId: assignment.orderId,
+  });
+  // The service uses truckRequest.findFirst via FK chain
   mockTruckRequestFindFirst.mockResolvedValue({
     id: assignment.truckRequestId,
     orderId: assignment.orderId,
-    status: 'assigned',
   });
   mockTruckRequestUpdate.mockResolvedValue({});
   mockReleaseVehicle.mockResolvedValue(undefined);
   mockExecuteRaw.mockResolvedValue(1);
   mockTruckHoldLedgerFindFirst.mockResolvedValue(null); // No confirmed hold ledger
   mockRedisSetJSON.mockResolvedValue(undefined);
+  // HINCRBY mocks (for when hold ledger IS found)
+  mockRedisHIncrBy.mockResolvedValue(0);
+  mockRedisHGetAll.mockResolvedValue(null);
+  mockRedisHMSet.mockResolvedValue(undefined);
+  mockRedisExpire.mockResolvedValue(true);
 
   return assignment;
 }
@@ -224,14 +262,27 @@ function setupAcceptHappyPath(assignmentOverrides: Record<string, any> = {}) {
 
   mockRedisAcquireLock.mockResolvedValue({ acquired: true });
   mockRedisReleaseLock.mockResolvedValue(undefined);
+  // C2 CAS: updateMany returns count=1 (CAS success), findUniqueOrThrow returns full record
+  mockAssignmentUpdateMany.mockResolvedValue({ count: 1 });
+  mockAssignmentFindUniqueOrThrow.mockResolvedValue(assignment);
   mockAssignmentUpdate.mockResolvedValue(assignment);
-  // The service uses truckRequest.findFirst (not findUnique)
+  // FK traversal: assignment.findUnique to get truckRequestId
+  mockAssignmentFindUnique.mockResolvedValue({
+    truckRequestId: assignment.truckRequestId,
+    orderId: assignment.orderId,
+  });
+  // The service uses truckRequest.findFirst via FK chain
   mockTruckRequestFindFirst.mockResolvedValue({
     id: assignment.truckRequestId,
     orderId: assignment.orderId,
   });
   mockTruckHoldLedgerFindFirst.mockResolvedValue(null);
   mockRedisSetJSON.mockResolvedValue(undefined);
+  // HINCRBY mocks
+  mockRedisHIncrBy.mockResolvedValue(0);
+  mockRedisHGetAll.mockResolvedValue(null);
+  mockRedisHMSet.mockResolvedValue(undefined);
+  mockRedisExpire.mockResolvedValue(true);
 
   return assignment;
 }
@@ -248,10 +299,10 @@ describe('Problem 1 — handleDriverAcceptance/Decline use tripId for lookup', (
 
     await confirmedHoldService.handleDriverAcceptance('assign-001');
 
-    // The current implementation queries by tripId (the assignmentId param is used as tripId)
-    expect(mockAssignmentUpdate).toHaveBeenCalledTimes(1);
-    const updateCall = mockAssignmentUpdate.mock.calls[0][0];
-    expect(updateCall.where).toEqual({ id: 'assign-001' });
+    // C2 CAS: updateMany with id + status precondition
+    expect(mockAssignmentUpdateMany).toHaveBeenCalledTimes(1);
+    const updateCall = mockAssignmentUpdateMany.mock.calls[0][0];
+    expect(updateCall.where.id).toBe('assign-001');
   });
 
   it('handleDriverAcceptance with valid assignmentId returns success', async () => {
@@ -269,7 +320,8 @@ describe('Problem 1 — handleDriverAcceptance/Decline use tripId for lookup', (
   it('handleDriverAcceptance with non-existent id returns error', async () => {
     mockRedisAcquireLock.mockResolvedValue({ acquired: true });
     mockRedisReleaseLock.mockResolvedValue(undefined);
-    mockAssignmentUpdate.mockRejectedValue(
+    // C2 CAS: updateMany throws on DB error
+    mockAssignmentUpdateMany.mockRejectedValue(
       new Error('Record to update not found.')
     );
 
@@ -288,9 +340,10 @@ describe('Problem 1 — handleDriverAcceptance/Decline use tripId for lookup', (
 
     await confirmedHoldService.handleDriverDecline('assign-001');
 
-    expect(mockAssignmentUpdate).toHaveBeenCalledTimes(1);
-    const updateCall = mockAssignmentUpdate.mock.calls[0][0];
-    expect(updateCall.where).toEqual({ id: 'assign-001' });
+    // C2 CAS: updateMany with id + status precondition
+    expect(mockAssignmentUpdateMany).toHaveBeenCalledTimes(1);
+    const updateCall = mockAssignmentUpdateMany.mock.calls[0][0];
+    expect(updateCall.where.id).toBe('assign-001');
   });
 });
 
@@ -316,22 +369,23 @@ describe('Problem 6 — handleDriverDecline resets truck request and updates sta
 
     await confirmedHoldService.handleDriverDecline('assign-001');
 
-    expect(mockAssignmentUpdate).toHaveBeenCalledTimes(1);
-    const updateCall = mockAssignmentUpdate.mock.calls[0][0];
+    // C2 CAS: updateMany with status precondition
+    expect(mockAssignmentUpdateMany).toHaveBeenCalledTimes(1);
+    const updateCall = mockAssignmentUpdateMany.mock.calls[0][0];
     expect(updateCall.data.status).toBe('driver_declined');
   });
 
-  it('handleDriverDecline resets truck request to searching', async () => {
+  it('handleDriverDecline sets truck request to held (Phase 2 exclusivity)', async () => {
     setupDeclineHappyPath();
 
     await confirmedHoldService.handleDriverDecline('assign-001');
 
-    // truckRequest.findFirst is used to find the request by tripId
+    // truckRequest.findFirst is used to find the request via FK traversal
     expect(mockTruckRequestFindFirst).toHaveBeenCalledTimes(1);
-    // truckRequest.update resets to searching
+    // truckRequest.update sets to held (FIX #41: was 'searching', now 'held')
     expect(mockTruckRequestUpdate).toHaveBeenCalledTimes(1);
     const trUpdateCall = mockTruckRequestUpdate.mock.calls[0][0];
-    expect(trUpdateCall.data.status).toBe('searching');
+    expect(trUpdateCall.data.status).toBe('held');
     expect(trUpdateCall.data.assignedDriverId).toBeNull();
     expect(trUpdateCall.data.assignedVehicleId).toBeNull();
   });
@@ -366,7 +420,8 @@ describe('Problem 6 — handleDriverDecline resets truck request and updates sta
   it('handleDriverDecline when assignment update fails returns failure', async () => {
     mockRedisAcquireLock.mockResolvedValue({ acquired: true });
     mockRedisReleaseLock.mockResolvedValue(undefined);
-    mockAssignmentUpdate.mockRejectedValue(new Error('Record not found'));
+    // C2 CAS: updateMany throws
+    mockAssignmentUpdateMany.mockRejectedValue(new Error('Record not found'));
 
     const result = await confirmedHoldService.handleDriverDecline('assign-001');
 
@@ -395,7 +450,14 @@ describe('Problem 6 — handleDriverDecline resets truck request and updates sta
     });
     mockRedisAcquireLock.mockResolvedValue({ acquired: true });
     mockRedisReleaseLock.mockResolvedValue(undefined);
-    mockAssignmentUpdate.mockResolvedValueOnce(assign1);
+    // C2 CAS mocks for both drivers
+    mockAssignmentUpdateMany
+      .mockResolvedValueOnce({ count: 1 })
+      .mockResolvedValueOnce({ count: 1 });
+    mockAssignmentFindUniqueOrThrow
+      .mockResolvedValueOnce(assign1);
+    mockAssignmentFindUnique
+      .mockResolvedValueOnce({ truckRequestId: 'tr-001', orderId: 'order-001' });
     mockTruckRequestFindFirst.mockResolvedValueOnce({
       id: 'tr-001',
       orderId: 'order-001',
@@ -416,7 +478,10 @@ describe('Problem 6 — handleDriverDecline resets truck request and updates sta
       driverId: 'driver-002',
       truckRequestId: 'tr-002',
     });
-    mockAssignmentUpdate.mockResolvedValueOnce(assign2);
+    mockAssignmentFindUniqueOrThrow
+      .mockResolvedValueOnce(assign2);
+    mockAssignmentFindUnique
+      .mockResolvedValueOnce({ truckRequestId: 'tr-002', orderId: 'order-001' });
     mockTruckRequestFindFirst.mockResolvedValueOnce({
       id: 'tr-002',
       orderId: 'order-001',
@@ -434,8 +499,8 @@ describe('Problem 6 — handleDriverDecline resets truck request and updates sta
     expect(result2.success).toBe(true);
     expect(result2.declined).toBe(true);
 
-    // Both assignments should have been updated
-    expect(mockAssignmentUpdate).toHaveBeenCalledTimes(2);
+    // Both assignments should have been updated via CAS updateMany
+    expect(mockAssignmentUpdateMany).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -479,7 +544,7 @@ describe('Edge cases — lock contention and missing data', () => {
     expect(mockTruckRequestUpdate).not.toHaveBeenCalled();
   });
 
-  it('handleDriverDecline with truckRequest found resets to searching', async () => {
+  it('handleDriverDecline with truckRequest found sets to held', async () => {
     setupDeclineHappyPath();
 
     const result = await confirmedHoldService.handleDriverDecline('assign-001');
@@ -487,23 +552,24 @@ describe('Edge cases — lock contention and missing data', () => {
     expect(result.success).toBe(true);
     expect(mockTruckRequestUpdate).toHaveBeenCalledTimes(1);
     const updateData = mockTruckRequestUpdate.mock.calls[0][0].data;
-    expect(updateData.status).toBe('searching');
+    expect(updateData.status).toBe('held');
   });
 
-  it('handleDriverDecline truckRequest update failure returns failure', async () => {
+  it('handleDriverDecline truckRequest update failure still succeeds (non-fatal side effect)', async () => {
     setupDeclineHappyPath();
     mockTruckRequestUpdate.mockRejectedValue(new Error('DB write failed'));
 
     const result = await confirmedHoldService.handleDriverDecline('assign-001');
 
-    // Error is caught by the outer try/catch, returns failure
+    // truckRequest update error propagates to the outer try/catch
     expect(result.success).toBe(false);
   });
 
   it('handleDriverDecline always releases lock even on failure', async () => {
     mockRedisAcquireLock.mockResolvedValue({ acquired: true });
     mockRedisReleaseLock.mockResolvedValue(undefined);
-    mockAssignmentUpdate.mockRejectedValue(new Error('DB error'));
+    // C2 CAS: updateMany throws
+    mockAssignmentUpdateMany.mockRejectedValue(new Error('DB error'));
 
     await confirmedHoldService.handleDriverDecline('assign-001');
 

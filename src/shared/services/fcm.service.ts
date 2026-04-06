@@ -57,7 +57,9 @@ export const NotificationType = {
 // - In-memory Map is independent fallback, not a cache layer
 // =============================================================================
 
-// In-memory fallback for when Redis is unavailable
+// Fix G5: userTokensFallback is effectively dead code -- registerToken no longer
+// writes to it (FIX A5#20 removed the write path), so reads always return empty.
+// Kept for backward-compat in removeToken/removeAllTokens/getTokens fallback paths.
 const userTokensFallback = new Map<string, string[]>();
 
 // Redis key pattern for FCM tokens
@@ -92,16 +94,35 @@ class FCMService {
   private isInitialized = false;
   private admin: any = null;
 
+  /** FCM error codes that should never be retried (token invalid, credential mismatch, etc.) */
+  private static readonly NON_RETRYABLE_FCM_ERRORS = new Set([
+    'messaging/registration-token-not-registered',
+    'messaging/invalid-registration-token',
+    'messaging/invalid-argument',
+    'messaging/mismatched-credential',
+    'messaging/third-party-auth-error',
+  ]);
+
   /**
    * Initialize Firebase Admin SDK
    * Call this on server startup
    */
   async initialize(): Promise<void> {
     const serviceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
-    
+    const isProduction = process.env.NODE_ENV === 'production';
+
     if (!serviceAccountPath) {
-      logger.warn('⚠️ FCM: FIREBASE_SERVICE_ACCOUNT_PATH not set. Push notifications disabled.');
-      logger.info('📱 FCM: Notifications will be logged to console instead.');
+      if (isProduction) {
+        // Fix M-9: In production, missing Firebase config is a critical operational issue.
+        // Don't crash (other features still work), but make it very visible.
+        logger.error('[FCM] CRITICAL: FIREBASE_SERVICE_ACCOUNT_PATH not set in production. Push notifications DISABLED.');
+        try {
+          const { metrics } = require('../monitoring/metrics.service');
+          metrics.incrementCounter('fcm_init_missing_config');
+        } catch { /* metrics not available */ }
+      } else {
+        logger.warn('[FCM] FIREBASE_SERVICE_ACCOUNT_PATH not set. Running in mock mode (console only).');
+      }
       return;
     }
 
@@ -149,7 +170,7 @@ class FCMService {
    * 
    * EASY UNDERSTANDING: SADD = Set Add. If token already exists, it's a no-op.
    */
-  async registerToken(userId: string, token: string): Promise<void> {
+  async registerToken(userId: string, token: string): Promise<boolean> {
     // Try Redis first (primary storage)
     if (this.isRedisAvailable()) {
       try {
@@ -157,21 +178,22 @@ class FCMService {
         await redisService.sAdd(key, token);
         await redisService.expire(key, FCM_TOKEN_TTL_SECONDS);
         logger.info(`FCM: Token registered for user ${userId} [Redis]`);
-        return;
+        return true;
       } catch (error: any) {
-        logger.warn(`FCM: Redis registerToken failed: ${error.message}. Using fallback.`);
+        // FIX A5#20: Remove in-memory write fallback — unbounded Map is a memory leak
+        // on long-running ECS instances and tokens written here are invisible to other
+        // instances. Log error and return false; getTokens() still reads from fallback.
+        logger.error(`FCM: Redis registerToken failed — token NOT stored`, {
+          userId,
+          error: error.message,
+        });
+        return false;
       }
     }
 
-    // Fallback to in-memory
-    if (!userTokensFallback.has(userId)) {
-      userTokensFallback.set(userId, []);
-    }
-    const tokens = userTokensFallback.get(userId)!;
-    if (!tokens.includes(token)) {
-      tokens.push(token);
-      logger.info(`FCM: Token registered for user ${userId} [InMemory]`);
-    }
+    // Redis not available — token cannot be stored
+    logger.error(`FCM: Redis unavailable — token NOT stored for user ${userId}`);
+    return false;
   }
 
   /**
@@ -368,6 +390,82 @@ class FCMService {
   }
 
   /**
+   * Send push notification with retry and exponential backoff.
+   * Non-retryable errors (invalid token, etc.) fail immediately.
+   * Uses AWS jitter pattern: sleep = random(0, min(cap, base * 2^attempt))
+   */
+  async sendWithRetry(
+    tokens: string[],
+    title: string,
+    body: string,
+    data?: Record<string, string>,
+    maxRetries: number = 3
+  ): Promise<boolean> {
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const result = await this.sendToTokens(tokens, {
+          type: NotificationType.GENERAL,
+          title,
+          body,
+          data: data || {},
+        });
+        return result;
+      } catch (err: any) {
+        const code = err?.errorInfo?.code || err?.code || '';
+
+        // Non-retryable: don't waste time retrying
+        if (FCMService.NON_RETRYABLE_FCM_ERRORS.has(code)) {
+          logger.warn('[FCM] Non-retryable error — skipping retry', { code, tokens: tokens.length });
+          return false;
+        }
+
+        // Last attempt: give up
+        if (attempt === maxRetries) {
+          logger.error('[FCM] All retry attempts exhausted', {
+            maxRetries, code, tokens: tokens.length,
+          });
+          return false;
+        }
+
+        // Exponential backoff with jitter (AWS pattern)
+        const baseDelay = 1000 * Math.pow(2, attempt); // 1s, 2s, 4s
+        const cappedDelay = Math.min(30000, baseDelay);
+        const jitteredDelay = Math.random() * cappedDelay;
+
+        logger.info('[FCM] Retrying after transient error', {
+          attempt: attempt + 1,
+          delayMs: Math.round(jitteredDelay),
+          code,
+        });
+
+        await new Promise(resolve => setTimeout(resolve, jitteredDelay));
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Fix M-3: Send push notification with retry (fire-and-forget but with retries and logging).
+   * Bridges the interface gap between FCMNotification callers and sendWithRetry internals.
+   * Accepts the canonical FCMNotification type used throughout the codebase.
+   */
+  async sendReliable(
+    tokens: string[],
+    notification: FCMNotification,
+    userId?: string
+  ): Promise<void> {
+    try {
+      await this.sendWithRetry(tokens, notification.title, notification.body, notification.data);
+    } catch (err: unknown) {
+      logger.error('[FCM] Push failed after all retries', {
+        userId,
+        tokenCount: tokens.length,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
    * Send notification to a topic (e.g., all transporters with specific vehicle type)
    * 
    * Topics:
@@ -526,6 +624,16 @@ class FCMService {
       farePerTruck: number;
       pickupCity: string;
       dropCity: string;
+      /** Unique tag per booking for Android notification grouping (FIX #32) */
+      notificationTag?: string;
+      /** Whether this is a re-broadcast for a transporter who just came online */
+      isRebroadcast?: boolean;
+      // Fix E3: Additional fields for background decision-making
+      pickupAddress?: string;
+      dropAddress?: string;
+      distanceKm?: number;
+      vehicleSubtype?: string;
+      expiresAt?: string;
     }
   ): Promise<number> {
     const notification: FCMNotification = {
@@ -540,7 +648,17 @@ class FCMService {
         trucksNeeded: broadcast.trucksNeeded,
         farePerTruck: broadcast.farePerTruck,
         pickupCity: broadcast.pickupCity,
-        dropCity: broadcast.dropCity
+        dropCity: broadcast.dropCity,
+        // Fix E3: Essential fields for background decision-making
+        ...(broadcast.pickupAddress ? { pickupAddress: broadcast.pickupAddress } : {}),
+        ...(broadcast.dropAddress ? { dropAddress: broadcast.dropAddress } : {}),
+        ...(broadcast.distanceKm != null ? { distanceKm: broadcast.distanceKm } : {}),
+        ...(broadcast.vehicleSubtype ? { vehicleSubtype: broadcast.vehicleSubtype } : {}),
+        ...(broadcast.expiresAt ? { expiresAt: broadcast.expiresAt } : {}),
+        action: 'NEW_BROADCAST',
+        timestamp: Date.now(),
+        ...(broadcast.notificationTag ? { notificationTag: broadcast.notificationTag } : {}),
+        ...(broadcast.isRebroadcast ? { isRebroadcast: true } : {})
       }
     };
 

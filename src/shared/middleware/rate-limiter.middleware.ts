@@ -231,16 +231,43 @@ function throttleHandler(code: string, message: string, fallbackWindowMs: number
 }
 
 // =============================================================================
+// ROLE-BASED RATE LIMITS
+// =============================================================================
+// Different roles have different usage patterns:
+//   - driver: GPS pings every 500ms + status updates → moderate limit
+//   - transporter: fleet management, multiple drivers → higher limit
+//   - customer: booking + tracking → standard limit
+//   - admin: dashboard + bulk ops → highest limit
+// Unauthenticated requests fall back to config.rateLimit.maxRequests.
+// =============================================================================
+const ROLE_RATE_LIMITS: Record<string, number> = {
+  driver: 200,
+  transporter: 500,
+  customer: 300,
+  admin: 2000,
+};
+
+// =============================================================================
 // RATE LIMITERS
 // =============================================================================
 
 /**
  * Default rate limiter for all routes
- * 1000 requests per minute per IP (production-ready)
+ * Role-aware: authenticated users get role-specific limits,
+ * unauthenticated requests get config.rateLimit.maxRequests per IP.
  */
 export const rateLimiter = rateLimit({
   windowMs: config.rateLimit.windowMs,
-  max: config.rateLimit.maxRequests,
+  max: ((req: Request) => {
+    const role = (req as any).user?.role;
+    return ROLE_RATE_LIMITS[role] || config.rateLimit.maxRequests;
+  }) as any,
+  keyGenerator: (req: Request) => {
+    // Authenticated users: key by userId (consistent across IPs/devices)
+    // Unauthenticated: key by IP (standard fallback)
+    const userId = (req as any).user?.userId;
+    return userId ? `user:${userId}` : (req.ip || 'unknown');
+  },
   handler: throttleHandler(
     'RATE_LIMIT_EXCEEDED',
     'Too many requests. Please try again later.',

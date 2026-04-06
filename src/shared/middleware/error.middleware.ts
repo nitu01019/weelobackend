@@ -40,12 +40,16 @@ export function errorHandler(
 
   // Determine if this is a known operational error
   if (error instanceof AppError) {
+    // Fix G3: Sanitize error details in production to prevent leaking internal state
+    const safeDetails = error.details && !config.isProduction
+      ? error.details
+      : undefined;
     res.status(error.statusCode).json({
       success: false,
       error: {
         code: error.code,
         message: error.message,
-        ...(error.details && { details: error.details })
+        ...(safeDetails && { details: safeDetails })
       }
     });
     return;

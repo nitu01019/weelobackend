@@ -207,7 +207,9 @@ class RedisCache implements CacheStore {
 
 class CacheService {
   private cache: CacheStore;
-  private prefix: string = 'weelo:';
+  // M-15 FIX: Use REDIS_KEY_PREFIX env var for environment-aware prefix.
+  // Falls back to 'weelo' for backward compatibility.
+  private prefix: string = `${process.env.REDIS_KEY_PREFIX || 'weelo'}:`;
 
   constructor() {
     // Use Redis if enabled, otherwise use in-memory
@@ -337,7 +339,11 @@ class CacheService {
    */
   async setRefreshToken(token: string, userId: string, expiryDays: number = 30): Promise<void> {
     const key = `refresh:${token}`;
-    await this.set(key, { userId, createdAt: new Date().toISOString() }, expiryDays * 24 * 60 * 60);
+    const ttlSeconds = expiryDays * 24 * 60 * 60;
+    await this.set(key, { userId, createdAt: new Date().toISOString() }, ttlSeconds);
+    // Fix C3/F-5-6: Maintain per-user token index for O(M) deletion instead of O(N^2) KEYS scan
+    await redisService.sAdd(`user_tokens:${userId}`, token).catch(() => {});
+    await redisService.expire(`user_tokens:${userId}`, ttlSeconds).catch(() => {});
   }
 
   /**
@@ -358,16 +364,18 @@ class CacheService {
 
   /**
    * Delete all refresh tokens for a user (logout from all devices)
+   * Fix C3/F-5-6: Uses per-user token index instead of O(N^2) KEYS scan.
+   * Token IDs are tracked in a Redis SET `user_tokens:{userId}`.
    */
   async deleteAllUserRefreshTokens(userId: string): Promise<void> {
-    const keys = await this.keys('refresh:*');
-
-    for (const key of keys) {
-      const data = await this.get<{ userId: string }>(`refresh:${key.replace('refresh:', '')}`);
-      if (data && data.userId === userId) {
-        await this.delete(key);
+    const indexKey = `user_tokens:${userId}`;
+    const tokenIds = await redisService.sMembers(indexKey).catch(() => [] as string[]);
+    if (tokenIds.length > 0) {
+      for (const tokenId of tokenIds) {
+        await this.delete(`refresh:${tokenId}`);
       }
     }
+    await redisService.del(indexKey).catch(() => {});
   }
 }
 

@@ -133,7 +133,15 @@ function startOrderExpiryChecker(): void {
  */
 async function processExpiredOrders(): Promise<void> {
   const expiredTimers = await redisService.getExpiredTimers<OrderTimerData>('timer:booking-order:');
-  
+
+  // Fix H-A3: Phase 1 deprecation logging — track usage so we know when to remove this file.
+  if (expiredTimers.length > 0) {
+    logger.warn('[DEPRECATED] Legacy booking/order.service processing expired timers', {
+      count: expiredTimers.length,
+      keys: expiredTimers.map(t => t.key),
+    });
+  }
+
   for (const timer of expiredTimers) {
     // Try to acquire lock for this order (prevents duplicate processing)
     const lockKey = `lock:booking-order-expiry:${timer.data.orderId}`;
@@ -433,44 +441,85 @@ class OrderService {
         const broadcastPayload = {
           orderId: order.id,
           customerName: order.customerName,
-          
+
           // Vehicle info for this group
           vehicleType: group.vehicleType,
           vehicleSubtype: group.vehicleSubtype,
           trucksNeeded: group.requests.length,
-          
+
           // Individual request IDs (transporters can accept specific ones)
           requestIds: group.requests.map(r => r.id),
-          
+
           // Pricing
           pricePerTruck: group.requests[0].pricePerTruck,
           totalFare: group.requests.reduce((sum, r) => sum + r.pricePerTruck, 0),
-          
+
           // Location info
           pickupAddress: order.pickup.address,
           pickupCity: order.pickup.city,
           dropAddress: order.drop.address,
           dropCity: order.drop.city,
           distanceKm,
-          
+          // H-8 FIX: Unified location format — nested objects for new Captain app, flat for legacy
+          pickupLocation: {
+            lat: order.pickup.latitude ?? order.pickup.lat,
+            lng: order.pickup.longitude ?? order.pickup.lng,
+            address: order.pickup.address || '',
+          },
+          dropLocation: {
+            lat: order.drop.latitude ?? order.drop.lat,
+            lng: order.drop.longitude ?? order.drop.lng,
+            address: order.drop.address || '',
+          },
+
+          // H-8 FIX: Unified ETA — both fields present for backward compatibility
+          // pickupEtaMinutes: DEPRECATED but kept for old Captain app versions
+          // pickupEtaSeconds: NEW standard field
+          pickupEtaSeconds: 0,
+          pickupEtaMinutes: 0,
+
           // Goods info
           goodsType: order.goodsType,
           weight: order.weight,
-          
+
           // Timing
           createdAt: order.createdAt,
           expiresAt: order.expiresAt,
           timeoutSeconds: ORDER_CONFIG.TIMEOUT_MS / 1000,
-          
-          isUrgent: false
+
+          isUrgent: false,
+
+          // H-8 FIX: Payload version — lets Captain app detect new format
+          payloadVersion: 2,
         };
         
+        // H-19 FIX: Cap notified transporters to prevent FCM throttling and latency spikes
+        const MAX_BROADCAST_TRANSPORTERS_ORDER = parseInt(process.env.MAX_BROADCAST_TRANSPORTERS || '100', 10);
+        const cappedOrderTransporters = transporterIds.length > MAX_BROADCAST_TRANSPORTERS_ORDER
+          ? (() => {
+              logger.info(`[Broadcast][Order] Capping ${transporterIds.length} -> ${MAX_BROADCAST_TRANSPORTERS_ORDER} transporters`);
+              return transporterIds.slice(0, MAX_BROADCAST_TRANSPORTERS_ORDER);
+            })()
+          : transporterIds;
+
         // Emit to all transporters in this group
         // Phase 3: Removed per-transporter db.getUserById() — already filtered by Redis online set.
         // Name lookup is non-critical for broadcast; transporter ID is logged instead.
-        for (const transporterId of transporterIds) {
+        for (const transporterId of cappedOrderTransporters) {
           emitToUser(transporterId, SocketEvent.NEW_BROADCAST, broadcastPayload);
           logger.info(`📢 Notified: ${transporterId.substring(0, 8)}... for ${group.vehicleType} ${group.vehicleSubtype} (${group.requests.length} trucks)`);
+
+          // H-7 FIX: Broadcast delivery tracking for observability (fire-and-forget)
+          try {
+            if (typeof redisService.hSet === 'function') {
+              redisService.hSet(
+                `broadcast:delivery:${order.id}`,
+                transporterId,
+                JSON.stringify({ emittedAt: Date.now(), channel: 'socket' })
+              ).then(() => redisService.expire(`broadcast:delivery:${order.id}`, 3600))
+               .catch((_err: unknown) => { /* silent -- observability only */ });
+            }
+          } catch (_h7Err: unknown) { /* H-7 is observability only -- never crash broadcast */ }
         }
       } else {
         logger.warn(`⚠️ No transporters found for ${group.vehicleType} ${group.vehicleSubtype}`);

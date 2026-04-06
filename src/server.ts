@@ -94,6 +94,7 @@ import { fcmService } from './shared/services/fcm.service';
 import { redisService } from './shared/services/redis.service';
 import { startBookingExpiryChecker } from './modules/booking/booking.service';
 import { startStaleTransporterCleanup, transporterOnlineService } from './shared/services/transporter-online.service';
+import { availabilityService } from './shared/services/availability.service';
 
 // =============================================================================
 // Phase 10: SHUTDOWN STATE (shared with health.routes.ts)
@@ -547,9 +548,21 @@ async function bootstrap(): Promise<void> {
   }
 
   // Live availability rebuild
+  // A5#18: Startup jitter + distributed lock to prevent thundering herd on multi-instance deploy
   try {
     const { liveAvailabilityService } = await import('./shared/services/live-availability.service');
-    await liveAvailabilityService.rebuildFromDatabase();
+    const jitterMs = Math.floor(Math.random() * 5000);
+    await new Promise(resolve => setTimeout(resolve, jitterMs));
+    const startupHolderId = `startup:${process.pid}:${Date.now()}`;
+    const rebuildLock = await redisService.acquireLock('rebuild:live-availability', startupHolderId, 60);
+    if (rebuildLock.acquired) {
+      await liveAvailabilityService.rebuildFromDatabase();
+      await redisService.releaseLock('rebuild:live-availability', startupHolderId).catch((err: any) =>
+        logger.warn('[Startup] Failed to release rebuild lock (will expire in 60s)', { error: err?.message })
+      );
+    } else {
+      logger.info('[Startup] Another instance is rebuilding live availability — skipping');
+    }
 
     // Periodic reconciliation: compare Redis with DB every 5 minutes as a safety net
     // L1 FIX: unref() so this non-critical timer doesn't block process exit
@@ -561,6 +574,12 @@ async function bootstrap(): Promise<void> {
     logger.warn(`[LiveAvail] Bootstrap failed: ${err.message}`);
   }
 
+  // Fix #16: Rebuild online:transporters SET from DB if Redis was restarted.
+  // Non-blocking -- failure is tolerable (heartbeats will repopulate within 90s).
+  availabilityService.rebuildGeoFromDB().catch(err => {
+    logger.error(`[Startup] Geo rebuild failed: ${(err as Error).message}`);
+  });
+
   // -------------------------------------------------------------------------
   // 3. Start background jobs that depend on Redis
   // -------------------------------------------------------------------------
@@ -570,6 +589,21 @@ async function bootstrap(): Promise<void> {
   // M12 FIX: Explicitly start driver offline checker (was auto-started on import)
   const { trackingService: trackingSvc } = await import('./modules/tracking/tracking.service');
   trackingSvc.startDriverOfflineChecker();
+
+  // C-8 FIX: Recover orphaned progressive step timers after server restart.
+  // Timer keys may exist in Redis but be missing from the timers:pending sorted
+  // set if a previous instance crashed between reading and processing a timer.
+  // This re-adds them so the 2-second polling loop picks them up immediately.
+  try {
+    const { recoverOrphanedStepTimers } = await import('./modules/order/order-timer.service');
+    const recovered = await recoverOrphanedStepTimers();
+    if (recovered > 0) {
+      logger.info(`[Startup] C-8: Recovered ${recovered} orphaned order timer(s)`);
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn(`[Startup] C-8 timer recovery failed (non-fatal): ${msg}`);
+  }
 
   // -------------------------------------------------------------------------
   // 4. Start listening for HTTP traffic
@@ -670,18 +704,33 @@ const gracefulShutdown = async (signal: string) => {
   // Phase 10: Set shutdown flag — middleware returns 503, health returns 503
   _isShuttingDown = true;
 
+  // Fix H-R4: Clean up adapter reconnect timer
+  try {
+    const { cleanupAdapterReconnect }: typeof import('./shared/services/socket.service') = require('./shared/services/socket.service');
+    cleanupAdapterReconnect();
+  } catch (err) {
+    logger.warn('[Shutdown] cleanupAdapterReconnect failed', err);
+  }
+
   // Stop all background intervals first (prevents new work during shutdown)
   try {
     // H18 FIX: Add type annotations to lazy require() calls for type safety
     const { stopBookingExpiryChecker }: typeof import('./modules/booking/booking.service') = require('./modules/booking/booking.service');
-    const { stopOrderExpiryChecker }: typeof import('./modules/booking/order.service') = require('./modules/booking/order.service');
+    // Fix H-A3: Wrap legacy order.service require in try/catch
+    let stopOrderExpiryChecker: (() => void) | undefined;
+    try {
+      const legacyOrderService: typeof import('./modules/booking/order.service') = require('./modules/booking/order.service');
+      stopOrderExpiryChecker = legacyOrderService.stopOrderExpiryChecker;
+    } catch {
+      logger.info('[Shutdown] Legacy booking/order.service not found -- skipping');
+    }
     const { stopOrderTimerChecker }: typeof import('./modules/order/order.service') = require('./modules/order/order.service');
     // Assignment timeouts now use queue-based delayed jobs (no polling to stop)
     const { broadcastService }: typeof import('./modules/broadcast/broadcast.service') = require('./modules/broadcast/broadcast.service');
     const { stopStaleTransporterCleanup }: typeof import('./shared/services/transporter-online.service') = require('./shared/services/transporter-online.service');
     const { trackingService }: typeof import('./modules/tracking/tracking.service') = require('./modules/tracking/tracking.service');
     stopBookingExpiryChecker();
-    stopOrderExpiryChecker();
+    if (stopOrderExpiryChecker) stopOrderExpiryChecker();
     stopOrderTimerChecker();
     broadcastService?.stopExpiryChecker?.();
     stopStaleTransporterCleanup();
@@ -689,6 +738,24 @@ const gracefulShutdown = async (signal: string) => {
     logger.info('All background intervals stopped');
   } catch (err) {
     logger.error('Error stopping background intervals', err);
+  }
+
+  // A5#8: Stop queue service and flush buffers before disconnecting Redis/Prisma
+  try {
+    const { queueService }: typeof import('./shared/services/queue.service') = require('./shared/services/queue.service');
+    queueService.stop();
+    logger.info('Queue service stopped and buffers flushed');
+  } catch (err) {
+    logger.error('Error stopping queue service', err);
+  }
+
+  // A5#8: Stop Google Maps metrics interval
+  try {
+    const { stopGoogleMapsMetrics }: typeof import('./shared/services/google-maps.service') = require('./shared/services/google-maps.service');
+    stopGoogleMapsMetrics();
+    logger.info('Google Maps metrics interval stopped');
+  } catch (err) {
+    logger.error('Error stopping Google Maps metrics', err);
   }
 
   // Phase 10 Issue 2: Graceful Socket.IO disconnect
@@ -724,9 +791,12 @@ const gracefulShutdown = async (signal: string) => {
 
     // Close Prisma/database connection pool
     try {
-      const { prismaClient }: typeof import('./shared/database/prisma.service') = require('./shared/database/prisma.service');
+      const { prismaClient, prismaReadClient }: typeof import('./shared/database/prisma.service') = require('./shared/database/prisma.service');
       await prismaClient.$disconnect();
-      logger.info('Database connection closed');
+      if (prismaReadClient) {
+        await prismaReadClient.$disconnect().catch(() => {});
+      }
+      logger.info('Database connections closed');
     } catch (err) {
       logger.error('Error closing database connection', err);
     }

@@ -29,7 +29,11 @@ import { metrics } from '../monitoring/metrics.service';
 // CONFIGURATION
 // =============================================================================
 
-const FF_CIRCUIT_BREAKER_ENABLED = process.env.FF_CIRCUIT_BREAKER_ENABLED === 'true';
+// Default: ENABLED. Opt-out by setting FF_CIRCUIT_BREAKER_ENABLED=false.
+// Rationale: Circuit breakers protect against cascading failures. Defaulting
+// to disabled means new deployments are unprotected until manually enabled.
+// Industry standard (Netflix, Uber): resilience features are ON by default.
+const FF_CIRCUIT_BREAKER_ENABLED = process.env.FF_CIRCUIT_BREAKER_ENABLED !== 'false';
 
 const DEFAULT_THRESHOLD = Math.max(
     1,

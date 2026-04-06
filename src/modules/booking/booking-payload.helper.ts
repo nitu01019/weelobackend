@@ -17,11 +17,99 @@
 import { BookingRecord } from '../../shared/database/db';
 
 /**
+ * Location payload sent inside broadcast events.
+ */
+export interface BroadcastLocation {
+    address: string;
+    city?: string;
+    latitude: number;
+    longitude: number;
+}
+
+/**
+ * Per-vehicle-type entry in the requestedVehicles array.
+ */
+export interface BroadcastRequestedVehicle {
+    vehicleType: string;
+    vehicleSubtype: string;
+    count: number;
+    filledCount: number;
+    farePerTruck: number;
+    capacityTons: number;
+}
+
+/**
+ * Full broadcast payload emitted via `new_broadcast` Socket.IO events.
+ * Captain app expects this exact shape — see SocketIOService.kt.
+ */
+export interface BroadcastPayload {
+    // IDs
+    broadcastId: string;
+    orderId: string;
+    bookingId: string;
+
+    // Customer
+    customerId: string;
+    customerName: string;
+
+    // Vehicle
+    vehicleType: string;
+    vehicleSubtype: string;
+    trucksNeeded: number;
+    totalTrucksNeeded: number;
+    trucksFilled: number;
+    trucksFilledSoFar: number;
+
+    // Pricing
+    pricePerTruck: number;
+    farePerTruck: number;
+    totalFare: number;
+
+    // Nested location format (for Captain app)
+    pickupLocation: BroadcastLocation;
+    dropLocation: BroadcastLocation;
+
+    // Flat format (legacy compatibility)
+    pickupAddress: string;
+    pickupCity?: string;
+    dropAddress: string;
+    dropCity?: string;
+
+    // Distance / Cargo
+    distanceKm: number;
+    distance: number;
+    goodsType?: string;
+    weight?: string;
+
+    // Per-transporter pickup proximity
+    pickupDistanceKm: number;
+    pickupEtaMinutes: number;
+    // H-8 FIX: Unified ETA — seconds is the new standard, minutes kept for backward compat
+    pickupEtaSeconds: number;
+
+    // Timing
+    createdAt: string;
+    expiresAt: string;
+    timeoutSeconds: number;
+
+    // Flags
+    isUrgent: boolean;
+    isRebroadcast?: boolean;
+    radiusStep?: number;
+
+    // H-8 FIX: Payload version — lets Captain app know which fields to expect
+    payloadVersion: number;
+
+    // Multi-truck UI compatibility array
+    requestedVehicles: BroadcastRequestedVehicle[];
+}
+
+/**
  * Builds the standard broadcast payload from a BookingRecord.
- * 
+ *
  * Used by every code path that emits `new_broadcast` events.
  * Captain app expects this exact format — see SocketIOService.kt.
- * 
+ *
  * @param booking  - The booking record from DB
  * @param options  - Override fields (e.g. timeoutSeconds, isRebroadcast, radiusStep)
  */
@@ -34,9 +122,14 @@ export function buildBroadcastPayload(
         trucksFilled?: number;  // Override if stale in record
         pickupDistanceKm?: number;  // How far THIS transporter is from pickup
         pickupEtaMinutes?: number;  // ETA for THIS transporter to reach pickup
+        pickupEtaSeconds?: number;  // ETA in seconds (preferred precision)
     }
-): Record<string, any> {
+): BroadcastPayload {
     const trucksFilled = options?.trucksFilled ?? booking.trucksFilled;
+
+    // H-8 FIX: Unified ETA — derive seconds from minutes if not provided, or vice versa
+    const etaMinutes = options?.pickupEtaMinutes ?? 0;
+    const etaSeconds = options?.pickupEtaSeconds ?? (etaMinutes * 60);
 
     return {
         // IDs (Captain app checks broadcastId first, then orderId)
@@ -89,7 +182,11 @@ export function buildBroadcastPayload(
 
         // Per-transporter pickup proximity (0 = unknown, e.g. DB fallback)
         pickupDistanceKm: options?.pickupDistanceKm ?? 0,
-        pickupEtaMinutes: options?.pickupEtaMinutes ?? 0,
+        // H-8 FIX: Both fields present for backward compatibility
+        // pickupEtaMinutes: DEPRECATED but kept for old Captain app versions
+        // pickupEtaSeconds: NEW standard field (precise)
+        pickupEtaMinutes: etaMinutes,
+        pickupEtaSeconds: etaSeconds,
 
         // Timing
         createdAt: booking.createdAt,
@@ -100,6 +197,9 @@ export function buildBroadcastPayload(
         isUrgent: false,
         ...(options?.isRebroadcast ? { isRebroadcast: true } : {}),
         ...(options?.radiusStep ? { radiusStep: options.radiusStep } : {}),
+
+        // H-8 FIX: Payload version — lets Captain app detect new format
+        payloadVersion: 2,
 
         // Multi-truck UI compatibility array
         requestedVehicles: [{

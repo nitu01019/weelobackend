@@ -267,7 +267,11 @@ export interface TrackingRecord {
 // =============================================================================
 
 const DB_POOL_CONFIG = {
-  connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT || '10', 10),
+  // Connection budget math (db.t4g.micro, 1GB RAM, max_connections ~87):
+  //   2 ECS tasks x 20 = 40 connections (46% utilization — safe headroom)
+  //   Reserve ~7 for RDS internals + admin = 80 available → 40/80 = 50%
+  // For scale-up (db.r6g.large): 4 tasks x 20 = 80 of ~1600 = 5% (excellent)
+  connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT || '20', 10),
   // Phase 10: Reduced from 10s to 5s — fail fast for user-facing APIs
   // 10s wait = user already abandoned. 5s returns meaningful 503 quickly.
   poolTimeout: parseInt(process.env.DB_POOL_TIMEOUT || '5', 10),
@@ -320,16 +324,63 @@ function getPrismaClient(): PrismaClient {
       return result;
     });
 
+    // =========================================================================
+    // CACHE INVALIDATION MIDDLEWARE — Auto-invalidate Redis on writes
+    // =========================================================================
+    // Ensures Redis caches stay consistent with DB writes without requiring
+    // every service to manually call redisService.del(). Covers User profile
+    // cache and Vehicle transporter-list cache. Non-fatal: cache misses on
+    // invalidation failure are acceptable (stale data expires via TTL).
+    //
+    // SAFETY: Calls next(params) FIRST, then invalidates — no infinite loop
+    // risk because findUnique in the invalidation path is a read (not a write),
+    // so it won't re-trigger this middleware's write-op guard.
+    //
+    // NOTE: Prisma $use middleware does NOT fire for operations inside $transaction().
+    // For cache-critical writes inside transactions (e.g., order cancel vehicle release),
+    // manual cache invalidation must be added in the post-commit section.
+    // See: https://github.com/prisma/prisma/issues/3740
+    // =========================================================================
+    prisma.$use(async (params, next) => {
+      const result = await next(params);
+      const writeOps = ['update', 'upsert', 'delete', 'updateMany', 'create', 'createMany'];
+      if (writeOps.includes(params.action)) {
+        try {
+          if (params.model === 'User') {
+            const id = params.args?.where?.id;
+            if (id && typeof id === 'string') {
+              await redisService.del(`user:profile:${id}`).catch(() => {});
+            }
+          }
+          if (params.model === 'Vehicle') {
+            // For single updates, use result.transporterId directly (no extra query)
+            // For updateMany, result is { count: N } — try to get transporterId from args
+            const transporterId = result?.transporterId;
+            if (transporterId) {
+              await redisService.del(`cache:vehicles:transporter:${transporterId}`).catch(() => {});
+            } else {
+              // Fallback: try to get ID from where clause for single-record ops
+              const id = params.args?.where?.id;
+              if (id && typeof id === 'string') {
+                const vehicle = await prisma.vehicle.findUnique({
+                  where: { id }, select: { transporterId: true }
+                }).catch(() => null);
+                if (vehicle?.transporterId) {
+                  await redisService.del(`cache:vehicles:transporter:${vehicle.transporterId}`).catch(() => {});
+                }
+              }
+            }
+          }
+        } catch { /* cache invalidation is non-fatal */ }
+      }
+      return result;
+    });
+
     logger.info(`🗄️ Prisma connection pool configured: limit=${DB_POOL_CONFIG.connectionLimit}, timeout=${DB_POOL_CONFIG.poolTimeout}s`);
     logger.info(`🐢 Slow query logging enabled: threshold=${SLOW_QUERY_THRESHOLD_MS}ms`);
+    logger.info(`🔄 Cache invalidation middleware enabled for User and Vehicle writes`);
 
-    // SCALABILITY: Graceful shutdown - properly close DB connections
-    const shutdown = async () => {
-      logger.info('Disconnecting Prisma client...');
-      await prisma.$disconnect();
-    };
-    process.on('SIGTERM', shutdown);
-    process.on('SIGINT', shutdown);
+    // Shutdown handled by server.ts gracefulShutdown() — see A5#28
   }
   return prisma;
 }
@@ -770,9 +821,13 @@ class PrismaDatabaseService {
     return records;
   }
 
-  async getVehiclesByType(vehicleType: string): Promise<VehicleRecord[]> {
+  // H-D1 FIX: Add limit parameter with default 500 to prevent unbounded queries
+  async getVehiclesByType(vehicleType: string, limit = 500): Promise<VehicleRecord[]> {
+    const safeLimit = Math.min(Math.max(1, limit), 1000);
     const vehicles = await this.prisma.vehicle.findMany({
-      where: { vehicleType, isActive: true }
+      where: { vehicleType, isActive: true },
+      take: safeLimit,
+      orderBy: { createdAt: 'desc' }
     });
     return vehicles.map(v => this.toVehicleRecord(v));
   }
@@ -866,7 +921,7 @@ class PrismaDatabaseService {
     return [...new Set(vehicles.map(vehicle => vehicle.transporterId))];
   }
 
-  async updateVehicle(id: string, updates: Partial<VehicleRecord>): Promise<VehicleRecord | undefined> {
+  async updateVehicle(id: string, updates: Partial<VehicleRecord>): Promise<VehicleRecord> {
     try {
       // Fetch old vehicle state BEFORE update for:
       // 1. Cache invalidation when transporterId changes
@@ -906,8 +961,8 @@ class PrismaDatabaseService {
       }
       return this.toVehicleRecord(updated);
     } catch (error) {
-      logger.error('DB operation failed', { error: error instanceof Error ? sanitizeDbError(error.message) : String(error) });
-      return undefined;
+      logger.error('DB operation failed', { operation: 'updateVehicle', id, error: error instanceof Error ? sanitizeDbError(error.message) : String(error) });
+      throw error;
     }
   }
 
@@ -1008,7 +1063,7 @@ class PrismaDatabaseService {
       .map(b => this.toBookingRecord(b));
   }
 
-  async updateBooking(id: string, updates: Partial<BookingRecord>): Promise<BookingRecord | undefined> {
+  async updateBooking(id: string, updates: Partial<BookingRecord>): Promise<BookingRecord> {
     try {
       const { createdAt, updatedAt, ...data } = updates as any;
       const updated = await this.prisma.booking.update({
@@ -1022,8 +1077,8 @@ class PrismaDatabaseService {
       });
       return this.toBookingRecord(updated);
     } catch (error) {
-      logger.error('DB operation failed', { error: error instanceof Error ? sanitizeDbError(error.message) : String(error) });
-      return undefined;
+      logger.error('DB operation failed', { operation: 'updateBooking', id, error: error instanceof Error ? sanitizeDbError(error.message) : String(error) });
+      throw error;
     }
   }
 
@@ -1135,7 +1190,7 @@ class PrismaDatabaseService {
     return this.toOrderRecord(activeOrder);
   }
 
-  async updateOrder(id: string, updates: Partial<OrderRecord>): Promise<OrderRecord | undefined> {
+  async updateOrder(id: string, updates: Partial<OrderRecord>): Promise<OrderRecord> {
     try {
       const { createdAt, updatedAt, ...data } = updates as any;
       const updated = await this.prisma.order.update({
@@ -1151,18 +1206,27 @@ class PrismaDatabaseService {
       });
       return this.toOrderRecord(updated);
     } catch (error) {
-      logger.error('DB operation failed', { error: error instanceof Error ? sanitizeDbError(error.message) : String(error) });
-      return undefined;
+      logger.error('DB operation failed', { operation: 'updateOrder', id, error: error instanceof Error ? sanitizeDbError(error.message) : String(error) });
+      throw error;
     }
   }
 
-  async getActiveOrders(): Promise<OrderRecord[]> {
+  // M-10 FIX: Cursor-based pagination replaces hard 1000 cap.
+  // Old: take:1000 made orders invisible at 1001+.
+  // New: Optional cursor+limit for pagination; default behavior unchanged
+  // for backward compatibility (existing callers get all results up to cap).
+  async getActiveOrders(options?: { cursor?: string; limit?: number }): Promise<OrderRecord[]> {
     const now = new Date();
+    const limit = Math.min(Math.max(1, options?.limit || 1000), 2000);
+
     const orders = await this.prisma.order.findMany({
       where: {
         status: { notIn: ['fully_filled', 'completed', 'cancelled'] },
         expiresAt: { gt: now.toISOString() }
-      }
+      },
+      take: limit,
+      ...(options?.cursor ? { cursor: { id: options.cursor }, skip: 1 } : {}),
+      orderBy: { createdAt: 'desc' }
     });
 
     return orders
@@ -1308,6 +1372,17 @@ class PrismaDatabaseService {
       take: 500
     });
 
+    // F-5-19: Monitor notifiedTransporters array growth
+    const maxArrayLen = requests.reduce(
+      (max, r) => Math.max(max, (r.notifiedTransporters as string[])?.length ?? 0), 0
+    );
+    if (maxArrayLen > 50) {
+      logger.warn('[DB] notifiedTransporters array exceeding 50 elements', {
+        maxArrayLen, transporterId, requestCount: requests.length,
+        hint: 'Consider migrating to TruckRequestNotification junction table'
+      });
+    }
+
     return requests
       .filter(request => {
         const requestKeys = generateVehicleKeyCandidates(request.vehicleType, request.vehicleSubtype || '');
@@ -1344,13 +1419,33 @@ class PrismaDatabaseService {
   }
 
   async getTruckRequestsByVehicleType(vehicleType: string, vehicleSubtype?: string): Promise<TruckRequestRecord[]> {
+    // H-5 FIX: Bound query to prevent OOM at 100k+ searching requests.
+    // Previously loaded ALL searching requests with no limit, then filtered
+    // in JS. At scale this could exhaust memory and crash the ECS task.
+    // Now: cap at MAX_RESULTS (most recent first) + push vehicleType filter
+    // into the WHERE clause for index efficiency.
+    const MAX_RESULTS = parseInt(process.env.MAX_TRUCK_REQUESTS_QUERY || '500', 10);
+
     const requests = await this.prisma.truckRequest.findMany({
-      where: { status: 'searching' }
+      where: {
+        status: 'searching',
+        vehicleType: { equals: vehicleType, mode: 'insensitive' as const },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: MAX_RESULTS,
     });
 
+    if (requests.length >= MAX_RESULTS) {
+      logger.warn('[DB] getTruckRequestsByVehicleType hit cap', {
+        vehicleType,
+        vehicleSubtype: vehicleSubtype || '(any)',
+        cap: MAX_RESULTS,
+      });
+    }
+
+    // Still need in-memory filter for vehicleSubtype (uses fuzzy matching)
     return requests
       .filter(r => {
-        if (!this.vehicleStringsMatch(r.vehicleType, vehicleType)) return false;
         if (vehicleSubtype && !this.vehicleStringsMatch(r.vehicleSubtype, vehicleSubtype)) return false;
         return true;
       })
@@ -1462,7 +1557,7 @@ class PrismaDatabaseService {
     return assignment ? this.toAssignmentRecord(assignment) : undefined;
   }
 
-  async updateAssignment(id: string, updates: Partial<AssignmentRecord>): Promise<AssignmentRecord | undefined> {
+  async updateAssignment(id: string, updates: Partial<AssignmentRecord>): Promise<AssignmentRecord> {
     try {
       const updated = await this.prisma.assignment.update({
         where: { id },
@@ -1473,8 +1568,8 @@ class PrismaDatabaseService {
       });
       return this.toAssignmentRecord(updated);
     } catch (error) {
-      logger.error('DB operation failed', { error: error instanceof Error ? sanitizeDbError(error.message) : String(error) });
-      return undefined;
+      logger.error('DB operation failed', { operation: 'updateAssignment', id, error: error instanceof Error ? sanitizeDbError(error.message) : String(error) });
+      throw error;
     }
   }
 
@@ -1703,14 +1798,18 @@ class PrismaDatabaseService {
   }
 
   async getRawData() {
+    // C4 FIX: Hard limit on all findMany() calls to prevent unbounded memory usage.
+    // At scale (millions of rows), an unbounded findMany() can OOM the ECS task.
+    const HARD_LIMIT = 1000;
+
     const [users, vehicles, bookings, orders, truckRequests, assignments, tracking] = await Promise.all([
-      this.prisma.user.findMany(),
-      this.prisma.vehicle.findMany(),
-      this.prisma.booking.findMany(),
-      this.prisma.order.findMany(),
-      this.prisma.truckRequest.findMany(),
-      this.prisma.assignment.findMany(),
-      this.prisma.tracking.findMany(),
+      this.prisma.user.findMany({ take: HARD_LIMIT, orderBy: { createdAt: 'desc' } }),
+      this.prisma.vehicle.findMany({ take: HARD_LIMIT, orderBy: { createdAt: 'desc' } }),
+      this.prisma.booking.findMany({ take: HARD_LIMIT, orderBy: { createdAt: 'desc' } }),
+      this.prisma.order.findMany({ take: HARD_LIMIT, orderBy: { createdAt: 'desc' } }),
+      this.prisma.truckRequest.findMany({ take: HARD_LIMIT, orderBy: { createdAt: 'desc' } }),
+      this.prisma.assignment.findMany({ take: HARD_LIMIT, orderBy: { assignedAt: 'desc' } }),
+      this.prisma.tracking.findMany({ take: HARD_LIMIT, orderBy: { lastUpdated: 'desc' } }),
     ]);
 
     return {
@@ -1724,6 +1823,8 @@ class PrismaDatabaseService {
       _meta: {
         version: '2.0.0',
         lastUpdated: new Date().toISOString(),
+        truncated: true,
+        limit: HARD_LIMIT,
       }
     };
   }
@@ -1800,15 +1901,7 @@ function getReadReplicaClient(): PrismaClient {
     return result;
   });
 
-  // Graceful shutdown for replica connection
-  const shutdownReplica = async () => {
-    if (prismaRead) {
-      logger.info('Disconnecting Prisma read replica client...');
-      await prismaRead.$disconnect();
-    }
-  };
-  process.on('SIGTERM', shutdownReplica);
-  process.on('SIGINT', shutdownReplica);
+  // Shutdown handled by server.ts gracefulShutdown() — see A5#28
 
   logger.info(`📖 [Prisma] Read replica configured: pool_limit=${readPoolLimit}, timeout=${DB_POOL_CONFIG.poolTimeout}s`);
 

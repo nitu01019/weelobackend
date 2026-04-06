@@ -75,6 +75,9 @@ jest.mock('../shared/services/redis.service', () => {
     isRedisEnabled: jest.fn().mockReturnValue(true),
     onReconnect: jest.fn(),
     healthCheck: jest.fn(),
+    sAdd: jest.fn().mockResolvedValue(1),
+    geoRemove: jest.fn().mockResolvedValue(undefined),
+    sAddWithExpire: jest.fn().mockResolvedValue(undefined),
   };
 
   return { redisService: mock };
@@ -125,6 +128,15 @@ jest.mock('../shared/services/cache.service', () => ({
 jest.mock('../shared/services/live-availability.service', () => ({
   liveAvailabilityService: {
     onVehicleStatusChange: jest.fn(),
+  },
+}));
+
+// H3 geo index mock
+jest.mock('../shared/services/h3-geo-index.service', () => ({
+  h3GeoIndexService: {
+    updateLocation: jest.fn().mockResolvedValue(undefined),
+    removeTransporter: jest.fn().mockResolvedValue(undefined),
+    findNearby: jest.fn().mockResolvedValue([]),
   },
 }));
 
@@ -290,6 +302,8 @@ describe('P11 — SCAN not KEYS (getExpiredTimers fallback)', () => {
 
     // When Redis set is empty, filterOnline falls back to DB
     mockUserFindMany.mockResolvedValue([{ id: 't-001' }]);
+    // FIX: DB fallback now also checks presence keys for recency
+    mockRedisExists.mockResolvedValue(true);
 
     const result = await onlineService.filterOnline(['t-001', 't-002']);
 
@@ -317,8 +331,12 @@ describe('P14 — Reconnect Grace Period', () => {
     // Grace period feature is not yet implemented in the service.
     // Test that cleanStaleTransporters works in the normal flow.
     mockRedisAcquireLock.mockResolvedValue({ acquired: true });
-    mockRedisSMembers.mockResolvedValue(['t-001']);
+    // FIX: cleanStaleTransporters now uses sScan loop instead of sMembers
+    mockRedisSScan.mockResolvedValueOnce(['0', ['t-001']]);
     mockRedisExists.mockResolvedValue(false); // stale — presence key expired
+    // Geo cleanup: sMembers for vehicle keys, get for single key
+    mockRedisSMembers.mockResolvedValueOnce([]); // no vehicle keys
+    mockRedisGet.mockResolvedValueOnce(null); // no single vehicle key
     mockRedisSRem.mockResolvedValue(1);
     mockUserUpdate.mockResolvedValue({});
     mockRedisReleaseLock.mockResolvedValue(undefined);
@@ -327,15 +345,19 @@ describe('P14 — Reconnect Grace Period', () => {
 
     expect(staleCount).toBe(1);
     expect(mockRedisAcquireLock).toHaveBeenCalled();
-    expect(mockRedisSMembers).toHaveBeenCalled();
+    expect(mockRedisSScan).toHaveBeenCalled();
     expect(mockRedisSRem).toHaveBeenCalledWith(ONLINE_TRANSPORTERS_SET, 't-001');
   });
 
   it('stale cleanup resumes after lock becomes available', async () => {
     // Normal cleanup flow — lock available
     mockRedisAcquireLock.mockResolvedValue({ acquired: true });
-    mockRedisSMembers.mockResolvedValue(['t-001']);
+    // FIX: cleanStaleTransporters now uses sScan loop
+    mockRedisSScan.mockResolvedValueOnce(['0', ['t-001']]);
     mockRedisExists.mockResolvedValue(false); // stale
+    // Geo cleanup
+    mockRedisSMembers.mockResolvedValueOnce([]);
+    mockRedisGet.mockResolvedValueOnce(null);
     mockRedisSRem.mockResolvedValue(1);
     mockUserUpdate.mockResolvedValue({});
     mockRedisReleaseLock.mockResolvedValue(undefined);
@@ -345,7 +367,7 @@ describe('P14 — Reconnect Grace Period', () => {
     // Cleanup ran normally
     expect(staleCount).toBe(1);
     expect(mockRedisAcquireLock).toHaveBeenCalled();
-    expect(mockRedisSMembers).toHaveBeenCalled();
+    expect(mockRedisSScan).toHaveBeenCalled();
     expect(mockRedisSRem).toHaveBeenCalledWith(ONLINE_TRANSPORTERS_SET, 't-001');
   });
 

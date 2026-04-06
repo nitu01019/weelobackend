@@ -55,6 +55,8 @@ const mockRedisGetExpiredTimers = jest.fn();
 const mockRedisCancelTimer = jest.fn();
 const mockRedisSetTimer = jest.fn();
 const mockRedisExpire = jest.fn();
+const mockRedisIncr = jest.fn();
+const mockRedisIncrBy = jest.fn();
 const mockRedisSIsMember = jest.fn();
 const mockRedisIsConnected = jest.fn().mockReturnValue(true);
 
@@ -74,8 +76,11 @@ jest.mock('../shared/services/redis.service', () => ({
     cancelTimer: (...args: any[]) => mockRedisCancelTimer(...args),
     setTimer: (...args: any[]) => mockRedisSetTimer(...args),
     expire: (...args: any[]) => mockRedisExpire(...args),
+    incr: (...args: any[]) => mockRedisIncr(...args),
+    incrBy: (...args: any[]) => mockRedisIncrBy(...args),
     sIsMember: (...args: any[]) => mockRedisSIsMember(...args),
     isConnected: () => mockRedisIsConnected(),
+    sAddWithExpire: jest.fn().mockResolvedValue(undefined),
   },
 }));
 
@@ -219,6 +224,7 @@ jest.mock('../shared/services/socket.service', () => ({
     BOOKING_FULLY_FILLED: 'booking_fully_filled',
     BOOKING_PARTIALLY_FILLED: 'booking_partially_filled',
     NEW_BROADCAST: 'new_broadcast',
+    TRIP_CANCELLED: 'trip_cancelled',
   },
 }));
 
@@ -269,9 +275,14 @@ jest.mock('../shared/services/availability.service', () => ({
 
 // Progressive radius matcher mock
 jest.mock('../modules/order/progressive-radius-matcher', () => ({
+  ...jest.requireActual('../modules/order/progressive-radius-matcher'),
   progressiveRadiusMatcher: {
     findCandidates: jest.fn().mockResolvedValue([]),
+    getStepCount: jest.fn().mockReturnValue(6),
+    getStep: jest.fn().mockReturnValue({ radiusKm: 10, windowMs: 10_000, h3RingK: 15 }),
   },
+  startProgressiveMatching: jest.fn(),
+  cancelProgressiveMatching: jest.fn(),
 }));
 
 // Transporter online service mock
@@ -318,6 +329,7 @@ jest.mock('../core/constants', () => ({
 jest.mock('../core/state-machines', () => ({
   BOOKING_VALID_TRANSITIONS: {},
   isValidTransition: jest.fn().mockReturnValue(true),
+  assertValidTransition: jest.fn(),
   TERMINAL_BOOKING_STATUSES: ['cancelled', 'expired', 'fully_filled', 'completed'],
 }));
 
@@ -364,9 +376,12 @@ function resetAllMocks(): void {
   mockRedisGet.mockReset();
   mockRedisSet.mockReset();
   mockRedisDel.mockReset();
+  mockRedisDel.mockResolvedValue(undefined);
   mockRedisExists.mockReset();
   mockRedisAcquireLock.mockReset();
+  mockRedisAcquireLock.mockResolvedValue({ acquired: true });
   mockRedisReleaseLock.mockReset();
+  mockRedisReleaseLock.mockResolvedValue(undefined);
   mockRedisSMembers.mockReset();
   mockRedisSAdd.mockReset();
   mockRedisGetJSON.mockReset();
@@ -375,6 +390,11 @@ function resetAllMocks(): void {
   mockRedisCancelTimer.mockReset();
   mockRedisSetTimer.mockReset();
   mockRedisExpire.mockReset();
+  mockRedisExpire.mockResolvedValue(undefined);
+  mockRedisIncr.mockReset();
+  mockRedisIncr.mockResolvedValue(1);
+  mockRedisIncrBy.mockReset();
+  mockRedisIncrBy.mockResolvedValue(0);
   mockRedisSIsMember.mockReset();
   mockRedisIsConnected.mockReturnValue(true);
   mockBookingFindUnique.mockReset();
@@ -393,6 +413,39 @@ function resetAllMocks(): void {
   mockUserFindUnique.mockReset();
   mockQueryRaw.mockReset();
   mockTransaction.mockReset();
+  // Default: interactive transaction executes callback with txProxy (same mocks)
+  mockTransaction.mockImplementation(async (fnOrArray: any, _opts?: any) => {
+    if (typeof fnOrArray === 'function') {
+      // Interactive transaction: prismaClient.$transaction(async (tx) => { ... })
+      const txProxy = {
+        booking: {
+          findUnique: (...a: any[]) => mockBookingFindUnique(...a),
+          updateMany: (...a: any[]) => mockBookingUpdateMany(...a),
+          update: (...a: any[]) => mockBookingUpdate(...a),
+          create: (...a: any[]) => mockBookingCreate(...a),
+          findFirst: (...a: any[]) => mockBookingFindFirst(...a),
+        },
+        assignment: {
+          findMany: (...a: any[]) => mockAssignmentFindMany(...a),
+          updateMany: (...a: any[]) => mockAssignmentUpdateMany(...a),
+          findFirst: (...a: any[]) => mockAssignmentFindFirst(...a),
+          create: (...a: any[]) => mockAssignmentCreate(...a),
+        },
+        vehicle: {
+          findUnique: (...a: any[]) => mockVehicleFindUnique(...a),
+          updateMany: (...a: any[]) => mockVehicleUpdateMany(...a),
+          update: (...a: any[]) => mockVehicleUpdate(...a),
+        },
+        user: {
+          findUnique: (...a: any[]) => mockUserFindUnique(...a),
+        },
+        $queryRaw: (...a: any[]) => mockQueryRaw(...a),
+      };
+      return fnOrArray(txProxy);
+    }
+    // Batch transaction: prismaClient.$transaction([...])
+    return Promise.all(fnOrArray);
+  });
   mockGetBookingById.mockReset();
   mockGetUserById.mockReset();
   mockCreateBooking.mockReset();
@@ -544,7 +597,7 @@ describe('P7 — Fare check uses Google distance, not client distance', () => {
     expect(mockCalculateRoute).toHaveBeenCalled();
     // Logger should have warned about fallback
     expect(logger.warn).toHaveBeenCalledWith(
-      expect.stringContaining('Google Directions API failed'),
+      expect.stringContaining('Google Directions failed'),
       expect.anything()
     );
   });
@@ -557,42 +610,36 @@ describe('P7 — Fare check uses Google distance, not client distance', () => {
 describe('P8 — Auth before timer clearing in cancelBooking', () => {
   beforeEach(resetAllMocks);
 
-  it('cancelBooking by wrong customer does NOT clear timers', async () => {
+  it('cancelBooking by wrong customer does NOT reach transaction', async () => {
     const booking = makeBooking({ customerId: 'customer-001' });
 
-    // The updateMany with customerId filter will return count=0 for wrong customer
-    mockBookingUpdateMany.mockResolvedValue({ count: 0 });
+    // Preflight check: getBookingById returns booking owned by customer-001
     mockGetBookingById.mockResolvedValue(booking);
     mockRedisCancelTimer.mockResolvedValue(undefined);
     mockRedisDel.mockResolvedValue(undefined);
 
     const { bookingService } = require('../modules/booking/booking.service');
 
-    // Wrong customer tries to cancel
+    // Wrong customer tries to cancel — preflight ownership check rejects
     await expect(
       bookingService.cancelBooking('booking-001', 'wrong-customer')
     ).rejects.toThrow(/only cancel your own/i);
 
-    // FIX P8: Timers should NOT be cleared because updateMany returned count=0
-    // (wrong customer). clearBookingTimers is only called after success.
-    expect(mockRedisCancelTimer).not.toHaveBeenCalled();
-
-    // updateMany was called with wrong customer, returned count=0
-    expect(mockBookingUpdateMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: expect.objectContaining({
-          id: 'booking-001',
-          customerId: 'wrong-customer',
-        }),
-      })
-    );
+    // The $transaction should NOT have been called (preflight rejected first)
+    expect(mockTransaction).not.toHaveBeenCalled();
+    // updateMany inside TX should not have been called either
+    expect(mockBookingUpdateMany).not.toHaveBeenCalled();
   });
 
   it('cancelBooking by correct customer DOES clear timers', async () => {
     const booking = makeBooking({ customerId: 'customer-001' });
 
     mockBookingUpdateMany.mockResolvedValue({ count: 1 });
-    mockGetBookingById.mockResolvedValue({ ...booking, status: 'cancelled' });
+    // preflight returns active booking, post-tx returns cancelled
+    mockGetBookingById
+      .mockResolvedValueOnce(booking)           // preflight
+      .mockResolvedValueOnce({ ...booking, status: 'cancelled' })  // post-tx
+      .mockResolvedValueOnce({ ...booking, status: 'cancelled' }); // fresh re-fetch
     mockRedisCancelTimer.mockResolvedValue(undefined);
     mockRedisDel.mockResolvedValue(undefined);
     mockRedisGet.mockResolvedValue(null);
@@ -608,15 +655,15 @@ describe('P8 — Auth before timer clearing in cancelBooking', () => {
     expect(result.status).toBe('cancelled');
   });
 
-  it('clearBookingTimers only called after updateMany succeeds', async () => {
-    // In the current implementation, timers are cleared BEFORE updateMany
-    // as a race-prevention measure. But the critical invariant is:
-    // the booking status only changes if customerId matches (updateMany WHERE clause).
+  it('cancel uses $transaction with booking+assignment atomicity', async () => {
     const booking = makeBooking({ customerId: 'customer-001' });
 
-    // updateMany returns count=1 (success)
+    // Preflight: returns active booking
+    mockGetBookingById
+      .mockResolvedValueOnce(booking)           // preflight
+      .mockResolvedValueOnce({ ...booking, status: 'cancelled' })  // post-tx
+      .mockResolvedValueOnce({ ...booking, status: 'cancelled' }); // fresh re-fetch
     mockBookingUpdateMany.mockResolvedValue({ count: 1 });
-    mockGetBookingById.mockResolvedValue({ ...booking, status: 'cancelled' });
     mockRedisCancelTimer.mockResolvedValue(undefined);
     mockRedisDel.mockResolvedValue(undefined);
     mockRedisGet.mockResolvedValue(null);
@@ -626,7 +673,9 @@ describe('P8 — Auth before timer clearing in cancelBooking', () => {
 
     await bookingService.cancelBooking('booking-001', 'customer-001');
 
-    // updateMany MUST include customerId in WHERE to enforce ownership
+    // $transaction must have been called (interactive transaction pattern)
+    expect(mockTransaction).toHaveBeenCalled();
+    // Inside TX, updateMany should enforce customerId in WHERE
     expect(mockBookingUpdateMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: expect.objectContaining({
@@ -634,7 +683,7 @@ describe('P8 — Auth before timer clearing in cancelBooking', () => {
         }),
       })
     );
-    // And it succeeded (count=1), so cleanup proceeds
+    // Timer cleanup should have been called
     expect(mockRedisCancelTimer).toHaveBeenCalled();
   });
 });
@@ -851,12 +900,14 @@ describe('P9 — Vehicle lock in acceptBroadcast', () => {
 // P20: CANCEL INCLUDES in_transit ASSIGNMENTS
 // =============================================================================
 
-describe('P20 — cancelBooking includes in_transit assignments', () => {
+// Fix B3: cancelBooking now only cancels PRE-TRIP assignments.
+// Mid-trip (in_transit, arrived_at_drop) are excluded to prevent releasing moving vehicles.
+describe('P20 — cancelBooking cancels pre-trip assignments only (Fix B3)', () => {
   beforeEach(resetAllMocks);
 
-  it('cancelBooking cancels in_transit assignments', async () => {
+  it('cancelBooking cancels pre-trip assignments but NOT in_transit', async () => {
     const booking = makeBooking({ customerId: 'customer-001', status: 'partially_filled' });
-    const inTransitAssignment = {
+    const pendingAssignment = {
       id: 'assign-001',
       bookingId: 'booking-001',
       tripId: 'trip-001',
@@ -865,17 +916,18 @@ describe('P20 — cancelBooking includes in_transit assignments', () => {
       transporterId: 'transporter-001',
       vehicleType: 'Open',
       vehicleSubtype: '17ft',
-      status: 'in_transit',
+      status: 'pending',
     };
 
     mockBookingUpdateMany.mockResolvedValue({ count: 1 });
     mockGetBookingById
-      .mockResolvedValueOnce({ ...booking, status: 'cancelled' })
-      .mockResolvedValueOnce({ ...booking, status: 'cancelled' });
+      .mockResolvedValueOnce(booking)           // preflight
+      .mockResolvedValueOnce({ ...booking, status: 'cancelled' })  // post-tx
+      .mockResolvedValueOnce({ ...booking, status: 'cancelled' }); // fresh re-fetch
     mockRedisCancelTimer.mockResolvedValue(undefined);
     mockRedisDel.mockResolvedValue(undefined);
     mockRedisGet.mockResolvedValue(null);
-    mockAssignmentFindMany.mockResolvedValue([inTransitAssignment]);
+    mockAssignmentFindMany.mockResolvedValue([pendingAssignment]);
     mockAssignmentUpdateMany.mockResolvedValue({ count: 1 });
     mockVehicleUpdate.mockResolvedValue({ id: 'vehicle-001', status: 'available' });
 
@@ -883,7 +935,7 @@ describe('P20 — cancelBooking includes in_transit assignments', () => {
 
     await bookingService.cancelBooking('booking-001', 'customer-001');
 
-    // FIX P20: Verify assignment query includes in_transit (and other active statuses)
+    // Fix B3: Verify in_transit is NOT in cancellable statuses
     expect(mockAssignmentFindMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: expect.objectContaining({
@@ -893,12 +945,16 @@ describe('P20 — cancelBooking includes in_transit assignments', () => {
               'pending',
               'driver_accepted',
               'en_route_pickup',
-              'in_transit',
+              'at_pickup',
             ]),
           }),
         }),
       })
     );
+    // in_transit must NOT be in the cancellable list
+    const findManyCall = mockAssignmentFindMany.mock.calls[0][0];
+    expect(findManyCall.where.status.in).not.toContain('in_transit');
+    expect(findManyCall.where.status.in).not.toContain('arrived_at_drop');
   });
 
   it('cancelBooking sends trip_cancelled socket event to driver', async () => {
@@ -917,8 +973,9 @@ describe('P20 — cancelBooking includes in_transit assignments', () => {
 
     mockBookingUpdateMany.mockResolvedValue({ count: 1 });
     mockGetBookingById
-      .mockResolvedValueOnce({ ...booking, status: 'cancelled' })
-      .mockResolvedValueOnce({ ...booking, status: 'cancelled' });
+      .mockResolvedValueOnce(booking)           // preflight
+      .mockResolvedValueOnce({ ...booking, status: 'cancelled' })  // post-tx
+      .mockResolvedValueOnce({ ...booking, status: 'cancelled' }); // fresh re-fetch
     mockRedisCancelTimer.mockResolvedValue(undefined);
     mockRedisDel.mockResolvedValue(undefined);
     mockRedisGet.mockResolvedValue(null);
@@ -961,10 +1018,10 @@ describe('P20 — cancelBooking includes in_transit assignments', () => {
     };
 
     mockBookingUpdateMany.mockResolvedValue({ count: 1 });
-    // First call returns cancelled booking, second call returns same for final fetch
     mockGetBookingById
-      .mockResolvedValueOnce({ ...booking, status: 'cancelled' })
-      .mockResolvedValueOnce({ ...booking, status: 'cancelled' });
+      .mockResolvedValueOnce(booking)           // preflight
+      .mockResolvedValueOnce({ ...booking, status: 'cancelled' })  // post-tx
+      .mockResolvedValueOnce({ ...booking, status: 'cancelled' }); // fresh re-fetch
     mockRedisCancelTimer.mockResolvedValue(undefined);
     mockRedisDel.mockResolvedValue(undefined);
     mockRedisGet.mockResolvedValue(null);
@@ -1011,8 +1068,9 @@ describe('P20 — cancelBooking includes in_transit assignments', () => {
 
     mockBookingUpdateMany.mockResolvedValue({ count: 1 });
     mockGetBookingById
-      .mockResolvedValueOnce({ ...booking, status: 'cancelled' })
-      .mockResolvedValueOnce({ ...booking, status: 'cancelled' });
+      .mockResolvedValueOnce(booking)           // preflight
+      .mockResolvedValueOnce({ ...booking, status: 'cancelled' })  // post-tx
+      .mockResolvedValueOnce({ ...booking, status: 'cancelled' }); // fresh re-fetch
     mockRedisCancelTimer.mockResolvedValue(undefined);
     mockRedisDel.mockResolvedValue(undefined);
     mockRedisGet.mockResolvedValue(null);
@@ -1024,7 +1082,7 @@ describe('P20 — cancelBooking includes in_transit assignments', () => {
 
     await bookingService.cancelBooking('booking-001', 'customer-001');
 
-    // Assignments should be cancelled
+    // Assignments should be cancelled (inside transaction)
     expect(mockAssignmentUpdateMany).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({

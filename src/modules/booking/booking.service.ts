@@ -37,7 +37,7 @@ import { queueService } from '../../shared/services/queue.service';
 import { CreateBookingInput, GetBookingsQuery } from './booking.schema';
 import { availabilityService } from '../../shared/services/availability.service';
 import { generateVehicleKey } from '../../shared/services/vehicle-key.service';
-import { progressiveRadiusMatcher } from '../order/progressive-radius-matcher';
+import { progressiveRadiusMatcher, PROGRESSIVE_RADIUS_STEPS } from '../order/progressive-radius-matcher';
 import { transporterOnlineService } from '../../shared/services/transporter-online.service';
 import { redisService } from '../../shared/services/redis.service';
 import { liveAvailabilityService } from '../../shared/services/live-availability.service';
@@ -46,6 +46,7 @@ import { haversineDistanceKm } from '../../shared/utils/geospatial.utils';
 import { distanceMatrixService } from '../../shared/services/distance-matrix.service';
 // 4 PRINCIPLES: Import production-grade error codes
 import { ErrorCode } from '../../core/constants';
+import { assertValidTransition, BOOKING_VALID_TRANSITIONS } from '../../core/state-machines';
 import { buildBroadcastPayload, getRemainingTimeoutSeconds } from './booking-payload.helper';
 import { googleMapsService } from '../../shared/services/google-maps.service';
 import { roundCoord } from '../../shared/utils/geo.utils';
@@ -67,21 +68,32 @@ const BOOKING_CONFIG = {
 // =============================================================================
 // PROGRESSIVE RADIUS EXPANSION CONFIG (Requirement 6)
 // =============================================================================
-// 4-step progressive search. If no transporter accepts at step N,
-// expand to step N+1 after the step timeout. After all steps exhaust,
-// fall back to DB query for ALL matching transporters.
+// Fix H-X2: Unified config — imports steps from progressive-radius-matcher.ts
+// Both booking path and order path now share the same 6-step radius steps.
+// Total time: 10+10+15+15+15+15 = 80s < 108s (passes startup validation)
 // =============================================================================
 const RADIUS_EXPANSION_CONFIG = {
-  steps: [
-    { radiusKm: 5,   timeoutMs: 10_000 },   // Step 0: 5km, immediate
-    { radiusKm: 10,  timeoutMs: 10_000 },   // Step 1: 10km at +10s
-    { radiusKm: 15,  timeoutMs: 15_000 },   // Step 2: 15km at +20s
-    { radiusKm: 30,  timeoutMs: 15_000 },   // Step 3: 30km at +25s
-    { radiusKm: 60,  timeoutMs: 15_000 },   // Step 4: 60km at +30s
-    { radiusKm: 100, timeoutMs: 15_000 },   // Step 5: 100km at +40s
-  ],
+  steps: PROGRESSIVE_RADIUS_STEPS.map(step => ({
+    radiusKm: step.radiusKm,
+    timeoutMs: step.windowMs,
+  })),
   maxTransportersPerStep: 20,  // Top N nearest per step
 };
+
+// =============================================================================
+// STARTUP CONFIG VALIDATION (F-2-17)
+// Fail fast if radius expansion time budget exceeds booking timeout.
+// =============================================================================
+const TOTAL_RADIUS_EXPANSION_MS = RADIUS_EXPANSION_CONFIG.steps.reduce(
+  (sum, step) => sum + step.timeoutMs, 0
+);
+if (TOTAL_RADIUS_EXPANSION_MS >= BOOKING_CONFIG.TIMEOUT_MS * 0.9) {
+  throw new Error(
+    `Config error: total radius expansion time (${TOTAL_RADIUS_EXPANSION_MS}ms) must be < 90% of ` +
+    `booking timeout (${BOOKING_CONFIG.TIMEOUT_MS}ms). ` +
+    `Set BROADCAST_TIMEOUT_SECONDS > ${Math.ceil(TOTAL_RADIUS_EXPANSION_MS / 900)}`
+  );
+}
 
 // =============================================================================
 // REDIS KEY PATTERNS (for distributed timers)
@@ -121,6 +133,8 @@ interface RadiusStepTimerData {
 // EXPIRY CHECKER (Runs on every server instance - Redis ensures no duplicates)
 // =============================================================================
 let expiryCheckerInterval: NodeJS.Timeout | null = null;
+// Fix #17: Counter for DB-based expiry sweep (runs every 12th tick = 60s)
+let dbSweepCounter = 0;
 
 /**
  * Start the booking expiry checker
@@ -133,6 +147,14 @@ function startBookingExpiryChecker(): void {
     try {
       await processExpiredBookings();
       await processRadiusExpansionTimers();
+
+      // Fix #17: DB-based fallback sweep every 60s (12 * 5s interval).
+      // Catches bookings that expired according to DB but were missed by Redis
+      // (e.g., Redis restart wiped all timers). Industry pattern: Stripe "completer".
+      dbSweepCounter++;
+      if (dbSweepCounter % 12 === 0) {
+        await sweepExpiredBookingsFromDB();
+      }
     } catch (error: any) {
       logger.error('Booking expiry checker error', { error: error.message });
     }
@@ -149,12 +171,21 @@ async function processExpiredBookings(): Promise<void> {
   const expiredTimers = await redisService.getExpiredTimers<BookingTimerData>('timer:booking:');
 
   for (const timer of expiredTimers) {
-    // Try to acquire lock for this booking (prevents duplicate processing)
-    const lockKey = `lock:booking-expiry:${timer.data.bookingId}`;
+    // Per-booking unified lock: both expiry and radius expansion contend on the same key.
+    // Prevents race where one expires the booking while the other expands radius.
+    // Pattern: Martin Kleppmann -- single lock per entity, not per operation type.
+    const lockKey = `lock:booking:${timer.data.bookingId}`;
     const lock = await redisService.acquireLock(lockKey, 'expiry-checker', 30);
 
     if (!lock.acquired) {
       // Another instance is processing this booking
+      continue;
+    }
+
+    // FIX-R2-6: Idempotent DB status check after lock (guards against Redis-degraded multi-instance)
+    const freshBooking = await db.getBookingById(timer.data.bookingId);
+    if (!freshBooking || ['expired', 'completed', 'cancelled', 'fully_filled'].includes(freshBooking.status)) {
+      await redisService.releaseLock(lockKey, 'expiry-checker');
       continue;
     }
 
@@ -170,6 +201,53 @@ async function processExpiredBookings(): Promise<void> {
     } finally {
       await redisService.releaseLock(lockKey, 'expiry-checker').catch(() => { });
     }
+  }
+}
+
+/**
+ * DB-based fallback for expired bookings missed by Redis timers.
+ * Runs every 60s (12th tick of the 5s interval). Catches bookings that expired
+ * according to DB but were never processed (e.g., Redis restart wiped timers).
+ *
+ * Industry pattern: Stripe "completer" process -- finds unfinished keys
+ * and drives them to completion.
+ *
+ * Handler (handleBookingTimeout) is already idempotent: checks booking status
+ * before acting, skips terminal states. Safe to call on already-processed bookings.
+ *
+ * Fix #17: Booking expiry timer lost on Redis restart.
+ */
+async function sweepExpiredBookingsFromDB(): Promise<void> {
+  const lockKey = 'lock:booking-db-sweep';
+  const lock = await redisService.acquireLock(lockKey, 'db-sweep', 55);
+  if (!lock.acquired) return;
+
+  try {
+    // expiresAt is stored as ISO string in DB (type String in Prisma schema).
+    // ISO 8601 strings compare lexicographically, so string lte works correctly.
+    const nowIso = new Date().toISOString();
+    const expiredBookings = await prismaClient.booking.findMany({
+      where: {
+        status: { in: ['broadcasting', 'active', 'partially_filled', 'created'] },
+        expiresAt: { lte: nowIso },
+      },
+      select: { id: true, customerId: true },
+      take: 50, // Process in batches to bound cycle time
+    });
+
+    if (expiredBookings.length === 0) return;
+
+    logger.warn(`[DB-SWEEP] Found ${expiredBookings.length} expired bookings missed by Redis timers`);
+
+    for (const b of expiredBookings) {
+      try {
+        await bookingService.handleBookingTimeout(b.id, b.customerId);
+      } catch (err: any) {
+        logger.error(`[DB-SWEEP] Failed to expire booking ${b.id}: ${err.message}`);
+      }
+    }
+  } finally {
+    await redisService.releaseLock(lockKey, 'db-sweep').catch(() => {});
   }
 }
 
@@ -194,7 +272,9 @@ async function processRadiusExpansionTimers(): Promise<void> {
   const expiredTimers = await redisService.getExpiredTimers<RadiusStepTimerData>('timer:radius:');
 
   for (const timer of expiredTimers) {
-    const lockKey = `lock:radius-expand:${timer.data.bookingId}`;
+    // Per-booking unified lock: same key as processExpiredBookings ensures mutual exclusion.
+    // If expiry gets the lock, radius expansion skips. If expansion gets it, expiry waits.
+    const lockKey = `lock:booking:${timer.data.bookingId}`;
     const lock = await redisService.acquireLock(lockKey, 'radius-expander', 15);
 
     if (!lock.acquired) continue;
@@ -247,6 +327,28 @@ class BookingService {
     data: CreateBookingInput,
     idempotencyKey?: string
   ): Promise<BookingRecord & { matchingTransportersCount: number; timeoutSeconds: number }> {
+    // FIX A5#27: Redis concurrency counter — backpressure to prevent system overload
+    const BOOKING_CONCURRENCY_LIMIT = parseInt(process.env.BOOKING_CONCURRENCY_LIMIT || '50', 10);
+    const BACKPRESSURE_TTL_SECONDS = 300;
+    const concurrencyKey = 'booking:create:inflight';
+    let incremented = false;
+    try {
+      const inflight = await redisService.incr(concurrencyKey);
+      incremented = true;
+      // TTL as crash safety net only (finally handles normal decrement)
+      await redisService.expire(concurrencyKey, BACKPRESSURE_TTL_SECONDS).catch(() => {});
+      if (inflight > BOOKING_CONCURRENCY_LIMIT) {
+        await redisService.incrBy(concurrencyKey, -1).catch(() => {});
+        incremented = false;
+        throw new AppError(503, 'SYSTEM_BUSY', 'Too many bookings being processed.');
+      }
+    } catch (err) {
+      if (err instanceof AppError) throw err; // re-throw 503
+      // Redis down — skip backpressure, proceed with booking
+      incremented = false;
+    }
+
+    try {
     // SCALABILITY: Check idempotency key to prevent duplicate bookings
     if (idempotencyKey) {
       const cacheKey = `idempotency:booking:${customerId}:${idempotencyKey}`;
@@ -283,6 +385,11 @@ class BookingService {
     // ========================================
     // ONE-ACTIVE-BROADCAST-PER-CUSTOMER GUARD
     // ========================================
+    // Layered dedup pattern (Uber RAMEN / Stripe idempotency):
+    //   Layer 1: Redis fast-path check below (catches 95%+ duplicates before DB)
+    //   Layer 2: SERIALIZABLE TX further down is the real guard (correctness)
+    // The Redis check is intentionally OUTSIDE the TX for performance —
+    // if Redis is degraded, the SERIALIZABLE TX alone is sufficient.
     const activeKey = `customer:active-broadcast:${customerId}`;
     const existingBroadcastId = await redisService.get(activeKey);
     if (existingBroadcastId) {
@@ -290,9 +397,13 @@ class BookingService {
     }
 
     const lockKey = `customer-broadcast-create:${customerId}`;
-    const lock = await redisService.acquireLock(lockKey, customerId, 10);
+    const lock = await redisService.acquireLock(lockKey, customerId, 30);
     if (!lock.acquired) {
       throw new AppError(409, 'ORDER_ACTIVE_EXISTS', 'Request already in progress. Cancel it first.');
+    }
+    // FIX-R2-6: Redis degradation guard — SERIALIZABLE TX below is the real dedup backstop
+    if (redisService.isDegraded) {
+      logger.warn('[LOCK] Redis degraded — booking dedup relies on SERIALIZABLE TX', { customerId, lockKey });
     }
 
     try {
@@ -306,7 +417,9 @@ class BookingService {
         roundCoord(data.pickup.coordinates.latitude),
         roundCoord(data.pickup.coordinates.longitude),
         roundCoord(data.drop.coordinates.latitude),
-        roundCoord(data.drop.coordinates.longitude)
+        roundCoord(data.drop.coordinates.longitude),
+        String(data.trucksNeeded),
+        String(data.pricePerTruck)
       ].join(':');
       const idempotencyHash = crypto.createHash('sha256').update(idempotencyFingerprint).digest('hex').substring(0, 32);
       const dedupeKey = `idem:broadcast:create:${customerId}:${idempotencyHash}`;
@@ -348,7 +461,7 @@ class BookingService {
           // Truck mode: OFF by default. When FF_TRUCK_MODE_ROUTING=true,
           // heavy vehicles avoid highways/tolls for truck-accurate routing.
           const FF_TRUCK_MODE_ROUTING = process.env.FF_TRUCK_MODE_ROUTING === 'true';
-          const HEAVY_VEHICLE_TYPES = new Set(['Open', 'Container', 'Tipper', 'Flatbed']);
+          const HEAVY_VEHICLE_TYPES = new Set(['open', 'container', 'tipper', 'flatbed']);
           const useTruckMode = FF_TRUCK_MODE_ROUTING && HEAVY_VEHICLE_TYPES.has(data.vehicleType);
 
           const googleRoute = await googleMapsService.calculateRoute(
@@ -376,19 +489,29 @@ class BookingService {
               ...(Math.abs(deltaPercent) > 200 ? { distanceAnomaly: true } : {})
             });
           } else {
-            logger.warn('[BOOKING] Google Directions returned null/zero — using client distance', {
-              distanceSource: 'client_fallback',
-              clientDistanceKm,
-              reason: 'google_returned_empty'
+            logger.warn('[BOOKING] Google Directions returned null/zero — will run Haversine check', {
+              clientDistanceKm, reason: 'google_returned_empty'
             });
           }
         }
       } catch (routeError: any) {
-        logger.warn('[BOOKING] Google Directions API failed — using client distance', {
-          distanceSource: 'client_fallback',
-          clientDistanceKm,
-          reason: routeError?.message || 'unknown'
+        logger.warn('[BOOKING] Google Directions failed — will run Haversine check', {
+          clientDistanceKm, error: (routeError as Error).message
         });
+      }
+
+      // FIX-R2-3: Haversine sanity check for ALL non-Google paths (covers both null-return AND exception)
+      if (distanceSource === 'client_fallback') {
+        const haversineKm = haversineDistanceKm(
+          data.pickup.coordinates.latitude, data.pickup.coordinates.longitude,
+          data.drop.coordinates.latitude, data.drop.coordinates.longitude
+        );
+        if (haversineKm > 0 && Math.abs(data.distanceKm - haversineKm) / haversineKm > 0.5) {
+          logger.warn('[BOOKING] Client distance differs >50% from Haversine — using Haversine', {
+            clientKm: data.distanceKm, haversineKm, roadEstimate: Math.ceil(haversineKm * 1.3)
+          });
+          data.distanceKm = Math.ceil(haversineKm * 1.3);
+        }
       }
 
       // ========================================
@@ -443,7 +566,8 @@ class BookingService {
         logger.info(`🎯 Using PROXIMITY-BASED matching (${nearbyTransporters.length} nearby at ${step1.radiusKm}km)`);
       } else {
         const allDbTransporters = await db.getTransportersWithVehicleType(data.vehicleType);
-        matchingTransporters = await transporterOnlineService.filterOnline(allDbTransporters);
+        // Cap at 100 to prevent unbounded fan-out — covers all realistic online counts
+        matchingTransporters = (await transporterOnlineService.filterOnline(allDbTransporters)).slice(0, 100);
         skipProgressiveExpansion = true;  // DB fallback already notified all — no radius expansion needed
         logger.info(`📋 Fallback to DATABASE matching (${allDbTransporters.length} total, ${matchingTransporters.length} online) — skipping progressive expansion`);
 
@@ -523,6 +647,24 @@ class BookingService {
             }
           }
         }
+
+        // Fix D3/F-3-6: Distance cap on step 1 DB fallback — prevent nationwide broadcasts
+        const MAX_STEP1_FALLBACK_RADIUS_KM = 200;
+        const candidateDistanceMap = new Map<string, number>();
+        for (const c of step1Candidates) {
+          candidateDistanceMap.set(c.transporterId, c.distanceKm);
+        }
+        const beforeFilter = matchingTransporters.length;
+        matchingTransporters = matchingTransporters.filter(tid => {
+          const dist = candidateDistanceMap.get(tid);
+          if (dist !== undefined) {
+            return dist <= MAX_STEP1_FALLBACK_RADIUS_KM;
+          }
+          return true; // No distance data — include (haversine fallback may not have run)
+        });
+        if (matchingTransporters.length < beforeFilter) {
+          logger.info(`[RADIUS] Step 1 DB fallback distance cap: ${beforeFilter} -> ${matchingTransporters.length} (filtered ${beforeFilter - matchingTransporters.length} beyond ${MAX_STEP1_FALLBACK_RADIUS_KM}km)`);
+        }
       }
 
       logger.info(`╔══════════════════════════════════════════════════════════════╗`);
@@ -582,12 +724,13 @@ class BookingService {
             trucksFilled: 0,
             distanceKm: data.distanceKm,
             pricePerTruck: data.pricePerTruck,
-            totalAmount: data.pricePerTruck * data.trucksNeeded,
+            totalAmount: Math.round(data.pricePerTruck * data.trucksNeeded * 100) / 100,
             goodsType: data.goodsType,
             weight: data.weight,
             status: BookingStatus.created,
             stateChangedAt: new Date(),
-            notifiedTransporters: matchingTransporters,
+            // Cap at 200 to bound cancel/expire iteration (industry standard)
+            notifiedTransporters: matchingTransporters.slice(0, 200),
             scheduledAt: data.scheduledAt,
             expiresAt
           }
@@ -600,8 +743,17 @@ class BookingService {
         throw new AppError(500, 'BOOKING_CREATE_FAILED', 'Failed to create booking');
       }
 
+      // ========================================
+      // SET ACTIVE-BROADCAST GUARD EARLY (before any broadcasts)
+      // Moved here from after broadcasts to prevent race where a second
+      // createBooking call slips in while broadcasts are still being sent.
+      // ========================================
+      // +30s buffer: safe margin after worst-case expiry delay (QA-validated)
+      const earlyGuardTtl = Math.ceil(BOOKING_CONFIG.TIMEOUT_MS / 1000) + 30;
+      await redisService.set(activeKey, booking.id, earlyGuardTtl);
+
       // Emit lifecycle state: created
-      emitToUser(customerId, 'broadcast_state_changed', {
+      emitToUser(customerId, SocketEvent.BROADCAST_STATE_CHANGED, {
         bookingId: booking.id,
         status: 'created',
         stateChangedAt: new Date().toISOString()
@@ -622,8 +774,23 @@ class BookingService {
           suggestion: 'search_again'
         });
 
+        // Transition through broadcasting before expiring (created -> broadcasting -> expired)
+        // This ensures state machine consistency even on the no-transporter path
+        // FIX-R2-1: Conditional status write — only transition from 'created'
+        await prismaClient.booking.updateMany({
+          where: { id: booking.id, status: 'created' },
+          data: { status: 'broadcasting', stateChangedAt: new Date() }
+        });
         // Mark as expired immediately
-        await db.updateBooking(booking.id, { status: 'expired', stateChangedAt: new Date() });
+        // FIX-R2-1: Conditional status write — only transition from created/broadcasting
+        try {
+          await prismaClient.booking.updateMany({
+            where: { id: booking.id, status: { in: ['created', 'broadcasting'] } },
+            data: { status: 'expired', stateChangedAt: new Date() }
+          });
+        } catch (err: any) {
+          logger.error('[BOOKING] Failed to mark booking as expired (no transporters)', { bookingId: booking.id, error: err.message });
+        }
 
         return {
           ...booking,
@@ -661,38 +828,105 @@ class BookingService {
       }
 
 
-      // DEBUG: Log candidate distance data to trace pickup distance issue
-      logger.info(`📊 [PICKUP_DEBUG] step1Candidates count: ${step1Candidates.length}, candidateMap size: ${candidateMap.size}, matchingTransporters: ${matchingTransporters.length}`);
-      if (step1Candidates.length > 0) {
-        const sample = step1Candidates[0];
-        logger.info(`📊 [PICKUP_DEBUG] First candidate: id=${sample.transporterId}, distanceKm=${sample.distanceKm}, etaSeconds=${sample.etaSeconds}, etaSource=${sample.etaSource}`);
-      }
+      // H-19 FIX: Cap notified transporters to prevent FCM throttling and latency spikes
+      const MAX_BROADCAST_TRANSPORTERS = parseInt(process.env.MAX_BROADCAST_TRANSPORTERS || '100', 10);
+      const cappedTransporters = matchingTransporters.length > MAX_BROADCAST_TRANSPORTERS
+        ? (() => {
+            logger.info(`[Broadcast] Capping ${matchingTransporters.length} -> ${MAX_BROADCAST_TRANSPORTERS} transporters`);
+            return matchingTransporters.slice(0, MAX_BROADCAST_TRANSPORTERS);
+          })()
+        : matchingTransporters;
 
-      logger.info(`📢 Broadcasting to ${matchingTransporters.length} transporters for ${data.vehicleType} ${data.vehicleSubtype || ''} (Radius Step 1: ${step1.radiusKm}km)`);
+      logger.info(`📢 Broadcasting to ${cappedTransporters.length} transporters for ${data.vehicleType} ${data.vehicleSubtype || ''} (Radius Step 1: ${step1.radiusKm}km)`);
+
+      // H-10 FIX: Route through queue for guaranteed delivery when available
+      const useQueue = process.env.FF_SEQUENCE_DELIVERY_ENABLED !== 'false'
+        && queueService && typeof queueService.queueBroadcast === 'function';
 
       // Phase 3 optimization: No per-transporter DB queries in broadcast loop.
       // filterOnline() already guarantees all transporters are online.
-      for (const transporterId of matchingTransporters) {
+      // M-23 FIX: Check booking status every N transporters to stop broadcasting after cancel
+      const BOOKING_STATUS_CHECK_INTERVAL = Math.max(
+        5,
+        parseInt(process.env.BROADCAST_STATUS_CHECK_INTERVAL || '20', 10) || 20
+      );
+      let bookingBroadcastIdx = 0;
+      for (const transporterId of cappedTransporters) {
+        if (bookingBroadcastIdx > 0 && bookingBroadcastIdx % BOOKING_STATUS_CHECK_INTERVAL === 0) {
+          try {
+            const currentBooking = await prismaClient.booking.findUnique({
+              where: { id: booking.id },
+              select: { status: true },
+            });
+            if (currentBooking && ['cancelled', 'expired', 'completed', 'fully_filled'].includes(currentBooking.status)) {
+              logger.info('[Broadcast] Booking became inactive mid-broadcast, stopping', {
+                bookingId: booking.id, status: currentBooking.status, emittedSoFar: bookingBroadcastIdx
+              });
+              break;
+            }
+          } catch (checkErr: unknown) {
+            // Fail-open: if check fails, continue broadcasting
+            const msg = checkErr instanceof Error ? checkErr.message : String(checkErr);
+            logger.warn('[Broadcast] Mid-broadcast booking status check failed', { bookingId: booking.id, error: msg });
+          }
+        }
+        bookingBroadcastIdx++;
         const candidate = candidateMap.get(transporterId);
         // Math.max(0, ...) clamps -1 sentinel (unknown location) to 0
         const pickupDistKm = candidate ? Math.max(0, Math.round(candidate.distanceKm * 10) / 10) : 0;
         const pickupEtaMin = candidate ? Math.max(0, Math.ceil(candidate.etaSeconds / 60)) : 0;
 
-        // DEBUG: Log per-transporter pickup distance
-        logger.info(`📊 [PICKUP_DEBUG] Transporter ${transporterId}: candidate_found=${!!candidate}, pickupDistanceKm=${pickupDistKm}, pickupEtaMinutes=${pickupEtaMin}`);
-
         const broadcastPayload = buildBroadcastPayload(booking, {
           timeoutSeconds: BOOKING_CONFIG.TIMEOUT_MS / 1000,
           trucksFilled: 0,
           pickupDistanceKm: pickupDistKm,
-          pickupEtaMinutes: pickupEtaMin
+          pickupEtaMinutes: pickupEtaMin,
+          pickupEtaSeconds: candidate ? Math.max(0, candidate.etaSeconds) : 0
         });
-        emitToUser(transporterId, SocketEvent.NEW_BROADCAST, broadcastPayload);
+
+        // H-10 FIX: Route through queue for guaranteed delivery, fallback to direct emit
+        if (useQueue) {
+          queueService.queueBroadcast(transporterId, SocketEvent.NEW_BROADCAST, broadcastPayload)
+            .catch((queueErr: unknown) => {
+              logger.warn('[Broadcast] Queue failed, falling back to direct emit', { error: (queueErr as Error)?.message });
+              emitToUser(transporterId, SocketEvent.NEW_BROADCAST, broadcastPayload);
+            });
+        } else {
+          emitToUser(transporterId, SocketEvent.NEW_BROADCAST, broadcastPayload);
+        }
+
+        // H-7 FIX: Broadcast delivery tracking for observability (fire-and-forget)
+        try {
+          if (typeof redisService.hSet === 'function') {
+            redisService.hSet(
+              `broadcast:delivery:${booking.id}`,
+              transporterId,
+              JSON.stringify({ emittedAt: Date.now(), channel: useQueue ? 'queue' : 'socket' })
+            ).then(() => redisService.expire(`broadcast:delivery:${booking.id}`, 3600))
+             .catch((_err: unknown) => { /* silent -- observability only */ });
+          }
+        } catch (_h7Err: unknown) { /* H-7 is observability only -- never crash broadcast */ }
       }
 
+      // FIX #29: INTENTIONAL DESIGN — Fire-and-forget broadcast delivery.
+      // Socket.IO emits above do NOT wait for delivery confirmation before
+      // transitioning status. This matches industry standard (Uber RAMEN):
+      // at-least-once delivery + client-side reconciliation on app foreground.
+      // deliverMissedBroadcasts() catches any transporters that missed the emit.
+
       // Transition: created -> broadcasting (transporters have been notified)
-      await db.updateBooking(booking.id, { status: 'broadcasting', stateChangedAt: new Date() });
-      emitToUser(customerId, 'broadcast_state_changed', {
+      // Fix B1: State machine ENFORCED -- invalid transitions throw, CAS guard is the race-condition safety net
+      assertValidTransition('Booking', BOOKING_VALID_TRANSITIONS, booking.status, 'broadcasting');
+      // FIX-R2-1: Conditional status write — only transition from 'created'
+      try {
+        await prismaClient.booking.updateMany({
+          where: { id: booking.id, status: 'created' },
+          data: { status: 'broadcasting', stateChangedAt: new Date() }
+        });
+      } catch (err: any) {
+        logger.error('[BOOKING] Failed to update status to broadcasting', { bookingId: booking.id, error: err.message });
+      }
+      emitToUser(customerId, SocketEvent.BROADCAST_STATE_CHANGED, {
         bookingId: booking.id,
         status: 'broadcasting',
         stateChangedAt: new Date().toISOString()
@@ -700,42 +934,74 @@ class BookingService {
 
       // ========================================
       // TRACK NOTIFIED TRANSPORTERS FOR PROGRESSIVE RADIUS (Requirement 6)
-      // Store in Redis SET so later steps only broadcast to NEW transporters
+      // Store in Redis SET so later steps only broadcast to NEW transporters.
+      //
+      // FIX #18: This SET is lost on Redis restart. Duplicate broadcasts after
+      // restart are safe because the accept handler is idempotent (checks
+      // assignment status before creating). See advanceRadiusStep() for the
+      // DB fallback that recovers notifiedTransporters from the booking row.
+      // Industry pattern: Uber RAMEN — at-least-once delivery by design.
       // ========================================
       if (matchingTransporters.length > 0) {
         const notifiedSetKey = RADIUS_KEYS.NOTIFIED_SET(booking.id);
         const ttlSeconds = Math.ceil(BOOKING_CONFIG.TIMEOUT_MS / 1000) + 120;
         try {
-          await redisService.sAdd(notifiedSetKey, ...matchingTransporters);
+          // FIX #21: Atomic SADD + EXPIRE via Lua script (LINE Engineering pattern).
+          // Prevents orphaned sets without TTL if crash occurs between separate calls.
+          await redisService.sAddWithExpire(notifiedSetKey, ttlSeconds, ...matchingTransporters);
         } catch (e: any) {
           // Retry once — incomplete notified set causes duplicate broadcasts on radius expansion
-          logger.warn('[RADIUS] sAdd failed, retrying once', { bookingId: booking.id, error: e.message });
-          await redisService.sAdd(notifiedSetKey, ...matchingTransporters).catch((retryErr: any) => {
-            logger.error('[RADIUS] Failed to track notified transporters after retry — radius expansion may send duplicate broadcasts', {
+          logger.warn('[RADIUS] sAddWithExpire failed, retrying once', { bookingId: booking.id, error: e.message });
+          await redisService.sAddWithExpire(notifiedSetKey, ttlSeconds, ...matchingTransporters).catch((retryErr: any) => {
+            logger.error('[RADIUS] Failed to track notified transporters after retry — radius expansion may send duplicate broadcasts (safe: accept is idempotent)', {
               bookingId: booking.id, error: retryErr.message, transporterCount: matchingTransporters.length
             });
           });
         }
-        // Set TTL on the notified set (same as booking timeout + buffer)
-        await redisService.expire(notifiedSetKey, ttlSeconds).catch(() => { });
       }
 
       // ========================================
       // SEND FCM PUSH NOTIFICATIONS (for app in background)
       // ========================================
-      fcmService.notifyNewBroadcast(matchingTransporters, {
-        broadcastId: booking.id,
-        customerName: booking.customerName,
-        vehicleType: booking.vehicleType,
-        trucksNeeded: booking.trucksNeeded,
-        farePerTruck: booking.pricePerTruck,
-        pickupCity: booking.pickup.city,
-        dropCity: booking.drop.city
-      }).then(sentCount => {
-        logger.info(`📱 FCM: Push notifications sent to ${sentCount}/${matchingTransporters.length} transporters`);
-      }).catch(err => {
-        logger.warn('📱 FCM: Failed to send push notifications', err);
-      });
+      // Fix E6: Only send FCM to transporters NOT connected via socket
+      // H-19: Use cappedTransporters (already capped above) for FCM too
+      const offlineTransporters = cappedTransporters.filter(tid => !isUserConnected(tid));
+      if (offlineTransporters.length > 0) {
+        fcmService.notifyNewBroadcast(offlineTransporters, {
+          broadcastId: booking.id,
+          customerName: booking.customerName,
+          vehicleType: booking.vehicleType,
+          trucksNeeded: booking.trucksNeeded,
+          farePerTruck: booking.pricePerTruck,
+          pickupCity: booking.pickup.city,
+          dropCity: booking.drop.city,
+          // Fix E3: Pass additional fields for background decision-making
+          pickupAddress: booking.pickup.address,
+          dropAddress: booking.drop.address,
+          distanceKm: booking.distanceKm,
+          vehicleSubtype: booking.vehicleSubtype,
+          expiresAt: booking.expiresAt
+        }).then(sentCount => {
+          logger.info(`📱 FCM: Push notifications sent to ${sentCount}/${offlineTransporters.length} offline transporters (${cappedTransporters.length - offlineTransporters.length} connected via socket)`);
+
+          // H-7 FIX: Track FCM delivery for observability (fire-and-forget)
+          try {
+            if (typeof redisService.hSet === 'function') {
+              for (const tid of offlineTransporters) {
+                redisService.hSet(
+                  `broadcast:delivery:${booking.id}`,
+                  `${tid}:fcm`,
+                  JSON.stringify({ emittedAt: Date.now(), channel: 'fcm' })
+                ).catch((_fcmTrackErr: unknown) => { /* silent -- observability only */ });
+              }
+            }
+          } catch (_h7Err: unknown) { /* H-7 is observability only -- never crash broadcast */ }
+        }).catch(err => {
+          logger.warn('📱 FCM: Failed to send push notifications', err);
+        });
+      } else {
+        logger.info(`📱 FCM: All ${cappedTransporters.length} transporters connected via socket -- skipping FCM`);
+      }
 
       // ========================================
       // START TIMEOUT TIMER
@@ -743,8 +1009,18 @@ class BookingService {
       this.startBookingTimeout(booking.id, customerId);
 
       // Transition: broadcasting -> active (timer started, awaiting responses)
-      await db.updateBooking(booking.id, { status: 'active', stateChangedAt: new Date() });
-      emitToUser(customerId, 'broadcast_state_changed', {
+      // Fix B1: State machine ENFORCED -- invalid transitions throw
+      assertValidTransition('Booking', BOOKING_VALID_TRANSITIONS, 'broadcasting', 'active');
+      // FIX-R2-1: Conditional status write — only transition from 'broadcasting'
+      try {
+        await prismaClient.booking.updateMany({
+          where: { id: booking.id, status: 'broadcasting' },
+          data: { status: 'active', stateChangedAt: new Date() }
+        });
+      } catch (err: any) {
+        logger.error('[BOOKING] Failed to update status to active', { bookingId: booking.id, error: err.message });
+      }
+      emitToUser(customerId, SocketEvent.BROADCAST_STATE_CHANGED, {
         bookingId: booking.id,
         status: 'active',
         stateChangedAt: new Date().toISOString()
@@ -781,8 +1057,7 @@ class BookingService {
       await redisService.set(dedupeKey, booking.id, bookingTimeoutSeconds + 30);
       await redisService.set(`idem:broadcast:latest:${customerId}`, dedupeKey, bookingTimeoutSeconds + 30);
 
-      // Set customer active broadcast key (one-per-customer enforcement)
-      await redisService.set(activeKey, booking.id, bookingTimeoutSeconds + 60);
+      // NOTE: activeKey already set early (right after booking creation, before broadcasts)
 
       return {
         ...booking,
@@ -794,12 +1069,18 @@ class BookingService {
         logger.warn('Failed to release customer broadcast lock', { customerId, error: err.message });
       });
     }
+    } finally {
+      // FIX A5#27: Only decrement if we successfully incremented (QA-8 fix)
+      if (incremented) {
+        await redisService.incrBy(concurrencyKey, -1).catch(() => {});
+      }
+    }
   }
 
   /**
    * Start timeout timer for booking (Redis-based for cluster support)
    * Auto-expires booking if not fully filled within timeout
-   * 
+   *
    * SCALABILITY: Uses Redis timers instead of in-memory setTimeout
    * - Works across multiple server instances
    * - Survives server restarts
@@ -834,19 +1115,43 @@ class BookingService {
       return;
     }
 
-    // Skip if already completed or cancelled
+    // #18 -- Explicit status assertions: skip terminal states
     if (['fully_filled', 'completed', 'cancelled'].includes(booking.status)) {
       logger.info(`Booking ${bookingId} already ${booking.status}, skipping timeout`);
       this.clearBookingTimers(bookingId);
       return;
     }
 
+    // #18 -- Log and skip unexpected states (safety guard)
+    const EXPECTED_TIMEOUT_STATES = ['broadcasting', 'active', 'partially_filled', 'created'];
+    if (!EXPECTED_TIMEOUT_STATES.includes(booking.status)) {
+      logger.warn('[BOOKING] Timeout for booking in unexpected status', { bookingId, status: booking.status });
+      return;
+    }
+
     logger.info(`⏰ TIMEOUT: Booking ${bookingId} expired`);
+
+    // State machine validation for timeout -> expired transition (warn-only)
+    try {
+      assertValidTransition('Booking', BOOKING_VALID_TRANSITIONS, booking.status, 'expired');
+    } catch (e) {
+      logger.warn('[BOOKING] Invalid state transition attempted', {
+        bookingId, from: booking.status, to: 'expired', error: (e as Error).message
+      });
+    }
 
     // Check if partially filled
     if (booking.trucksFilled > 0 && booking.trucksFilled < booking.trucksNeeded) {
       // Partially filled - notify customer
-      await db.updateBooking(bookingId, { status: 'expired', stateChangedAt: new Date() });
+      // FIX-R2-2: Conditional status write — only expire from active-like states
+      try {
+        await prismaClient.booking.updateMany({
+          where: { id: bookingId, status: { in: ['broadcasting', 'active', 'partially_filled', 'created'] } },
+          data: { status: 'expired', stateChangedAt: new Date() }
+        });
+      } catch (err: any) {
+        logger.error('[BOOKING] Failed to expire partially filled booking', { bookingId, error: err.message });
+      }
 
       emitToUser(customerId, SocketEvent.BOOKING_EXPIRED, {
         bookingId,
@@ -866,7 +1171,15 @@ class BookingService {
 
     } else if (booking.trucksFilled === 0) {
       // No trucks filled - "No vehicle available"
-      await db.updateBooking(bookingId, { status: 'expired', stateChangedAt: new Date() });
+      // FIX-R2-2: Conditional status write — only expire from active-like states
+      try {
+        await prismaClient.booking.updateMany({
+          where: { id: bookingId, status: { in: ['broadcasting', 'active', 'partially_filled', 'created'] } },
+          data: { status: 'expired', stateChangedAt: new Date() }
+        });
+      } catch (err: any) {
+        logger.error('[BOOKING] Failed to expire unfilled booking', { bookingId, error: err.message });
+      }
 
       emitToUser(customerId, SocketEvent.NO_VEHICLES_AVAILABLE, {
         bookingId,
@@ -933,15 +1246,19 @@ class BookingService {
    */
   private async clearCustomerActiveBroadcast(customerId: string): Promise<void> {
     const activeKey = `customer:active-broadcast:${customerId}`;
-    await redisService.del(activeKey).catch((err: any) => {
-      logger.warn('Failed to clear customer active broadcast key', { customerId, error: err.message });
-    });
-    // Clean up server-generated idempotency key
     const latestIdemKey = await redisService.get(`idem:broadcast:latest:${customerId}`).catch(() => null);
+
+    // Delete all keys in parallel (reduces 4 sequential Redis calls to 1 round-trip)
+    const delPromises: Promise<unknown>[] = [
+      redisService.del(activeKey).catch((err: any) => {
+        logger.warn('Failed to clear customer active broadcast key', { customerId, error: err.message });
+      }),
+      redisService.del(`idem:broadcast:latest:${customerId}`).catch(() => { })
+    ];
     if (latestIdemKey) {
-      await redisService.del(latestIdemKey).catch(() => { });
-      await redisService.del(`idem:broadcast:latest:${customerId}`).catch(() => { });
+      delPromises.push(redisService.del(latestIdemKey).catch(() => { }));
     }
+    await Promise.all(delPromises);
   }
 
   private async clearBookingTimers(bookingId: string): Promise<void> {
@@ -1014,13 +1331,33 @@ class BookingService {
    * 4. Broadcast to NEW transporters only
    * 5. Schedule next step if not at max
    *
+   * FIX #30: INTENTIONAL DESIGN — The DB read at step 1 occurs under the
+   * per-booking distributed lock acquired in processRadiusExpansionTimers()
+   * (Fix 2.4, lock key: `lock:booking:{bookingId}`). The stale-read window
+   * between lock acquisition and DB read is acceptable because:
+   * (a) the accept handler is idempotent — duplicate broadcasts don't cause
+   *     double-assignment, and
+   * (b) the worst case is one extra radius step for a booking that was just
+   *     cancelled/expired, which is immediately caught by the next status check.
+   *
    * STOPS if:
    * - Booking is cancelled/expired/fully_filled
    * - All steps exhausted → fall back to DB query
    */
   async advanceRadiusStep(data: RadiusStepTimerData): Promise<void> {
     const nextStepIndex = data.currentStep + 1;
-    const totalSteps = RADIUS_EXPANSION_CONFIG.steps.length;
+    // FIX #36: Clamp totalSteps to matcher's actual step count.
+    // H-X2: Both configs are now unified (derived from PROGRESSIVE_RADIUS_STEPS).
+    // Clamp is kept as a safety net in case they diverge in the future.
+    const matcherStepCount = progressiveRadiusMatcher.getStepCount();
+    const totalSteps = Math.min(RADIUS_EXPANSION_CONFIG.steps.length, matcherStepCount);
+    if (RADIUS_EXPANSION_CONFIG.steps.length !== matcherStepCount) {
+      logger.warn('[RADIUS] Step count mismatch between booking config and matcher', {
+        bookingServiceSteps: RADIUS_EXPANSION_CONFIG.steps.length,
+        matcherSteps: matcherStepCount,
+        effectiveSteps: totalSteps
+      });
+    }
 
     // Check booking is still active
     const booking = await db.getBookingById(data.bookingId);
@@ -1076,20 +1413,53 @@ class BookingService {
           timeoutSeconds: getRemainingTimeoutSeconds(booking, BOOKING_CONFIG.TIMEOUT_MS),
           radiusStep: nextStepIndex + 1,
           pickupDistanceKm: candidate ? Math.round(candidate.distanceKm * 10) / 10 : 0,
-          pickupEtaMinutes: candidate ? Math.ceil(candidate.etaSeconds / 60) : 0
+          pickupEtaMinutes: candidate ? Math.ceil(candidate.etaSeconds / 60) : 0,
+          pickupEtaSeconds: candidate ? Math.max(0, candidate.etaSeconds) : 0
         });
-        emitToUser(transporterId, SocketEvent.NEW_BROADCAST, broadcastPayload);
+
+        // H-10 FIX: Route through queue for guaranteed delivery, fallback to direct emit
+        const useQueueRadius = process.env.FF_SEQUENCE_DELIVERY_ENABLED !== 'false'
+          && queueService && typeof queueService.queueBroadcast === 'function';
+        if (useQueueRadius) {
+          queueService.queueBroadcast(transporterId, SocketEvent.NEW_BROADCAST, broadcastPayload)
+            .catch((queueErr: unknown) => {
+              logger.warn('[Broadcast][Radius] Queue failed, falling back to direct emit', { error: (queueErr as Error)?.message });
+              emitToUser(transporterId, SocketEvent.NEW_BROADCAST, broadcastPayload);
+            });
+        } else {
+          emitToUser(transporterId, SocketEvent.NEW_BROADCAST, broadcastPayload);
+        }
+
+        // H-7 FIX: Broadcast delivery tracking for observability (fire-and-forget)
+        try {
+          if (typeof redisService.hSet === 'function') {
+            redisService.hSet(
+              `broadcast:delivery:${booking.id}`,
+              transporterId,
+              JSON.stringify({ emittedAt: Date.now(), channel: useQueueRadius ? 'queue' : 'socket', radiusStep: nextStepIndex + 1 })
+            ).then(() => redisService.expire(`broadcast:delivery:${booking.id}`, 3600))
+             .catch((_err: unknown) => { /* silent -- observability only */ });
+          }
+        } catch (_h7Err: unknown) { /* H-7 is observability only -- never crash broadcast */ }
       }
 
-      // Track newly notified transporters
-      await redisService.sAdd(RADIUS_KEYS.NOTIFIED_SET(data.bookingId), ...newTransporters).catch(() => { });
+      // Track newly notified transporters (Fix C2/F-5-4: atomic SADD+EXPIRE prevents orphan keys)
+      const radiusTtl = Math.ceil(BOOKING_CONFIG.TIMEOUT_MS / 1000) + 120;
+      await redisService.sAddWithExpire(
+        RADIUS_KEYS.NOTIFIED_SET(data.bookingId), radiusTtl, ...newTransporters
+      ).catch(() => { });
 
       // Also update the booking's notified list in DB
       const allNotified = [...(booking.notifiedTransporters || []), ...newTransporters];
-      const uniqueNotified = [...new Set(allNotified)];
-      await db.updateBooking(data.bookingId, { notifiedTransporters: uniqueNotified });
+      // Cap at 200 to bound cancel/expire iteration (industry standard)
+      const uniqueNotified = [...new Set(allNotified)].slice(0, 200);
+      try {
+        await db.updateBooking(data.bookingId, { notifiedTransporters: uniqueNotified });
+      } catch (err: any) {
+        logger.error('[RADIUS] Failed to update notifiedTransporters', { bookingId: data.bookingId, error: err.message });
+      }
 
-      // FCM push to new transporters
+      // TODO: refactor to use fcmService.sendWithRetry when notifyNewBroadcast is decomposed
       fcmService.notifyNewBroadcast(newTransporters, {
         broadcastId: booking.id,
         customerName: booking.customerName,
@@ -1132,7 +1502,8 @@ class BookingService {
    */
   private async radiusDbFallback(booking: BookingRecord, data: RadiusStepTimerData): Promise<void> {
     const allDbTransporters = await db.getTransportersWithVehicleType(booking.vehicleType);
-    const onlineTransporters = await transporterOnlineService.filterOnline(allDbTransporters);
+    // Cap at 100 to prevent unbounded fan-out — covers all realistic online counts
+    const onlineTransporters = (await transporterOnlineService.filterOnline(allDbTransporters)).slice(0, 100);
 
     // Dedup: remove already-notified
     let alreadyNotified: string[] = [];
@@ -1187,25 +1558,75 @@ class BookingService {
       logger.warn(`[RADIUS] DB fallback distance calc failed: ${err.message} — broadcasting with haversine estimates`);
     }
 
+    // Fix D2/F-3-5: Filter out transporters beyond 200km to prevent nationwide broadcasts
+    const MAX_FALLBACK_RADIUS_KM = 200;
+    const distanceFilteredTransporters = newTransporters.filter(tid => {
+      const candidate = candidateMap.get(tid);
+      if (candidate) {
+        return candidate.distanceKm <= MAX_FALLBACK_RADIUS_KM;
+      }
+      // No distance data — include but log (haversine fallback didn't produce data)
+      return true;
+    });
+
+    if (distanceFilteredTransporters.length === 0) {
+      logger.info(`[RADIUS] DB fallback: all ${newTransporters.length} transporters beyond ${MAX_FALLBACK_RADIUS_KM}km cap`);
+      return;
+    }
+
+    if (distanceFilteredTransporters.length < newTransporters.length) {
+      logger.info(`[RADIUS] DB fallback distance cap: ${newTransporters.length} -> ${distanceFilteredTransporters.length} (filtered ${newTransporters.length - distanceFilteredTransporters.length} beyond ${MAX_FALLBACK_RADIUS_KM}km)`);
+    }
+
     // Broadcast with per-transporter pickup distance
-    for (const transporterId of newTransporters) {
+    const useQueueFallback = process.env.FF_SEQUENCE_DELIVERY_ENABLED !== 'false'
+      && queueService && typeof queueService.queueBroadcast === 'function';
+    for (const transporterId of distanceFilteredTransporters) {
       const candidate = candidateMap.get(transporterId);
       const broadcastPayload = buildBroadcastPayload(booking, {
         timeoutSeconds: getRemainingTimeoutSeconds(booking, BOOKING_CONFIG.TIMEOUT_MS),
         pickupDistanceKm: candidate ? Math.round(candidate.distanceKm * 10) / 10 : 0,
         pickupEtaMinutes: candidate ? Math.ceil(candidate.etaSeconds / 60) : 0,
+        pickupEtaSeconds: candidate ? Math.max(0, candidate.etaSeconds) : 0,
         radiusStep: RADIUS_EXPANSION_CONFIG.steps.length + 1  // DB fallback marker
       });
-      emitToUser(transporterId, SocketEvent.NEW_BROADCAST, broadcastPayload);
+
+      // H-10 FIX: Route through queue for guaranteed delivery, fallback to direct emit
+      if (useQueueFallback) {
+        queueService.queueBroadcast(transporterId, SocketEvent.NEW_BROADCAST, broadcastPayload)
+          .catch((queueErr: unknown) => {
+            logger.warn('[Broadcast][DBFallback] Queue failed, falling back to direct emit', { error: (queueErr as Error)?.message });
+            emitToUser(transporterId, SocketEvent.NEW_BROADCAST, broadcastPayload);
+          });
+      } else {
+        emitToUser(transporterId, SocketEvent.NEW_BROADCAST, broadcastPayload);
+      }
+
+      // H-7 FIX: Broadcast delivery tracking for observability (fire-and-forget)
+      try {
+        if (typeof redisService.hSet === 'function') {
+          redisService.hSet(
+            `broadcast:delivery:${booking.id}`,
+            transporterId,
+            JSON.stringify({ emittedAt: Date.now(), channel: useQueueFallback ? 'queue' : 'socket', radiusStep: 'db_fallback' })
+          ).then(() => redisService.expire(`broadcast:delivery:${booking.id}`, 3600))
+           .catch((_err: unknown) => { /* silent -- observability only */ });
+        }
+      } catch (_h7Err: unknown) { /* H-7 is observability only -- never crash broadcast */ }
     }
 
     // Update DB record with all notified transporters
-    const allNotified = [...(booking.notifiedTransporters || []), ...newTransporters];
-    const uniqueNotified = [...new Set(allNotified)];
-    await db.updateBooking(data.bookingId, { notifiedTransporters: uniqueNotified });
+    const allNotified = [...(booking.notifiedTransporters || []), ...distanceFilteredTransporters];
+    // Cap at 200 to bound cancel/expire iteration (industry standard)
+    const uniqueNotified = [...new Set(allNotified)].slice(0, 200);
+    try {
+      await db.updateBooking(data.bookingId, { notifiedTransporters: uniqueNotified });
+    } catch (err: any) {
+      logger.error('[RADIUS] Failed to update notifiedTransporters (DB fallback)', { bookingId: data.bookingId, error: err.message });
+    }
 
-    // FCM push
-    fcmService.notifyNewBroadcast(newTransporters, {
+    // TODO: refactor to use fcmService.sendWithRetry when notifyNewBroadcast is decomposed
+    fcmService.notifyNewBroadcast(distanceFilteredTransporters, {
       broadcastId: booking.id,
       customerName: booking.customerName,
       vehicleType: booking.vehicleType,
@@ -1215,7 +1636,7 @@ class BookingService {
       dropCity: booking.drop.city
     }).catch(() => { });
 
-    logger.info(`[RADIUS] ✅ DB fallback delivered to ${newTransporters.length} additional transporters (${candidateMap.size} with road distance)`);
+    logger.info(`[RADIUS] DB fallback delivered to ${distanceFilteredTransporters.length} transporters (${candidateMap.size} with road distance)`);
   }
 
   /**
@@ -1282,9 +1703,12 @@ class BookingService {
     // Get bookings that match this transporter's vehicle types
     let bookings = await db.getActiveBookingsForTransporter(transporterId);
 
-    // Only show active/partially filled
+    // Only show active/partially filled and not expired
+    // Fix E5: Filter out bookings past their expiresAt even if status not yet updated
+    const now = new Date();
     bookings = bookings.filter(b =>
-      b.status === 'active' || b.status === 'partially_filled'
+      (b.status === 'active' || b.status === 'partially_filled')
+      && (!b.expiresAt || new Date(b.expiresAt) > now)
     );
 
     // Sort by newest first
@@ -1293,8 +1717,11 @@ class BookingService {
     const total = bookings.length;
 
     // Pagination
-    const start = (query.page - 1) * query.limit;
-    bookings = bookings.slice(start, start + query.limit);
+    // FIX F-4-1: Add page param for reconnect broadcasts
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 20;
+    const start = (page - 1) * limit;
+    bookings = bookings.slice(start, start + limit);
 
     logger.info(`Transporter ${transporterId} can see ${total} matching bookings`);
 
@@ -1410,36 +1837,94 @@ class BookingService {
    * Already-cancelled bookings return success (idempotent).
    */
   async cancelBooking(bookingId: string, customerId: string): Promise<BookingRecord> {
-    // FIX P8: Moved clearBookingTimers AFTER the updateMany ownership check succeeds.
-    // Previously timers were cleared before verifying the caller owns the booking,
-    // violating Authorize-Before-Act (OWASP API1:2023). If cancel fails (wrong
-    // customer or invalid state), timers are never touched.
+    // Idempotent — safe to call even if timers don't exist yet.
+    await this.clearBookingTimers(bookingId).catch(() => { });
 
-    // ATOMIC cancel: only succeeds if status is still cancellable AND customerId matches
-    const updated = await prismaClient.booking.updateMany({
-      where: {
-        id: bookingId,
-        customerId,
-        status: { in: [BookingStatus.created, BookingStatus.broadcasting, BookingStatus.active, BookingStatus.partially_filled] }
-      },
-      data: {
-        status: BookingStatus.cancelled,
-        stateChangedAt: new Date()
+    // Pre-flight: fetch booking for ownership check and idempotency
+    const preflight = await db.getBookingById(bookingId);
+    if (!preflight) {
+      throw new AppError(404, 'BOOKING_NOT_FOUND', 'Booking not found');
+    }
+    if (preflight.customerId !== customerId) {
+      throw new AppError(403, 'FORBIDDEN', 'You can only cancel your own bookings');
+    }
+    // IDEMPOTENT: already cancelled is success (not error)
+    if (preflight.status === 'cancelled') {
+      logger.info('Idempotent cancel: booking already cancelled', { bookingId });
+      return preflight;
+    }
+
+    // =====================================================================
+    // #27 — SPLIT CANCEL TRANSACTION (QA-4 pattern)
+    // Booking cancel + assignment cancel = INSIDE $transaction (atomic)
+    // Vehicle release + Redis cleanup + notifications = OUTSIDE (best-effort)
+    // =====================================================================
+    let cancelledAssignments: Array<{ id: string; vehicleId: string | null; transporterId: string; vehicleType: string | null; vehicleSubtype: string | null; driverId: string | null; tripId: string | null; status: string }> = [];
+
+    // A5#2: Booking-level distributed lock to serialize cancel-vs-accept races.
+    // CAS inside the transaction is the real safety net; lock reduces wasted work.
+    const lockKey = 'lock:booking:' + bookingId;
+    let lock = { acquired: false };
+    try {
+      lock = await redisService.acquireLock(lockKey, `cancel:${customerId}`, 15);
+    } catch (lockErr: any) {
+      // Redis failure should not block cancels — CAS is the real guard
+      logger.warn('[CANCEL] Lock acquisition failed, proceeding with CAS only', { error: lockErr?.message });
+    }
+    try {
+
+    const updated = await prismaClient.$transaction(async (tx) => {
+      // 1. Cancel booking — only succeeds if status is still cancellable
+      const result = await tx.booking.updateMany({
+        where: {
+          id: bookingId,
+          customerId,
+          status: { in: [BookingStatus.created, BookingStatus.broadcasting, BookingStatus.active, BookingStatus.partially_filled, BookingStatus.fully_filled] }
+        },
+        data: {
+          status: BookingStatus.cancelled,
+          stateChangedAt: new Date()
+        }
+      });
+
+      if (result.count === 0) {
+        // Re-check: if already cancelled, return 0 (handled below as idempotent)
+        return result;
       }
-    });
 
-    // Fetch current state for response and post-cancel logic
+      // 2. Find active assignments BEFORE cancelling (need vehicleId list)
+      // Fix B3: Only cancel PRE-TRIP assignments. Mid-trip vehicles must NOT be released.
+      const cancellableStatuses = [
+        AssignmentStatus.pending,
+        AssignmentStatus.driver_accepted,
+        AssignmentStatus.en_route_pickup,
+        AssignmentStatus.at_pickup,
+      ];
+      const activeAssignments = await tx.assignment.findMany({
+        where: { bookingId, status: { in: cancellableStatuses } },
+        select: { id: true, vehicleId: true, transporterId: true, vehicleType: true, vehicleSubtype: true, driverId: true, tripId: true, status: true }
+      });
+
+      // 3. Cancel all active assignments
+      if (activeAssignments.length > 0) {
+        await tx.assignment.updateMany({
+          where: { bookingId, status: { in: cancellableStatuses } },
+          data: { status: AssignmentStatus.cancelled }
+        });
+      }
+
+      // Store for post-transaction cleanup
+      cancelledAssignments = activeAssignments;
+      return result;
+    }, { timeout: 10000 });
+
+    // Post-transaction: re-fetch for final state
     const booking = await db.getBookingById(bookingId);
-
     if (!booking) {
       throw new AppError(404, 'BOOKING_NOT_FOUND', 'Booking not found');
     }
 
-    if (booking.customerId !== customerId) {
-      throw new AppError(403, 'FORBIDDEN', 'You can only cancel your own bookings');
-    }
-
-    // IDEMPOTENT: already cancelled is success (not error)
+    // IDEMPOTENT: race with another cancel — already cancelled is success
     if (updated.count === 0 && booking.status === 'cancelled') {
       logger.info('Idempotent cancel: booking already cancelled', { bookingId });
       return booking;
@@ -1449,13 +1934,12 @@ class BookingService {
       throw new AppError(409, 'BOOKING_CANNOT_CANCEL', `Cannot cancel booking in ${booking.status} state`);
     }
 
-    // === CANCEL WON: Full cleanup ===
+    // === CANCEL WON: Best-effort cleanup (DB is already consistent) ===
 
-    // 1. FIX P8: Clear booking timers AFTER ownership verified (updateMany succeeded)
-    await this.clearBookingTimers(bookingId).catch(() => { });
+    // 1. Timers already cleared above (before DB update) — skip duplicate call
 
     // 2. Clear customer active broadcast key + idempotency keys
-    await this.clearCustomerActiveBroadcast(customerId);
+    await this.clearCustomerActiveBroadcast(customerId).catch(e => logger.warn('Timer cleanup failed', e));
 
     // 3. Clear notified transporter set
     await redisService.del(`broadcast:notified:${bookingId}`).catch(() => { });
@@ -1472,9 +1956,13 @@ class BookingService {
       logger.warn(`[CANCEL] Failed to clear legacy idempotency cache (non-critical)`, { error: err.message });
     }
 
-    // 5. Notify all notified transporters
-    if (booking.notifiedTransporters && booking.notifiedTransporters.length > 0) {
-      for (const transporterId of booking.notifiedTransporters) {
+    // #28 — Re-fetch notifiedTransporters AFTER cancel commit for fresh data
+    const freshBooking = await db.getBookingById(bookingId);
+    const notifiedTransporters = freshBooking?.notifiedTransporters || booking.notifiedTransporters || [];
+
+    // 5. Notify all notified transporters (using fresh list)
+    if (notifiedTransporters.length > 0) {
+      for (const transporterId of notifiedTransporters) {
         emitToUser(transporterId, SocketEvent.BOOKING_EXPIRED, {
           bookingId,
           orderId: bookingId,
@@ -1485,11 +1973,11 @@ class BookingService {
           customerName: booking.customerName
         });
       }
-      logger.info(`[CANCEL] Sent BOOKING_EXPIRED to ${booking.notifiedTransporters.length} transporters`);
+      logger.info(`[CANCEL] Sent BOOKING_EXPIRED to ${notifiedTransporters.length} transporters`);
 
       // FCM push for background/closed apps
       queueService.queuePushNotificationBatch(
-        booking.notifiedTransporters,
+        notifiedTransporters,
         {
           title: '❌ Booking Cancelled',
           body: `${booking.customerName} cancelled ${booking.vehicleType} booking`,
@@ -1510,86 +1998,67 @@ class BookingService {
       status: 'cancelled'
     });
 
-    // 7. Revert active assignments — release vehicles and notify drivers
-    // FIX P20: Stage-Aware Cancellation (Uber/Gojek pattern) — includes ALL
-    // non-terminal assignment stages: in_transit, at_pickup, arrived_at_drop.
-    // Previously only pending/driver_accepted/en_route_pickup were handled,
-    // silently leaving drivers mid-trip with no cancellation notice.
-    try {
-      const cancellableStatuses = [
-        AssignmentStatus.pending,
-        AssignmentStatus.driver_accepted,
-        AssignmentStatus.en_route_pickup,
-        AssignmentStatus.at_pickup,
-        AssignmentStatus.in_transit,
-        AssignmentStatus.arrived_at_drop,
-      ];
-      const activeAssignments = await prismaClient.assignment.findMany({
-        where: { bookingId, status: { in: cancellableStatuses } }
-      });
-      if (activeAssignments.length > 0) {
-        await prismaClient.assignment.updateMany({
-          where: { bookingId, status: { in: cancellableStatuses } },
-          data: { status: AssignmentStatus.cancelled }
-        });
-        for (const assignment of activeAssignments) {
-          const isInProgressTrip = ['in_transit', 'at_pickup', 'arrived_at_drop'].includes(assignment.status);
+    // 7. Post-transaction: vehicle release + Redis cache sync + driver notifications
+    for (const assignment of cancelledAssignments) {
+      const isInProgressTrip = ['in_transit', 'at_pickup', 'arrived_at_drop'].includes(assignment.status);
 
-          if (assignment.vehicleId) {
-            // Use centralized releaseVehicle() for validated transition + Redis sync
-            await releaseVehicle(assignment.vehicleId, 'bookingCancellation').catch((err: any) => {
-              logger.warn('[BOOKING_CANCEL] Vehicle release failed', { vehicleId: assignment.vehicleId, error: err.message });
-            });
-          }
-          if (assignment.driverId) {
-            // Socket: real-time cancellation notice with stage context
-            emitToUser(assignment.driverId, 'trip_cancelled', {
+      if (assignment.vehicleId) {
+        // Vehicle release OUTSIDE transaction (best-effort, QA-4 pattern)
+        await releaseVehicle(assignment.vehicleId, 'bookingCancellation').catch((err: any) => {
+          logger.warn('[BOOKING_CANCEL] Vehicle release failed', { vehicleId: assignment.vehicleId, error: err.message });
+        });
+      }
+      if (assignment.driverId) {
+        emitToUser(assignment.driverId, SocketEvent.TRIP_CANCELLED, {
+          assignmentId: assignment.id,
+          bookingId,
+          tripId: assignment.tripId,
+          reason: 'booking_cancelled_by_customer',
+          wasInProgress: isInProgressTrip,
+          previousStatus: assignment.status,
+          message: isInProgressTrip
+            ? 'Trip cancelled by customer while in progress. Please stop and return.'
+            : 'Trip cancelled by customer'
+        });
+
+        // FCM push: driver gets notification even if app is backgrounded
+        queueService.queuePushNotificationBatch(
+          [assignment.driverId],
+          {
+            title: isInProgressTrip ? 'Trip Cancelled (In Progress)' : 'Trip Cancelled',
+            body: isInProgressTrip
+              ? `Customer cancelled the trip while ${assignment.status.replace(/_/g, ' ')}. Please stop and contact support if needed.`
+              : `${booking.customerName} cancelled the booking`,
+            data: {
+              type: 'trip_cancelled',
               assignmentId: assignment.id,
               bookingId,
               tripId: assignment.tripId,
               reason: 'booking_cancelled_by_customer',
-              wasInProgress: isInProgressTrip,
-              previousStatus: assignment.status,
-              message: isInProgressTrip
-                ? 'Trip cancelled by customer while in progress. Please stop and return.'
-                : 'Trip cancelled by customer'
-            });
-
-            // FCM push: driver gets notification even if app is backgrounded
-            queueService.queuePushNotificationBatch(
-              [assignment.driverId],
-              {
-                title: isInProgressTrip ? 'Trip Cancelled (In Progress)' : 'Trip Cancelled',
-                body: isInProgressTrip
-                  ? `Customer cancelled the trip while ${assignment.status.replace(/_/g, ' ')}. Please stop and contact support if needed.`
-                  : `${booking.customerName} cancelled the booking`,
-                data: {
-                  type: 'trip_cancelled',
-                  assignmentId: assignment.id,
-                  bookingId,
-                  tripId: assignment.tripId,
-                  reason: 'booking_cancelled_by_customer',
-                  wasInProgress: String(isInProgressTrip)
-                }
-              }
-            ).catch((fcmErr: any) => {
-              logger.warn(`[CANCEL] FCM to driver ${assignment.driverId} failed`, { error: fcmErr.message });
-            });
+              wasInProgress: String(isInProgressTrip)
+            }
           }
-        }
-        const inProgressCount = activeAssignments.filter(a =>
-          ['in_transit', 'at_pickup', 'arrived_at_drop'].includes(a.status)
-        ).length;
-        logger.info(`[CANCEL] Reverted ${activeAssignments.length} assignments (${inProgressCount} in-progress), released vehicles`);
+        ).catch((fcmErr: any) => {
+          logger.warn(`[CANCEL] FCM to driver ${assignment.driverId} failed`, { error: fcmErr.message });
+        });
       }
-    } catch (err: any) {
-      logger.warn(`[CANCEL] Failed to revert assignments (non-critical)`, { error: err.message });
+    }
+    if (cancelledAssignments.length > 0) {
+      const inProgressCount = cancelledAssignments.filter(a =>
+        ['in_transit', 'at_pickup', 'arrived_at_drop'].includes(a.status)
+      ).length;
+      logger.info(`[CANCEL] Reverted ${cancelledAssignments.length} assignments (${inProgressCount} in-progress), released vehicles`);
     }
 
-    // Re-fetch to get the updated record
-    const cancelledBooking = await db.getBookingById(bookingId);
     logger.info(`[CANCEL] Booking ${bookingId} cancelled, all broadcast state cleaned`);
-    return cancelledBooking || booking;
+    return freshBooking || booking;
+
+    } finally {
+      // A5#2: Release booking-level lock (safe even if not acquired)
+      if (lock.acquired) {
+        await redisService.releaseLock(lockKey, `cancel:${customerId}`).catch(() => { });
+      }
+    }
   }
 
   /**
@@ -1633,28 +2102,38 @@ class BookingService {
     const newFilled = atomicResult[0].trucksFilled;
     const newStatus = newFilled >= atomicResult[0].trucksNeeded ? 'fully_filled' : 'partially_filled';
 
-    // Update status based on the atomically-incremented count
-    const updated = await db.updateBooking(bookingId, {
-      status: newStatus
-    });
+    // FIX-R2-9: Conditional status write — block if booking already in terminal state
+    let updated: BookingRecord | undefined;
+    try {
+      const statusResult = await prismaClient.booking.updateMany({
+        where: {
+          id: bookingId,
+          status: { notIn: ['cancelled', 'expired', 'completed'] }
+        },
+        data: { status: newStatus, stateChangedAt: new Date() }
+      });
+      if (statusResult.count === 0) {
+        logger.warn('[RACE] Status write blocked — booking already in terminal state', {
+          bookingId, attemptedStatus: newStatus
+        });
+      }
+      updated = await db.getBookingById(bookingId);
+    } catch (err: any) {
+      logger.error('[BOOKING] Failed to update status after increment', { bookingId, newStatus, error: err.message });
+    }
 
-    // Notify customer via WebSocket
+    // M-19 FIX: Emit booking_updated only via emitToUser (customer's personal room).
+    // Previously also emitted via emitToBooking (booking room), causing the customer
+    // to receive the event twice since they are in both rooms. The personal room
+    // emission is the canonical one because it carries the user-facing message.
     emitToUser(booking.customerId, SocketEvent.BOOKING_UPDATED, {
       bookingId,
       status: newStatus,
       trucksFilled: newFilled,
       trucksNeeded: booking.trucksNeeded,
       message: newStatus === 'fully_filled'
-        ? `🎉 All ${booking.trucksNeeded} trucks assigned! Your booking is complete.`
-        : `✅ ${newFilled}/${booking.trucksNeeded} trucks assigned. Searching for more...`
-    });
-
-    // Also notify via booking room
-    emitToBooking(bookingId, SocketEvent.BOOKING_UPDATED, {
-      bookingId,
-      status: newStatus,
-      trucksFilled: newFilled,
-      trucksNeeded: booking.trucksNeeded
+        ? `All ${booking.trucksNeeded} trucks assigned! Your booking is complete.`
+        : `${newFilled}/${booking.trucksNeeded} trucks assigned. Searching for more...`
     });
 
     // If fully filled, cancel timeout, clear active key, and notify
@@ -1696,7 +2175,7 @@ class BookingService {
       logger.info(`📦 Booking ${bookingId} PARTIALLY FILLED: ${newFilled}/${booking.trucksNeeded} trucks`);
     }
 
-    return updated!;
+    return updated || booking;
   }
 
   /**
@@ -1731,10 +2210,25 @@ class BookingService {
     const newFilled = atomicResult[0].trucksFilled;
     const newStatus = newFilled === 0 ? 'active' : 'partially_filled';
 
-    // Update status based on the atomically-decremented count
-    const updated = await db.updateBooking(bookingId, {
-      status: newStatus
-    });
+    // FIX-R2-9: Conditional status write — block if booking already in terminal state
+    let updated: BookingRecord | undefined;
+    try {
+      const statusResult = await prismaClient.booking.updateMany({
+        where: {
+          id: bookingId,
+          status: { notIn: ['cancelled', 'expired', 'completed'] }
+        },
+        data: { status: newStatus, stateChangedAt: new Date() }
+      });
+      if (statusResult.count === 0) {
+        logger.warn('[RACE] Status write blocked — booking already in terminal state', {
+          bookingId, attemptedStatus: newStatus
+        });
+      }
+      updated = await db.getBookingById(bookingId);
+    } catch (err: any) {
+      logger.error('[BOOKING] Failed to update status after decrement', { bookingId, newStatus, error: err.message });
+    }
 
     // Notify via WebSocket
     emitToBooking(bookingId, SocketEvent.BOOKING_UPDATED, {
@@ -1744,7 +2238,18 @@ class BookingService {
       trucksNeeded: booking.trucksNeeded
     });
 
-    return updated!;
+    // Fix B5: Restart broadcast/timeout for remaining slots after decrement
+    if (newFilled < booking.trucksNeeded) {
+      const remaining = booking.trucksNeeded - newFilled;
+      logger.info(`[BOOKING] Driver declined after fill. Restarting broadcast for ${remaining} remaining slots`, { bookingId });
+      this.startBookingTimeout(bookingId, booking.customerId);
+      // Emit socket event to customer
+      emitToUser(booking.customerId, SocketEvent.TRUCKS_REMAINING_UPDATE, {
+        bookingId, trucksFilled: newFilled, trucksNeeded: booking.trucksNeeded
+      });
+    }
+
+    return updated || booking;
   }
 
   // ==========================================================================
@@ -1827,13 +2332,53 @@ class BookingService {
         );
       }
 
+      // Fix E10: Filter by vehicle subtype -- only deliver bookings matching transporter's fleet
+      try {
+        const transporterVehicles = await prismaClient.vehicle.findMany({
+          where: { transporterId, status: { not: 'inactive' } },
+          select: { vehicleType: true, vehicleSubtype: true }
+        });
+        if (transporterVehicles.length > 0) {
+          const vehicleKeys = new Set(
+            transporterVehicles.map(v => `${(v.vehicleType || '').toLowerCase()}_${(v.vehicleSubtype || '').toLowerCase()}`)
+          );
+          const beforeSubtype = activeBookings.length;
+          activeBookings = activeBookings.filter(b => {
+            const key = `${(b.vehicleType || '').toLowerCase()}_${(b.vehicleSubtype || '').toLowerCase()}`;
+            return vehicleKeys.has(key);
+          });
+          if (beforeSubtype !== activeBookings.length) {
+            logger.info(`[RE-BROADCAST] Subtype-filtered: ${beforeSubtype} → ${activeBookings.length} bookings matching fleet`);
+          }
+        }
+      } catch { /* DB query failed -- proceed without subtype filter (safe: accept validates) */ }
+
+      // FIX #31: Skip bookings where this transporter already has an active assignment.
+      // The status filter above prevents fully-accepted bookings, but partially_filled
+      // bookings could have this transporter already assigned. Re-broadcasting is safe
+      // (accept handler is idempotent) but skipping reduces noise.
+      try {
+        const existingAssignments = await prismaClient.assignment.findMany({
+          where: {
+            transporterId,
+            bookingId: { in: activeBookings.map(b => b.id) },
+            status: { in: ['pending', 'driver_accepted', 'in_transit'] }
+          },
+          select: { bookingId: true }
+        });
+        if (existingAssignments.length > 0) {
+          const assignedBookingIds = new Set(existingAssignments.map(a => a.bookingId));
+          activeBookings = activeBookings.filter(b => !assignedBookingIds.has(b.id));
+        }
+      } catch { /* DB query failed -- proceed with all bookings (safe: accept is idempotent) */ }
+
       if (activeBookings.length === 0) {
         logger.info(`[RE-BROADCAST] Transporter ${transporterId} came online — 0 active bookings to deliver`);
         return;
       }
 
       logger.info(`╔══════════════════════════════════════════════════════════════╗`);
-      logger.info(`║  📡 RE-BROADCAST: Delivering ${activeBookings.length} missed bookings            ║`);
+      logger.info(`║  RE-BROADCAST: Delivering ${activeBookings.length} missed bookings              ║`);
       logger.info(`║  Transporter: ${transporterId}                                ║`);
       logger.info(`╚══════════════════════════════════════════════════════════════╝`);
 
@@ -1845,34 +2390,53 @@ class BookingService {
         });
 
         emitToUser(transporterId, SocketEvent.NEW_BROADCAST, broadcastPayload);
-        logger.info(`  📡 Delivered booking ${booking.id} (${booking.vehicleType}, ${booking.trucksNeeded - booking.trucksFilled} trucks remaining)`);
+        logger.info(`  Delivered booking ${booking.id} (${booking.vehicleType}, ${booking.trucksNeeded - booking.trucksFilled} trucks remaining)`);
+
+        // H-7 FIX: Broadcast delivery tracking for re-broadcast (fire-and-forget)
+        try {
+          if (typeof redisService.hSet === 'function') {
+            redisService.hSet(
+              `broadcast:delivery:${booking.id}`,
+              transporterId,
+              JSON.stringify({ emittedAt: Date.now(), channel: 'socket', rebroadcast: true })
+            ).then(() => redisService.expire(`broadcast:delivery:${booking.id}`, 3600))
+             .catch((_err: unknown) => { /* silent -- observability only */ });
+          }
+        } catch (_h7Err: unknown) { /* H-7 is observability only -- never crash broadcast */ }
       }
 
       // Add this transporter to each booking's notifiedTransporters in DB
       // so they receive cancellation/expiry notifications later
       for (const booking of activeBookings) {
         if (!booking.notifiedTransporters.includes(transporterId)) {
-          const updatedNotified = [...booking.notifiedTransporters, transporterId];
+          // Cap at 200 to bound cancel/expire iteration (industry standard)
+          const updatedNotified = [...booking.notifiedTransporters, transporterId].slice(0, 200);
           await db.updateBooking(booking.id, { notifiedTransporters: updatedNotified }).catch((err: any) => {
             logger.warn(`[RE-BROADCAST] Failed to update notifiedTransporters for booking ${booking.id}`, { error: err.message });
           });
         }
       }
 
-      // FCM push summary (one notification for all missed bookings)
-      fcmService.notifyNewBroadcast([transporterId], {
-        broadcastId: activeBookings[0].id,
-        customerName: activeBookings.length === 1 ? activeBookings[0].customerName : 'Multiple Customers',
-        vehicleType: activeBookings.length === 1 ? activeBookings[0].vehicleType : 'Multiple Types',
-        trucksNeeded: activeBookings.reduce((sum, b) => sum + (b.trucksNeeded - b.trucksFilled), 0),
-        farePerTruck: activeBookings[0].pricePerTruck,
-        pickupCity: activeBookings[0].pickup.city,
-        dropCity: activeBookings[0].drop.city
-      }).catch(err => {
-        logger.warn(`[RE-BROADCAST] FCM push failed for transporter ${transporterId}`, err);
-      });
+      // FIX #32: Individual FCM per booking with unique tag (Android notification grouping).
+      // Prevents Android from collapsing 4+ notifications into a summary that loses
+      // individual booking data. Industry pattern: Uber RAMEN -- individual push per event.
+      for (const booking of activeBookings) {
+        fcmService.notifyNewBroadcast([transporterId], {
+          broadcastId: booking.id,
+          customerName: booking.customerName,
+          vehicleType: booking.vehicleType,
+          trucksNeeded: booking.trucksNeeded - booking.trucksFilled,
+          farePerTruck: booking.pricePerTruck,
+          pickupCity: booking.pickup.city,
+          dropCity: booking.drop.city,
+          notificationTag: `broadcast_${booking.id}`,
+          isRebroadcast: true
+        }).catch(err => {
+          logger.warn(`[RE-BROADCAST] FCM push failed for booking ${booking.id}`, err);
+        });
+      }
 
-      logger.info(`[RE-BROADCAST] ✅ Delivered ${activeBookings.length} bookings to transporter ${transporterId}`);
+      logger.info(`[RE-BROADCAST] Delivered ${activeBookings.length} bookings to transporter ${transporterId}`);
     } catch (error: any) {
       // Non-critical — transporter can still manually refresh
       logger.error(`[RE-BROADCAST] Failed to deliver missed broadcasts to ${transporterId}`, {

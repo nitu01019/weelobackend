@@ -46,96 +46,25 @@
 import { logger } from './logger.service';
 import { redisService, GeoMember } from './redis.service';
 import { db } from '../database/db';
+import { prismaClient } from '../database/prisma.service';
 import { haversineDistanceKm } from '../utils/geospatial.utils';
 import { h3GeoIndexService } from './h3-geo-index.service';
+import { metrics } from '../monitoring/metrics.service';
 
 // =============================================================================
-// GEOHASH IMPLEMENTATION (Simple version - no external dependency)
+// M-16 FIX: Atomic heartbeat update via Lua script.
+// Replaces separate del() + sAdd() which has a tiny window where the set
+// does not exist (race condition during concurrent heartbeats).
+// Single round-trip: DEL + SADD(members) + EXPIRE in one atomic op.
 // =============================================================================
-
-const BASE32 = '0123456789bcdefghjkmnpqrstuvwxyz';
-
-/**
- * Encode latitude/longitude to geohash
- * @param lat - Latitude (-90 to 90)
- * @param lng - Longitude (-180 to 180)
- * @param precision - Number of characters (default 5 = ~5km accuracy)
- */
-function encodeGeohash(lat: number, lng: number, precision: number = 5): string {
-  let latRange = [-90, 90];
-  let lngRange = [-180, 180];
-  let hash = '';
-  let bit = 0;
-  let ch = 0;
-  let isLng = true;
-
-  while (hash.length < precision) {
-    const range = isLng ? lngRange : latRange;
-    const val = isLng ? lng : lat;
-    const mid = (range[0] + range[1]) / 2;
-
-    if (val >= mid) {
-      ch |= (1 << (4 - bit));
-      range[0] = mid;
-    } else {
-      range[1] = mid;
-    }
-
-    isLng = !isLng;
-    bit++;
-
-    if (bit === 5) {
-      hash += BASE32[ch];
-      bit = 0;
-      ch = 0;
-    }
-  }
-
-  return hash;
-}
-
-/**
- * Get neighboring geohashes (for proximity search)
- * Returns the 8 surrounding geohashes + the center = 9 cells total
- * 
- * Geohash grid looks like:
- *   NW | N | NE
- *   ---+---+---
- *   W  | C | E
- *   ---+---+---
- *   SW | S | SE
- * 
- * This ensures we check all adjacent cells for nearby transporters
- * Total cells checked = 9 max (fast lookup < 5ms)
- */
-function getNeighbors(geohash: string): string[] {
-  if (!geohash || geohash.length === 0) return [geohash];
-
-  const neighbors: string[] = [geohash]; // Center
-
-  // Simplified but effective neighbor calculation
-  // Uses last character variation for adjacent cells
-  const lastChar = geohash[geohash.length - 1];
-  const prefix = geohash.slice(0, -1);
-  const idx = BASE32.indexOf(lastChar);
-
-  // Direct neighbors (N, S, E, W)
-  if (idx > 0) neighbors.push(prefix + BASE32[idx - 1]);
-  if (idx < 31) neighbors.push(prefix + BASE32[idx + 1]);
-
-  // Row-based neighbors (using 8-column layout of geohash)
-  if (idx >= 8) neighbors.push(prefix + BASE32[idx - 8]);
-  if (idx <= 23) neighbors.push(prefix + BASE32[idx + 8]);
-
-  // Diagonal neighbors
-  if (idx > 0 && idx >= 8) neighbors.push(prefix + BASE32[idx - 9]);
-  if (idx < 31 && idx >= 8) neighbors.push(prefix + BASE32[idx - 7]);
-  if (idx > 0 && idx <= 23) neighbors.push(prefix + BASE32[idx + 7]);
-  if (idx < 31 && idx <= 23) neighbors.push(prefix + BASE32[idx + 9]);
-
-  // Filter valid and unique
-  return [...new Set(neighbors.filter(n => n && n.length === geohash.length))];
-}
+const LUA_HEARTBEAT_SET_UPDATE = `
+redis.call('DEL', KEYS[1])
+for i = 1, #ARGV - 1 do
+  redis.call('SADD', KEYS[1], ARGV[i])
+end
+redis.call('EXPIRE', KEYS[1], ARGV[#ARGV])
+return 1
+`;
 
 // =============================================================================
 // REDIS KEY PATTERNS
@@ -245,9 +174,14 @@ class AvailabilityService {
     longitude: number;
     isOnTrip?: boolean;
   }): void {
-    // Call async version but don't await (fire and forget for backward compat)
+    // Fire-and-forget is acceptable (Uber uses same pattern for GPS updates --
+    // next heartbeat corrects drift). But failures must be visible in monitoring.
     this.updateAvailabilityAsync(data).catch(err => {
       logger.error(`[Availability] Update failed: ${err.message}`);
+      // Increment failure counter for monitoring dashboards / alerting
+      try {
+        metrics.incrementCounter('availability.update.failure_total');
+      } catch { /* metrics service may not be initialized */ }
     });
   }
 
@@ -276,26 +210,27 @@ class AvailabilityService {
     const now = Date.now();
 
     try {
-      // 1. Get previously indexed vehicle keys.
-      const previousVehicleKey = await redisService.get(
-        REDIS_KEYS.TRANSPORTER_VEHICLE(transporterId)
-      );
-      const previousVehicleKeys = await redisService.sMembers(
-        REDIS_KEYS.TRANSPORTER_VEHICLE_KEYS(transporterId)
-      ).catch(() => []);
+      // Fix C4/F-5-14: Phase 1 — parallel reads (was 8-10 sequential Redis calls)
+      const [previousVehicleKey, previousVehicleKeys] = await Promise.all([
+        redisService.get(REDIS_KEYS.TRANSPORTER_VEHICLE(transporterId)),
+        redisService.sMembers(REDIS_KEYS.TRANSPORTER_VEHICLE_KEYS(transporterId)).catch(() => [] as string[])
+      ]);
 
-      // 2. If vehicle changed, remove stale geo index entries.
+      // Phase 2: Stale cleanup in parallel
       const staleVehicleKeys = new Set(previousVehicleKeys);
       if (previousVehicleKey) staleVehicleKeys.add(previousVehicleKey);
+      const staleRemoveOps: Promise<any>[] = [];
       for (const staleKey of staleVehicleKeys) {
         if (!staleKey || staleKey === vehicleKey) continue;
-        await redisService.geoRemove(
-          REDIS_KEYS.GEO_TRANSPORTERS(staleKey),
-          transporterId
+        staleRemoveOps.push(
+          redisService.geoRemove(REDIS_KEYS.GEO_TRANSPORTERS(staleKey), transporterId)
         );
       }
+      if (staleRemoveOps.length > 0) {
+        await Promise.all(staleRemoveOps);
+      }
 
-      // 3. Store transporter details (with TTL for auto-cleanup)
+      // Phase 3: All writes batched via Promise.all
       const details: Record<string, string> = {
         transporterId,
         vehicleKey,
@@ -310,37 +245,45 @@ class AvailabilityService {
         details.driverId = driverId;
       }
 
-      await redisService.hMSet(REDIS_KEYS.TRANSPORTER_DETAILS(transporterId), details);
-      await redisService.expire(REDIS_KEYS.TRANSPORTER_DETAILS(transporterId), this.TRANSPORTER_TTL_SECONDS);
+      // M-16 FIX: Atomic del+sAdd+expire via Lua (replaces separate del then sAdd)
+      const vehicleKeysKey = REDIS_KEYS.TRANSPORTER_VEHICLE_KEYS(transporterId);
+      const writeOps: Promise<any>[] = [
+        redisService.hMSet(REDIS_KEYS.TRANSPORTER_DETAILS(transporterId), details),
+        redisService.set(REDIS_KEYS.TRANSPORTER_VEHICLE(transporterId), vehicleKey, this.TRANSPORTER_TTL_SECONDS),
+        redisService.eval(
+          LUA_HEARTBEAT_SET_UPDATE,
+          [vehicleKeysKey],
+          [vehicleKey, String(this.TRANSPORTER_TTL_SECONDS)]
+        ),
+      ];
 
-      // 4. Store current vehicle key
-      await redisService.set(
-        REDIS_KEYS.TRANSPORTER_VEHICLE(transporterId),
-        vehicleKey,
-        this.TRANSPORTER_TTL_SECONDS
-      );
-      await redisService.del(REDIS_KEYS.TRANSPORTER_VEHICLE_KEYS(transporterId));
-      await redisService.sAdd(REDIS_KEYS.TRANSPORTER_VEHICLE_KEYS(transporterId), vehicleKey);
-      await redisService.expire(REDIS_KEYS.TRANSPORTER_VEHICLE_KEYS(transporterId), this.TRANSPORTER_TTL_SECONDS);
-
-      // 5. Update geo index (only if NOT on trip)
       if (!isOnTrip) {
-        await redisService.geoAdd(
-          REDIS_KEYS.GEO_TRANSPORTERS(vehicleKey),
-          longitude,
-          latitude,
-          transporterId
+        writeOps.push(
+          redisService.geoAdd(REDIS_KEYS.GEO_TRANSPORTERS(vehicleKey), longitude, latitude, transporterId),
+          redisService.sAdd(REDIS_KEYS.ONLINE_TRANSPORTERS, transporterId)
         );
+      } else {
+        writeOps.push(
+          redisService.geoRemove(REDIS_KEYS.GEO_TRANSPORTERS(vehicleKey), transporterId)
+        );
+      }
 
-        await redisService.sAdd(REDIS_KEYS.ONLINE_TRANSPORTERS, transporterId);
+      await Promise.all(writeOps);
 
+      // Phase 4: TTL refreshes in parallel
+      // Fix C5/F-5-15: Safety-net TTL on geo + online keys — refreshed every heartbeat, expires if no heartbeats for 10 min
+      // Note: TRANSPORTER_VEHICLE_KEYS TTL is now set atomically inside LUA_HEARTBEAT_SET_UPDATE (M-16)
+      await Promise.all([
+        redisService.expire(REDIS_KEYS.TRANSPORTER_DETAILS(transporterId), this.TRANSPORTER_TTL_SECONDS),
+        ...(!isOnTrip ? [
+          redisService.expire(REDIS_KEYS.GEO_TRANSPORTERS(vehicleKey), 600).catch(() => {}),
+          redisService.expire(REDIS_KEYS.ONLINE_TRANSPORTERS, 600).catch(() => {}),
+        ] : []),
+      ]);
+
+      if (!isOnTrip) {
         logger.debug(`[Availability] Updated: ${transporterId} @ (${latitude}, ${longitude}) - ${vehicleKey}`);
       } else {
-        await redisService.geoRemove(
-          REDIS_KEYS.GEO_TRANSPORTERS(vehicleKey),
-          transporterId
-        );
-
         logger.debug(`[Availability] ${transporterId} on trip - removed from geo index`);
       }
 
@@ -426,9 +369,12 @@ class AvailabilityService {
       primary.vehicleKey,
       this.TRANSPORTER_TTL_SECONDS
     );
-    await redisService.del(REDIS_KEYS.TRANSPORTER_VEHICLE_KEYS(transporterId));
-    await redisService.sAdd(REDIS_KEYS.TRANSPORTER_VEHICLE_KEYS(transporterId), ...currentVehicleKeys);
-    await redisService.expire(REDIS_KEYS.TRANSPORTER_VEHICLE_KEYS(transporterId), this.TRANSPORTER_TTL_SECONDS);
+    // M-16 FIX: Atomic del+sAdd+expire via Lua (replaces separate del then sAdd+expire)
+    await redisService.eval(
+      LUA_HEARTBEAT_SET_UPDATE,
+      [REDIS_KEYS.TRANSPORTER_VEHICLE_KEYS(transporterId)],
+      [...currentVehicleKeys, String(this.TRANSPORTER_TTL_SECONDS)]
+    );
 
     if (!isOnTrip) {
       await Promise.all(currentVehicleKeys.map((key) =>
@@ -530,6 +476,9 @@ class AvailabilityService {
    * @param longitude - Pickup longitude
    * @param limit - Max results (default 20)
    * @returns Array of transporter IDs, sorted by proximity
+   * @deprecated Use {@link getAvailableTransportersAsync} instead. Will be removed in v2.
+   * This synchronous wrapper always returns [] because Redis operations are async.
+   * Retained only for backward API compatibility.
    */
   getAvailableTransporters(
     vehicleKey: string,
@@ -540,7 +489,7 @@ class AvailabilityService {
     // For backward compatibility, we need sync return
     // But Redis is async, so we return empty and log warning
     // Use getAvailableTransportersAsync for proper async usage
-    logger.warn('[Availability] getAvailableTransporters called synchronously - use getAvailableTransportersAsync instead');
+    logger.warn('[Availability] DEPRECATED: getAvailableTransporters called -- use getAvailableTransportersAsync');
 
     // Trigger async version in background
     this.getAvailableTransportersAsync(vehicleKey, latitude, longitude, limit)
@@ -580,18 +529,53 @@ class AvailabilityService {
         nearbyTransporters.map((entry) => entry.member)
       );
 
-      // Filter out transporters who are on trip or stale.
+      // H-P4 FIX: Batch SMISMEMBER replaces per-transporter SISMEMBER loop.
+      // Single Redis round-trip instead of N round-trips.
+      const transporterIds = nearbyTransporters.map(entry => entry.member);
+      let onlineFlags: boolean[];
+      try {
+        onlineFlags = await redisService.smIsMembers(REDIS_KEYS.ONLINE_TRANSPORTERS, transporterIds);
+      } catch (err) {
+        logger.warn('[Availability] smIsMembers failed, fail-open applied', {
+          error: err instanceof Error ? err.message : String(err),
+          candidateCount: transporterIds.length
+        });
+        onlineFlags = transporterIds.map(() => true);
+      }
+
+      // Filter out transporters who are offline, on trip, or stale.
       const validTransporters: Array<{ id: string; distance: number }> = [];
-      for (const entry of nearbyTransporters) {
+      for (let i = 0; i < nearbyTransporters.length; i++) {
+        const entry = nearbyTransporters[i];
+
+        if (!onlineFlags[i]) {
+          // Not in online set -- clean up stale geo entry
+          await redisService.geoRemove(
+            REDIS_KEYS.GEO_TRANSPORTERS(vehicleKey), entry.member
+          ).catch(() => {});
+          continue;
+        }
+
         const details = detailsMap.get(entry.member) || {};
 
         // Skip if no details (TTL expired = offline).
         if (Object.keys(details).length === 0) {
-          // Clean up stale geo entry in background-safe path.
-          await redisService.geoRemove(
-            REDIS_KEYS.GEO_TRANSPORTERS(vehicleKey),
-            entry.member
-          );
+          // FIX #2: Clean up stale entry from ALL indexes, not just current vehicleKey geo.
+          // Previously only removed from the single geo index being queried, leaving
+          // the transporter in online SET and H3 cells for up to 90s.
+          try {
+            await redisService.geoRemove(
+              REDIS_KEYS.GEO_TRANSPORTERS(vehicleKey),
+              entry.member
+            );
+            // Also remove from online set (stale entry)
+            await redisService.sRem(REDIS_KEYS.ONLINE_TRANSPORTERS, entry.member);
+            // Also clean H3 index (fire-and-forget)
+            h3GeoIndexService.removeTransporter(entry.member).catch(() => {});
+          } catch (cleanupErr: any) {
+            // Non-critical: don't let cleanup failure break the query path
+            logger.warn(`[Availability] Stale cleanup failed for ${entry.member}: ${cleanupErr.message}`);
+          }
           continue;
         }
 
@@ -829,6 +813,8 @@ class AvailabilityService {
    * @param longitude - Pickup longitude
    * @param limitPerType - Max results per vehicle type (default 20)
    * @returns Map of vehicleKey -> transporter IDs
+   * @deprecated Use {@link getAvailableTransportersMultiAsync} instead. Will be removed in v2.
+   * This synchronous wrapper always returns an empty Map because Redis operations are async.
    */
   getAvailableTransportersMulti(
     vehicleKeys: string[],
@@ -944,8 +930,15 @@ class AvailabilityService {
       const byVehicleType: Record<string, number> = {};
       const byGeohash: Record<string, number> = {};
 
-      // Get breakdown by vehicle type (BATCHED — single pipeline instead of N GETs)
-      const onlineTransporters = await redisService.sMembers(REDIS_KEYS.ONLINE_TRANSPORTERS);
+      // Fix C7/F-5-23: Use SSCAN for bounded member fetch instead of SMEMBERS on unbounded SET
+      const onlineTransporters: string[] = [];
+      let scanCursor = '0';
+      do {
+        const [newCursor, batch] = await redisService.sScan(REDIS_KEYS.ONLINE_TRANSPORTERS, scanCursor, 100);
+        scanCursor = newCursor;
+        onlineTransporters.push(...batch);
+        if (onlineTransporters.length >= 1000) break;
+      } while (scanCursor !== '0');
       const transporterSlice = onlineTransporters.slice(0, 1000);
 
       if (transporterSlice.length > 0) {
@@ -995,6 +988,59 @@ class AvailabilityService {
   }
 
   /**
+   * Rebuild online:transporters SET from DB after Redis restart.
+   *
+   * Only runs when the online:transporters SET is empty (cold-start indicator).
+   * Queries active transporters from the DB and re-adds them to the online SET
+   * so that filterOnline() works immediately. Full geo positions will be
+   * repopulated by normal heartbeats within ~5 seconds.
+   *
+   * Industry pattern: Uber State Digest, Grab Pharos auto-rebuild.
+   * Fix #16: Redis restart wipes geo index, no rebuild.
+   */
+  async rebuildGeoFromDB(): Promise<void> {
+    try {
+      const onlineCount = await redisService.sCard(REDIS_KEYS.ONLINE_TRANSPORTERS);
+      if (onlineCount > 0) {
+        logger.info('[Availability] Redis geo index populated -- skipping rebuild');
+        return;
+      }
+
+      logger.warn('[Availability] Redis geo index EMPTY -- rebuilding from DB');
+
+      const recentTransporters = await prismaClient.user.findMany({
+        where: {
+          role: 'transporter',
+          isAvailable: true,
+          isActive: true,
+        },
+        select: { id: true },
+        take: 500,
+      });
+
+      if (recentTransporters.length === 0) {
+        logger.info('[Availability] No active transporters in DB -- clean cold start');
+        return;
+      }
+
+      let rebuilt = 0;
+      for (const t of recentTransporters) {
+        // Add to online SET so filterOnline works immediately.
+        // Full geo positions will rebuild via next heartbeat (~5s).
+        await redisService.sAdd(REDIS_KEYS.ONLINE_TRANSPORTERS, t.id);
+        rebuilt++;
+      }
+
+      logger.warn(
+        `[Availability] Geo rebuild: added ${rebuilt} transporters to online set. ` +
+        `Full geo index will rebuild via heartbeats within 5s.`
+      );
+    } catch (err: any) {
+      logger.error(`[Availability] rebuildGeoFromDB failed: ${err.message}`);
+    }
+  }
+
+  /**
    * Stop the service (for graceful shutdown)
    * Note: No cleanup interval needed with Redis - TTL handles expiration
    */
@@ -1008,6 +1054,3 @@ class AvailabilityService {
 // =============================================================================
 
 export const availabilityService = new AvailabilityService();
-
-// Export geohash utilities for external use
-export { encodeGeohash, getNeighbors };
