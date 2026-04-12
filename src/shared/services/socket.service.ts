@@ -30,6 +30,7 @@ import { config } from '../../config/environment';
 import { HOLD_CONFIG } from '../../core/config/hold-config';
 import { logger } from './logger.service';
 import { redisService } from './redis.service';
+import { socketCircuit } from './circuit-breaker.service';
 import {
   TRANSPORTER_PRESENCE_KEY,
   PRESENCE_TTL_SECONDS as TRANSPORTER_PRESENCE_TTL,
@@ -155,12 +156,40 @@ export const SocketEvent = {
   DRIVER_ONLINE: 'driver_online',               // Driver came online
   DRIVER_OFFLINE: 'driver_offline',             // Driver went offline
   DRIVER_TIMEOUT: 'driver_timeout',             // Driver didn't accept in time
+  ASSIGNMENT_TIMEOUT: 'assignment_timeout',     // Assignment timed out (no driver response)
+  DRIVER_PRESENCE_TIMEOUT: 'driver_presence_timeout', // Driver presence TTL expired
   TRIP_CANCELLED: 'trip_cancelled',             // Trip cancelled by customer
 
   // Broadcast lifecycle events (Fix E1: consolidated from BroadcastEvents)
   BROADCAST_EXPIRED: 'broadcast_expired',
   BROADCAST_CANCELLED: 'order_cancelled',
   BROADCAST_STATE_CHANGED: 'broadcast_state_changed',
+
+  // Booking lifecycle additions (FIX-4: #88)
+  BOOKING_CANCELLED: 'booking_cancelled',
+  DRIVER_APPROACHING: 'driver_approaching',
+  DRIVER_MAY_BE_OFFLINE: 'driver_may_be_offline',
+  DRIVER_CONNECTIVITY_ISSUE: 'driver_connectivity_issue',
+  HOLD_EXPIRED: 'hold_expired',
+  TRANSPORTER_STATUS_CHANGED: 'transporter_status_changed',
+  DRIVER_ACCEPTED: 'driver_accepted',
+  DRIVER_DECLINED: 'driver_declined',
+  FLEX_HOLD_EXTENDED: 'flex_hold_extended',
+  CASCADE_REASSIGNED: 'cascade_reassigned',
+  DRIVER_RATING_UPDATED: 'driver_rating_updated',
+  PROFILE_COMPLETED: 'profile_completed',
+  PROFILE_PHOTO_UPDATED: 'profile_photo_updated',
+  LICENSE_PHOTOS_UPDATED: 'license_photos_updated',
+  ASSIGNMENT_STALE: 'assignment_stale',
+  ORDER_NO_SUPPLY: 'order_no_supply',                   // No vehicles available (order.service.ts)
+  ROUTE_PROGRESS_UPDATED: 'route_progress_updated',
+  ORDER_COMPLETED: 'order_completed',
+  BOOKING_COMPLETED: 'booking_completed',   // Backward compat: Customer app rating trigger
+  ORDER_PROGRESS_UPDATE: 'order_progress_update',
+  ORDER_TIMEOUT_EXTENDED: 'order_timeout_extended',
+  ORDER_EXPIRED: 'order_expired',
+  ORDER_CANCELLED: 'order_cancelled',
+  ORDER_STATE_SYNC: 'order_state_sync',
 
   // Client -> Server
   JOIN_BOOKING: 'join_booking',
@@ -169,7 +198,14 @@ export const SocketEvent = {
   LEAVE_ORDER: 'leave_order',
   UPDATE_LOCATION: 'update_location',
   JOIN_TRANSPORTER: 'join_transporter', // Driver joins transporter room for broadcasts
-  BROADCAST_ACK: 'broadcast_ack'            // Phase 4: client ACKs sequence-numbered message
+  BROADCAST_ACK: 'broadcast_ack',           // Phase 4: client ACKs sequence-numbered message
+  DRIVER_SOS: 'driver_sos',                 // C13: Driver emergency SOS
+
+  // C-16: Trip room join (customer joins trip room for per-truck tracking)
+  JOIN_TRIP: 'join_trip',
+
+  // C-17: ETA push to customer
+  ETA_UPDATED: 'eta_updated'
 };
 
 /**
@@ -188,11 +224,12 @@ export const SocketEvent = {
 export function initializeSocket(server: HttpServer): Server {
   io = new Server(server, {
     cors: {
-      origin: config.isDevelopment ? '*' : [
-        'https://weelo.app',
-        'https://captain.weelo.app',
-        /\.weelo\.app$/
-      ],
+      // FIX-33 (#66): Exact whitelist replaces regex to prevent subdomain spoofing
+      origin: config.isDevelopment ? '*' : (
+        process.env.CORS_ORIGINS
+          ? process.env.CORS_ORIGINS.split(',')
+          : ['https://weelo.app', 'https://captain.weelo.app', 'https://admin.weelo.app']
+      ),
       methods: ['GET', 'POST'],
       credentials: true
     },
@@ -246,11 +283,24 @@ export function initializeSocket(server: HttpServer): Server {
     }
 
     try {
-      const decoded = jwt.verify(token, config.jwt.secret) as {
+      const decoded = jwt.verify(token, config.jwt.secret, { algorithms: ['HS256'] }) as {
         userId: string;
         role: string;
         phone: string;
+        jti?: string;
       };
+
+      // Check JTI blacklist for token revocation
+      if (decoded.jti) {
+        try {
+          const isBlacklisted = await redisService.exists(`blacklist:${decoded.jti}`);
+          if (isBlacklisted) {
+            return next(new Error('Token has been revoked'));
+          }
+        } catch {
+          // Redis down — fail open, allow the connection
+        }
+      }
 
       socket.data.userId = decoded.userId;
       socket.data.role = decoded.role;
@@ -279,6 +329,9 @@ export function initializeSocket(server: HttpServer): Server {
 
   // Connection handler
   io.on('connection', async (socket: Socket) => {
+    // FIX-46 (#110): Jitter to prevent thundering herd on mass reconnect
+    await new Promise(resolve => setTimeout(resolve, Math.random() * 500));
+
     const userId = socket.data.userId;
     const role = socket.data.role;
     const phone = socket.data.phone;
@@ -329,6 +382,111 @@ export function initializeSocket(server: HttpServer): Server {
     // Join user's personal room
     socket.join(`user:${userId}`);
     socket.join(`role:${role}`);
+
+    // H8 FIX: Auto-join transporter/driver room on connection
+    // Captain app's SocketConnectionManager.joinRoom() has zero callers,
+    // so the server must auto-join based on JWT role
+    if (role === 'transporter') {
+      socket.join(`transporter:${userId}`);
+    } else if (role === 'driver') {
+      socket.join(`driver:${userId}`);
+      // Also join the transporter's room if driver has a transporterId
+      if (socket.data.transporterId) {
+        socket.join(`transporter:${socket.data.transporterId}`);
+      }
+    } else if (role === 'customer') {
+      socket.join(`customer:${userId}`);
+    }
+
+    // H14 FIX: Auto-join active booking/order rooms on connection
+    // TripStatusManagementViewModel never calls joinBookingRoom(),
+    // so the server auto-joins the user to any active bookings/orders
+    try {
+      const { prismaClient } = await import('../database/prisma.service');
+
+      if (role === 'transporter' || role === 'driver') {
+        // Find active assignments for this user
+        const activeAssignments = await prismaClient.assignment.findMany({
+          where: {
+            OR: [
+              { transporterId: userId },
+              { driverId: userId }
+            ],
+            status: { in: ['pending', 'driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit', 'arrived_at_drop'] }
+          },
+          select: { bookingId: true, orderId: true },
+          take: 10 // Limit to prevent excessive joins
+        });
+        for (const a of activeAssignments) {
+          if (a.bookingId) socket.join(`booking:${a.bookingId}`);
+          if (a.orderId) socket.join(`order:${a.orderId}`);
+        }
+      } else if (role === 'customer') {
+        // Find active bookings/orders for this customer
+        const activeBookings = await prismaClient.booking.findMany({
+          where: {
+            customerId: userId,
+            status: { in: ['created', 'broadcasting', 'active', 'partially_filled', 'fully_filled', 'in_progress'] }
+          },
+          select: { id: true },
+          take: 10
+        });
+        for (const b of activeBookings) {
+          socket.join(`booking:${b.id}`);
+        }
+
+        const activeOrders = await prismaClient.order.findMany({
+          where: {
+            customerId: userId,
+            status: { in: ['created', 'broadcasting', 'active', 'partially_filled', 'fully_filled', 'in_progress'] }
+          },
+          select: { id: true },
+          take: 10
+        });
+        for (const o of activeOrders) {
+          socket.join(`order:${o.id}`);
+        }
+
+        // C-16 FIX: Auto-join customer to trip:{tripId} rooms for active assignments
+        // Enables per-truck real-time tracking via emitToTrip()
+        try {
+          const bookingIds = activeBookings.map((b: { id: string }) => b.id);
+          const orderIds = activeOrders.map((o: { id: string }) => o.id);
+
+          if (bookingIds.length > 0 || orderIds.length > 0) {
+            const orConditions: any[] = [];
+            if (bookingIds.length > 0) orConditions.push({ bookingId: { in: bookingIds } });
+            if (orderIds.length > 0) orConditions.push({ orderId: { in: orderIds } });
+
+            const activeTrips = await prismaClient.assignment.findMany({
+              where: {
+                OR: orConditions,
+                status: { in: ['pending', 'driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit', 'arrived_at_drop'] },
+                tripId: { not: undefined }
+              },
+              select: { tripId: true },
+              take: 20
+            });
+
+            for (const trip of activeTrips) {
+              if (trip.tripId) {
+                socket.join(`trip:${trip.tripId}`);
+              }
+            }
+
+            if (activeTrips.length > 0) {
+              logger.debug(`[Socket] Customer ${userId} auto-joined ${activeTrips.length} trip room(s)`);
+            }
+          }
+        } catch (tripJoinErr: any) {
+          // Non-fatal: customer still gets updates via booking/order rooms
+          logger.warn(`[Socket] Customer trip room auto-join failed for ${userId}: ${tripJoinErr?.message}`);
+        }
+      }
+    } catch (autoJoinErr: any) {
+      // Non-fatal: user still has personal room, just missing resource rooms
+      logger.warn(`[Socket] Auto-join active rooms failed for ${userId}: ${autoJoinErr?.message}`);
+    }
 
     // Industry Standard: DoorDash O(1) role counter increment
     // Updated atomically on connect - eliminates O(n) forEach traversal later
@@ -486,7 +644,8 @@ export function initializeSocket(server: HttpServer): Server {
         }
 
         // Decrement Redis connection counter (cross-instance tracking)
-        try { redisService.incrBy(`socket:conncount:${userId}`, -1).catch(() => { }); } catch { }
+        // FIX-45 (#109): Log counter decrement failures instead of swallowing silently
+        try { redisService.incrBy(`socket:conncount:${userId}`, -1).catch(err => logger.warn('[Socket] Counter decrement failed', { error: err.message })); } catch { }
 
         // H-S4 FIX: Clean up join debounce entries for disconnected user
         for (const [key] of recentJoinAttempts) {
@@ -605,17 +764,60 @@ export function initializeSocket(server: HttpServer): Server {
             const remainingMs = ASSIGNMENT_TIMEOUT_MS - elapsedMs;
 
             if (remainingMs > 2000) {
-              // Still within timeout window — re-send the assignment
-              socket.emit(SocketEvent.ASSIGNMENT_STATUS_CHANGED, {
+              // FIX-2: Fetch full assignment with order details for enriched reconnect payload.
+              // Uber RAMEN pattern: reconnect re-delivery must use the SAME event + payload
+              // as initial delivery. Captain app only shows trip overlay for 'trip_assigned'
+              // events (SocketEventRouter.kt:130), NOT 'assignment_status_changed'.
+              const fullAssignment = await prismaClient.assignment.findUnique({
+                where: { id: pendingAssignment.id },
+                include: {
+                  order: { select: { id: true, pickup: true, drop: true, distanceKm: true } },
+                  truckRequest: { select: { pricePerTruck: true } }
+                }
+              });
+
+              const orderPickup = fullAssignment?.order?.pickup ?? null;
+              const orderDrop = fullAssignment?.order?.drop ?? null;
+
+              // Still within timeout window — re-send using TRIP_ASSIGNED (matches initial delivery)
+              socket.emit(SocketEvent.TRIP_ASSIGNED, {
+                type: 'trip_assigned',
                 assignmentId: pendingAssignment.id,
                 tripId: pendingAssignment.tripId,
                 bookingId: pendingAssignment.bookingId,
+                orderId: fullAssignment?.order?.id || pendingAssignment.orderId || null,
+                pickup: orderPickup,
+                drop: orderDrop,
+                vehicleNumber: pendingAssignment.vehicleNumber || '',
+                farePerTruck: fullAssignment?.truckRequest?.pricePerTruck || 0,
+                distanceKm: fullAssignment?.order?.distanceKm || 0,
                 status: 'pending',
                 message: 'New trip assigned to you',
                 remainingSeconds: Math.floor(remainingMs / 1000),
                 _reconnectDelivery: true
               });
-              logger.info(`[Socket] 📡 Re-sent pending assignment ${pendingAssignment.id} to driver ${userId} on reconnect (${Math.floor(remainingMs / 1000)}s remaining)`);
+              logger.info(`[Socket] Re-sent pending assignment ${pendingAssignment.id} to driver ${userId} on reconnect via trip_assigned (${Math.floor(remainingMs / 1000)}s remaining)`);
+
+              // Dual-channel: FCM fallback for 2G/3G (Gojek Courier pattern)
+              // Socket emit may silently fail if driver's connection is flaky.
+              // FCM push ensures driver sees the assignment even if socket drops again.
+              try {
+                const { sendPushNotification } = await import('./fcm.service');
+                await sendPushNotification(userId, {
+                  title: 'New Trip Assigned',
+                  body: 'You have a pending trip assignment',
+                  data: {
+                    type: 'trip_assigned',
+                    assignmentId: pendingAssignment.id,
+                    tripId: pendingAssignment.tripId || '',
+                    bookingId: pendingAssignment.bookingId || '',
+                    remainingSeconds: String(Math.floor(remainingMs / 1000)),
+                    _reconnectDelivery: 'true'
+                  }
+                });
+              } catch (fcmErr: any) {
+                logger.debug(`[Socket] FCM fallback failed for driver ${userId}: ${fcmErr?.message}`);
+              }
             } else {
               logger.debug(`[Socket] Pending assignment ${pendingAssignment.id} for driver ${userId} has <2s remaining — skipping re-send`);
             }
@@ -700,16 +902,16 @@ export function initializeSocket(server: HttpServer): Server {
           const { prismaClient } = await import('../database/prisma.service');
           const activeOrderBroadcasts = await prismaClient.order.findMany({
             where: {
-              status: { in: ['searching', 'active'] },
+              status: { in: ['broadcasting' as any, 'active'] },
               // Only orders where this transporter was notified
               notifiedTransporters: { has: userId },
-            },
+            } as any,
             select: {
               id: true,
               status: true,
               customerId: true,
-              pickupAddress: true,
-              dropAddress: true,
+              pickup: true,
+              drop: true,
               totalAmount: true,
               createdAt: true,
             },
@@ -722,8 +924,8 @@ export function initializeSocket(server: HttpServer): Server {
             emitToUser(userId, 'new_broadcast', {
               orderId: order.id,
               status: order.status,
-              pickupAddress: order.pickupAddress,
-              dropAddress: order.dropAddress,
+              pickupAddress: (order.pickup as any)?.address,
+              dropAddress: (order.drop as any)?.address,
               totalAmount: order.totalAmount,
               _reconnectDelivery: true,
               _replayed: true,
@@ -752,11 +954,11 @@ export function initializeSocket(server: HttpServer): Server {
           const activeOrders = await prismaClient.order.findMany({
             where: {
               customerId: userId,
-              status: { in: ['searching', 'active', 'partially_filled'] },
+              status: { in: ['broadcasting' as any, 'active', 'partially_filled'] },
             },
             include: {
               truckRequests: {
-                select: { id: true, status: true, vehicleType: true, quantity: true },
+                select: { id: true, status: true, vehicleType: true },
               },
             },
             take: 10,
@@ -797,8 +999,9 @@ export function initializeSocket(server: HttpServer): Server {
           // Also check legacy bookings
           try {
             const { bookingService } = await import('../../modules/booking/booking.service');
-            const activeBookings = await bookingService.getActiveBroadcasts(userId);
-            if (activeBookings && activeBookings.length > 0) {
+            const activeBookingsResult = await bookingService.getActiveBroadcasts(userId, { page: 1, limit: 10 });
+            const activeBookings = activeBookingsResult?.bookings ?? [];
+            if (activeBookings.length > 0) {
               for (const booking of (activeBookings as any[]).slice(0, 10)) {
                 emitToUser(userId, 'order_state_sync', {
                   orderId: (booking as any).id || (booking as any).bookingId,
@@ -875,6 +1078,147 @@ export function initializeSocket(server: HttpServer): Server {
     });
 
     // ================================================================
+    // C-16 FIX: Handle joining trip room (customer per-truck tracking)
+    // ================================================================
+    // Customer sends { tripId } to join trip room for real-time updates.
+    // Ownership verified: customer must own the booking associated with
+    // the trip's assignment. Transporters/drivers auto-join via H14 block.
+    // ================================================================
+    socket.on(SocketEvent.JOIN_TRIP, async (data: { tripId?: string }) => {
+      const tripId = data?.tripId;
+      if (!tripId) {
+        socket.emit(SocketEvent.ERROR, { message: 'tripId required' });
+        return;
+      }
+
+      const joinKey = `${userId}:trip:${tripId}`;
+      const now = Date.now();
+      if (recentJoinAttempts.get(joinKey) && now - recentJoinAttempts.get(joinKey)! < 5000) {
+        return; // Debounce: ignore duplicate join within 5s
+      }
+      recentJoinAttempts.set(joinKey, now);
+
+      try {
+        const { prismaClient } = await import('../database/prisma.service');
+        const assignment = await prismaClient.assignment.findFirst({
+          where: { tripId },
+          select: {
+            id: true,
+            bookingId: true,
+            orderId: true,
+            transporterId: true,
+            driverId: true,
+            booking: { select: { customerId: true } },
+            order: { select: { customerId: true } }
+          }
+        });
+
+        if (!assignment) {
+          socket.emit(SocketEvent.ERROR, { message: 'Trip not found' });
+          return;
+        }
+
+        // Ownership verification
+        if (socket.data.role === 'customer') {
+          const bookingOwner = assignment.booking?.customerId;
+          const orderOwner = assignment.order?.customerId;
+          if (bookingOwner !== userId && orderOwner !== userId) {
+            socket.emit(SocketEvent.ERROR, { message: 'Unauthorized: not your trip' });
+            return;
+          }
+        } else if (socket.data.role === 'driver' || socket.data.role === 'transporter') {
+          if (assignment.transporterId !== userId && assignment.driverId !== userId) {
+            socket.emit(SocketEvent.ERROR, { message: 'Unauthorized: not assigned to this trip' });
+            return;
+          }
+        }
+
+        socket.join(`trip:${tripId}`);
+        logger.debug(`User ${userId} joined trip room: ${tripId}`);
+      } catch (err: any) {
+        logger.warn(`[Socket] join_trip ownership check failed, denying: ${err?.message}`);
+        socket.emit(SocketEvent.ERROR, { message: 'Failed to verify trip access' });
+      }
+    });
+
+    // ================================================================
+    // C13 FIX: DRIVER SOS HANDLER
+    // ================================================================
+    // Driver sends SOS from the app → log, notify transporter, store in Redis.
+    // Without this handler, driver_sos events were silently dropped.
+    // ================================================================
+    socket.on('driver_sos', async (data: { location?: { lat: number; lng: number }; message?: string }) => {
+      try {
+        if (!checkRateLimit(socket.id, socket.data?.userId)) return;
+        if (socket.data.role !== 'driver') return;
+
+        logger.warn('[SOCKET] Driver SOS received', {
+          driverId: userId,
+          location: data?.location,
+          message: data?.message
+        });
+
+        // Emit to transporter room if available
+        const transporterId = socket.data.transporterId;
+        if (transporterId && io) {
+          io.to(`transporter:${transporterId}`).emit('driver_sos_alert', {
+            driverId: userId,
+            location: data?.location,
+            message: data?.message,
+            timestamp: new Date().toISOString()
+          });
+
+          // FCM push fallback: ensures transporter sees SOS even if Captain app is backgrounded
+          try {
+            const { sendPushNotification } = await import('./fcm.service');
+            await sendPushNotification(transporterId, {
+              title: 'DRIVER SOS ALERT',
+              body: `Driver ${userId} triggered SOS! Tap for location.`,
+              data: {
+                type: 'driver_sos_alert',
+                driverId: userId,
+                lat: String(data?.location?.lat || ''),
+                lng: String(data?.location?.lng || ''),
+                message: data?.message || '',
+                timestamp: new Date().toISOString()
+              }
+            });
+          } catch (fcmErr: unknown) {
+            const fcmMsg = fcmErr instanceof Error ? fcmErr.message : String(fcmErr);
+            logger.error('[SOCKET] SOS FCM fallback failed', { transporterId, error: fcmMsg });
+          }
+        }
+
+        // Store in Redis for tracking (5 min TTL)
+        await redisService.setJSON(`sos:${userId}`, {
+          driverId: userId,
+          location: data?.location,
+          message: data?.message,
+          timestamp: new Date().toISOString()
+        }, 300);
+      } catch (err) {
+        logger.error('[SOCKET] Error handling driver_sos', { error: err });
+      }
+    });
+
+    // ================================================================
+    // M15 FIX: Handle mid-session FCM token refresh via socket
+    // ================================================================
+    socket.on('fcm_token_refresh', async (data: { token?: string }) => {
+      try {
+        if (!data?.token || data.token.length < 10) return;
+        if (!userId) return;
+        const { fcmService } = await import('./fcm.service');
+        await fcmService.registerToken(userId, data.token);
+        logger.info('[FCM] Mid-session token refresh via socket', { userId });
+        socket.emit('fcm_token_refresh_ack', { success: true });
+      } catch (error) {
+        logger.error('[FCM] Token refresh failed', { userId, error });
+        socket.emit('fcm_token_refresh_ack', { success: false });
+      }
+    });
+
+    // ================================================================
     // PHASE 4: SEQUENCE REPLAY ON RECONNECT (flag-gated)
     // ================================================================
     // If FF_SEQUENCE_DELIVERY_ENABLED and client sends lastSeq in auth,
@@ -938,6 +1282,26 @@ export function initializeSocket(server: HttpServer): Server {
 
   logger.info('Socket.IO initialized with optimized settings');
 
+  // FIX-32 (#63): Cleanup stale eventCounts entries every 60s to prevent memory leak
+  setInterval(() => {
+    const cutoff = Date.now() - 60_000;
+    for (const [key, entry] of eventCounts) {
+      if (entry.resetAt && entry.resetAt < cutoff) {
+        eventCounts.delete(key);
+      }
+    }
+  }, 60_000).unref();
+
+  // FIX-13 (#62): Cleanup stale recentJoinAttempts every 60s to prevent memory leak
+  setInterval(() => {
+    const cutoff = Date.now() - 5 * 60 * 1000;
+    for (const [key, timestamp] of recentJoinAttempts) {
+      if (typeof timestamp === 'number' && timestamp < cutoff) {
+        recentJoinAttempts.delete(key);
+      }
+    }
+  }, 60_000).unref();
+
   // FIX A5#11: TTL refresh interval — keep alive counters for active users
   // The 300s TTL ensures counters auto-expire if this instance dies.
   // We only refresh TTL, never overwrite count (safe for multi-instance).
@@ -962,8 +1326,9 @@ export function initializeSocket(server: HttpServer): Server {
         userSockets.get(userId)?.delete(socketId);
         if (userSockets.get(userId)?.size === 0) userSockets.delete(userId);
         // Decrement Redis connection counter to prevent inflation (QA-6 fix)
+        // FIX-45 (#109): Log counter decrement failures instead of swallowing silently
         const connKey = `socket:conncount:${userId}`;
-        redisService.incrBy(connKey, -1).catch(() => {});
+        redisService.incrBy(connKey, -1).catch(err => logger.warn('[Socket] Counter decrement failed', { error: err.message }));
         swept++;
       }
     }
@@ -1156,9 +1521,20 @@ function withSocketMeta(data: any): any {
  */
 // Fix E7: Return boolean — false when io=null, true on success
 export function emitToUser(userId: string, event: string, data: any): boolean {
+  // FIX-4 (#88): Guard against undefined/null event names
+  if (!event) {
+    logger.error(`[Socket] BUG: Attempted to emit undefined event to ${userId}`);
+    return false;
+  }
+
   if (!io) {
     logger.error(`[emitToUser] Socket.IO not initialized! Cannot emit ${event} to ${userId}`);
     return false;
+  }
+
+  // FIX-9 (#44): Warn when Redis adapter is down — emit only reaches local instance
+  if (!redisPubSubInitialized) {
+    logger.warn('[Socket] Redis adapter down — broadcasting to local instance only');
   }
 
   // Observability: log local socket count (may be 0 in multi-server — that's OK)
@@ -1168,8 +1544,21 @@ export function emitToUser(userId: string, event: string, data: any): boolean {
     logger.debug(`[emitToUser] No LOCAL sockets for user:${userId} — ${event} will route via Redis adapter to other instances`);
   }
 
+  // Issue #13: Socket.IO circuit breaker — skip emit if socket layer is degraded
+  if (socketCircuit.isLocallyOpen()) {
+    logger.warn('[Socket] Circuit open, skipping emit — FCM fallback expected', { userId, event });
+    return false;
+  }
+
   // ALWAYS emit — Redis adapter handles cross-instance delivery
-  io.to(`user:${userId}`).emit(event, withSocketMeta(data));
+  try {
+    io.to(`user:${userId}`).emit(event, withSocketMeta(data));
+  } catch (emitErr: unknown) {
+    socketCircuit.reportFailure();
+    const msg = emitErr instanceof Error ? emitErr.message : String(emitErr);
+    logger.warn('[Socket] Emit failed, circuit breaker recording', { userId, event, error: msg });
+    return false;
+  }
 
   logger.debug(`[Socket] Emitted ${event} to user:${userId} (${localSocketCount} local sockets)`);
   return true;
@@ -1228,6 +1617,29 @@ export function getConnectedUserCount(): number {
  */
 export function isUserConnected(userId: string): boolean {
   return userSockets.has(userId) && userSockets.get(userId)!.size > 0;
+}
+
+/**
+ * Async cross-instance user connection check.
+ * Checks Redis presence sets first (online:transporters, driver:presence:{id}),
+ * falls back to local isUserConnected() if Redis is unavailable.
+ * Used by booking-broadcast.service.ts for FCM push decisions.
+ */
+export async function isUserConnectedAsync(userId: string): Promise<boolean> {
+  try {
+    const { redisService } = require('./redis.service');
+    // Check transporter presence
+    const isOnline = await redisService.sIsMember('online:transporters', userId);
+    if (isOnline) return true;
+    // Check driver presence
+    const driverPresence = await redisService.exists(`driver:presence:${userId}`);
+    if (driverPresence) return true;
+    // Fall back to local check
+    return isUserConnected(userId);
+  } catch {
+    // Redis down — fall back to local-only check
+    return isUserConnected(userId);
+  }
 }
 
 /**
@@ -1388,6 +1800,7 @@ export const socketService = {
 
   // Connection utilities
   isUserConnected,
+  isUserConnectedAsync,
   getConnectedUserCount,
   getConnectionStats,
 

@@ -130,6 +130,8 @@ interface LocationData {
   speed: number;
   bearing: number;
   accuracy?: number;
+  /** Whether a real GPS fix has been received. Old data without this field is treated as true. */
+  locationAvailable?: boolean;
   status: string;
   lastUpdated: string;  // ISO string for Redis
 }
@@ -162,7 +164,7 @@ export interface FleetTrackingResponse {
 }
 
 class TrackingService {
-  // WARNING: In-memory state — lost on ECS restart. TODO: migrate to Redis.
+  // L1 cache — Redis is primary store (lines 1562-1606). In-memory Map is read-through fallback only.
   // KNOWN_ISSUE(H2): history persist state resets on restart; harmless (next GPS update re-seeds it)
   private readonly historyPersistStateByTrip = new Map<string, HistoryPersistState>();
 
@@ -214,6 +216,28 @@ class TrackingService {
         redisService.set(`mock_gps:${data.tripId}`, 'true', TTL.TRIP).catch(() => {});
       }
 
+      // =====================================================================
+      // C-13 FIX: Coordinate validation (Grab-Posisi pattern)
+      // Reject null island (0,0) and out-of-range coordinates.
+      // Zod schema already enforces [-90,90] / [-180,180], but this guards
+      // against exactly (0,0) which is valid in Zod but not a real GPS fix.
+      // =====================================================================
+      if (data.latitude === 0 && data.longitude === 0) {
+        logger.warn('[TRACKING] Rejected null island (0,0) coordinates', {
+          tripId: data.tripId, driverId
+        });
+        return; // Silently drop — do not update Redis with (0,0)
+      }
+      if (
+        data.latitude < -90 || data.latitude > 90 ||
+        data.longitude < -180 || data.longitude > 180
+      ) {
+        logger.warn('[TRACKING] Rejected out-of-range coordinates', {
+          tripId: data.tripId, driverId, lat: data.latitude, lng: data.longitude
+        });
+        return;
+      }
+
       // 2. Create location data
       const locationData: LocationData = {
         tripId: data.tripId,
@@ -228,6 +252,7 @@ class TrackingService {
         speed: data.speed || 0,
         bearing: data.bearing || 0,
         accuracy: data.accuracy,
+        locationAvailable: true,  // C-13 FIX: Real GPS fix received
         status: existing?.status || 'in_transit',
         lastUpdated: now
       };
@@ -301,6 +326,28 @@ class TrackingService {
       });
 
       logger.debug('📍 Location updated', { tripId: data.tripId, driverId, lat: data.latitude, lng: data.longitude });
+
+      // ==================================================================
+      // C-17 FIX: Real-time ETA push to customer (throttled: 1 per 60s per trip)
+      // Non-blocking — ETA failure must NEVER break location updates.
+      // Uses Google Maps getETA for road-distance estimate to dropoff.
+      // ==================================================================
+      if (
+        existing &&
+        existing.bookingId &&
+        (existing.status === 'in_transit' || existing.status === 'en_route_pickup' || existing.status === 'heading_to_pickup')
+      ) {
+        this.computeAndEmitETA(
+          data.tripId,
+          data.latitude,
+          data.longitude,
+          existing
+        ).catch(err => {
+          logger.debug('[TRACKING] ETA calculation failed (non-fatal)', {
+            tripId: data.tripId, error: err?.message
+          });
+        });
+      }
 
       // ==================================================================
       // Phase 7: 2km Proximity Notification — "Your driver is about to arrive"
@@ -572,40 +619,70 @@ class TrackingService {
 
   /**
    * Get driver's online status
-   * 
+   *
    * STATUS LOGIC:
    * - ONLINE: Updated within OFFLINE_THRESHOLD
    * - OFFLINE: Explicitly set (app backgrounded, etc)
    * - UNKNOWN: No update for > OFFLINE_THRESHOLD (network issue?)
+   *
+   * BUG-H7 BRIDGE: Also reads from `driver:presence:{driverId}` (the real
+   * heartbeat-based presence system managed by driver.service.ts, 35s TTL).
+   * Logs a warning when the two systems disagree so split-brain is visible
+   * in CloudWatch. Return type unchanged for backward compatibility.
    */
   async getDriverStatus(driverId: string): Promise<DriverOnlineStatus> {
-    const status = await redisService.get(REDIS_KEYS.DRIVER_STATUS(driverId));
+    const rawStatus = await redisService.get(REDIS_KEYS.DRIVER_STATUS(driverId));
 
-    if (status === 'ONLINE' || status === 'OFFLINE') {
-      return status;
+    let trackingStatus: DriverOnlineStatus;
+
+    if (rawStatus === 'ONLINE' || rawStatus === 'OFFLINE') {
+      trackingStatus = rawStatus;
+    } else {
+      // Check if we have recent location data
+      const location = await redisService.getJSON<LocationData>(REDIS_KEYS.DRIVER_LOCATION(driverId));
+
+      if (!location) {
+        trackingStatus = 'OFFLINE';
+      } else {
+        const lastUpdateMs = new Date(location.lastUpdated).getTime();
+        const ageSeconds = (Date.now() - lastUpdateMs) / 1000;
+
+        if (ageSeconds > TRACKING_CONFIG.OFFLINE_THRESHOLD_SECONDS) {
+          trackingStatus = 'UNKNOWN';
+        } else {
+          trackingStatus = 'ONLINE';
+        }
+      }
     }
 
-    // Check if we have recent location data
-    const location = await redisService.getJSON<LocationData>(REDIS_KEYS.DRIVER_LOCATION(driverId));
-
-    if (!location) {
-      return 'OFFLINE';
+    // BUG-H7 BRIDGE: Read the real presence system key (driver.service.ts, 35s TTL heartbeat).
+    // This key exists only while the driver app is actively sending heartbeats.
+    let presenceStatus: string = 'OFFLINE';
+    try {
+      const presenceValue = await redisService.get(`driver:presence:${driverId}`);
+      presenceStatus = presenceValue ? 'ONLINE' : 'OFFLINE';
+    } catch {
+      // Non-critical — if Redis read fails, default to OFFLINE
+      presenceStatus = 'UNKNOWN';
     }
 
-    const lastUpdateMs = new Date(location.lastUpdated).getTime();
-    const ageSeconds = (Date.now() - lastUpdateMs) / 1000;
-
-    if (ageSeconds > TRACKING_CONFIG.OFFLINE_THRESHOLD_SECONDS) {
-      return 'UNKNOWN';
+    // Warn when the two systems disagree so we can detect split-brain in logs
+    if (trackingStatus !== presenceStatus) {
+      logger.warn('[Tracking] Split-brain: tracking says %s but presence says %s', trackingStatus, presenceStatus, { driverId });
     }
 
-    return 'ONLINE';
+    return trackingStatus;
   }
 
   /**
    * Set driver status explicitly (called by app when going background/foreground)
+   *
+   * BUG-H7 NOTE: This endpoint ONLY sets `driver:status:{driverId}` (300s TTL).
+   * It does NOT affect the real presence system (`driver:presence:{driverId}`,
+   * 35s TTL heartbeat managed by driver.service.ts). The two systems can diverge.
    */
   async setDriverStatus(driverId: string, status: DriverOnlineStatus): Promise<void> {
+    logger.warn('[Tracking] setDriverStatus sets driver:status:%s ONLY — does NOT affect driver:presence:%s (real heartbeat presence)', driverId, driverId);
     await redisService.set(REDIS_KEYS.DRIVER_STATUS(driverId), status, TTL.LOCATION);
     logger.debug(`Driver ${driverId} status: ${status}`);
   }
@@ -667,6 +744,7 @@ class TrackingService {
       longitude: 0,
       speed: 0,
       bearing: 0,
+      locationAvailable: false,  // C-13 FIX: No real GPS fix yet — prevents null island on customer map
       status: 'pending',
       lastUpdated: now
     };
@@ -1139,6 +1217,8 @@ class TrackingService {
       longitude: location.longitude,
       speed: location.speed,
       bearing: location.bearing,
+      // C-13: Backward compat — old data without the field is treated as true (real GPS)
+      locationAvailable: location.locationAvailable !== false,
       status: location.status,
       lastUpdated: location.lastUpdated
     };
@@ -1191,6 +1271,8 @@ class TrackingService {
           longitude: location.longitude,
           speed: location.speed,
           bearing: location.bearing,
+          // C-13: Backward compat — old data without the field is treated as true
+          locationAvailable: location.locationAvailable !== false,
           status: location.status,
           lastUpdated: location.lastUpdated
         });
@@ -1471,6 +1553,96 @@ class TrackingService {
       roadDistanceKm: eta.distanceKm.toFixed(1),
       durationText: eta.durationText
     });
+  }
+
+  /**
+   * ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+   * ┃  C-17 FIX: Real-Time ETA Push to Customer                              ┃
+   * ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+   *
+   * Calculates ETA from driver's current position to the dropoff location
+   * and emits it to the customer via the booking room.
+   *
+   * THROTTLE: Redis key with 60s TTL ensures max 1 Google Maps API call
+   *   per minute per trip. This limits cost while keeping ETA reasonably fresh.
+   *
+   * NON-BLOCKING: Entire method is wrapped in try/catch and called with
+   *   .catch() from updateLocation — failures never break GPS updates.
+   *
+   * INDUSTRY PATTERN (Uber/Grab): Push ETA updates periodically during trip,
+   *   not just on-demand via GET endpoint.
+   */
+  private async computeAndEmitETA(
+    tripId: string,
+    driverLat: number,
+    driverLng: number,
+    existing: LocationData
+  ): Promise<void> {
+    try {
+      const throttleKey = `eta:last_calc:${tripId}`;
+
+      // Throttle check: only calculate if key doesn't exist (max 1 per 60s)
+      const alreadyCalculated = await redisService.exists(throttleKey);
+      if (alreadyCalculated) return;
+
+      // Set throttle key with 60s TTL (fire-and-forget, non-critical)
+      await redisService.set(throttleKey, '1', 60);
+
+      // Look up dropoff location from order or booking
+      const entityId = existing.orderId || existing.bookingId;
+      if (!entityId) return;
+
+      const assignment = await prismaClient.assignment.findFirst({
+        where: { tripId },
+        select: {
+          order: { select: { drop: true } },
+          booking: { select: { drop: true } }
+        }
+      });
+
+      if (!assignment) return;
+
+      const dropSource = assignment.order?.drop || assignment.booking?.drop;
+      const dropData = typeof dropSource === 'string'
+        ? safeJsonParse<Record<string, unknown>>(dropSource, {})
+        : dropSource as Record<string, unknown> | undefined;
+
+      const dropLat = Number(dropData?.latitude || dropData?.lat);
+      const dropLng = Number(dropData?.longitude || dropData?.lng);
+
+      if (!dropLat || !dropLng) return;
+
+      // Calculate ETA via Google Maps (road distance)
+      const eta = await googleMapsService.getETA(
+        { lat: driverLat, lng: driverLng },
+        { lat: dropLat, lng: dropLng }
+      );
+
+      if (!eta) return;
+
+      // Emit to customer via booking room
+      const etaPayload = {
+        tripId,
+        estimatedMinutes: eta.durationMinutes,
+        distanceKm: eta.distanceKm,
+        durationText: eta.durationText,
+        updatedAt: new Date().toISOString()
+      };
+
+      emitToBooking(existing.bookingId, 'eta_updated', etaPayload);
+
+      logger.debug('[TRACKING] ETA pushed to customer', {
+        tripId,
+        bookingId: existing.bookingId,
+        estimatedMinutes: eta.durationMinutes,
+        distanceKm: eta.distanceKm.toFixed(1)
+      });
+    } catch (err: any) {
+      // Non-fatal — ETA is optional, GPS updates are critical
+      logger.debug('[TRACKING] computeAndEmitETA error (non-fatal)', {
+        tripId, error: err?.message
+      });
+    }
   }
 
   private async shouldPersistHistoryPoint(tripId: string, entry: LocationHistoryEntry, status: string): Promise<boolean> {
@@ -1767,7 +1939,7 @@ class TrackingService {
 
           await redisService.set(cooldownKey, '1', 300);
 
-          emitToUser(transporterId, 'driver_may_be_offline', {
+          emitToUser(transporterId, SocketEvent.DRIVER_MAY_BE_OFFLINE, {
             driverId,
             driverName: location.vehicleNumber,
             vehicleNumber: location.vehicleNumber,
@@ -2039,6 +2211,12 @@ class TrackingService {
             orderId,
             totalAssignments: assignments.length,
             message: `All deliveries for your order are complete!`
+          });
+          // Backward compat: Customer app listens for 'booking_completed' for rating trigger
+          emitToUser(order.customerId, 'booking_completed', {
+            orderId,
+            bookingId: orderId,
+            completedAt: new Date().toISOString()
           });
 
           queueService.queuePushNotification(order.customerId, {

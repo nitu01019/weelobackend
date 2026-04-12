@@ -126,6 +126,9 @@ const mockRedisGetJSON = jest.fn().mockResolvedValue(null);
 const mockRedisSetJSON = jest.fn().mockResolvedValue(undefined);
 const mockRedisGetOrSet = jest.fn();
 
+const mockRedisAcquireLock = jest.fn().mockResolvedValue({ acquired: true });
+const mockRedisReleaseLock = jest.fn().mockResolvedValue(true);
+
 jest.mock('../shared/services/redis.service', () => ({
   redisService: {
     set: (...args: any[]) => mockRedisSet(...args),
@@ -134,6 +137,8 @@ jest.mock('../shared/services/redis.service', () => ({
     setJSON: (...args: any[]) => mockRedisSetJSON(...args),
     getOrSet: (...args: any[]) => mockRedisGetOrSet(...args),
     get: jest.fn().mockResolvedValue(null),
+    acquireLock: (...args: any[]) => mockRedisAcquireLock(...args),
+    releaseLock: (...args: any[]) => mockRedisReleaseLock(...args),
   },
 }));
 
@@ -296,6 +301,8 @@ describe('Assignment Lifecycle', () => {
     mockRedisDel.mockResolvedValue(undefined);
     mockRedisGetJSON.mockResolvedValue(null);
     mockRedisSetJSON.mockResolvedValue(undefined);
+    mockRedisAcquireLock.mockResolvedValue({ acquired: true });
+    mockRedisReleaseLock.mockResolvedValue(true);
     mockOnVehicleStatusChange.mockResolvedValue(undefined);
     mockQueuePushNotification.mockResolvedValue(undefined);
     mockCancelAssignmentTimeout.mockResolvedValue(undefined);
@@ -862,7 +869,7 @@ describe('Assignment Lifecycle', () => {
       // Truck request restored via prismaClient.truckRequest.updateMany
       expect(mockPrismaTruckRequestUpdateMany).toHaveBeenCalledWith({
         where: { id: TRUCK_REQUEST_ID, orderId: ORDER_ID },
-        data: expect.objectContaining({ status: 'held', assignedVehicleId: null }),
+        data: expect.objectContaining({ status: 'searching', assignedVehicleId: null }),
       });
     });
   });
@@ -977,7 +984,7 @@ describe('Assignment Lifecycle', () => {
       // Uses prismaClient.truckRequest.updateMany directly
       expect(mockPrismaTruckRequestUpdateMany).toHaveBeenCalledWith({
         where: { id: TRUCK_REQUEST_ID, orderId: ORDER_ID },
-        data: expect.objectContaining({ status: 'held' }),
+        data: expect.objectContaining({ status: 'searching' }),
       });
     });
   });

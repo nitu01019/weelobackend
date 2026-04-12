@@ -22,17 +22,20 @@ import { Prisma } from '@prisma/client';
 import { db, OrderRecord } from '../../shared/database/db';
 import { prismaClient, AssignmentStatus, OrderStatus } from '../../shared/database/prisma.service';
 import { logger } from '../../shared/services/logger.service';
-import { emitToUser } from '../../shared/services/socket.service';
-import { sendPushNotification } from '../../shared/services/fcm.service';
+import { emitToUser, emitToBooking } from '../../shared/services/socket.service';
+import { sendPushNotification, fcmService } from '../../shared/services/fcm.service';
 import { queueService } from '../../shared/services/queue.service';
 import { generateVehicleKey } from '../../shared/services/vehicle-key.service';
 import { liveAvailabilityService } from '../../shared/services/live-availability.service';
 import { redisService } from '../../shared/services/redis.service';
 import { metrics } from '../../shared/monitoring/metrics.service';
+import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
 import { truckHoldService } from '../truck-hold/truck-hold.service';
 import { releaseVehicle } from '../../shared/services/vehicle-lifecycle.service';
 import type {
   OrderLifecycleOutboxPayload,
+  OrderCancelledOutboxPayload,
+  TripCompletedOutboxPayload,
   LifecycleOutboxRow,
 } from './order-types';
 import type { CreateOrderResponse } from './order.service';
@@ -67,15 +70,24 @@ export function parseLifecycleOutboxPayload(payload: Prisma.JsonValue): OrderLif
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
   const raw = payload as Record<string, unknown>;
   const type = typeof raw.type === 'string' ? raw.type : '';
+
+  if (type === 'trip_completed') {
+    return parseTripCompletedPayload(raw);
+  }
+
   if (type !== 'order_cancelled') return null;
+  return parseCancelledPayload(raw);
+}
+
+function parseCancelledPayload(raw: Record<string, unknown>): OrderCancelledOutboxPayload | null {
   const orderId = typeof raw.orderId === 'string' ? raw.orderId.trim() : '';
   const customerId = typeof raw.customerId === 'string' ? raw.customerId.trim() : '';
   if (!orderId || !customerId) return null;
   const transporters = Array.isArray(raw.transporters)
     ? raw.transporters.map((item) => String(item || '').trim()).filter(Boolean)
     : [];
-  const drivers: OrderLifecycleOutboxPayload['drivers'] = Array.isArray(raw.drivers)
-    ? raw.drivers.reduce<OrderLifecycleOutboxPayload['drivers']>((acc, item) => {
+  const drivers: OrderCancelledOutboxPayload['drivers'] = Array.isArray(raw.drivers)
+    ? raw.drivers.reduce<OrderCancelledOutboxPayload['drivers']>((acc, item) => {
       if (!item || typeof item !== 'object' || Array.isArray(item)) return acc;
       const row = item as Record<string, unknown>;
       const driverId = typeof row.driverId === 'string' ? row.driverId.trim() : '';
@@ -84,7 +96,7 @@ export function parseLifecycleOutboxPayload(payload: Prisma.JsonValue): OrderLif
         driverId,
         tripId: typeof row.tripId === 'string' ? row.tripId : undefined,
         customerName: typeof row.customerName === 'string' ? row.customerName : undefined,
-        customerPhone: typeof row.customerPhone === 'string' ? row.customerPhone : undefined,
+        customerPhone: typeof row.customerPhone === 'string' ? maskPhoneForExternal(row.customerPhone) : undefined,
         pickupAddress: typeof row.pickupAddress === 'string' ? row.pickupAddress : undefined,
         dropAddress: typeof row.dropAddress === 'string' ? row.dropAddress : undefined
       });
@@ -114,6 +126,41 @@ export function parseLifecycleOutboxPayload(payload: Prisma.JsonValue): OrderLif
     reason,
     reasonCode,
     cancelledAt,
+    eventId,
+    eventVersion: Number.isFinite(eventVersion) && eventVersion > 0 ? Math.floor(eventVersion) : 1,
+    serverTimeMs: Number.isFinite(serverTimeMs) && serverTimeMs > 0 ? Math.floor(serverTimeMs) : Date.now()
+  };
+}
+
+function parseTripCompletedPayload(raw: Record<string, unknown>): TripCompletedOutboxPayload | null {
+  const assignmentId = typeof raw.assignmentId === 'string' ? raw.assignmentId.trim() : '';
+  const tripId = typeof raw.tripId === 'string' ? raw.tripId.trim() : '';
+  const driverId = typeof raw.driverId === 'string' ? raw.driverId.trim() : '';
+  const transporterId = typeof raw.transporterId === 'string' ? raw.transporterId.trim() : '';
+  if (!assignmentId || !tripId || !driverId || !transporterId) return null;
+  const bookingId = typeof raw.bookingId === 'string' ? raw.bookingId.trim() : '';
+  const orderId = typeof raw.orderId === 'string' ? raw.orderId.trim() : '';
+  const vehicleId = typeof raw.vehicleId === 'string' ? raw.vehicleId.trim() : '';
+  const customerId = typeof raw.customerId === 'string' ? raw.customerId.trim() : '';
+  const completedAt = typeof raw.completedAt === 'string' && raw.completedAt.trim().length > 0
+    ? raw.completedAt
+    : new Date().toISOString();
+  const eventId = typeof raw.eventId === 'string' && raw.eventId.trim().length > 0
+    ? raw.eventId
+    : uuidv4();
+  const eventVersion = Number(raw.eventVersion || 1);
+  const serverTimeMs = Number(raw.serverTimeMs || Date.now());
+  return {
+    type: 'trip_completed',
+    assignmentId,
+    tripId,
+    bookingId,
+    orderId,
+    vehicleId,
+    transporterId,
+    driverId,
+    customerId,
+    completedAt,
     eventId,
     eventVersion: Number.isFinite(eventVersion) && eventVersion > 0 ? Math.floor(eventVersion) : 1,
     serverTimeMs: Number.isFinite(serverTimeMs) && serverTimeMs > 0 ? Math.floor(serverTimeMs) : Date.now()
@@ -187,6 +234,27 @@ export async function enqueueCancelLifecycleOutbox(
   return outboxId;
 }
 
+export async function enqueueCompletionLifecycleOutbox(
+  payload: TripCompletedOutboxPayload
+): Promise<string> {
+  const outboxId = uuidv4();
+  // orderId may be empty for booking-path trips; use bookingId as fallback for the DB column
+  const outboxOrderId = payload.orderId || payload.bookingId || payload.assignmentId;
+  await lifecycleOutboxDelegate().create({
+    data: {
+      id: outboxId,
+      orderId: outboxOrderId,
+      eventType: 'trip_completed',
+      payload: payload as unknown as Prisma.InputJsonValue,
+      status: 'pending',
+      attempts: 0,
+      maxAttempts: 10,
+      nextRetryAt: new Date()
+    }
+  });
+  return outboxId;
+}
+
 export async function claimLifecycleOutboxById(outboxId: string): Promise<LifecycleOutboxRow | null> {
   const now = new Date();
   const staleLockBefore = new Date(now.getTime() - 120_000);
@@ -210,48 +278,32 @@ export async function claimLifecycleOutboxById(outboxId: string): Promise<Lifecy
 export async function claimReadyLifecycleOutboxRows(limit: number): Promise<LifecycleOutboxRow[]> {
   const now = new Date();
   const staleLockBefore = new Date(now.getTime() - 120_000);
-  const candidates = await lifecycleOutboxDelegate().findMany({
-    where: {
-      status: { in: ['pending', 'retrying'] },
-      nextRetryAt: { lte: now },
-      OR: [{ lockedAt: null }, { lockedAt: { lt: staleLockBefore } }]
-    },
-    orderBy: [{ nextRetryAt: 'asc' }, { createdAt: 'asc' }],
-    take: limit
-  });
 
-  const claimed: LifecycleOutboxRow[] = [];
-  for (const candidate of candidates) {
-    const claim = await lifecycleOutboxDelegate().updateMany({
-      where: {
-        id: candidate.id,
-        status: { in: ['pending', 'retrying'] },
-        nextRetryAt: { lte: now },
-        OR: [{ lockedAt: null }, { lockedAt: { lt: staleLockBefore } }]
-      },
-      data: {
-        status: 'processing',
-        lockedAt: now
-      }
-    });
-    if (claim.count > 0) {
-      claimed.push({
-        id: candidate.id,
-        orderId: candidate.orderId,
-        eventType: candidate.eventType,
-        payload: candidate.payload as Prisma.JsonValue,
-        status: 'processing',
-        attempts: candidate.attempts,
-        maxAttempts: candidate.maxAttempts,
-        nextRetryAt: candidate.nextRetryAt,
-        lockedAt: now
-      });
-    }
+  try {
+    const rows = await prismaClient.$queryRaw<LifecycleOutboxRow[]>`
+      UPDATE "OrderLifecycleOutbox"
+      SET "status" = 'processing',
+          "lockedAt" = ${now}
+      WHERE id IN (
+        SELECT id FROM "OrderLifecycleOutbox"
+        WHERE "status" IN ('pending', 'retrying')
+          AND "nextRetryAt" <= ${now}
+          AND ("lockedAt" IS NULL OR "lockedAt" < ${staleLockBefore})
+        ORDER BY "nextRetryAt" ASC, "createdAt" ASC
+        LIMIT ${limit}
+        FOR UPDATE SKIP LOCKED
+      )
+      RETURNING *
+    `;
+    return rows;
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.error('[Lifecycle Outbox] SKIP LOCKED query failed, rethrowing to caller', { error: message });
+    throw err;
   }
-  return claimed;
 }
 
-export async function emitCancellationLifecycle(payload: OrderLifecycleOutboxPayload): Promise<void> {
+export async function emitCancellationLifecycle(payload: OrderCancelledOutboxPayload): Promise<void> {
   const dismissalPayload = {
     broadcastId: payload.orderId,
     orderId: payload.orderId,
@@ -339,13 +391,104 @@ export async function emitCancellationLifecycle(payload: OrderLifecycleOutboxPay
       message: 'Trip cancelled by customer',
       cancelledAt: payload.cancelledAt,
       customerName: driver.customerName || '',
-      customerPhone: driver.customerPhone || '',
+      customerPhone: maskPhoneForExternal(driver.customerPhone || ''),
       pickupAddress: driver.pickupAddress || '',
       dropAddress: driver.dropAddress || '',
       compensationAmount: payload.compensationAmount,
       settlementState: payload.settlementState
     });
   }
+}
+
+// ---------------------------------------------------------------------------
+// Trip Completed Lifecycle Emission
+// ---------------------------------------------------------------------------
+// Emits payment_pending Socket.IO event and FCM notification on trip completion.
+// This is the TRIGGER for payment — no actual payment module exists yet.
+// Follows same pattern as emitCancellationLifecycle above.
+// ---------------------------------------------------------------------------
+
+export async function emitTripCompletedLifecycle(payload: TripCompletedOutboxPayload): Promise<void> {
+  const eventPayload = {
+    type: 'trip_completed',
+    assignmentId: payload.assignmentId,
+    tripId: payload.tripId,
+    bookingId: payload.bookingId,
+    orderId: payload.orderId,
+    vehicleId: payload.vehicleId,
+    transporterId: payload.transporterId,
+    driverId: payload.driverId,
+    customerId: payload.customerId,
+    completedAt: payload.completedAt,
+    eventId: payload.eventId,
+    eventVersion: payload.eventVersion,
+    serverTimeMs: payload.serverTimeMs,
+    emittedAt: new Date().toISOString()
+  };
+
+  logger.info('[TRIP_COMPLETED OUTBOX] Processing trip completion event', {
+    assignmentId: payload.assignmentId,
+    tripId: payload.tripId,
+    bookingId: payload.bookingId,
+    orderId: payload.orderId,
+    driverId: payload.driverId,
+    transporterId: payload.transporterId,
+    customerId: payload.customerId,
+    completedAt: payload.completedAt
+  });
+
+  // 1. Emit payment_pending to booking room (customer + transporter listening)
+  const roomId = payload.bookingId || payload.orderId;
+  if (roomId) {
+    emitToBooking(roomId, 'payment_pending', eventPayload);
+  }
+
+  // 2. Direct Socket.IO to customer
+  if (payload.customerId) {
+    emitToUser(payload.customerId, 'payment_pending', eventPayload);
+  }
+
+  // 3. Direct Socket.IO to transporter
+  if (payload.transporterId) {
+    emitToUser(payload.transporterId, 'payment_pending', eventPayload);
+  }
+
+  // 4. FCM push to customer (covers background/killed app)
+  if (payload.customerId) {
+    await fcmService.notifyPayment(payload.customerId, {
+      amount: 0, // Actual fare calculation is a future initiative
+      tripId: payload.tripId,
+      status: 'pending'
+    }).catch((err: unknown) => {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      logger.warn('[TRIP_COMPLETED OUTBOX] FCM payment notification to customer failed (non-fatal)', {
+        customerId: payload.customerId,
+        tripId: payload.tripId,
+        error: errorMessage
+      });
+    });
+  }
+
+  // 5. FCM push to transporter
+  if (payload.transporterId) {
+    await fcmService.notifyPayment(payload.transporterId, {
+      amount: 0,
+      tripId: payload.tripId,
+      status: 'pending'
+    }).catch((err: unknown) => {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      logger.warn('[TRIP_COMPLETED OUTBOX] FCM payment notification to transporter failed (non-fatal)', {
+        transporterId: payload.transporterId,
+        tripId: payload.tripId,
+        error: errorMessage
+      });
+    });
+  }
+
+  logger.info('[TRIP_COMPLETED OUTBOX] Payment trigger emitted successfully', {
+    assignmentId: payload.assignmentId,
+    tripId: payload.tripId
+  });
 }
 
 export async function processLifecycleOutboxRow(row: LifecycleOutboxRow): Promise<void> {
@@ -367,7 +510,12 @@ export async function processLifecycleOutboxRow(row: LifecycleOutboxRow): Promis
   }
 
   try {
-    await emitCancellationLifecycle(payload);
+    // Dispatch to the correct handler based on event type
+    if (payload.type === 'trip_completed') {
+      await emitTripCompletedLifecycle(payload);
+    } else {
+      await emitCancellationLifecycle(payload);
+    }
     await lifecycleOutboxDelegate().update({
       where: { id: row.id },
       data: {
@@ -380,7 +528,8 @@ export async function processLifecycleOutboxRow(row: LifecycleOutboxRow): Promis
       }
     });
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : 'CANCEL_LIFECYCLE_EMIT_FAILED';
+    const errorLabel = payload.type === 'trip_completed' ? 'TRIP_COMPLETED_EMIT_FAILED' : 'CANCEL_LIFECYCLE_EMIT_FAILED';
+    const message = error instanceof Error ? error.message : errorLabel;
     const retryable = nextAttempt < row.maxAttempts;
     metrics.incrementCounter('cancel_emit_retry_total', {
       channel: 'lifecycle_outbox',
@@ -409,7 +558,7 @@ export async function processLifecycleOutboxRow(row: LifecycleOutboxRow): Promis
           dlqReason: 'RETRY_EXHAUSTED'
         }
       });
-      logger.error('[CANCEL OUTBOX] moved to DLQ', {
+      logger.error('[LIFECYCLE OUTBOX] moved to DLQ', {
         outboxId: row.id,
         orderId: row.orderId,
         eventType: row.eventType,
@@ -526,23 +675,6 @@ export async function handleOrderExpiry(orderId: string): Promise<void> {
     notifiedTransporters: notifiedCount
   }));
 
-  // H-15 FIX: FCM fallback for offline customer on order expiry — fire-and-forget
-  // Previously only transporters received FCM push on expiry. If customer is
-  // offline (app killed / no connectivity), they never learn their order expired.
-  sendPushNotification(order.customerId, {
-    title: 'Order Expired',
-    body: 'Your order has expired. No transporters responded in time.',
-    data: {
-      type: 'ORDER_EXPIRED',
-      orderId,
-    },
-  }).catch((err: unknown) => {
-    logger.warn('[FCM] Order expiry customer push failed', {
-      orderId,
-      error: err instanceof Error ? err.message : String(err),
-    });
-  });
-
   // =========================================================================
   // Notify ALL transporters to remove expired broadcast
   // =========================================================================
@@ -616,7 +748,12 @@ export async function handleOrderExpiry(orderId: string): Promise<void> {
       where: {
         orderId,
         status: { in: cancellableAssignmentStatuses }
-      }
+      },
+      select: {
+        id: true, driverId: true, vehicleId: true, tripId: true,
+        status: true, orderId: true, transporterId: true,
+      },
+      take: 200,  // FIX-27: Bound query to prevent unbounded result sets
     });
 
     if (activeAssignments.length > 0) {
@@ -650,7 +787,12 @@ export async function handleOrderExpiry(orderId: string): Promise<void> {
         where: {
           id: { in: candidateAssignmentIds },
           status: AssignmentStatus.cancelled
-        }
+        },
+        select: {
+          id: true, driverId: true, vehicleId: true, tripId: true,
+          status: true, orderId: true, transporterId: true,
+        },
+        take: 200,  // FIX-27: Bound query to prevent unbounded result sets
       });
 
       if (cancelledAssignments.length > 0) {
@@ -677,7 +819,7 @@ export async function handleOrderExpiry(orderId: string): Promise<void> {
               message: 'This trip request has expired',
               cancelledAt: expiredAt,
               customerName: order.customerName,
-              customerPhone: order.customerPhone,
+              customerPhone: maskPhoneForExternal(order.customerPhone),
               pickupAddress: order.pickup?.address || '',
               dropAddress: order.drop?.address || ''
             });

@@ -41,7 +41,7 @@ jest.mock('../shared/monitoring/metrics.service', () => ({
 
 // Config mock
 jest.mock('../config/environment', () => ({
-  config: { redis: { enabled: true }, isProduction: false, otp: { expiryMinutes: 5 }, sms: {} },
+  config: { redis: { enabled: true }, isProduction: false, otp: { expiryMinutes: 5 }, sms: {}, googleMaps: { apiKey: '', enabled: false } },
 }));
 
 // Redis service mock
@@ -93,8 +93,10 @@ const mockVehicleUpdateMany = jest.fn();
 const mockTruckRequestUpdateMany = jest.fn();
 const mockExecuteRaw = jest.fn();
 const mockBookingFindFirst = jest.fn();
+const mockBookingFindUnique = jest.fn();
 const mockQueryRaw = jest.fn();
 const mockBookingUpdateMany = jest.fn();
+const mockOrderFindUnique = jest.fn();
 
 const mockAssignmentUpdate = jest.fn();
 
@@ -110,11 +112,15 @@ jest.mock('../shared/database/prisma.service', () => ({
       update: (...args: any[]) => mockVehicleUpdate(...args),
       updateMany: (...args: any[]) => mockVehicleUpdateMany(...args),
     },
+    order: {
+      findUnique: (...args: any[]) => mockOrderFindUnique(...args),
+    },
     truckRequest: {
       updateMany: (...args: any[]) => mockTruckRequestUpdateMany(...args),
     },
     booking: {
       findFirst: (...args: any[]) => mockBookingFindFirst(...args),
+      findUnique: (...args: any[]) => mockBookingFindUnique(...args),
       updateMany: (...args: any[]) => mockBookingUpdateMany(...args),
     },
     $executeRaw: (...args: any[]) => mockExecuteRaw(...args),
@@ -246,6 +252,61 @@ jest.mock('../core/state-machines', () => ({
   TERMINAL_BOOKING_STATUSES: ['cancelled', 'expired', 'fully_filled', 'completed'],
 }));
 
+// Hold config mock
+jest.mock('../core/config/hold-config', () => ({
+  HOLD_CONFIG: {
+    driverAcceptTimeoutMs: 45000,
+    driverAcceptTimeoutSeconds: 45,
+    confirmedHoldMaxSeconds: 180,
+    flexHoldDurationSeconds: 90,
+  },
+}));
+
+// --- Transitive dependency mocks (order-lifecycle-outbox -> order-broadcast -> routing -> google-maps) ---
+jest.mock('../shared/services/google-maps.service', () => ({
+  googleMapsService: {
+    calculateRoute: jest.fn().mockResolvedValue({ distanceKm: 100, durationMinutes: 120 }),
+  },
+}));
+
+jest.mock('../modules/routing', () => ({
+  routingService: {
+    calculateRoute: jest.fn().mockResolvedValue({ distanceKm: 100, durationMinutes: 120 }),
+  },
+}));
+
+jest.mock('../modules/order/order-lifecycle-outbox.service', () => ({
+  FF_CANCEL_OUTBOX_ENABLED: false,
+  ORDER_CANCEL_OUTBOX_POLL_MS: 5000,
+  ORDER_CANCEL_OUTBOX_BATCH_SIZE: 10,
+  startLifecycleOutboxWorker: jest.fn().mockReturnValue(null),
+  enqueueCancelLifecycleOutbox: jest.fn().mockResolvedValue('outbox-id'),
+  enqueueCompletionLifecycleOutbox: jest.fn().mockResolvedValue('outbox-id'),
+  processLifecycleOutboxImmediately: jest.fn().mockResolvedValue(undefined),
+  emitCancellationLifecycle: jest.fn().mockResolvedValue(undefined),
+  emitTripCompletedLifecycle: jest.fn().mockResolvedValue(undefined),
+  lifecycleOutboxDelegate: jest.fn(),
+  handleOrderExpiry: jest.fn().mockResolvedValue(undefined),
+}));
+
+jest.mock('../modules/assignment/auto-redispatch.service', () => ({
+  tryAutoRedispatch: jest.fn().mockResolvedValue(false),
+}));
+
+jest.mock('../modules/driver/driver-presence.service', () => ({
+  driverPresenceService: {
+    isDriverOnline: jest.fn().mockResolvedValue(false),
+  },
+}));
+
+jest.mock('../shared/utils/pii.utils', () => ({
+  maskPhoneForExternal: jest.fn().mockImplementation((p: string) => `****${p.slice(-4)}`),
+}));
+
+jest.mock('../shared/services/vehicle-lifecycle.service', () => ({
+  releaseVehicle: jest.fn().mockResolvedValue(undefined),
+}));
+
 // =============================================================================
 // IMPORTS
 // =============================================================================
@@ -285,8 +346,12 @@ function resetAllMocks(): void {
   mockTruckRequestUpdateMany.mockReset();
   mockExecuteRaw.mockReset();
   mockBookingFindFirst.mockReset();
+  mockBookingFindUnique.mockReset();
+  mockBookingFindUnique.mockResolvedValue({ customerId: 'cust-1' });
   mockQueryRaw.mockReset();
   mockBookingUpdateMany.mockReset();
+  mockOrderFindUnique.mockReset();
+  mockOrderFindUnique.mockResolvedValue({ customerId: 'cust-1' });
   mockGetAssignmentById.mockReset();
   mockUpdateAssignment.mockReset();
   mockUpdateVehicle.mockReset();

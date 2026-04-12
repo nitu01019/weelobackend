@@ -28,6 +28,7 @@ import { emitToUser, SocketEvent } from '../../shared/services/socket.service';
 import { sendPushNotification } from '../../shared/services/fcm.service';
 import { redisService } from '../../shared/services/redis.service';
 import { metrics } from '../../shared/monitoring/metrics.service';
+import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
 import { clearProgressiveStepTimers } from './order-timer.service';
 import { clearCustomerActiveBroadcast } from './order-broadcast.service';
 import { orderExpiryTimerKey } from './order-timer.service';
@@ -76,6 +77,7 @@ export async function acceptTruckRequest(
     vehicleNumber: string;
     vehicleType: string;
     vehicleSubtype: string;
+    vehicleKey: string;
     driverName: string;
     driverPhone: string;
     transporterName: string;
@@ -108,14 +110,30 @@ export async function acceptTruckRequest(
         }
 
         const transporter = await tx.user.findUnique({
-          where: { id: transporterId }
+          where: { id: transporterId },
+          select: { id: true, name: true, businessName: true, phone: true, role: true, isActive: true }
         });
+
+        // C-09 FIX: Validate transporter exists and is active
+        if (!transporter) {
+          throw new Error('EARLY_RETURN:Transporter account not found');
+        }
+        if (transporter.role !== 'transporter') {
+          throw new Error('EARLY_RETURN:Only transporters can accept truck requests');
+        }
+        if (transporter.isActive === false) {
+          metrics.incrementCounter('assignment_blocked_total', { reason: 'transporter_suspended' });
+          throw new Error('EARLY_RETURN:Transporter account is suspended');
+        }
 
         const vehicle = await tx.vehicle.findUnique({
           where: { id: vehicleId }
         });
         if (!vehicle) {
           throw new Error('EARLY_RETURN:Vehicle not found');
+        }
+        if (vehicle.transporterId !== transporterId) {
+          throw new Error('EARLY_RETURN:Vehicle does not belong to your fleet');
         }
 
         // Phase 6 guard: Vehicle must be available (not already on a trip)
@@ -137,6 +155,9 @@ export async function acceptTruckRequest(
         });
         if (!driver) {
           throw new Error('EARLY_RETURN:Driver not found');
+        }
+        if (driver.transporterId !== transporterId) {
+          throw new Error('EARLY_RETURN:Driver does not belong to your fleet');
         }
 
         // Phase 6 guard: Driver must NOT have an active assignment already
@@ -193,7 +214,7 @@ export async function acceptTruckRequest(
           data: {
             status: 'assigned',
             assignedTransporterId: transporterId,
-            assignedTransporterName: transporter?.name || transporter?.businessName || '',
+            assignedTransporterName: transporter.name || transporter.businessName || '',
             assignedVehicleId: vehicleId,
             assignedVehicleNumber: vehicle.vehicleNumber,
             assignedDriverId: driverId,
@@ -224,7 +245,7 @@ export async function acceptTruckRequest(
             truckRequestId,
             orderId: truckRequest.orderId,
             transporterId,
-            transporterName: transporter?.name || '',
+            transporterName: transporter.name || '',
             vehicleId,
             vehicleNumber: vehicle.vehicleNumber,
             vehicleType: vehicle.vehicleType,
@@ -267,8 +288,22 @@ export async function acceptTruckRequest(
           data: { status: newStatus, stateChangedAt: new Date() }
         });
 
-        // FIX: Vehicle stays 'available' until driver accepts
-        // Vehicle will be set to 'in_transit' in assignment.acceptAssignment()
+        // C-04 FIX: Set vehicle to on_hold ATOMICALLY inside the transaction.
+        // BEFORE: Vehicle stayed 'available' for 0-45s until driver accepted → double-booking window.
+        // NOW: Vehicle becomes 'on_hold' immediately → matches assignment.service.ts:249-260 pattern.
+        // Vehicle transitions on_hold → in_transit in assignment.acceptAssignment() when driver accepts.
+        await tx.vehicle.updateMany({
+          where: {
+            id: vehicleId,
+            status: 'available'  // CAS guard: only hold if still available
+          },
+          data: {
+            status: 'on_hold',
+            currentTripId: tripId,
+            assignedDriverId: driverId,
+            lastStatusChange: new Date().toISOString()
+          }
+        });
 
         // Parse JSON fields for notification use outside the transaction
         let pickup: unknown;
@@ -299,16 +334,17 @@ export async function acceptTruckRequest(
           orderDrop: drop as OrderRecord['drop'],
           orderDistanceKm: order.distanceKm,
           orderCustomerName: order.customerName,
-          orderCustomerPhone: order.customerPhone,
+          orderCustomerPhone: maskPhoneForExternal(order.customerPhone),
           orderTotalTrucks: order.totalTrucks,
           truckRequestPricePerTruck: truckRequest.pricePerTruck,
           vehicleNumber: vehicle.vehicleNumber,
           vehicleType: vehicle.vehicleType,
           vehicleSubtype: vehicle.vehicleSubtype,
+          vehicleKey: vehicle.vehicleKey || '',
           driverName: driver.name,
           driverPhone: driver.phone || '',
-          transporterName: transporter?.name || transporter?.businessName || '',
-          transporterPhone: transporter?.phone || '',
+          transporterName: transporter.name || transporter.businessName || '',
+          transporterPhone: transporter.phone || '',
           now
         };
       // Fix B10(F-2-12): Serializable isolation guarantees fresh reads on retry.
@@ -386,6 +422,7 @@ export async function acceptTruckRequest(
     vehicleNumber,
     vehicleType,
     vehicleSubtype,
+    vehicleKey,
     driverName,
     driverPhone,
     transporterName,
@@ -399,8 +436,24 @@ export async function acceptTruckRequest(
   logger.info(`   Driver: ${driverName} (${driverPhone})`);
   logger.info(`   Order progress: ${newTrucksFilled}/${orderTotalTrucks}`);
 
-  // FIX: No Redis sync here - vehicle stays 'available' until driver accepts
-  // Redis will be updated in assignment.acceptAssignment()
+  // C-04 FIX: Redis sync after vehicle set to on_hold in the transaction.
+  // Matches pattern in assignment.service.ts:109-115.
+  if (vehicleKey) {
+    try {
+      const { liveAvailabilityService } = require('../../shared/services/live-availability.service');
+      await liveAvailabilityService.onVehicleStatusChange(
+        transporterId,
+        vehicleKey,
+        'available',
+        'on_hold'
+      );
+    } catch (redisErr: unknown) {
+      logger.warn('[OrderAccept] Redis vehicle status sync failed (non-fatal)', {
+        vehicleId,
+        error: redisErr instanceof Error ? redisErr.message : String(redisErr)
+      });
+    }
+  }
 
   // ============== NOTIFY DRIVER ==============
   const driverNotification = {
@@ -431,7 +484,11 @@ export async function acceptTruckRequest(
       type: 'trip_assigned',
       tripId,
       assignmentId,
-      orderId
+      orderId,
+      driverName: driverName || '',
+      vehicleNumber: vehicleNumber || '',
+      vehicleType: vehicleType || '',
+      status: 'trip_assigned'
     }
   }).catch((err: unknown) => {
     const errorMessage = err instanceof Error ? err.message : String(err);
@@ -475,16 +532,15 @@ export async function acceptTruckRequest(
   // logger.info(`Notified customer - ${newTrucksFilled}/${orderTotalTrucks} trucks confirmed`);
   //
   // Phase 3 parity: keep searching dialog in sync with backend fill progress.
-  // emitToUser(customerId, 'trucks_remaining_update', {
-  //   orderId,
-  //   trucksNeeded: orderTotalTrucks,
-  //   trucksFilled: newTrucksFilled,
-  //   trucksRemaining: Math.max(orderTotalTrucks - newTrucksFilled, 0),
-  //   isFullyFilled: newTrucksFilled >= orderTotalTrucks,
-  //   timestamp: now,
-  //   eventId: customerEventId,
-  //   emittedAt: now
-  // });
+  emitToUser(customerId, 'trucks_remaining_update', {
+    orderId,
+    trucksNeeded: orderTotalTrucks,
+    trucksFilled: newTrucksFilled,
+    trucksRemaining: Math.max(orderTotalTrucks - newTrucksFilled, 0),
+    isFullyFilled: newTrucksFilled >= orderTotalTrucks,
+    timestamp: now,
+    emittedAt: now
+  });
   //
   // Lifecycle update whenever order status changes due to accept flow.
   // emitToUser(customerId, 'broadcast_state_changed', this.withEventMeta({
@@ -496,29 +552,27 @@ export async function acceptTruckRequest(
   //   stateChangedAt: now
   // }, customerEventId));
 
-  // PRD 7777: Customer notification removed - will be notified on driver accept
-  // if (newStatus === 'fully_filled') {
-  //   const latestAssignment = {
-  //     assignmentId,
-  //     tripId,
-  //     vehicleNumber,
-  //     driverName,
-  //     driverPhone
-  //   };
-  //   emitToUser(customerId, 'booking_fully_filled', {
-  //     orderId,
-  //     trucksNeeded: orderTotalTrucks,
-  //     trucksFilled: newTrucksFilled,
-  //     filledAt: now,
-  //     eventId: customerEventId,
-  //     emittedAt: now,
-  //     latestAssignment,
-  //     // Keep array for backward compatibility with existing consumers.
-  //     assignments: [
-  //       latestAssignment
-  //     ]
-  //   });
-  // }
+  // PRD 7777: Notify customer when all trucks are filled so searching screen transitions out.
+  if (newStatus === 'fully_filled') {
+    const latestAssignment = {
+      assignmentId,
+      tripId,
+      vehicleNumber,
+      driverName,
+      driverPhone
+    };
+    emitToUser(customerId, 'booking_fully_filled', {
+      orderId,
+      trucksNeeded: orderTotalTrucks,
+      trucksFilled: newTrucksFilled,
+      filledAt: now,
+      emittedAt: now,
+      latestAssignment,
+      assignments: [
+        latestAssignment
+      ]
+    });
+  }
 
   // Push notification to customer - REMOVED per PRD 7777
   // Customer will be notified when driver accepts

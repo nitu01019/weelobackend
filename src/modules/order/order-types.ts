@@ -54,7 +54,7 @@ export interface DispatchOutboxRow {
 
 export type OrderLifecycleOutboxStatus = 'pending' | 'processing' | 'retrying' | 'dispatched' | 'failed';
 
-export interface OrderLifecycleOutboxPayload {
+export interface OrderCancelledOutboxPayload {
   type: 'order_cancelled';
   orderId: string;
   customerId: string;
@@ -76,6 +76,24 @@ export interface OrderLifecycleOutboxPayload {
   compensationAmount?: number;
   settlementState?: string;
 }
+
+export interface TripCompletedOutboxPayload {
+  type: 'trip_completed';
+  assignmentId: string;
+  tripId: string;
+  bookingId: string;
+  orderId: string;
+  vehicleId: string;
+  transporterId: string;
+  driverId: string;
+  customerId: string;
+  completedAt: string;
+  eventId: string;
+  eventVersion: number;
+  serverTimeMs: number;
+}
+
+export type OrderLifecycleOutboxPayload = OrderCancelledOutboxPayload | TripCompletedOutboxPayload;
 
 export interface LifecycleOutboxRow {
   id: string;

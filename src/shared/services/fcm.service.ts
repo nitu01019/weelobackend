@@ -26,41 +26,36 @@
  * =============================================================================
  */
 
+import fs from 'fs';
 import { logger } from './logger.service';
 import { redisService } from './redis.service';
+import { prismaClient } from '../database/prisma.service';
 
 // Notification types - must match mobile apps
 export const NotificationType = {
   NEW_BROADCAST: 'new_broadcast',
   ASSIGNMENT_UPDATE: 'assignment_update',
   TRIP_UPDATE: 'trip_update',
-  PAYMENT: 'payment',
+  PAYMENT: 'payment_received',
   GENERAL: 'general'
 } as const;
 
 // =============================================================================
 // FCM TOKEN STORAGE
 // =============================================================================
-// 
+//
 // SCALABILITY:
 // - Primary: Redis SET per userId — shared across all ECS instances
-// - Fallback: In-memory Map — used if Redis is unavailable
 // - 90-day TTL on Redis keys (FCM tokens expire ~60 days)
-// 
+//
 // EASY UNDERSTANDING:
 // - registerToken() → Add token to user's set (Redis SADD = no duplicates)
 // - removeToken() → Remove token from user's set (Redis SREM)
 // - getTokens() → Get all tokens for a user (Redis SMEMBERS)
-// 
+//
 // MODULARITY:
 // - Uses existing redisService singleton (no new connections)
-// - In-memory Map is independent fallback, not a cache layer
 // =============================================================================
-
-// Fix G5: userTokensFallback is effectively dead code -- registerToken no longer
-// writes to it (FIX A5#20 removed the write path), so reads always return empty.
-// Kept for backward-compat in removeToken/removeAllTokens/getTokens fallback paths.
-const userTokensFallback = new Map<string, string[]>();
 
 // Redis key pattern for FCM tokens
 const FCM_TOKEN_KEY = (userId: string) => `fcm:tokens:${userId}`;
@@ -130,8 +125,7 @@ class FCMService {
       // Dynamic import of firebase-admin (optional dependency)
       const firebaseAdmin = await import('firebase-admin');
       
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const serviceAccount = require(serviceAccountPath);
+      const serviceAccount = JSON.parse(fs.readFileSync(serviceAccountPath, 'utf8'));
       
       firebaseAdmin.initializeApp({
         credential: firebaseAdmin.credential.cert(serviceAccount)
@@ -170,7 +164,9 @@ class FCMService {
    * 
    * EASY UNDERSTANDING: SADD = Set Add. If token already exists, it's a no-op.
    */
-  async registerToken(userId: string, token: string): Promise<boolean> {
+  async registerToken(userId: string, token: string, platform: string = 'android'): Promise<boolean> {
+    let redisOk = false;
+
     // Try Redis first (primary storage)
     if (this.isRedisAvailable()) {
       try {
@@ -178,22 +174,36 @@ class FCMService {
         await redisService.sAdd(key, token);
         await redisService.expire(key, FCM_TOKEN_TTL_SECONDS);
         logger.info(`FCM: Token registered for user ${userId} [Redis]`);
-        return true;
+        redisOk = true;
       } catch (error: any) {
         // FIX A5#20: Remove in-memory write fallback — unbounded Map is a memory leak
         // on long-running ECS instances and tokens written here are invisible to other
-        // instances. Log error and return false; getTokens() still reads from fallback.
-        logger.error(`FCM: Redis registerToken failed — token NOT stored`, {
+        // instances. Log error and fall through to DB fallback.
+        logger.error(`FCM: Redis registerToken failed`, {
           userId,
           error: error.message,
         });
-        return false;
       }
     }
 
-    // Redis not available — token cannot be stored
-    logger.error(`FCM: Redis unavailable — token NOT stored for user ${userId}`);
-    return false;
+    // Fix H15: Always persist to DB as durable fallback (even if Redis succeeded).
+    // If Redis loses data (restart/eviction), getTokens() recovers from here.
+    try {
+      await prismaClient.deviceToken.upsert({
+        where: { userId_token: { userId, token } },
+        update: { lastSeenAt: new Date() },
+        create: { userId, token, platform, lastSeenAt: new Date() }
+      });
+    } catch (dbErr: any) {
+      // Non-fatal: DB fallback is best-effort. Redis is primary.
+      logger.warn('FCM: DB fallback write failed', { userId, error: dbErr.message });
+    }
+
+    if (!redisOk && !this.isRedisAvailable()) {
+      logger.error(`FCM: Redis unavailable — token stored in DB only for user ${userId}`);
+    }
+
+    return redisOk;
   }
 
   /**
@@ -215,15 +225,8 @@ class FCMService {
       }
     }
 
-    // Fallback to in-memory
-    const tokens = userTokensFallback.get(userId);
-    if (tokens) {
-      const index = tokens.indexOf(token);
-      if (index > -1) {
-        tokens.splice(index, 1);
-        logger.info(`FCM: Token removed for user ${userId} [InMemory]`);
-      }
-    }
+    // Redis unavailable — token removal cannot proceed
+    logger.warn(`[FCM] Redis unavailable — cannot remove token for user ${userId}`);
   }
 
   /**
@@ -243,8 +246,8 @@ class FCMService {
       }
     }
 
-    userTokensFallback.delete(userId);
-    logger.info(`FCM: All tokens removed for user ${userId} [InMemory]`);
+    // Redis unavailable — token removal cannot proceed
+    logger.warn(`[FCM] Redis unavailable — cannot remove all tokens for user ${userId}`);
   }
 
   /**
@@ -262,16 +265,32 @@ class FCMService {
       try {
         const key = FCM_TOKEN_KEY(userId);
         const tokens = await redisService.sMembers(key);
-        return tokens;
+        if (tokens.length > 0) {
+          return tokens;
+        }
+        // Redis returned empty — fall through to DB fallback
       } catch (error: any) {
-        logger.warn(`FCM: Redis getTokens failed: ${error.message}. Using fallback.`);
+        logger.warn(`FCM: Redis getTokens failed: ${error.message}. Trying DB fallback.`);
       }
     }
 
-    // Fallback to in-memory — cross-instance delivery degraded
-    // FIX #5: Log warning so operators know Redis-backed delivery is down
-    logger.warn('[FCM] Using in-memory token fallback — cross-instance FCM delivery degraded', { userId });
-    return userTokensFallback.get(userId) || [];
+    // Fix H15: Fall back to PostgreSQL if Redis returned empty or is unavailable.
+    // This recovers tokens after Redis restart/eviction without losing push capability.
+    try {
+      const dbTokens = await prismaClient.deviceToken.findMany({
+        where: { userId },
+        select: { token: true }
+      });
+      if (dbTokens.length > 0) {
+        logger.info(`FCM: Retrieved ${dbTokens.length} token(s) from DB fallback`, { userId });
+        return dbTokens.map(t => t.token);
+      }
+    } catch (dbErr: any) {
+      logger.warn('FCM: DB fallback read failed', { userId, error: dbErr.message });
+    }
+
+    logger.warn('[FCM] No tokens found in Redis or DB', { userId });
+    return [];
   }
 
   /**
@@ -301,13 +320,16 @@ class FCMService {
     userIds: string[],
     notification: FCMNotification
   ): Promise<number> {
-    // FIX #2: Parallel FCM delivery — all transporters get push simultaneously
-    // BEFORE: Sequential for+await → last transporter delayed by ~1s for 20 users
-    // NOW: Promise.allSettled → all fire at once, ~50ms total
-    // SAFETY: allSettled never rejects; sendToUser handles individual errors internally
-    const results = await Promise.allSettled(
-      userIds.map(userId => this.sendToUser(userId, notification))
-    );
+    // Batch FCM sends to avoid overwhelming Firebase (max 50 concurrent)
+    const BATCH_SIZE = 50;
+    const results: PromiseSettledResult<boolean>[] = [];
+    for (let i = 0; i < userIds.length; i += BATCH_SIZE) {
+      const batch = userIds.slice(i, i + BATCH_SIZE);
+      const batchResults = await Promise.allSettled(
+        batch.map(userId => this.sendToUser(userId, notification))
+      );
+      results.push(...batchResults);
+    }
     return results.filter(r => r.status === 'fulfilled' && r.value).length;
   }
 
@@ -326,7 +348,8 @@ class FCMService {
     if (!this.isInitialized || !this.admin) {
       // Mock mode - log notification instead
       this.logNotification(notification, tokens);
-      return true;
+      // M20 FIX: Mock mode returns false — notification was NOT delivered
+      return false;
     }
 
     try {
@@ -361,7 +384,7 @@ class FCMService {
           if (deadTokens.length > 0) {
             logger.info(`FCM: Cleaning ${deadTokens.length} dead token(s) for user ${userId}`);
             for (const deadToken of deadTokens) {
-              this.removeToken(userId, deadToken).catch(() => {});
+              this.removeToken(userId, deadToken).catch((err) => logger.warn('[FCM] Token cleanup failed', { userId, error: err instanceof Error ? err.message : String(err) }));
             }
           }
         }
@@ -382,7 +405,7 @@ class FCMService {
          error?.code === 'messaging/invalid-registration-token')
       ) {
         logger.info(`FCM: Removing dead token for user ${userId}`);
-        this.removeToken(userId, tokens[0]).catch(() => {});
+        this.removeToken(userId, tokens[0]).catch((err) => logger.warn('[FCM] Token cleanup failed', { userId, error: err instanceof Error ? err.message : String(err) }));
       }
       logger.error('FCM: Failed to send notification', error);
       return false;
@@ -399,12 +422,13 @@ class FCMService {
     title: string,
     body: string,
     data?: Record<string, string>,
-    maxRetries: number = 3
+    maxRetries: number = 3,
+    type: string = NotificationType.GENERAL
   ): Promise<boolean> {
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
         const result = await this.sendToTokens(tokens, {
-          type: NotificationType.GENERAL,
+          type,
           title,
           body,
           data: data || {},
@@ -455,7 +479,7 @@ class FCMService {
     userId?: string
   ): Promise<void> {
     try {
-      await this.sendWithRetry(tokens, notification.title, notification.body, notification.data);
+      await this.sendWithRetry(tokens, notification.title, notification.body, notification.data, 3, notification.type);
     } catch (err: unknown) {
       logger.error('[FCM] Push failed after all retries', {
         userId,
@@ -482,7 +506,8 @@ class FCMService {
 
     if (!this.isInitialized || !this.admin) {
       this.logNotification(notification, [], topic);
-      return true;
+      // M20 FIX: Mock mode returns false — notification was NOT delivered
+      return false;
     }
 
     try {
@@ -526,18 +551,29 @@ class FCMService {
    * Build FCM message payload
    */
   private buildMessage(notification: FCMNotification, tokens?: string[]): any {
+    // FCM 4KB hard limit -- truncate long fields to stay safe
+    const truncate = (s: string | undefined, max: number): string | undefined =>
+      s && s.length > max ? s.slice(0, max) + '\u2026' : s;
+
+    const truncatedData = notification.data
+      ? Object.fromEntries(
+          Object.entries(notification.data).map(([k, v]) => {
+            const strVal = String(v);
+            // Truncate address fields to 100 chars, other strings to 200
+            const limit = k.toLowerCase().includes('address') ? 100 : 200;
+            return [k, strVal.length > limit ? strVal.slice(0, limit) + '\u2026' : strVal];
+          })
+        )
+      : {};
+
     return {
       notification: {
-        title: notification.title,
-        body: notification.body
+        title: truncate(notification.title, 100) || '',
+        body: truncate(notification.body, 200) || ''
       },
       data: {
         type: notification.type,
-        ...notification.data,
-        // Convert all values to strings (FCM requirement)
-        ...(notification.data && Object.fromEntries(
-          Object.entries(notification.data).map(([k, v]) => [k, String(v)])
-        ))
+        ...truncatedData,
       },
       android: {
         priority: notification.priority === 'high' ? 'high' : 'normal',

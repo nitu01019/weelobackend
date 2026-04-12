@@ -22,6 +22,7 @@ import { z } from 'zod';
 import { authMiddleware } from '../../shared/middleware/auth.middleware';
 import { fcmService } from '../../shared/services/fcm.service';
 import { logger } from '../../shared/services/logger.service';
+import { redisService } from '../../shared/services/redis.service';
 
 const router = Router();
 
@@ -68,7 +69,7 @@ router.post('/register-token', authMiddleware, async (req: Request, res: Respons
     const userRole = req.user!.role;
 
     // Register token (Redis-backed for scalability across ECS instances)
-    await fcmService.registerToken(userId, token);
+    await fcmService.registerToken(userId, token, deviceType || 'android');
 
     // Subscribe to role-based topics
     if (userRole === 'transporter') {
@@ -162,9 +163,8 @@ router.delete('/unregister-token', authMiddleware, async (req: Request, res: Res
 router.get('/preferences', authMiddleware, async (req: Request, res: Response) => {
   try {
     const userId = req.user!.userId;
-    
-    // Default preferences (in production, fetch from database)
-    const preferences = {
+
+    const defaults = {
       newBroadcasts: true,
       tripUpdates: true,
       payments: true,
@@ -172,6 +172,9 @@ router.get('/preferences', authMiddleware, async (req: Request, res: Response) =
       sound: true,
       vibration: true
     };
+
+    const saved = await redisService.getJSON<Record<string, boolean>>(`notification_prefs:${userId}`);
+    const preferences = saved ? { ...defaults, ...saved } : defaults;
 
     res.json({
       success: true,
@@ -203,8 +206,36 @@ router.put('/preferences', authMiddleware, async (req: Request, res: Response) =
     const userId = req.user!.userId;
     const preferences = req.body;
 
-    // In production, save to database
-    logger.info(`Notification preferences updated for user ${userId}`, preferences);
+    await redisService.setJSON(`notification_prefs:${userId}`, preferences, 86400 * 365);
+    logger.info(`Notification preferences updated for user ${userId}`);
+
+    res.json({
+      success: true,
+      data: {
+        message: 'Preferences updated successfully',
+        preferences
+      }
+    });
+  } catch (error) {
+    logger.error('Failed to update notification preferences', error);
+    res.status(500).json({
+      success: false,
+      error: {
+        code: 'INTERNAL_ERROR',
+        message: 'Failed to update notification preferences'
+      }
+    });
+  }
+});
+
+/** POST alias for Captain app compatibility (Captain declares both POST and PUT) */
+router.post('/preferences', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const userId = req.user!.userId;
+    const preferences = req.body;
+
+    await redisService.setJSON(`notification_prefs:${userId}`, preferences, 86400 * 365);
+    logger.info(`Notification preferences updated for user ${userId}`);
 
     res.json({
       success: true,

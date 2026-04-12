@@ -109,29 +109,44 @@ class ConfirmedHoldService {
 
   /**
    * Initialize a confirmed hold (transition from FLEX)
+   * FIX-6: Added transporterId parameter for ownership verification.
+   * FIX-39: Uses a single `now` timestamp for all writes in this operation.
    */
   async initializeConfirmedHold(
     holdId: string,
+    transporterId: string,
     assignments: Array<{
       assignmentId: string;
       driverId: string;
       truckRequestId: string;
     }>
-  ): Promise<{ success: boolean; message: string; confirmedExpiresAt?: Date }> {
+  ): Promise<{ success: boolean; message: string; confirmedExpiresAt?: Date; missingAssignmentIds?: string[] }> {
     logger.info('[CONFIRMED HOLD] Initializing confirmed hold', {
       holdId,
+      transporterId,
       assignmentsCount: assignments.length,
     });
 
     try {
       // Fix M-8: Phase guard -- prevent double initialization
+      // FIX-6: Also fetch transporterId for ownership check
       const existing = await prismaClient.truckHoldLedger.findUnique({
         where: { holdId },
-        select: { phase: true, confirmedExpiresAt: true }
+        select: { phase: true, confirmedExpiresAt: true, transporterId: true }
       });
 
       if (!existing) {
         return { success: false, message: 'Hold not found' };
+      }
+
+      // FIX-6: Ownership verification — only the transporter who created the hold can confirm it
+      if (existing.transporterId !== transporterId) {
+        logger.warn('[CONFIRMED HOLD] Ownership check failed for initializeConfirmedHold', {
+          holdId,
+          requestedBy: transporterId,
+          ownedBy: existing.transporterId,
+        });
+        return { success: false, message: 'Not your hold' };
       }
 
       if (existing.phase === HoldPhase.CONFIRMED) {
@@ -216,21 +231,26 @@ class ConfirmedHoldService {
       );
 
       // Schedule driver acceptance timeouts with full data
+      const missingIds: string[] = [];
       for (const assignment of assignments) {
         const fullData = assignmentMap.get(assignment.assignmentId);
 
         if (!fullData) {
-          logger.warn('[CONFIRMED HOLD] Assignment not found in database', {
-            assignmentId: assignment.assignmentId
-          });
+          missingIds.push(assignment.assignmentId);
           continue;
         }
 
+        // FIX-39: Pass the operation-level `now` timestamp for consistency
         await this.scheduleDriverAcceptanceTimeout(
           assignment.assignmentId,
           fullData,
-          this.config.driverAcceptTimeoutSeconds
+          this.config.driverAcceptTimeoutSeconds,
+          now
         );
+      }
+
+      if (missingIds.length > 0) {
+        logger.warn('[CONFIRMED HOLD] Some assignments not found', { missingIds });
       }
 
       logger.info('[CONFIRMED HOLD] Confirmed hold initialized', {
@@ -242,6 +262,7 @@ class ConfirmedHoldService {
         success: true,
         message: 'Confirmed hold initialized',
         confirmedExpiresAt,
+        missingAssignmentIds: missingIds.length > 0 ? missingIds : undefined,
       };
     } catch (error: any) {
       logger.error('[CONFIRMED HOLD] Failed to initialize confirmed hold', {
@@ -260,13 +281,15 @@ class ConfirmedHoldService {
    * Handle driver acceptance
    */
   async handleDriverAcceptance(
-    assignmentId: string
+    assignmentId: string,
+    driverId: string
   ): Promise<DriverAcceptResponse> {
     logger.info('[CONFIRMED HOLD] Handling driver acceptance', { assignmentId });
 
     try {
       const lockKey = REDIS_KEYS.DRIVER_ACCEPTANCE(assignmentId);
-      const lock = await redisService.acquireLock(lockKey, 'driver-acceptance', 10);
+      const lockHolder = uuidv4();
+      const lock = await redisService.acquireLock(lockKey, lockHolder, 10);
 
       if (!lock.acquired) {
         return {
@@ -280,15 +303,20 @@ class ConfirmedHoldService {
       }
 
       try {
+        // FIX-39: Single timestamp for the entire acceptance operation
+        const now = new Date();
+        const nowIso = now.toISOString();
+
         // CAS guard: only accept if assignment is still pending
         const updated = await prismaClient.assignment.updateMany({
           where: {
             id: assignmentId,
+            driverId,
             status: AssignmentStatus.pending,  // CAS precondition
           },
           data: {
             status: AssignmentStatus.driver_accepted,
-            driverAcceptedAt: new Date().toISOString(),
+            driverAcceptedAt: nowIso,
           },
         });
 
@@ -403,7 +431,7 @@ class ConfirmedHoldService {
           message: 'Driver accepted successfully',
         };
       } finally {
-        await redisService.releaseLock(lockKey, 'driver-acceptance').catch(() => {});
+        await redisService.releaseLock(lockKey, lockHolder).catch(() => {});
       }
     } catch (error: any) {
       logger.error('[CONFIRMED HOLD] Failed to handle driver acceptance', {
@@ -427,6 +455,7 @@ class ConfirmedHoldService {
    */
   async handleDriverDecline(
     assignmentId: string,
+    driverId: string,
     reason: string = ''
   ): Promise<DriverAcceptResponse> {
     logger.info('[CONFIRMED HOLD] Handling driver decline', {
@@ -436,7 +465,8 @@ class ConfirmedHoldService {
 
     try {
       const lockKey = REDIS_KEYS.DRIVER_ACCEPTANCE(assignmentId);
-      const lock = await redisService.acquireLock(lockKey, 'driver-decline', 10);
+      const lockHolder = uuidv4();
+      const lock = await redisService.acquireLock(lockKey, lockHolder, 10);
 
       if (!lock.acquired) {
         return {
@@ -454,6 +484,7 @@ class ConfirmedHoldService {
         const updated = await prismaClient.assignment.updateMany({
           where: {
             id: assignmentId,
+            driverId,
             status: AssignmentStatus.pending,  // CAS precondition
           },
           data: {
@@ -589,7 +620,7 @@ class ConfirmedHoldService {
           message: 'Driver declined successfully',
         };
       } finally {
-        await redisService.releaseLock(lockKey, 'driver-decline').catch(() => {});
+        await redisService.releaseLock(lockKey, lockHolder).catch(() => {});
       }
     } catch (error: any) {
       logger.error('[CONFIRMED HOLD] Failed to handle driver decline', {
@@ -614,7 +645,22 @@ class ConfirmedHoldService {
   async handleDriverTimeout(assignmentId: string): Promise<DriverAcceptResponse> {
     logger.info('[CONFIRMED HOLD] Handling driver timeout', { assignmentId });
 
-    return await this.handleDriverDecline(assignmentId, 'Driver timed out');
+    const assignment = await prismaClient.assignment.findUnique({
+      where: { id: assignmentId },
+      select: { driverId: true },
+    });
+    if (!assignment?.driverId) {
+      return {
+        success: false,
+        assignmentId,
+        accepted: false,
+        declined: false,
+        timeout: true,
+        message: 'Assignment not found for timeout',
+      };
+    }
+
+    return await this.handleDriverDecline(assignmentId, assignment.driverId, 'Driver timed out');
   }
 
   /**
@@ -666,6 +712,14 @@ class ConfirmedHoldService {
         },
       });
 
+      // Count declined assignments for this order (driver_declined lives on Assignment, not TruckRequest)
+      const declinedCount = await prismaClient.assignment.count({
+        where: {
+          orderId: holdLedger.orderId,
+          status: AssignmentStatus.driver_declined,
+        },
+      });
+
       const now = new Date();
       const expiresAt = holdLedger.confirmedExpiresAt || holdLedger.expiresAt;
       const remainingSeconds = Math.max(
@@ -685,7 +739,7 @@ class ConfirmedHoldService {
         trucksAccepted: truckRequests.filter((tr) =>
           ['accepted', 'in_progress'].includes(tr.status)
         ).length,
-        trucksDeclined: 0, // Need to track separately
+        trucksDeclined: declinedCount,
         trucksPending: truckRequests.filter((tr) =>
           tr.status === 'assigned'
         ).length,
@@ -782,8 +836,11 @@ class ConfirmedHoldService {
       orderId: string;
       truckRequestId?: string;
     },
-    timeoutSeconds: number
+    timeoutSeconds: number,
+    now?: Date
   ): Promise<void> {
+    // FIX-39: Use caller-provided timestamp or create one once for consistency
+    const ts = now ?? new Date();
     await queueService.scheduleAssignmentTimeout({
       assignmentId,
       driverId: assignmentData.driverId,
@@ -794,7 +851,7 @@ class ConfirmedHoldService {
       tripId: assignmentData.tripId,
       orderId: assignmentData.orderId,
       truckRequestId: assignmentData.truckRequestId,
-      createdAt: new Date().toISOString(),
+      createdAt: ts.toISOString(),
     }, timeoutSeconds * 1000);
 
     logger.debug('[CONFIRMED HOLD] Driver acceptance timeout scheduled', {

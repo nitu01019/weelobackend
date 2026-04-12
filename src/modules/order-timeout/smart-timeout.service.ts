@@ -119,12 +119,70 @@ const REDIS_KEYS = {
 
 class SmartTimeoutService {
   private config: SmartTimeoutConfig;
-  // KNOWN_ISSUE(H2): extension counters reset on restart — lost on ECS restart.
-  // WARNING: In-memory state — lost on ECS restart. TODO: migrate to Redis.
+  // Redis-backed extension count with in-memory fallback (migrated from in-memory-only Map).
+  // Redis key: order:ext:count:{orderId}, TTL: 1 hour.
+  // In-memory Map kept as fallback if Redis is temporarily unavailable.
   private extensionCountByOrder: Map<string, number> = new Map();
 
   constructor(config: Partial<SmartTimeoutConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
+  }
+
+  // ===========================================================================
+  // REDIS-BACKED EXTENSION COUNT (migrated from in-memory-only Map)
+  // ===========================================================================
+  // Redis is the primary store; in-memory Map is a fallback if Redis is down.
+  // TTL: 1 hour (extensions are only relevant during active order timeout).
+  // ===========================================================================
+
+  private static readonly EXT_COUNT_TTL = 3600; // 1 hour
+
+  private static extCountKey(orderId: string): string {
+    return `order:ext:count:${orderId}`;
+  }
+
+  private async getExtensionCount(orderId: string): Promise<number> {
+    try {
+      const countStr = await redisService.get(SmartTimeoutService.extCountKey(orderId));
+      if (countStr !== null) {
+        const count = parseInt(countStr, 10);
+        // Sync in-memory fallback
+        this.extensionCountByOrder.set(orderId, count);
+        return count;
+      }
+    } catch (err: any) {
+      logger.debug('[SMART TIMEOUT] Redis ext count read failed, using in-memory fallback', {
+        orderId, error: err?.message,
+      });
+    }
+    // Fallback to in-memory Map
+    return this.extensionCountByOrder.get(orderId) ?? 0;
+  }
+
+  private async setExtensionCount(orderId: string, count: number): Promise<void> {
+    // Always update in-memory fallback
+    this.extensionCountByOrder.set(orderId, count);
+    // Write to Redis (fire-and-forget for non-critical state)
+    try {
+      await redisService.set(
+        SmartTimeoutService.extCountKey(orderId),
+        String(count),
+        SmartTimeoutService.EXT_COUNT_TTL,
+      );
+    } catch (err: any) {
+      logger.debug('[SMART TIMEOUT] Redis ext count write failed (in-memory fallback active)', {
+        orderId, error: err?.message,
+      });
+    }
+  }
+
+  private async deleteExtensionCount(orderId: string): Promise<void> {
+    this.extensionCountByOrder.delete(orderId);
+    try {
+      await redisService.del(SmartTimeoutService.extCountKey(orderId));
+    } catch {
+      // Non-critical — key will expire via TTL
+    }
   }
 
   /**
@@ -133,7 +191,7 @@ class SmartTimeoutService {
   async initializeOrderTimeout(
     orderId: string,
     totalTrucks: number
-  ): Promise<{ success: boolean; expiresAt: Date }> {
+  ): Promise<{ success: boolean; expiresAt?: Date }> {
     logger.info('[SMART TIMEOUT] Initializing order timeout', {
       orderId,
       totalTrucks,
@@ -175,8 +233,8 @@ class SmartTimeoutService {
 
       await this.cacheTimeoutState(orderId, state);
 
-      // Track extension count
-      this.extensionCountByOrder.set(orderId, 0);
+      // Track extension count (Redis-backed with in-memory fallback)
+      await this.setExtensionCount(orderId, 0);
 
       // Schedule expiry check
       await this.scheduleExpiryCheck(orderId, expiresAt);
@@ -194,8 +252,8 @@ class SmartTimeoutService {
       });
 
       return {
-        success: true,
-        expiresAt: new Date(Date.now() + this.config.baseTimeoutSeconds * 1000),
+        success: false,
+        expiresAt: undefined,
       };
     }
   }
@@ -254,10 +312,11 @@ class SmartTimeoutService {
       // Calculate extension amount
       let addedSeconds: number;
       const isFirstDriver = request.isFirstDriver;
+      const currentExtCount = await this.getExtensionCount(request.orderId);
       const isFirstExtension =
         isFirstDriver ||
         orderTimeout.extendedMs === 0 ||
-        this.extensionCountByOrder.get(request.orderId) === 0;
+        currentExtCount === 0;
 
       if (isFirstExtension) {
         addedSeconds = this.config.firstDriverExtensionSeconds; // +60s
@@ -306,9 +365,9 @@ class SmartTimeoutService {
         },
       });
 
-      // Update extension count
-      const currentCount = this.extensionCountByOrder.get(request.orderId) || 0;
-      this.extensionCountByOrder.set(request.orderId, currentCount + 1);
+      // Update extension count (Redis-backed with in-memory fallback)
+      const currentCount = currentExtCount;
+      await this.setExtensionCount(request.orderId, currentCount + 1);
 
       // Get state for notification
       const state: OrderTimeoutState = {
@@ -415,7 +474,7 @@ class SmartTimeoutService {
           Math.floor((orderTimeout.expiresAt.getTime() - now.getTime()) / 1000)
         ),
         isExpired: orderTimeout.isExpired || new Date() > orderTimeout.expiresAt,
-        extensionCount: this.extensionCountByOrder.get(orderId) || 0,
+        extensionCount: await this.getExtensionCount(orderId),
         firstExtensionUsed: orderTimeout.extendedMs > 0,
       };
 
@@ -550,8 +609,8 @@ class SmartTimeoutService {
           },
         });
 
-        // Only expire if no recent progress
-        if (!recentProgress || orderTimeout.expiresAt < noProgressThreshold) {
+        // Only expire if no recent progress AND past the no-progress threshold
+        if (!recentProgress && orderTimeout.expiresAt < noProgressThreshold) {
           await prismaClient.orderTimeout.update({
             where: { orderId: orderTimeout.orderId },
             data: {
@@ -571,6 +630,12 @@ class SmartTimeoutService {
           logger.info('[SMART TIMEOUT] Order marked as expired', {
             orderId: orderTimeout.orderId,
             expiredAt: now.toISOString(),
+          });
+        } else {
+          logger.info('[SMART TIMEOUT] Order spared from expiry due to recent progress', {
+            orderId: orderTimeout.orderId,
+            lastProgressAt: recentProgress?.timestamp?.toISOString(),
+            expiresAt: orderTimeout.expiresAt.toISOString(),
           });
         }
       }

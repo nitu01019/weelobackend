@@ -297,7 +297,7 @@ describe('Problem 1 — handleDriverAcceptance/Decline use tripId for lookup', (
   it('handleDriverAcceptance queries by id (fixed implementation)', async () => {
     const assignment = setupAcceptHappyPath();
 
-    await confirmedHoldService.handleDriverAcceptance('assign-001');
+    await confirmedHoldService.handleDriverAcceptance('assign-001', 'driver-001');
 
     // C2 CAS: updateMany with id + status precondition
     expect(mockAssignmentUpdateMany).toHaveBeenCalledTimes(1);
@@ -308,7 +308,7 @@ describe('Problem 1 — handleDriverAcceptance/Decline use tripId for lookup', (
   it('handleDriverAcceptance with valid assignmentId returns success', async () => {
     setupAcceptHappyPath();
 
-    const result = await confirmedHoldService.handleDriverAcceptance('assign-001');
+    const result = await confirmedHoldService.handleDriverAcceptance('assign-001', 'driver-001');
 
     expect(result.success).toBe(true);
     expect(result.accepted).toBe(true);
@@ -325,7 +325,7 @@ describe('Problem 1 — handleDriverAcceptance/Decline use tripId for lookup', (
       new Error('Record to update not found.')
     );
 
-    const result = await confirmedHoldService.handleDriverAcceptance('non-existent-id');
+    const result = await confirmedHoldService.handleDriverAcceptance('non-existent-id', 'driver-001');
 
     expect(result.success).toBe(false);
     expect(result.accepted).toBe(false);
@@ -338,7 +338,7 @@ describe('Problem 1 — handleDriverAcceptance/Decline use tripId for lookup', (
   it('handleDriverDecline queries by id (fixed implementation)', async () => {
     setupDeclineHappyPath();
 
-    await confirmedHoldService.handleDriverDecline('assign-001');
+    await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
 
     // C2 CAS: updateMany with id + status precondition
     expect(mockAssignmentUpdateMany).toHaveBeenCalledTimes(1);
@@ -357,7 +357,7 @@ describe('Problem 6 — handleDriverDecline resets truck request and updates sta
   it('handleDriverDecline succeeds and marks as declined', async () => {
     setupDeclineHappyPath();
 
-    const result = await confirmedHoldService.handleDriverDecline('assign-001');
+    const result = await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
 
     expect(result.success).toBe(true);
     expect(result.declined).toBe(true);
@@ -367,7 +367,7 @@ describe('Problem 6 — handleDriverDecline resets truck request and updates sta
   it('handleDriverDecline updates assignment status to driver_declined', async () => {
     setupDeclineHappyPath();
 
-    await confirmedHoldService.handleDriverDecline('assign-001');
+    await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
 
     // C2 CAS: updateMany with status precondition
     expect(mockAssignmentUpdateMany).toHaveBeenCalledTimes(1);
@@ -378,7 +378,7 @@ describe('Problem 6 — handleDriverDecline resets truck request and updates sta
   it('handleDriverDecline sets truck request to held (Phase 2 exclusivity)', async () => {
     setupDeclineHappyPath();
 
-    await confirmedHoldService.handleDriverDecline('assign-001');
+    await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
 
     // truckRequest.findFirst is used to find the request via FK traversal
     expect(mockTruckRequestFindFirst).toHaveBeenCalledTimes(1);
@@ -393,14 +393,14 @@ describe('Problem 6 — handleDriverDecline resets truck request and updates sta
   it('handleDriverDecline is idempotent — calling twice does not crash', async () => {
     // First call — normal happy path
     setupDeclineHappyPath();
-    const result1 = await confirmedHoldService.handleDriverDecline('assign-001');
+    const result1 = await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
     expect(result1.success).toBe(true);
 
     // Second call — assignment is already declined; prisma update still succeeds
     // because we query by { tripId } not { tripId, status }
     resetAllMocks();
     setupDeclineHappyPath({ status: 'driver_declined' });
-    const result2 = await confirmedHoldService.handleDriverDecline('assign-001');
+    const result2 = await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
     expect(result2.success).toBe(true);
   });
 
@@ -409,7 +409,7 @@ describe('Problem 6 — handleDriverDecline resets truck request and updates sta
     // Override: findFirst returns null (no truck request for this tripId)
     mockTruckRequestFindFirst.mockResolvedValue(null);
 
-    const result = await confirmedHoldService.handleDriverDecline('assign-001');
+    const result = await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
 
     expect(result.success).toBe(true);
     expect(result.declined).toBe(true);
@@ -423,7 +423,7 @@ describe('Problem 6 — handleDriverDecline resets truck request and updates sta
     // C2 CAS: updateMany throws
     mockAssignmentUpdateMany.mockRejectedValue(new Error('Record not found'));
 
-    const result = await confirmedHoldService.handleDriverDecline('assign-001');
+    const result = await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
 
     // Error is caught and returns failure
     expect(result.success).toBe(false);
@@ -433,7 +433,7 @@ describe('Problem 6 — handleDriverDecline resets truck request and updates sta
   it('handleDriverDecline message contains success text', async () => {
     setupDeclineHappyPath();
 
-    const result = await confirmedHoldService.handleDriverDecline('assign-001');
+    const result = await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
 
     expect(result.message).toContain('declined');
   });
@@ -469,7 +469,7 @@ describe('Problem 6 — handleDriverDecline resets truck request and updates sta
     mockReleaseVehicle.mockResolvedValue(undefined);
     mockExecuteRaw.mockResolvedValue(1);
 
-    const promise1 = confirmedHoldService.handleDriverDecline('assign-001');
+    const promise1 = confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
 
     // Driver 2 decline (different assignment)
     const assign2 = buildAssignment({
@@ -490,7 +490,7 @@ describe('Problem 6 — handleDriverDecline resets truck request and updates sta
     mockTruckRequestUpdate.mockResolvedValueOnce({});
     mockTruckHoldLedgerFindFirst.mockResolvedValueOnce(null);
 
-    const promise2 = confirmedHoldService.handleDriverDecline('assign-002');
+    const promise2 = confirmedHoldService.handleDriverDecline('assign-002', 'driver-001');
 
     const [result1, result2] = await Promise.all([promise1, promise2]);
 
@@ -514,7 +514,7 @@ describe('Edge cases — lock contention and missing data', () => {
   it('handleDriverAcceptance returns failure when lock not acquired', async () => {
     mockRedisAcquireLock.mockResolvedValue({ acquired: false });
 
-    const result = await confirmedHoldService.handleDriverAcceptance('assign-001');
+    const result = await confirmedHoldService.handleDriverAcceptance('assign-001', 'driver-001');
 
     expect(result.success).toBe(false);
     expect(result.message).toContain('lock');
@@ -524,7 +524,7 @@ describe('Edge cases — lock contention and missing data', () => {
   it('handleDriverDecline returns failure when lock not acquired', async () => {
     mockRedisAcquireLock.mockResolvedValue({ acquired: false });
 
-    const result = await confirmedHoldService.handleDriverDecline('assign-001');
+    const result = await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
 
     expect(result.success).toBe(false);
     expect(result.message).toContain('lock');
@@ -536,7 +536,7 @@ describe('Edge cases — lock contention and missing data', () => {
     // Override: findFirst returns null (no truck request)
     mockTruckRequestFindFirst.mockResolvedValue(null);
 
-    const result = await confirmedHoldService.handleDriverDecline('assign-001');
+    const result = await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
 
     expect(result.success).toBe(true);
     expect(result.declined).toBe(true);
@@ -547,7 +547,7 @@ describe('Edge cases — lock contention and missing data', () => {
   it('handleDriverDecline with truckRequest found sets to held', async () => {
     setupDeclineHappyPath();
 
-    const result = await confirmedHoldService.handleDriverDecline('assign-001');
+    const result = await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
 
     expect(result.success).toBe(true);
     expect(mockTruckRequestUpdate).toHaveBeenCalledTimes(1);
@@ -559,7 +559,7 @@ describe('Edge cases — lock contention and missing data', () => {
     setupDeclineHappyPath();
     mockTruckRequestUpdate.mockRejectedValue(new Error('DB write failed'));
 
-    const result = await confirmedHoldService.handleDriverDecline('assign-001');
+    const result = await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
 
     // truckRequest update error propagates to the outer try/catch
     expect(result.success).toBe(false);
@@ -571,12 +571,12 @@ describe('Edge cases — lock contention and missing data', () => {
     // C2 CAS: updateMany throws
     mockAssignmentUpdateMany.mockRejectedValue(new Error('DB error'));
 
-    await confirmedHoldService.handleDriverDecline('assign-001');
+    await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
 
-    // Lock should be released in the finally block
+    // Lock should be released in the finally block (C-02: holder is now uuidv4())
     expect(mockRedisReleaseLock).toHaveBeenCalledWith(
       'driver-acceptance:assign-001',
-      'driver-decline'
+      expect.any(String)
     );
   });
 });

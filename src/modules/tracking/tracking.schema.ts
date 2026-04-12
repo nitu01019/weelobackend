@@ -133,6 +133,8 @@ export interface TrackingResponse {
   longitude: number;
   speed: number;
   bearing: number;
+  /** Whether a real GPS fix has been received. Missing/undefined = true (backward compat). */
+  locationAvailable?: boolean;
   status: string;
   lastUpdated: string;
 }

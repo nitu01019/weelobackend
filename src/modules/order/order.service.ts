@@ -40,6 +40,7 @@ import { googleMapsService } from '../../shared/services/google-maps.service';
 import { metrics } from '../../shared/monitoring/metrics.service';
 import { truckHoldService } from '../truck-hold/truck-hold.service';
 import { roundCoord } from '../../shared/utils/geo.utils';
+import { haversineDistanceKm } from '../../shared/utils/geospatial.utils';
 import { releaseVehicle } from '../../shared/services/vehicle-lifecycle.service';
 // Fix B4: Import state machine for order status assertions
 import { assertValidTransition, ORDER_VALID_TRANSITIONS } from '../../core/state-machines';
@@ -56,6 +57,7 @@ import type {
   DispatchAttemptContext,
   DispatchAttemptOutcome,
   OrderLifecycleOutboxPayload,
+  OrderCancelledOutboxPayload,
   TruckCancelPolicyStage,
   TruckCancelDecision,
   CancelMoneyBreakdown,
@@ -322,7 +324,7 @@ class OrderService {
     return processLifecycleOutboxImmediatelyFn(outboxId);
   }
 
-  private async emitCancellationLifecycle(payload: OrderLifecycleOutboxPayload): Promise<void> {
+  private async emitCancellationLifecycle(payload: OrderCancelledOutboxPayload): Promise<void> {
     return emitCancellationLifecycleFn(payload);
   }
 
@@ -610,6 +612,10 @@ class OrderService {
     // Fix B11: Redis-based system-wide backpressure -- shed load before heavy work
     const BACKPRESSURE_KEY = 'order:create:inflight';
     const MAX_CONCURRENT_ORDERS = Math.max(10, Math.min(1000, parseInt(process.env.ORDER_MAX_CONCURRENT_CREATES || '200', 10)));
+    // FIX-35: Track whether in-memory fallback was used so we only decrement
+    // the in-memory counter when it was actually incremented. Prevents counter
+    // drift when Redis succeeds for increment but fails for decrement (or vice versa).
+    let usedInMemoryFallback = false;
     try {
       const inflight = await redisService.incrBy(BACKPRESSURE_KEY, 1);
       // Set TTL on first use (safety net for stale counters)
@@ -626,8 +632,12 @@ class OrderService {
       // M-20 FIX: In-memory backpressure fallback when Redis is unavailable
       const IN_MEMORY_MAX = Math.ceil(MAX_CONCURRENT_ORDERS / 4); // Per-instance share
       inMemoryInflight++;
+      // FIX-35: Mark that in-memory counter was incremented
+      usedInMemoryFallback = true;
       if (inMemoryInflight > IN_MEMORY_MAX) {
         inMemoryInflight--;
+        // FIX-35: Rejection already decremented, reset flag
+        usedInMemoryFallback = false;
         logger.warn('[ORDER] In-memory backpressure triggered (Redis unavailable)', { inMemoryInflight, max: IN_MEMORY_MAX });
         throw new AppError(503, 'SYSTEM_BUSY', 'System is processing too many orders. Please retry in a few seconds.');
       }
@@ -642,6 +652,10 @@ class OrderService {
     const invalidQuantity = request.vehicleRequirements.find((item) => item.quantity <= 0);
     if (invalidQuantity) {
       throw new AppError(400, 'VALIDATION_ERROR', 'Truck quantity must be greater than zero');
+    }
+    const totalTrucks = request.vehicleRequirements.reduce((sum, item) => sum + item.quantity, 0);
+    if (totalTrucks > 50) {
+      throw new AppError(400, 'VALIDATION_ERROR', 'Maximum 50 trucks per order');
     }
     const requestPayloadHash = this.buildRequestPayloadHash(request);
 
@@ -721,13 +735,25 @@ class OrderService {
     // ONE-ACTIVE-BROADCAST-PER-CUSTOMER GUARD
     // ========================================
     const activeKey = `customer:active-broadcast:${request.customerId}`;
-    const existingBroadcastId = await redisService.get(activeKey);
+    let existingBroadcastId: string | null = null;
+    try {
+      existingBroadcastId = await redisService.get(activeKey);
+    } catch (err) {
+      logger.warn('Redis sentinel dedup check failed, proceeding without cache', { orderId: request.customerId, error: (err as Error).message });
+    }
     if (existingBroadcastId) {
       throw new AppError(409, 'ACTIVE_ORDER_EXISTS', 'You already have an active order');
     }
 
     const lockKey = `customer-broadcast-create:${request.customerId}`;
-    const lock = await redisService.acquireLock(lockKey, request.customerId, 10);
+    let lock: { acquired: boolean } = { acquired: false };
+    try {
+      lock = await redisService.acquireLock(lockKey, request.customerId, 10);
+    } catch (err) {
+      logger.warn('Redis acquireLock failed, proceeding without lock', { orderId: request.customerId, error: (err as Error).message });
+      metrics.incrementCounter('order_create_lock_fallback_total');
+      lock = { acquired: true }; // skip lock on failure; DB unique constraint is the guarantee
+    }
     if (!lock.acquired) {
       throw new AppError(409, 'LOCK_CONTENTION', 'Order creation in progress, please wait');
     }
@@ -765,7 +791,12 @@ class OrderService {
       const idempotencyHash = crypto.createHash('sha256').update(idempotencyFingerprint).digest('hex').substring(0, 32);
       const dedupeKey = `idem:broadcast:create:${request.customerId}:${idempotencyHash}`;
 
-      const existingDedupeId = await redisService.get(dedupeKey);
+      let existingDedupeId: string | null = null;
+      try {
+        existingDedupeId = await redisService.get(dedupeKey);
+      } catch (err) {
+        logger.warn('Redis dedup check failed, proceeding without cache', { orderId: request.customerId, error: (err as Error).message });
+      }
       if (existingDedupeId) {
         const existingDedupeOrder = await db.getOrderById(existingDedupeId);
         if (existingDedupeOrder && !['cancelled', 'expired'].includes(existingDedupeOrder.status)) {
@@ -874,6 +905,43 @@ class OrderService {
           clientDistanceKm,
           reason: routeError?.message || 'unknown'
         });
+      }
+
+      // FIX-8: Haversine floor validation when using client-provided distance.
+      // Client distance may be stale, zero, or manipulated. Apply a minimum floor
+      // of haversine * 1.3 (India road circuity factor) so pricing is never based
+      // on an impossibly low distance value.
+      // Note: local pickup/drop variables are declared later, so derive coords from request fields.
+      const haversinePickup = request.routePoints?.[0] || request.pickup;
+      const haversineDrop = request.routePoints?.[request.routePoints?.length ? request.routePoints.length - 1 : 0] || request.drop;
+      if (distanceSource === 'client_fallback' && haversinePickup && haversineDrop) {
+        const haversineDist = haversineDistanceKm(
+          haversinePickup.latitude, haversinePickup.longitude,
+          haversineDrop.latitude, haversineDrop.longitude
+        );
+        if (haversineDist > 0) {
+          const haversineFloor = Math.ceil(haversineDist * 1.3);
+          if (request.distanceKm < haversineFloor) {
+            logger.warn('[ORDER] Client distance below haversine floor — correcting', {
+              clientDistanceKm: request.distanceKm,
+              haversineKm: haversineDist,
+              haversineFloor,
+              orderId
+            });
+            request.distanceKm = haversineFloor;
+          }
+
+          // Ceiling: cap absurdly high client distances
+          const haversineCeiling = Math.ceil(haversineDist * 3.0);
+          if (request.distanceKm > haversineCeiling) {
+            logger.warn('[ORDER] Client distance exceeds ceiling, capping', {
+              clientDistance: request.distanceKm,
+              haversineDist,
+              ceiling: haversineCeiling
+            });
+            request.distanceKm = haversineCeiling;
+          }
+        }
       }
 
       // ==========================================================================
@@ -1101,7 +1169,7 @@ class OrderService {
           where: { customerId: request.customerId, status: { in: [OrderStatus.created, OrderStatus.broadcasting, OrderStatus.active, OrderStatus.partially_filled] } }
         });
         if (dupBooking || dupOrder) {
-          throw new Error('Request already in progress. Cancel it first.');
+          throw new AppError(409, 'ACTIVE_ORDER_EXISTS', 'Request already in progress. Cancel it first.');
         }
 
         await tx.order.create({
@@ -1184,18 +1252,12 @@ class OrderService {
       };
 
       if (FF_ORDER_DISPATCH_OUTBOX) {
-        const immediateOutcome = await this.processDispatchOutboxImmediately(orderId, dispatchContext);
-        if (immediateOutcome) {
-          dispatchState = immediateOutcome.dispatchState;
-          dispatchReasonCode = immediateOutcome.reasonCode;
-          onlineCandidates = immediateOutcome.onlineCandidates;
-          notifiedTransporters = immediateOutcome.notifiedTransporters;
-          dispatchAttempts = immediateOutcome.dispatchAttempts;
-        } else {
-          dispatchState = 'dispatching';
-          dispatchReasonCode = 'DISPATCH_RETRYING';
-          dispatchAttempts = 1;
-        }
+        this.processDispatchOutboxImmediately(orderId, dispatchContext).catch(err =>
+          logger.warn('Immediate dispatch failed, outbox poller will retry', { orderId, error: err.message })
+        );
+        dispatchState = 'dispatching';
+        dispatchReasonCode = 'DISPATCH_RETRYING';
+        dispatchAttempts = 1;
       } else {
         // IMPORTANT: Wrapped in try-catch - dispatch errors should NEVER fail order creation
         try {
@@ -1221,6 +1283,46 @@ class OrderService {
             stack: broadcastError.stack
           });
         }
+      }
+
+      // FIX-14: Expire immediately when 0 transporters were notified.
+      // Waiting the full broadcast timeout (120s) with zero supply wastes
+      // the customer's time. Expire now and let them retry or widen the search.
+      if (notifiedTransporters === 0 && dispatchState === 'dispatch_failed') {
+        logger.warn('[Order] 0 transporters notified — expiring immediately', { orderId, onlineCandidates, dispatchReasonCode });
+        await prismaClient.order.update({
+          where: { id: orderId },
+          data: {
+            status: 'expired' as OrderStatus,
+            dispatchState: 'no_supply',
+            stateChangedAt: new Date(),
+          },
+        });
+        // Notify customer
+        try {
+          emitToUser(request.customerId, SocketEvent.ORDER_NO_SUPPLY, {
+            orderId,
+            message: 'No vehicles available in your area right now. Please try again.',
+          });
+        } catch { /* non-fatal */ }
+        // Clean up customer active broadcast key
+        await this.clearCustomerActiveBroadcast(request.customerId).catch(() => {});
+        // Build and return expired response
+        const expiredResponse: CreateOrderResponse = {
+          orderId,
+          totalTrucks,
+          totalAmount,
+          dispatchState: 'dispatch_failed',
+          dispatchAttempts,
+          onlineCandidates,
+          notifiedTransporters: 0,
+          reasonCode: 'NO_SUPPLY',
+          serverTimeMs: Date.now(),
+          truckRequests: responseRequests,
+          expiresAt,
+          expiresIn: 0
+        };
+        return expiredResponse;
       }
 
       // 4. Set expiry timer
@@ -1330,9 +1432,15 @@ class OrderService {
     // Fix B11: Decrement backpressure counter (outer try/finally)
     } finally {
       // H-P6 FIX: Log backpressure decrement failures instead of silently ignoring
-      await redisService.incrBy(BACKPRESSURE_KEY, -1).catch((err: unknown) => { logger.warn('[ORDER] Backpressure decrement failed in finally', { error: err instanceof Error ? err.message : String(err) }); });
-      // M-20 FIX: Always decrement in-memory fallback counter
-      inMemoryInflight = Math.max(0, inMemoryInflight - 1);
+      if (!usedInMemoryFallback) {
+        // Redis path was used for increment — decrement via Redis
+        await redisService.incrBy(BACKPRESSURE_KEY, -1).catch((err: unknown) => { logger.warn('[ORDER] Backpressure decrement failed in finally', { error: err instanceof Error ? err.message : String(err) }); });
+      }
+      // FIX-35: Only decrement in-memory counter when it was actually incremented.
+      // Previously this always decremented, causing negative drift when Redis succeeded.
+      if (usedInMemoryFallback) {
+        inMemoryInflight = Math.max(0, inMemoryInflight - 1);
+      }
     }
   }
 

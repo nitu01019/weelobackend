@@ -95,7 +95,7 @@ import { v4 as uuidv4 } from 'uuid';
 import crypto from 'crypto';
 import { Prisma } from '@prisma/client';
 import { db } from '../../shared/database/db';
-import { prismaClient, withDbTimeout, AssignmentStatus, OrderStatus, TruckRequestStatus, VehicleStatus } from '../../shared/database/prisma.service';
+import { prismaClient, withDbTimeout, AssignmentStatus, OrderStatus, TruckRequestStatus, VehicleStatus, HoldPhase } from '../../shared/database/prisma.service';
 import { logger } from '../../shared/services/logger.service';
 import { socketService, SocketEvent } from '../../shared/services/socket.service';
 import { redisService } from '../../shared/services/redis.service';
@@ -105,6 +105,7 @@ import { metrics } from '../../shared/monitoring/metrics.service';
 import { fcmService } from '../../shared/services/fcm.service';
 import { driverService } from '../driver/driver.service';
 import { HOLD_CONFIG } from '../../core/config/hold-config';
+import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
 
 // =============================================================================
 // TYPES & INTERFACES
@@ -481,7 +482,8 @@ const holdStore = new HoldStore();
 
 class TruckHoldService {
   private cleanupInterval: NodeJS.Timeout | null = null;
-  private lastIdempotencyPurgeAtMs = 0;
+  // FIX-38: Removed private lastIdempotencyPurgeAtMs field.
+  // Purge timestamp is now stored in Redis for distributed-safe coordination.
 
   constructor() {
     this.startCleanupJob();
@@ -585,22 +587,22 @@ class TruckHoldService {
 
   private recordHoldOutcomeMetrics(result: HoldTrucksResponse, startedAtMs: number, replay: boolean = false): void {
     const durationMs = Math.max(0, Date.now() - startedAtMs);
-    metrics.observeHistogram('hold.latency_ms', durationMs, {
+    metrics.observeHistogram('hold_latency_ms', durationMs, {
       replay: replay ? 'true' : 'false',
       result: result.success ? 'success' : 'failed'
     });
     if (replay) {
-      metrics.incrementCounter('hold.idempotent_replay.total', {
+      metrics.incrementCounter('hold_idempotent_replay_total', {
         result: result.success ? 'success' : 'failed',
         reason: (result.error || 'none').toLowerCase()
       });
       return;
     }
     if (result.success) {
-      metrics.incrementCounter('hold.success.total');
+      metrics.incrementCounter('hold_success_total');
     } else {
       const reason = (result.error || 'unknown').toLowerCase();
-      metrics.incrementCounter('hold.conflict.total', { reason });
+      metrics.incrementCounter('hold_conflict_total', { reason });
     }
   }
 
@@ -624,7 +626,7 @@ class TruckHoldService {
    */
   async holdTrucks(request: HoldTrucksRequest): Promise<HoldTrucksResponse> {
     const holdStartedAtMs = Date.now();
-    metrics.incrementCounter('hold.request.total');
+    metrics.incrementCounter('hold_request_total');
 
     const transporterId = request.transporterId;
     const orderId = (request.orderId || '').trim();
@@ -709,6 +711,28 @@ class TruckHoldService {
           this.recordHoldOutcomeMetrics(response, holdStartedAtMs, true);
           return response;
         }
+      }
+
+      // C-08 fix: Check for existing FLEX hold before creating a legacy hold.
+      // Prevents two parallel hold systems from creating overlapping holds
+      // for the same order + transporter combination.
+      // (Mirrors guard in truck-hold-create.service.ts:262-281)
+      const existingFlexHold = await prismaClient.truckHoldLedger.findFirst({
+        where: {
+          orderId,
+          transporterId,
+          status: 'active',
+          phase: HoldPhase.FLEX,
+        },
+      });
+      if (existingFlexHold) {
+        response = {
+          success: false,
+          message: 'Active flex hold already exists. Use the flex hold API to manage it.',
+          error: 'FLEX_HOLD_CONFLICT',
+        };
+        this.recordHoldOutcomeMetrics(response, holdStartedAtMs);
+        return response;
       }
 
       const holdId = `HOLD_${uuidv4().substring(0, 8).toUpperCase()}`;
@@ -961,7 +985,7 @@ class TruckHoldService {
       logger.error(`[TruckHold] Error confirming hold: ${message}`, error);
       return { success: false, message: 'Failed to confirm. Please try again.' };
     } finally {
-      metrics.observeHistogram('confirm.latency_ms', Math.max(0, Date.now() - confirmStartedAtMs));
+      metrics.observeHistogram('confirm_latency_ms', Math.max(0, Date.now() - confirmStartedAtMs));
     }
   }
 
@@ -1473,7 +1497,7 @@ class TruckHoldService {
         farePerTruck: assignment.farePerTruck,
         distanceKm: order.distanceKm,
         customerName: order.customerName,
-        customerPhone: order.customerPhone,
+        customerPhone: maskPhoneForExternal(order.customerPhone),
         assignedAt: now,
         expiresAt: new Date(Date.now() + DRIVER_TIMEOUT_MS).toISOString(),
         message: `New trip assigned! ${order.pickup.address} → ${order.drop.address}`
@@ -1497,7 +1521,7 @@ class TruckHoldService {
           farePerTruck: assignment.farePerTruck,
           distanceKm: order.distanceKm,
           customerName: order.customerName,
-          customerPhone: order.customerPhone,
+          customerPhone: maskPhoneForExternal(order.customerPhone),
           assignedAt: now,
           expiresAt: new Date(Date.now() + DRIVER_TIMEOUT_MS).toISOString(),
           message: `New trip assigned! ${order.pickup.address} → ${order.drop.address}`
@@ -1537,7 +1561,7 @@ class TruckHoldService {
           fare: String(assignment.farePerTruck ?? 0),
           distanceKm: String(order.distanceKm ?? 0),
           customerName: order.customerName || '',
-          customerPhone: order.customerPhone || '',
+          customerPhone: maskPhoneForExternal(order.customerPhone),
           assignedAt: now,
           expiresAt: new Date(Date.now() + DRIVER_TIMEOUT_MS).toISOString()
         };
@@ -1778,7 +1802,7 @@ class TruckHoldService {
 
       logger.info(`[TruckHold] ✅ Released hold ${normalizedHoldId}. ${hold.quantity} trucks reconciled.`);
       if (releaseSource !== 'cleanup') {
-        metrics.incrementCounter('hold.release.total', { source: releaseSource });
+        metrics.incrementCounter('hold_release_total', { source: releaseSource });
       }
 
       response = { success: true, message: 'Hold released successfully.' };
@@ -1869,7 +1893,7 @@ class TruckHoldService {
       return {
         orderId,
         customerName: order.customerName || 'Customer',
-        customerPhone: order.customerPhone || '',
+        customerPhone: maskPhoneForExternal(order.customerPhone),
         pickup: order.pickup,
         drop: order.drop,
         distanceKm: order.distanceKm || 0,
@@ -2196,9 +2220,9 @@ class TruckHoldService {
    */
   private async processExpiredHoldsOnce(): Promise<void> {
     try {
-      // Distributed lock: only ONE instance runs cleanup per interval
+      // FIX-22: Unified cleanup lock key — all cleanup systems share this lock to prevent conflicts
       const cleanupLock = await redisService.acquireLock(
-        'hold-cleanup-job',
+        'hold:cleanup:unified',
         `cleanup-${process.pid}`,
         60  // 60s lock TTL — cleanup should complete well within this
       );
@@ -2243,11 +2267,17 @@ class TruckHoldService {
         if (expiredHolds.length > 0) {
           logger.info(`[TruckHold] Cleanup: Reconciled ${expiredHolds.length} expired holds`);
           // Emit explicit cleanup metric at job level for release-gate visibility.
-          metrics.incrementCounter('hold.cleanup.released_total', { source: 'cleanup_job' }, cleanupReleasedCount);
+          metrics.incrementCounter('hold_cleanup_released_total', { source: 'cleanup_job' }, cleanupReleasedCount);
         }
 
+        // FIX-38: Use Redis for distributed-safe purge timestamp instead of in-memory field.
+        // This ensures all instances share the same "last purge at" value and prevents
+        // redundant purges across horizontally scaled servers.
+        const PURGE_KEY = 'hold:idempotency:lastPurgeAt';
+        const lastPurgeRaw = await redisService.get(PURGE_KEY);
+        const lastPurgeMs = lastPurgeRaw ? parseInt(lastPurgeRaw, 10) : 0;
         const nowMs = Date.now();
-        if (nowMs - this.lastIdempotencyPurgeAtMs >= HOLD_IDEMPOTENCY_PURGE_INTERVAL_MS) {
+        if (nowMs - lastPurgeMs >= HOLD_IDEMPOTENCY_PURGE_INTERVAL_MS) {
           // Distributed lock: only ONE instance runs purge per interval
           const purgeLock = await redisService.acquireLock(
             'hold-idempotency-purge',
@@ -2258,7 +2288,8 @@ class TruckHoldService {
             // Another instance is handling purge — skip
           } else {
             try {
-              this.lastIdempotencyPurgeAtMs = nowMs;
+              // FIX-38: Write purge timestamp to Redis with 1hr TTL
+              await redisService.set(PURGE_KEY, String(nowMs), 3600);
               const cutoff = new Date(nowMs - (HOLD_IDEMPOTENCY_RETENTION_HOURS * 60 * 60 * 1000));
               const purged = await prismaClient.truckHoldIdempotency.deleteMany({
                 where: {
@@ -2267,7 +2298,7 @@ class TruckHoldService {
               });
               if (purged.count > 0) {
                 logger.info(`[TruckHold] Purged ${purged.count} old hold idempotency row(s)`);
-                metrics.incrementCounter('hold.idempotency.purged_total', {}, purged.count);
+                metrics.incrementCounter('hold_idempotency_purged_total', {}, purged.count);
               }
             } finally {
               await redisService.releaseLock('hold-idempotency-purge', `purge-${process.pid}`).catch(() => {});
@@ -2275,8 +2306,8 @@ class TruckHoldService {
           }
         }
       } finally {
-        // Release the cleanup lock (auto-expires after 60s if we crash)
-        await redisService.releaseLock('hold-cleanup-job', `cleanup-${process.pid}`).catch(() => {});
+        // FIX-22: Release the unified cleanup lock (auto-expires after 60s if we crash)
+        await redisService.releaseLock('hold:cleanup:unified', `cleanup-${process.pid}`).catch(() => {});
       }
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);

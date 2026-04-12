@@ -21,9 +21,11 @@ import { liveAvailabilityService } from '../../shared/services/live-availability
 import { generateVehicleKey } from '../../shared/services/vehicle-key.service';
 import { AppError } from '../../shared/types/error.types';
 import { metrics } from '../../shared/monitoring/metrics.service';
+import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
 import { truckHoldService } from '../truck-hold/truck-hold.service';
 import type {
   OrderLifecycleOutboxPayload,
+  OrderCancelledOutboxPayload,
   CancelOrderResult,
 } from './order-types';
 import {
@@ -193,7 +195,7 @@ export async function cancelOrder(
   }
 
   let lifecycleOutboxId: string | null = null;
-  let lifecyclePayload: OrderLifecycleOutboxPayload | null = null;
+  let lifecyclePayload: OrderCancelledOutboxPayload | null = null;
   let closedHoldsCount = 0;
   let closedHoldIds: string[] = [];
   let result: CancelOrderResult = {
@@ -594,7 +596,7 @@ export async function cancelOrder(
           driverId: String(assignment.driverId),
           tripId: assignment.tripId || undefined,
           customerName: refreshedOrder.customerName,
-          customerPhone: refreshedOrder.customerPhone,
+          customerPhone: maskPhoneForExternal(refreshedOrder.customerPhone),
           pickupAddress: (refreshedOrder.pickup as any)?.address || '',
           dropAddress: (refreshedOrder.drop as any)?.address || ''
         })),
