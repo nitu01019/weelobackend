@@ -71,6 +71,7 @@ const mockAssignmentUpdateMany = jest.fn();
 const mockAssignmentFindUnique = jest.fn();
 const mockAssignmentFindUniqueOrThrow = jest.fn();
 const mockAssignmentFindMany = jest.fn();
+const mockAssignmentCount = jest.fn();
 const mockTruckRequestFindFirst = jest.fn();
 const mockTruckRequestFindUnique = jest.fn();
 const mockTruckRequestFindMany = jest.fn();
@@ -88,6 +89,7 @@ jest.mock('../shared/database/prisma.service', () => ({
       findUnique: (...args: any[]) => mockAssignmentFindUnique(...args),
       findUniqueOrThrow: (...args: any[]) => mockAssignmentFindUniqueOrThrow(...args),
       findMany: (...args: any[]) => mockAssignmentFindMany(...args),
+      count: (...args: any[]) => mockAssignmentCount(...args),
     },
     truckRequest: {
       findFirst: (...args: any[]) => mockTruckRequestFindFirst(...args),
@@ -182,6 +184,7 @@ function resetAllMocks(): void {
   mockAssignmentFindUnique.mockReset();
   mockAssignmentFindUniqueOrThrow.mockReset();
   mockAssignmentFindMany.mockReset();
+  mockAssignmentCount.mockReset();
   mockTruckRequestFindFirst.mockReset();
   mockTruckRequestFindUnique.mockReset();
   mockTruckRequestFindMany.mockReset();
@@ -310,7 +313,7 @@ describe('FIX #25 — FK traversal: Assignment queried first, TruckRequest found
   it('queries Assignment.findUnique to get truckRequestId, then TruckRequest.findFirst by that ID', async () => {
     setupAcceptanceHappyPath();
 
-    await confirmedHoldService.handleDriverAcceptance('assign-001');
+    await confirmedHoldService.handleDriverAcceptance('assign-001', 'driver-001');
 
     // Step 1: assignment.findUnique called with the assignmentId
     expect(mockAssignmentFindUnique).toHaveBeenCalledTimes(1);
@@ -340,7 +343,7 @@ describe('FIX #25 — FK traversal: Assignment queried first, TruckRequest found
       orderId: assignment.orderId,
     });
 
-    await confirmedHoldService.handleDriverAcceptance('assign-001');
+    await confirmedHoldService.handleDriverAcceptance('assign-001', 'driver-001');
 
     // Verify the truckRequest lookup used 'tr-custom-999', not 'assign-001'
     const trFindCall = mockTruckRequestFindFirst.mock.calls[0][0];
@@ -359,7 +362,7 @@ describe('FIX #25 — valid truckRequestId resolves holdRecord', () => {
   it('holdRecord is found when truckRequestId is valid, counter updates proceed', async () => {
     setupAcceptanceHappyPath();
 
-    const result = await confirmedHoldService.handleDriverAcceptance('assign-001');
+    const result = await confirmedHoldService.handleDriverAcceptance('assign-001', 'driver-001');
 
     expect(result.success).toBe(true);
     expect(result.accepted).toBe(true);
@@ -414,7 +417,7 @@ describe('FIX #25 — null truckRequestId fallback to orderId', () => {
     mockRedisExpire.mockResolvedValue(true);
     mockEmitToUser.mockResolvedValue(undefined);
 
-    const result = await confirmedHoldService.handleDriverAcceptance('assign-001');
+    const result = await confirmedHoldService.handleDriverAcceptance('assign-001', 'driver-001');
 
     expect(result.success).toBe(true);
     expect(result.accepted).toBe(true);
@@ -450,7 +453,7 @@ describe('FIX #25 — both truckRequestId and orderId null — no crash', () => 
       orderId: null,
     });
 
-    const result = await confirmedHoldService.handleDriverAcceptance('assign-001');
+    const result = await confirmedHoldService.handleDriverAcceptance('assign-001', 'driver-001');
 
     // Should still succeed (acceptance recorded), just no counter update
     expect(result.success).toBe(true);
@@ -475,7 +478,7 @@ describe('FIX #25 — both truckRequestId and orderId null — no crash', () => 
     // findUnique returns null entirely (edge case)
     mockAssignmentFindUnique.mockResolvedValue(null);
 
-    const result = await confirmedHoldService.handleDriverAcceptance('assign-001');
+    const result = await confirmedHoldService.handleDriverAcceptance('assign-001', 'driver-001');
 
     // Still succeeds — assignment status was updated
     expect(result.success).toBe(true);
@@ -497,7 +500,7 @@ describe('FIX #28 — trucksAccepted increments atomically', () => {
   it('calls hIncrBy with correct key and field for trucksAccepted', async () => {
     setupAcceptanceHappyPath();
 
-    await confirmedHoldService.handleDriverAcceptance('assign-001');
+    await confirmedHoldService.handleDriverAcceptance('assign-001', 'driver-001');
 
     // hIncrBy called for trucksAccepted with +1
     const acceptedCall = mockRedisHIncrBy.mock.calls.find(
@@ -568,8 +571,8 @@ describe('FIX #28 — concurrent driver acceptances with atomic HINCRBY', () => 
 
     // Fire both acceptances concurrently
     const [result1, result2] = await Promise.all([
-      confirmedHoldService.handleDriverAcceptance('assign-001'),
-      confirmedHoldService.handleDriverAcceptance('assign-002'),
+      confirmedHoldService.handleDriverAcceptance('assign-001', 'driver-001'),
+      confirmedHoldService.handleDriverAcceptance('assign-002', 'driver-001'),
     ]);
 
     expect(result1.success).toBe(true);
@@ -595,7 +598,7 @@ describe('FIX #28 — trucksPending decrements atomically', () => {
   it('calls hIncrBy with -1 for trucksPending field', async () => {
     setupAcceptanceHappyPath();
 
-    await confirmedHoldService.handleDriverAcceptance('assign-001');
+    await confirmedHoldService.handleDriverAcceptance('assign-001', 'driver-001');
 
     // Find the hIncrBy call for trucksPending
     const pendingCall = mockRedisHIncrBy.mock.calls.find(
@@ -610,7 +613,7 @@ describe('FIX #28 — trucksPending decrements atomically', () => {
   it('hIncrBy for trucksAccepted and trucksPending are called in parallel', async () => {
     setupAcceptanceHappyPath();
 
-    await confirmedHoldService.handleDriverAcceptance('assign-001');
+    await confirmedHoldService.handleDriverAcceptance('assign-001', 'driver-001');
 
     // Both hIncrBy calls should have been made (Promise.all in the implementation)
     expect(mockRedisHIncrBy).toHaveBeenCalledTimes(2);
@@ -632,7 +635,7 @@ describe('FIX #28 — socket event emitted with correct progress', () => {
   it('emits driver_accepted event with N/M trucks confirmed to transporter', async () => {
     setupAcceptanceHappyPath();
 
-    await confirmedHoldService.handleDriverAcceptance('assign-001');
+    await confirmedHoldService.handleDriverAcceptance('assign-001', 'driver-001');
 
     expect(mockEmitToUser).toHaveBeenCalledTimes(1);
     const [userId, event, payload] = mockEmitToUser.mock.calls[0];
@@ -682,7 +685,7 @@ describe('FIX #28 — socket event emitted with correct progress', () => {
     mockRedisExpire.mockResolvedValue(true);
     mockEmitToUser.mockResolvedValue(undefined);
 
-    await confirmedHoldService.handleDriverAcceptance('assign-001');
+    await confirmedHoldService.handleDriverAcceptance('assign-001', 'driver-001');
 
     const [, , payload] = mockEmitToUser.mock.calls[0];
     expect(payload.trucksAccepted).toBe(2);
@@ -785,6 +788,9 @@ describe('FIX #28 — getConfirmedHoldState DB fallback when Redis empty', () =>
       { id: 'tr-003', status: 'in_progress', orderId: 'order-001' },
     ]);
 
+    // L3 fix: assignment.count for declined drivers
+    mockAssignmentCount.mockResolvedValue(0);
+
     // cacheConfirmedHoldState will re-cache
     mockRedisHMSet.mockResolvedValue(undefined);
     mockRedisExpire.mockResolvedValue(true);
@@ -813,6 +819,8 @@ describe('FIX #28 — getConfirmedHoldState DB fallback when Redis empty', () =>
     const holdLedger = buildHoldLedger();
     mockTruckHoldLedgerFindUnique.mockResolvedValue(holdLedger);
     mockTruckRequestFindMany.mockResolvedValue([]);
+    // L3 fix: assignment.count for declined drivers
+    mockAssignmentCount.mockResolvedValue(0);
     mockRedisHMSet.mockResolvedValue(undefined);
     mockRedisExpire.mockResolvedValue(true);
 
@@ -851,6 +859,8 @@ describe('FIX #28 — getConfirmedHoldState DB fallback when Redis empty', () =>
     mockTruckRequestFindMany.mockResolvedValue([
       { id: 'tr-001', status: 'accepted', orderId: 'order-001' },
     ]);
+    // L3 fix: assignment.count for declined drivers
+    mockAssignmentCount.mockResolvedValue(0);
     mockRedisHMSet.mockResolvedValue(undefined);
     mockRedisExpire.mockResolvedValue(true);
 
@@ -878,6 +888,8 @@ describe('FIX #28 — cacheConfirmedHoldState writes Redis Hash', () => {
       { id: 'tr-002', status: 'assigned', orderId: 'order-001' },
       { id: 'tr-003', status: 'in_progress', orderId: 'order-001' },
     ]);
+    // L3 fix: assignment.count for declined drivers
+    mockAssignmentCount.mockResolvedValue(0);
     mockRedisHMSet.mockResolvedValue(undefined);
     mockRedisExpire.mockResolvedValue(true);
 
@@ -910,6 +922,8 @@ describe('FIX #28 — cacheConfirmedHoldState writes Redis Hash', () => {
     const holdLedger = buildHoldLedger();
     mockTruckHoldLedgerFindUnique.mockResolvedValue(holdLedger);
     mockTruckRequestFindMany.mockResolvedValue([]);
+    // L3 fix: assignment.count for declined drivers
+    mockAssignmentCount.mockResolvedValue(0);
     mockRedisHMSet.mockResolvedValue(undefined);
     mockRedisExpire.mockResolvedValue(true);
 
@@ -928,6 +942,8 @@ describe('FIX #28 — cacheConfirmedHoldState writes Redis Hash', () => {
     const holdLedger = buildHoldLedger({ confirmedAt: now });
     mockTruckHoldLedgerFindUnique.mockResolvedValue(holdLedger);
     mockTruckRequestFindMany.mockResolvedValue([]);
+    // L3 fix: assignment.count for declined drivers
+    mockAssignmentCount.mockResolvedValue(0);
     mockRedisHMSet.mockResolvedValue(undefined);
     mockRedisExpire.mockResolvedValue(true);
 

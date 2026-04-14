@@ -37,6 +37,8 @@ import { queueService } from '../../shared/services/queue.service';
 import { holdExpiryCleanupService } from '../hold-expiry/hold-expiry-cleanup.service';
 import { releaseVehicle } from '../../shared/services/vehicle-lifecycle.service';
 import { HOLD_CONFIG } from '../../core/config/hold-config';
+import { smartTimeoutService } from '../order-timeout/smart-timeout.service';
+import { tryAutoRedispatch } from '../assignment/auto-redispatch.service';
 
 // =============================================================================
 // TYPES & INTERFACES
@@ -77,6 +79,7 @@ export interface DriverAcceptResponse {
   declined: boolean;
   timeout: boolean;
   message: string;
+  errorCode?: string;
 }
 
 // =============================================================================
@@ -128,61 +131,96 @@ class ConfirmedHoldService {
     });
 
     try {
-      // Fix M-8: Phase guard -- prevent double initialization
-      // FIX-6: Also fetch transporterId for ownership check
-      const existing = await prismaClient.truckHoldLedger.findUnique({
-        where: { holdId },
-        select: { phase: true, confirmedExpiresAt: true, transporterId: true }
+      // H-8 FIX: Wrap read-check-write in a Prisma $transaction with SELECT FOR UPDATE
+      // to prevent TOCTOU race where two concurrent requests both read phase=FLEX
+      // and both update to CONFIRMED.
+      const txResult = await prismaClient.$transaction(async (tx) => {
+        // Lock the row with FOR UPDATE to prevent concurrent phase transitions
+        const rows = await tx.$queryRaw<Array<{
+          holdId: string;
+          phase: string;
+          transporterId: string;
+          confirmedExpiresAt: Date | null;
+        }>>`
+          SELECT "holdId", "phase", "transporterId", "confirmedExpiresAt"
+          FROM "TruckHoldLedger"
+          WHERE "holdId" = ${holdId}
+          FOR UPDATE
+        `;
+        const existing = rows[0];
+
+        if (!existing) {
+          return { success: false as const, message: 'Hold not found' };
+        }
+
+        // FIX-6: Ownership verification — only the transporter who created the hold can confirm it
+        if (existing.transporterId !== transporterId) {
+          logger.warn('[CONFIRMED HOLD] Ownership check failed for initializeConfirmedHold', {
+            holdId,
+            requestedBy: transporterId,
+            ownedBy: existing.transporterId,
+          });
+          return { success: false as const, message: 'Not your hold' };
+        }
+
+        if (existing.phase === HoldPhase.CONFIRMED) {
+          logger.info('[CONFIRMED HOLD] Already initialized, returning existing', { holdId });
+          return {
+            success: true as const,
+            message: 'Already in CONFIRMED phase (idempotent)',
+            confirmedExpiresAt: existing.confirmedExpiresAt ?? undefined,
+          };
+        }
+
+        if (existing.phase !== HoldPhase.FLEX) {
+          return {
+            success: false as const,
+            message: `Cannot move to CONFIRMED from ${existing.phase} -- must be FLEX`
+          };
+        }
+
+        const now = new Date();
+        const confirmedExpiresAt = new Date(
+          now.getTime() + this.config.maxDurationSeconds * 1000
+        );
+
+        // Update hold to confirmed phase (within the same TX that holds the row lock)
+        const updated = await tx.truckHoldLedger.update({
+          where: { holdId },
+          data: {
+            phase: HoldPhase.CONFIRMED,
+            phaseChangedAt: now,
+            status: 'confirmed',
+            confirmedAt: now,
+            confirmedExpiresAt,
+            expiresAt: confirmedExpiresAt,
+            updatedAt: now,
+          },
+        });
+
+        return { success: true as const, updated, now, confirmedExpiresAt };
       });
 
-      if (!existing) {
-        return { success: false, message: 'Hold not found' };
+      // Handle early-return cases from the transaction
+      if (!txResult.success) {
+        return { success: false, message: txResult.message };
       }
-
-      // FIX-6: Ownership verification — only the transporter who created the hold can confirm it
-      if (existing.transporterId !== transporterId) {
-        logger.warn('[CONFIRMED HOLD] Ownership check failed for initializeConfirmedHold', {
-          holdId,
-          requestedBy: transporterId,
-          ownedBy: existing.transporterId,
-        });
-        return { success: false, message: 'Not your hold' };
-      }
-
-      if (existing.phase === HoldPhase.CONFIRMED) {
-        logger.info('[CONFIRMED HOLD] Already initialized, returning existing', { holdId });
+      if (txResult.message) {
+        // Idempotent return — already CONFIRMED
         return {
           success: true,
-          message: 'Already in CONFIRMED phase (idempotent)',
-          confirmedExpiresAt: existing.confirmedExpiresAt ?? undefined,
+          message: txResult.message,
+          confirmedExpiresAt: txResult.confirmedExpiresAt,
         };
       }
 
-      if (existing.phase !== HoldPhase.FLEX) {
-        return {
-          success: false,
-          message: `Cannot move to CONFIRMED from ${existing.phase} -- must be FLEX`
-        };
-      }
-
-      const now = new Date();
-      const confirmedExpiresAt = new Date(
-        now.getTime() + this.config.maxDurationSeconds * 1000
-      );
-
-      // Update hold to confirmed phase
-      const updated = await prismaClient.truckHoldLedger.update({
-        where: { holdId },
-        data: {
-          phase: HoldPhase.CONFIRMED,
-          phaseChangedAt: now,
-          status: 'confirmed',
-          confirmedAt: now,
-          confirmedExpiresAt,
-         expiresAt: confirmedExpiresAt,
-          updatedAt: now,
-        },
-      });
+      // Transaction succeeded with a phase transition — extract results
+      const { updated, now, confirmedExpiresAt } = txResult as {
+        success: true;
+        updated: { orderId: string; transporterId: string; quantity: number };
+        now: Date;
+        confirmedExpiresAt: Date;
+      };
 
       // Cache state
       await this.cacheConfirmedHoldState(holdId, {
@@ -346,6 +384,7 @@ class ConfirmedHoldService {
         });
 
         // FIX A5#3: Apply post-accept side effects (Redis availability, tracking, GPS, notifications)
+        // FIX M12: Pass bookingId and orderId separately so order-path customer lookup works
         try {
           const { applyPostAcceptSideEffects } = require('../assignment/post-accept.effects');
           await applyPostAcceptSideEffects({
@@ -354,7 +393,8 @@ class ConfirmedHoldService {
             vehicleId: assignment.vehicleId,
             vehicleNumber: assignment.vehicleNumber,
             tripId: assignment.tripId,
-            bookingId: assignment.orderId, // TruckRequest.bookingId maps to orderId in the Order system (legacy naming)
+            bookingId: assignment.bookingId,
+            orderId: assignment.orderId,
             transporterId: assignment.transporterId,
             driverName: assignment.driverName || 'Driver',
           });
@@ -364,23 +404,8 @@ class ConfirmedHoldService {
           });
         }
 
-        // FIX #25: FK traversal — resolve Assignment → TruckRequest relationship
-        // Previously queried truckRequest.id = assignmentId (wrong entity), always returned null.
-        // Now we first find the Assignment's truckRequestId, then look up the TruckRequest.
-        const assignmentRecord = await prismaClient.assignment.findUnique({
-          where: { id: assignmentId },
-          select: { truckRequestId: true, orderId: true },
-        });
-
-        const holdRecord = assignmentRecord?.truckRequestId
-          ? await prismaClient.truckRequest.findFirst({
-              where: { id: assignmentRecord.truckRequestId },
-              select: { id: true, orderId: true },
-            })
-          : null;
-
-        // Determine the orderId from holdRecord or directly from the assignment
-        const resolvedOrderId = holdRecord?.orderId ?? assignmentRecord?.orderId;
+        // FIX #25 + F-L10: FK traversal via DRY helper
+        const { orderId: resolvedOrderId } = await this.resolveAssignmentTruckRequest(assignmentId);
 
         if (resolvedOrderId) {
           // Find any hold ledger for this order
@@ -414,6 +439,24 @@ class ConfirmedHoldService {
               trucksPending: Math.max(0, newPending),
               message: `Driver accepted. ${newAccepted}/${trucksCount} confirmed.`,
             });
+
+            // M10 FIX: Extend smart timeout when driver accepts in Phase 2.
+            // First acceptance adds +60s, subsequent adds +30s.
+            try {
+              await smartTimeoutService.extendTimeout({
+                orderId: resolvedOrderId,
+                driverId: assignment.driverId,
+                driverName: assignment.driverName || 'Driver',
+                assignmentId,
+                truckRequestId: assignment.truckRequestId ?? undefined,
+                isFirstDriver: newAccepted === 1,
+                reason: 'Driver accepted in confirmed hold (Phase 2)',
+              });
+            } catch (extErr: any) {
+              logger.warn('[CONFIRMED HOLD] Smart timeout extension failed (non-fatal)', {
+                assignmentId, orderId: resolvedOrderId, error: extErr?.message,
+              });
+            }
           }
         }
 
@@ -480,19 +523,53 @@ class ConfirmedHoldService {
       }
 
       try {
-        // CAS guard: only decline if assignment is still pending
-        const updated = await prismaClient.assignment.updateMany({
-          where: {
-            id: assignmentId,
-            driverId,
-            status: AssignmentStatus.pending,  // CAS precondition
-          },
-          data: {
-            status: AssignmentStatus.driver_declined,
-          },
-        });
+        // F-M14 FIX: Atomic decline — CAS assignment update + trucksFilled decrement in one TX.
+        // Previously these were two standalone calls; if the decrement failed, trucksFilled drifted.
+        let txCasMiss = false;
+        let txOrderId: string | null = null;
 
-        if (updated.count === 0) {
+        try {
+          await prismaClient.$transaction(async (tx) => {
+            // CAS guard: only decline if assignment is still pending
+            const updated = await tx.assignment.updateMany({
+              where: {
+                id: assignmentId,
+                driverId,
+                status: AssignmentStatus.pending,  // CAS precondition
+              },
+              data: {
+                status: AssignmentStatus.driver_declined,
+              },
+            });
+
+            if (updated.count === 0) {
+              txCasMiss = true;
+              return; // TX commits with no-op — handled below
+            }
+
+            // Fetch orderId inside TX so the decrement targets the correct row
+            const asnForOrder = await tx.assignment.findUnique({
+              where: { id: assignmentId },
+              select: { orderId: true },
+            });
+            txOrderId = asnForOrder?.orderId ?? null;
+
+            // Decrement trucksFilled atomically with the decline
+            if (txOrderId) {
+              await tx.$executeRaw`
+                UPDATE "Order" SET "trucksFilled" = GREATEST(0, "trucksFilled" - 1), "updatedAt" = NOW()
+                WHERE "id" = ${txOrderId}
+              `;
+            }
+          });
+        } catch (txErr: any) {
+          logger.error('[CONFIRMED HOLD] Atomic decline TX failed', {
+            assignmentId, error: txErr?.message,
+          });
+          throw txErr; // propagate — outer catch returns failure response
+        }
+
+        if (txCasMiss) {
           const current = await prismaClient.assignment.findUnique({
             where: { id: assignmentId },
             select: { status: true },
@@ -516,19 +593,8 @@ class ConfirmedHoldService {
           where: { id: assignmentId },
         });
 
-        // FIX #41 + FK traversal: Resolve Assignment → TruckRequest via FK chain
-        // (mirrors FIX #25 pattern from handleDriverAcceptance)
-        const assignmentRecord = await prismaClient.assignment.findUnique({
-          where: { id: assignmentId },
-          select: { truckRequestId: true, orderId: true },
-        });
-
-        const truckRequest = assignmentRecord?.truckRequestId
-          ? await prismaClient.truckRequest.findFirst({
-              where: { id: assignmentRecord.truckRequestId },
-              select: { id: true, orderId: true },
-            })
-          : null;
+        // FIX #41 + F-L10: FK traversal via DRY helper
+        const { truckRequest, orderId: resolvedOrderId } = await this.resolveAssignmentTruckRequest(assignmentId);
 
         if (truckRequest) {
           // FIX #41: Keep truck in transporter's exclusive hold on decline.
@@ -546,9 +612,7 @@ class ConfirmedHoldService {
           });
         }
 
-        // Update confirmed hold state — resolve orderId from FK chain
-        const resolvedOrderId = truckRequest?.orderId ?? assignmentRecord?.orderId;
-
+        // Update confirmed hold state
         if (resolvedOrderId) {
           const holdLedger = await prismaClient.truckHoldLedger.findFirst({
             where: { orderId: resolvedOrderId, phase: HoldPhase.CONFIRMED },
@@ -593,15 +657,23 @@ class ConfirmedHoldService {
           });
         }
 
-        // P6 fix: Decrement trucksFilled with floor at 0
-        if (assignment.orderId) {
-          await prismaClient.$executeRaw`
-            UPDATE "Order" SET "trucksFilled" = GREATEST(0, "trucksFilled" - 1), "updatedAt" = NOW()
-            WHERE "id" = ${assignment.orderId}
-          `.catch((err: any) => {
-            logger.warn('[CONFIRMED HOLD] trucksFilled decrement on decline failed (non-fatal)', {
-              orderId: assignment.orderId, error: err?.message,
-            });
+        // H9 FIX: Cascade auto-redispatch after decline (Grab/Uber pattern).
+        // Wrapped in try/catch so cascade failure never breaks the decline flow.
+        try {
+          await tryAutoRedispatch({
+            bookingId: assignment.bookingId ?? undefined,
+            orderId: assignment.orderId ?? undefined,
+            transporterId: assignment.transporterId,
+            vehicleId: assignment.vehicleId,
+            vehicleType: assignment.vehicleType,
+            vehicleSubtype: assignment.vehicleSubtype ?? undefined,
+            declinedDriverId: driverId,
+            assignmentId,
+          });
+        } catch (redispatchErr: any) {
+          logger.warn('[CONFIRMED HOLD] Auto-redispatch after decline failed (non-fatal)', {
+            assignmentId,
+            error: redispatchErr?.message,
           });
         }
 
@@ -772,6 +844,33 @@ class ConfirmedHoldService {
   // =========================================================================
   // PRIVATE METHODS
   // =========================================================================
+
+  /**
+   * F-L10 FIX: DRY — extracted shared FK traversal for Assignment → TruckRequest.
+   * Used by both handleDriverAcceptance and handleDriverDecline to resolve
+   * the TruckRequest and orderId from an assignment's FK chain.
+   */
+  private async resolveAssignmentTruckRequest(assignmentId: string): Promise<{
+    truckRequest: { id: string; orderId: string } | null;
+    orderId: string | null;
+  }> {
+    const record = await prismaClient.assignment.findUnique({
+      where: { id: assignmentId },
+      select: { truckRequestId: true, orderId: true },
+    });
+
+    const truckRequest = record?.truckRequestId
+      ? await prismaClient.truckRequest.findFirst({
+          where: { id: record.truckRequestId },
+          select: { id: true, orderId: true },
+        })
+      : null;
+
+    return {
+      truckRequest,
+      orderId: truckRequest?.orderId ?? record?.orderId ?? null,
+    };
+  }
 
   /**
    * Cache confirmed hold state in Redis

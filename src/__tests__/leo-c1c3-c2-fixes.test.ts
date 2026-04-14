@@ -165,6 +165,7 @@ jest.mock('../modules/hold-expiry/hold-expiry-cleanup.service', () => {
 // Vehicle lifecycle service mock
 const mockReleaseVehicle = jest.fn();
 jest.mock('../shared/services/vehicle-lifecycle.service', () => ({
+  onVehicleTransition: jest.fn().mockResolvedValue(undefined),
   releaseVehicle: (...args: any[]) => mockReleaseVehicle(...args),
 }));
 

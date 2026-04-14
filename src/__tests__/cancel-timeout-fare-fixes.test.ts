@@ -139,6 +139,13 @@ const mockTransaction = jest.fn().mockImplementation(async (fnOrArray: any, _opt
         findUnique: (...a: any[]) => mockUserFindUnique(...a),
         findMany: (...a: any[]) => mockUserFindMany(...a),
       },
+      // H-26: CancellationLedger + CancellationAbuseCounter for post-cancel transaction
+      cancellationLedger: {
+        create: jest.fn().mockResolvedValue({ id: 'ledger-1' }),
+      },
+      cancellationAbuseCounter: {
+        upsert: jest.fn().mockResolvedValue({ customerId: 'customer-001', cancelCount7d: 1 }),
+      },
       $queryRaw: (...a: any[]) => mockQueryRaw(...a),
     };
     return fnOrArray(txProxy);
@@ -525,6 +532,13 @@ beforeEach(() => {
           findUnique: (...a: any[]) => mockUserFindUnique(...a),
           findMany: (...a: any[]) => mockUserFindMany(...a),
         },
+        // H-26: CancellationLedger + CancellationAbuseCounter for post-cancel transaction
+        cancellationLedger: {
+          create: jest.fn().mockResolvedValue({ id: 'ledger-1' }),
+        },
+        cancellationAbuseCounter: {
+          upsert: jest.fn().mockResolvedValue({ customerId: 'customer-001', cancelCount7d: 1 }),
+        },
         $queryRaw: (...a: any[]) => mockQueryRaw(...a),
       };
       return fnOrArray(txProxy);
@@ -569,7 +583,8 @@ describe('Category 1: Cancel Transaction Safety (#27)', () => {
       const result = await bookingService.cancelBooking('booking-001', 'customer-001');
 
       expect(result.status).toBe('cancelled');
-      expect(mockTransaction).toHaveBeenCalledTimes(1);
+      // H-26: $transaction called twice — once for main cancel, once for CancellationLedger+AbuseCounter
+      expect(mockTransaction).toHaveBeenCalledTimes(2);
       expect(mockReleaseVehicle).toHaveBeenCalledWith('v-1', 'bookingCancellation');
     });
 
@@ -579,7 +594,8 @@ describe('Category 1: Cancel Transaction Safety (#27)', () => {
       const result = await bookingService.cancelBooking('booking-001', 'customer-001');
 
       expect(result.status).toBe('cancelled');
-      expect(mockTransaction).toHaveBeenCalledTimes(1);
+      // H-26: $transaction called twice — once for main cancel, once for CancellationLedger+AbuseCounter
+      expect(mockTransaction).toHaveBeenCalledTimes(2);
     });
 
     it('cancel partially_filled booking cancels active assignments and releases their vehicles', async () => {
@@ -665,8 +681,8 @@ describe('Category 1: Cancel Transaction Safety (#27)', () => {
 
       await bookingService.cancelBooking('booking-001', 'customer-001');
 
-      // $transaction was called exactly once for the combined operation
-      expect(mockTransaction).toHaveBeenCalledTimes(1);
+      // H-26: $transaction called twice — main cancel TX + CancellationLedger+AbuseCounter TX
+      expect(mockTransaction).toHaveBeenCalledTimes(2);
       // The TX function receives a tx proxy and does BOTH booking.updateMany and assignment.updateMany
       expect(mockBookingUpdateMany).toHaveBeenCalled();
       expect(mockAssignmentUpdateMany).toHaveBeenCalled();
@@ -680,8 +696,8 @@ describe('Category 1: Cancel Transaction Safety (#27)', () => {
 
       // releaseVehicle is called separately, not inside the TX mock proxy
       expect(mockReleaseVehicle).toHaveBeenCalledWith('v-1', 'bookingCancellation');
-      // The TX itself only does booking+assignment, not vehicle release
-      expect(mockTransaction).toHaveBeenCalledTimes(1);
+      // H-26: $transaction called twice — main cancel TX + CancellationLedger+AbuseCounter TX
+      expect(mockTransaction).toHaveBeenCalledTimes(2);
     });
 
     it('TX failure does not leave partial state (no vehicle release on rollback)', async () => {

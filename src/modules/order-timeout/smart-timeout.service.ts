@@ -162,6 +162,17 @@ class SmartTimeoutService {
   private async setExtensionCount(orderId: string, count: number): Promise<void> {
     // Always update in-memory fallback
     this.extensionCountByOrder.set(orderId, count);
+
+    // M-19 FIX: Evict oldest entries when in-memory Map exceeds 500 to prevent unbounded growth.
+    // The Map is only a fallback for Redis failures, so evicting stale entries is safe.
+    if (this.extensionCountByOrder.size > 500) {
+      const keysToDelete = Array.from(this.extensionCountByOrder.keys()).slice(0, 100);
+      for (const key of keysToDelete) {
+        this.extensionCountByOrder.delete(key);
+      }
+      logger.info(`[SMART TIMEOUT] Evicted ${keysToDelete.length} stale entries from in-memory extension count map`);
+    }
+
     // Write to Redis (fire-and-forget for non-critical state)
     try {
       await redisService.set(
@@ -619,11 +630,16 @@ class SmartTimeoutService {
             },
           });
 
-          // Update order status
-          await prismaClient.order.update({
-            where: { id: orderTimeout.orderId },
-            data: { status: OrderStatus.expired },
-          });
+          // Delegate full cleanup (order status, truck requests, notifications) to handleOrderExpiry
+          try {
+            const { handleOrderExpiry } = require('../order/order-lifecycle-outbox.service');
+            await handleOrderExpiry(orderTimeout.orderId);
+          } catch (err: unknown) {
+            logger.error('[SMART TIMEOUT] handleOrderExpiry failed', {
+              orderId: orderTimeout.orderId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
 
           markedCount++;
 

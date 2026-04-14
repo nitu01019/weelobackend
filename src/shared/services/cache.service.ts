@@ -232,7 +232,10 @@ class CacheService {
     try {
       return JSON.parse(value) as T;
     } catch {
-      return value as unknown as T;
+      // If JSON parse fails, the cached value is corrupted (e.g. "[object Object]").
+      // Return null to trigger a cache miss rather than returning an invalid type.
+      logger.warn(`[CacheService] JSON parse failed for key ${key}, treating as cache miss`);
+      return null;
     }
   }
 

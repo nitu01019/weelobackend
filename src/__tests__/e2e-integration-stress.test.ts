@@ -51,7 +51,7 @@ const mockRedisSRem = jest.fn();
 const mockRedisSScan = jest.fn();
 const mockRedisExists = jest.fn();
 const mockRedisAcquireLock = jest.fn().mockResolvedValue({ acquired: true });
-const mockRedisReleaseLock = jest.fn().mockResolvedValue(undefined);
+const mockRedisReleaseLock = jest.fn().mockResolvedValue(true);
 const mockRedisLPush = jest.fn();
 const mockRedisLTrim = jest.fn();
 const mockRedisIsConnected = jest.fn().mockReturnValue(true);
@@ -60,6 +60,7 @@ const mockRedisCancelTimer = jest.fn();
 const mockRedisGetExpiredTimers = jest.fn();
 const mockRedisSAdd = jest.fn();
 const mockRedisHMSet = jest.fn();
+const mockRedisHSet = jest.fn().mockResolvedValue(undefined);
 const mockRedisHGetAll = jest.fn();
 const mockRedisHGetAllBatch = jest.fn();
 const mockRedisGeoAdd = jest.fn();
@@ -95,6 +96,7 @@ jest.mock('../shared/services/redis.service', () => ({
     getExpiredTimers: (...args: any[]) => mockRedisGetExpiredTimers(...args),
     sAdd: (...args: any[]) => mockRedisSAdd(...args),
     hMSet: (...args: any[]) => mockRedisHMSet(...args),
+    hSet: (...args: any[]) => mockRedisHSet(...args),
     hGetAll: (...args: any[]) => mockRedisHGetAll(...args),
     hGetAllBatch: (...args: any[]) => mockRedisHGetAllBatch(...args),
     geoAdd: (...args: any[]) => mockRedisGeoAdd(...args),
@@ -383,6 +385,7 @@ jest.mock('../shared/services/live-availability.service', () => ({
 // --- Vehicle lifecycle mock ---
 const mockReleaseVehicle = jest.fn().mockResolvedValue(undefined);
 jest.mock('../shared/services/vehicle-lifecycle.service', () => ({
+  onVehicleTransition: jest.fn().mockResolvedValue(undefined),
   releaseVehicle: (...args: any[]) => mockReleaseVehicle(...args),
   isValidTransition: jest.fn().mockReturnValue(true),
   VALID_TRANSITIONS: {},
@@ -439,7 +442,7 @@ jest.mock('../shared/utils/geo.utils', () => ({
 
 // --- Config mock ---
 jest.mock('../config/environment', () => ({
-  config: { redis: { enabled: true }, isProduction: false, otp: { expiryMinutes: 5 }, sms: {} },
+  config: { redis: { enabled: true }, isProduction: false, otp: { expiryMinutes: 5 }, sms: {}, bookingConcurrencyLimit: 50 },
 }));
 jest.mock('../core/constants', () => ({
   ErrorCode: { VEHICLE_INSUFFICIENT: 'VEHICLE_INSUFFICIENT', BOOKING_NOT_FOUND: 'BOOKING_NOT_FOUND' },
@@ -503,7 +506,7 @@ function resetAllMocks(): void {
   mockRedisSScan.mockReset();
   mockRedisExists.mockReset();
   mockRedisAcquireLock.mockReset().mockResolvedValue({ acquired: true });
-  mockRedisReleaseLock.mockReset().mockResolvedValue(undefined);
+  mockRedisReleaseLock.mockReset().mockResolvedValue(true);
   mockRedisLPush.mockReset();
   mockRedisLTrim.mockReset();
   mockRedisSetTimer.mockReset().mockResolvedValue(undefined);
@@ -890,11 +893,19 @@ describe('Section 2: Full Flow Tests (Driver Journey)', () => {
     const inTransit = await assignmentService.updateStatus('assign-1', 'driver-1', { status: 'in_transit' } as any);
     expect(inTransit.status).toBe('in_transit');
 
+    // Status: arrived_at_drop (M-20: required step before completed)
+    resetAllMocks();
+    mockGetAssignmentById.mockResolvedValue(makeAssignmentRecord({ status: 'in_transit' }));
+    mockUpdateAssignment.mockResolvedValue(makeAssignmentRecord({ status: 'arrived_at_drop' }));
+    const arrivedAtDrop = await assignmentService.updateStatus('assign-1', 'driver-1', { status: 'arrived_at_drop' } as any);
+    expect(arrivedAtDrop.status).toBe('arrived_at_drop');
+
     // Status: completed (C-12/C-15: now uses $transaction for atomic completion)
     resetAllMocks();
     mockGetAssignmentById
-      .mockResolvedValueOnce(makeAssignmentRecord({ status: 'in_transit', vehicleId: 'v-1' }))  // initial lookup
-      .mockResolvedValueOnce(makeAssignmentRecord({ status: 'completed', completedAt: new Date().toISOString() })); // re-fetch after tx
+      .mockResolvedValueOnce(makeAssignmentRecord({ status: 'arrived_at_drop', vehicleId: 'v-1' }))  // initial lookup in updateStatus
+      .mockResolvedValueOnce(makeAssignmentRecord({ status: 'arrived_at_drop', vehicleId: 'v-1' }))  // lookup inside completeTrip orchestrator
+      .mockResolvedValueOnce(makeAssignmentRecord({ status: 'completed', completedAt: new Date().toISOString() })); // re-fetch after completeTrip
     mockVehicleFindUnique.mockResolvedValue(makeVehicleRecord({ vehicleKey: 'open_17ft', transporterId: 't-1' }));
     mockAssignmentUpdate.mockResolvedValue(makeAssignmentRecord({ status: 'completed' }));
     mockGetBookingById.mockResolvedValue(makeBookingRecord());
@@ -1038,8 +1049,10 @@ describe('Section 3: Full Flow Tests (Transporter Journey)', () => {
     // Step 2: Customer notified of truck assignment
     expect(mockEmitToBooking).toHaveBeenCalledWith('booking-1', 'truck_assigned', expect.any(Object));
 
-    // Step 3: Fully filled notification
-    expect(mockEmitToUser).toHaveBeenCalledWith('cust-1', 'booking_fully_filled', expect.any(Object));
+    // Step 3: Driver notified of trip assignment
+    // H-14: booking_fully_filled notification moved to broadcast-accept path.
+    // createAssignment now emits trip_assigned to the driver.
+    expect(mockEmitToUser).toHaveBeenCalledWith('driver-1', 'trip_assigned', expect.any(Object));
   });
 
   it('3.2 transporter assigns driver -> driver declines -> transporter can reassign', async () => {

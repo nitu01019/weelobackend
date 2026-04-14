@@ -179,9 +179,13 @@ class FleetCacheService {
     if (!forceRefresh) {
       try {
         const cached = await cacheService.get<CachedVehicle[]>(cacheKey);
-        if (cached) {
+        if (cached && Array.isArray(cached)) {
           logger.debug(`[FleetCache] HIT: vehicles for ${transporterId.substring(0, 8)}`);
           return cached;
+        }
+        if (cached && !Array.isArray(cached)) {
+          logger.warn(`[FleetCache] Corrupted cache (not array) for vehicles:${transporterId.substring(0, 8)}, deleting`);
+          await cacheService.delete(cacheKey).catch(() => {});
         }
       } catch (error) {
         logger.warn(`[FleetCache] Cache read error: ${error}`);
@@ -245,9 +249,13 @@ class FleetCacheService {
     // Check cache first
     try {
       const cached = await cacheService.get<CachedVehicle[]>(cacheKey);
-      if (cached) {
+      if (cached && Array.isArray(cached)) {
         logger.debug(`[FleetCache] HIT: ${vehicleType} vehicles for ${transporterId.substring(0, 8)}`);
         return cached;
+      }
+      if (cached && !Array.isArray(cached)) {
+        logger.warn(`[FleetCache] Corrupted cache (not array) for vehiclesByType:${transporterId.substring(0, 8)}, deleting`);
+        await cacheService.delete(cacheKey).catch(() => {});
       }
     } catch (error) {
       logger.warn(`[FleetCache] Cache read error: ${error}`);
@@ -303,8 +311,12 @@ class FleetCacheService {
 
     try {
       const cached = await cacheService.get<CachedVehicle>(cacheKey);
-      if (cached) {
+      if (cached && typeof cached === 'object' && cached.id) {
         return cached;
+      }
+      if (cached && (typeof cached !== 'object' || !cached.id)) {
+        logger.warn(`[FleetCache] Corrupted cache for vehicle:${vehicleId.substring(0, 8)}, deleting`);
+        await cacheService.delete(cacheKey).catch(() => {});
       }
     } catch (error) {
       logger.warn(`[FleetCache] Cache read error: ${error}`);
@@ -354,9 +366,13 @@ class FleetCacheService {
     if (!forceRefresh) {
       try {
         const cached = await cacheService.get<CachedDriver[]>(cacheKey);
-        if (cached) {
+        if (cached && Array.isArray(cached)) {
           logger.debug(`[FleetCache] HIT: drivers for ${transporterId.substring(0, 8)}`);
           return cached;
+        }
+        if (cached && !Array.isArray(cached)) {
+          logger.warn(`[FleetCache] Corrupted cache (not array) for drivers:${transporterId.substring(0, 8)}, deleting`);
+          await cacheService.delete(cacheKey).catch(() => {});
         }
       } catch (error) {
         logger.warn(`[FleetCache] Cache read error: ${error}`);
@@ -499,8 +515,12 @@ class FleetCacheService {
 
     try {
       const cached = await cacheService.get<CachedDriver>(cacheKey);
-      if (cached) {
+      if (cached && typeof cached === 'object' && cached.id) {
         return cached;
+      }
+      if (cached && (typeof cached !== 'object' || !cached.id)) {
+        logger.warn(`[FleetCache] Corrupted cache for driver:${driverId.substring(0, 8)}, deleting`);
+        await cacheService.delete(cacheKey).catch(() => {});
       }
     } catch (error) {
       logger.warn(`[FleetCache] Cache read error: ${error}`);
@@ -560,8 +580,12 @@ class FleetCacheService {
 
     try {
       const cached = await cacheService.get<AvailabilitySnapshot>(cacheKey);
-      if (cached) {
+      if (cached && typeof cached === 'object' && cached.transporterId) {
         return cached;
+      }
+      if (cached && (typeof cached !== 'object' || !cached.transporterId)) {
+        logger.warn(`[FleetCache] Corrupted cache for snapshot:${transporterId.substring(0, 8)}, deleting`);
+        await cacheService.delete(cacheKey).catch(() => {});
       }
     } catch (error) {
       logger.warn(`[FleetCache] Cache read error: ${error}`);

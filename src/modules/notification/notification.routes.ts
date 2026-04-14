@@ -72,6 +72,7 @@ router.post('/register-token', authMiddleware, async (req: Request, res: Respons
     await fcmService.registerToken(userId, token, deviceType || 'android');
 
     // Subscribe to role-based topics
+    // TODO(L-09): Topic subscriptions are created here but sendToTopic() is never called. Wire broadcast-via-topic when implementing batch announcements.
     if (userRole === 'transporter') {
       await fcmService.subscribeToTopic(userId, 'transporter_all');
     } else if (userRole === 'driver') {

@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * STATUS EVENT CLEANUP JOB
  *

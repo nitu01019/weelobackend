@@ -218,7 +218,7 @@ export function normalizeCreateOrderInput(raw: unknown): NormalizedCreateOrderIn
   const routePoints = normalizeRoutePoints(input.routePoints);
   const pickup = input.pickup != null ? normalizeLocation(input.pickup, 'pickup') : undefined;
   const drop = input.drop != null ? normalizeLocation(input.drop, 'drop') : undefined;
-  const distanceKm = Math.max(0, Math.floor(parseNumber(input.distanceKm, 'distanceKm')));
+  const distanceKm = Math.max(1, Math.round(parseNumber(input.distanceKm, 'distanceKm')));
   const vehicleRequirements = normalizeVehicleRequirements(input);
   const goodsType = typeof input.goodsType === 'string' && input.goodsType.trim().length > 0
     ? input.goodsType.trim()

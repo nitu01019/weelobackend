@@ -49,7 +49,7 @@ enum VehicleStatus {
   inactive    // Not operational
 }
 
-// Booking status (legacy single-truck bookings)
+/// Booking lifecycle (legacy single-truck). Intentionally separate from OrderStatus.
 enum BookingStatus {
   created          // Initial state before broadcasting
   broadcasting     // Actively sending to transporters
@@ -62,7 +62,7 @@ enum BookingStatus {
   expired          // No transporter accepted in time
 }
 
-// Order status (new multi-truck system)
+/// Order lifecycle (multi-truck). Intentionally separate from BookingStatus.
 enum OrderStatus {
   created          // Initial state before broadcasting
   broadcasting     // Actively sending to transporters
@@ -88,16 +88,19 @@ enum TruckRequestStatus {
 }
 
 // Assignment/Trip status
+// L-17: partial_delivery added. Run SQL on production DB:
+//   ALTER TYPE "AssignmentStatus" ADD VALUE 'partial_delivery';
 enum AssignmentStatus {
-  pending          // Waiting for driver to accept
-  driver_accepted  // Driver accepted the trip
-  driver_declined  // Driver declined
-  en_route_pickup  // Driver heading to pickup
-  at_pickup        // Driver arrived at pickup
-  in_transit       // Goods loaded, heading to drop
-  arrived_at_drop  // Driver arrived at drop-off location
-  completed        // Trip completed
-  cancelled        // Trip cancelled
+  pending            // Waiting for driver to accept
+  driver_accepted    // Driver accepted the trip
+  driver_declined    // Driver declined
+  en_route_pickup    // Driver heading to pickup
+  at_pickup          // Driver arrived at pickup
+  in_transit         // Goods loaded, heading to drop
+  arrived_at_drop    // Driver arrived at drop-off location
+  completed          // Trip completed
+  partial_delivery   // L-17: Trip partially delivered (driver reported reason)
+  cancelled          // Trip cancelled
 }
 
 // Route point type for multi-stop orders
@@ -318,6 +321,7 @@ model Vehicle {
   @@index([isActive])                         // Active vehicles only
   @@index([status, isActive, vehicleType])    // Combined query optimization
   @@index([transporterId, status, isActive])  // Transporter's available trucks
+  @@index([assignedDriverId])                 // M-13: Fast lookup by assigned driver
 }
 
 // =============================================================================
@@ -396,6 +400,7 @@ model Booking {
   @@index([createdAt])                   // Recent bookings
   @@index([customerId, status])          // Customer's active bookings
   @@index([status, vehicleType])         // Transporter feed: status + vehicle type filter
+  @@index([notifiedTransporters], type: Gin) // M-12: Fast membership lookup for broadcast filtering
 }
 
 // =============================================================================
@@ -498,6 +503,11 @@ model Order {
   @@index([customerId, status, expiresAt])
   // L-1: Composite index for expiry sweep queries (cleanup-expired-orders.job)
   @@index([status, expiresAt])
+
+  // H3: DB-level guarantee: one active order per customer (partial unique index)
+  // Allows multiple completed/cancelled/expired rows, but only ONE active order.
+  // NOTE: Applied via direct SQL (see database-indexes.sql). Prisma cannot express partial indexes.
+  // The actual DB constraint is: UNIQUE(customerId) WHERE status NOT IN ('completed','cancelled','expired')
 }
 
 // =============================================================================
@@ -969,6 +979,13 @@ model Assignment {
   rating         Rating?  // Full rating record relation
 
   // =========================================
+  // DECLINE TRACKING (H11 fix)
+  // =========================================
+  declineReason  String?    // Reason text (e.g., "too far", "wrong vehicle")
+  declineType    String?    // Type: 'explicit' | 'timeout' | 'auto_system'
+  declinedAt     DateTime?  // When the decline occurred
+
+  // =========================================
   // TIMESTAMPS
   // =========================================
   assignedAt       String
@@ -1296,4 +1313,73 @@ model Rating {
   @@index([driverId, createdAt])       // Driver ratings over time (analytics)
   @@index([stars])                     // Rating distribution analytics
   @@index([customerId])               // Customer's given ratings
+}
+
+// =============================================================================
+// DEVICE TOKEN MODEL (Fix H15: PostgreSQL fallback for FCM tokens)
+// =============================================================================
+// Primary FCM token storage is Redis (fast, shared across ECS instances).
+// This table is a durable fallback: if Redis loses data (restart, eviction),
+// tokens can be recovered from here so push notifications keep working.
+//
+// NOTE: Table must be created via direct SQL (per CLAUDE.md rules — no prisma migrate).
+// CREATE TABLE "DeviceToken" (
+//   "id" TEXT NOT NULL DEFAULT gen_random_uuid(),
+//   "userId" TEXT NOT NULL,
+//   "token" TEXT NOT NULL,
+//   "platform" TEXT NOT NULL DEFAULT 'android',
+//   "lastSeenAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+//   "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+//   CONSTRAINT "DeviceToken_pkey" PRIMARY KEY ("id")
+// );
+// CREATE UNIQUE INDEX "DeviceToken_userId_token_key" ON "DeviceToken"("userId", "token");
+// CREATE INDEX "DeviceToken_userId_idx" ON "DeviceToken"("userId");
+// =============================================================================
+
+model DeviceToken {
+  id         String   @id @default(uuid())
+  userId     String
+  token      String
+  platform   String   @default("android")
+  lastSeenAt DateTime @default(now())
+  createdAt  DateTime @default(now())
+
+  @@unique([userId, token])
+  @@index([userId])
+}
+
+// =============================================================================
+// TRIP ROUTE POINT MODEL (H-23: GPS History DB Persistence)
+// =============================================================================
+// Persisted route points from Redis history list on trip completion.
+// Allows post-trip route replay, analytics, and dispute evidence.
+//
+// NOTE: Table must be created via direct SQL (per CLAUDE.md rules — no prisma migrate).
+// CREATE TABLE "TripRoutePoint" (
+//   "id" TEXT NOT NULL DEFAULT gen_random_uuid(),
+//   "tripId" TEXT NOT NULL,
+//   "latitude" DOUBLE PRECISION NOT NULL,
+//   "longitude" DOUBLE PRECISION NOT NULL,
+//   "speed" DOUBLE PRECISION,
+//   "heading" DOUBLE PRECISION,
+//   "timestamp" TIMESTAMP(3) NOT NULL,
+//   "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+//   CONSTRAINT "TripRoutePoint_pkey" PRIMARY KEY ("id")
+// );
+// CREATE INDEX "TripRoutePoint_tripId_timestamp_idx" ON "TripRoutePoint"("tripId", "timestamp");
+// CREATE INDEX "TripRoutePoint_tripId_idx" ON "TripRoutePoint"("tripId");
+// =============================================================================
+
+model TripRoutePoint {
+  id        String   @id @default(uuid())
+  tripId    String
+  latitude  Float
+  longitude Float
+  speed     Float?
+  heading   Float?
+  timestamp DateTime
+  createdAt DateTime @default(now())
+
+  @@index([tripId, timestamp])
+  @@index([tripId])
 }

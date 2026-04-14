@@ -53,8 +53,8 @@ const mockRedisGet = jest.fn();
 const mockRedisSet = jest.fn();
 const mockRedisDel = jest.fn().mockResolvedValue(undefined);
 const mockRedisExists = jest.fn();
-const mockRedisAcquireLock = jest.fn();
-const mockRedisReleaseLock = jest.fn().mockResolvedValue(undefined);
+const mockRedisAcquireLock = jest.fn().mockResolvedValue({ acquired: true, ttl: 15 });
+const mockRedisReleaseLock = jest.fn().mockResolvedValue(true);
 const mockRedisSMembers = jest.fn();
 const mockRedisSAdd = jest.fn();
 const mockRedisGetJSON = jest.fn();
@@ -358,6 +358,7 @@ jest.mock('../shared/utils/geo.utils', () => ({
 }));
 
 jest.mock('../shared/utils/geospatial.utils', () => ({
+  ...jest.requireActual('../shared/utils/geospatial.utils'),
   haversineDistanceKm: jest.fn().mockReturnValue(10),
 }));
 
@@ -410,6 +411,7 @@ jest.mock('../core/constants', () => ({
 }));
 
 jest.mock('../core/state-machines', () => ({
+  ...jest.requireActual('../core/state-machines'),
   BOOKING_VALID_TRANSITIONS: {},
   isValidTransition: jest.fn().mockReturnValue(true),
   assertValidTransition: jest.fn(),
@@ -417,6 +419,7 @@ jest.mock('../core/state-machines', () => ({
 }));
 
 jest.mock('../shared/services/vehicle-lifecycle.service', () => ({
+  onVehicleTransition: jest.fn().mockResolvedValue(undefined),
   releaseVehicle: jest.fn().mockResolvedValue(undefined),
 }));
 
@@ -643,8 +646,8 @@ function resetAllMocks(): void {
   mockRedisSet.mockReset();
   mockRedisDel.mockReset().mockResolvedValue(undefined);
   mockRedisExists.mockReset();
-  mockRedisAcquireLock.mockReset();
-  mockRedisReleaseLock.mockReset().mockResolvedValue(undefined);
+  mockRedisAcquireLock.mockReset().mockResolvedValue({ acquired: true, ttl: 15 });
+  mockRedisReleaseLock.mockReset().mockResolvedValue(true);
   mockRedisGetJSON.mockReset();
   mockRedisSetJSON.mockReset();
   mockRedisCancelTimer.mockReset().mockResolvedValue(undefined);
@@ -820,12 +823,16 @@ describe('C-04: Vehicle status set to on_hold during order accept', () => {
 
     expect(result.success).toBe(true);
 
-    // Verify liveAvailabilityService.onVehicleStatusChange was called
-    expect(mockOnVehicleStatusChange).toHaveBeenCalledWith(
+    // C-04 now calls onVehicleTransition (vehicle-lifecycle.service) which wraps
+    // liveAvailabilityService.onVehicleStatusChange + fleet cache invalidation.
+    const { onVehicleTransition } = require('../shared/services/vehicle-lifecycle.service');
+    expect(onVehicleTransition).toHaveBeenCalledWith(
       'transporter-001',
+      'vehicle-001',
       expect.any(String),       // vehicleKey
       'available',              // old status
-      'on_hold'                 // new status
+      'on_hold',                // new status
+      'orderAccept'             // context
     );
   });
 

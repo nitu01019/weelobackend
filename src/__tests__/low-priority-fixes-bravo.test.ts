@@ -217,7 +217,7 @@ describe('F-2-5: fully_filled cancellation', () => {
       expect(cancelOrderIdx).toBeGreaterThan(-1);
 
       // Need larger slice to reach past the idempotency + lock logic to the status array
-      const methodBlock = cancelServiceSource.slice(cancelOrderIdx, cancelOrderIdx + 2000);
+      const methodBlock = cancelServiceSource.slice(cancelOrderIdx, cancelOrderIdx + 5000);
       expect(methodBlock).toContain('OrderStatus.fully_filled');
       expect(methodBlock).toContain('cancellableOrderStatuses');
     });

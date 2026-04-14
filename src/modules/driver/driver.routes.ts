@@ -47,6 +47,7 @@ import { generateSecureOTP, maskForLogging } from '../../shared/utils/crypto.uti
 import { config } from '../../config/environment';
 import { db } from '../../shared/database/db';
 import { prismaClient } from '../../shared/database/prisma.service';
+import { otpRateLimiter, verifyOtpRateLimiter } from '../../shared/middleware/rate-limiter.middleware';
 
 const router = Router();
 
@@ -77,6 +78,7 @@ const onboardVerifySchema = z.object({
  */
 router.post(
   '/onboard/initiate',
+  otpRateLimiter,  // FIX-10: Rate limit OTP send requests
   authMiddleware,
   roleGuard(['transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
@@ -149,16 +151,10 @@ router.post(
       
       // Dev mode: Log OTP (same as auth flow)
       if (config.isDevelopment) {
-        console.log('\n');
-        console.log('╔══════════════════════════════════════════════════════════════╗');
-        console.log('║       🚗 DRIVER ONBOARD OTP (DEV MODE ONLY)                  ║');
-        console.log('╠══════════════════════════════════════════════════════════════╣');
-        console.log(`║  Driver Phone: ${maskForLogging(driverPhone, 2, 4).padEnd(44)}║`);
-        console.log(`║  OTP:          ${otp.padEnd(44)}║`);
-        console.log('╠══════════════════════════════════════════════════════════════╣');
-        console.log('║  ⚠️  Ask driver for this OTP to complete registration!       ║');
-        console.log('╚══════════════════════════════════════════════════════════════╝');
-        console.log('\n');
+        logger.debug('[DRIVER ONBOARD] OTP generated', {
+          phoneLast4: driverPhone.slice(-4),
+          otpLength: otp.length
+        });
       }
       
       res.json({
@@ -187,6 +183,7 @@ router.post(
  */
 router.post(
   '/onboard/verify',
+  verifyOtpRateLimiter,  // Issue #21: Use verify-OTP limiter (separate bucket from send-OTP)
   authMiddleware,
   roleGuard(['transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
@@ -294,6 +291,7 @@ router.post(
  */
 router.post(
   '/onboard/resend',
+  otpRateLimiter,  // FIX-10: Rate limit OTP resend requests
   authMiddleware,
   roleGuard(['transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
@@ -336,7 +334,7 @@ router.post(
       }
       
       if (config.isDevelopment) {
-        console.log(`\n🔐 RESENT OTP: ${otp} (for ${phone})\n`);
+        logger.debug('[DRIVER ONBOARD] OTP resent', { phoneLast4: phone.slice(-4) });
       }
       
       res.json({
@@ -1146,7 +1144,7 @@ router.put(
  * Converts old S3 URLs to presigned URLs for existing photos
  * Useful after bucket policy changes or initial setup
  */
-router.post('/regenerate-urls', authMiddleware, roleGuard(['transporter']), async (req: Request, res: Response) => {
+router.post('/regenerate-urls', authMiddleware, roleGuard(['admin']), async (req: Request, res: Response) => {
   try {
     logger.info('[ADMIN] Regenerating presigned URLs...');
     

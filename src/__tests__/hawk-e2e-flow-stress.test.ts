@@ -124,7 +124,7 @@ const mockRedisSRem = jest.fn().mockResolvedValue(1);
 const mockRedisGetJSON = jest.fn().mockResolvedValue(null);
 const mockRedisSetJSON = jest.fn().mockResolvedValue(undefined);
 const mockRedisAcquireLock = jest.fn().mockResolvedValue({ acquired: true });
-const mockRedisReleaseLock = jest.fn().mockResolvedValue(undefined);
+const mockRedisReleaseLock = jest.fn().mockResolvedValue(true);
 const mockRedisCancelTimer = jest.fn().mockResolvedValue(undefined);
 const mockRedisSetTimer = jest.fn().mockResolvedValue(undefined);
 const mockRedisScanIterator = jest.fn().mockReturnValue((async function* () {})());
@@ -181,7 +181,7 @@ const mockPrismaTruckHoldLedgerFindFirst = jest.fn().mockResolvedValue(null);
 const mockPrismaTruckHoldLedgerCreate = jest.fn();
 const mockPrismaTruckHoldLedgerUpdate = jest.fn();
 const mockPrismaExecuteRaw = jest.fn().mockResolvedValue(1);
-const mockPrismaTransaction = jest.fn().mockImplementation(async (fn: any) => fn({
+const txClient = {
   booking: {
     create: mockPrismaBookingCreate,
     findFirst: mockPrismaBookingFindFirst,
@@ -222,7 +222,15 @@ const mockPrismaTransaction = jest.fn().mockImplementation(async (fn: any) => fn
     update: mockPrismaTruckHoldLedgerUpdate,
   },
   $executeRaw: mockPrismaExecuteRaw,
-}));
+};
+const mockPrismaTransaction = jest.fn().mockImplementation(async (fnOrArray: any) => {
+  // Support both callback ($transaction(fn)) and array ($transaction([p1, p2])) forms
+  if (typeof fnOrArray === 'function') {
+    return fnOrArray(txClient);
+  }
+  // Array form: resolve all promises
+  return Promise.all(fnOrArray);
+});
 
 jest.mock('../shared/database/prisma.service', () => ({
   prismaClient: {
@@ -453,6 +461,7 @@ jest.mock('../modules/booking/booking-payload.helper', () => ({
 
 // -- Vehicle Lifecycle --
 jest.mock('../shared/services/vehicle-lifecycle.service', () => ({
+  onVehicleTransition: jest.fn().mockResolvedValue(undefined),
   releaseVehicle: jest.fn().mockResolvedValue(undefined),
 }));
 
@@ -460,6 +469,7 @@ jest.mock('../shared/services/vehicle-lifecycle.service', () => ({
 jest.mock('../modules/tracking/tracking-history.service', () => ({
   trackingHistoryService: {
     deleteHistoryPersistState: jest.fn().mockResolvedValue(undefined),
+    flushHistoryToDb: jest.fn().mockResolvedValue(undefined),
   },
 }));
 jest.mock('../modules/tracking/tracking-fleet.service', () => ({
@@ -484,6 +494,7 @@ jest.mock('../core/config/hold-config', () => ({
 
 // -- State Machines --
 jest.mock('../core/state-machines', () => ({
+  ...jest.requireActual('../core/state-machines'),
   assertValidTransition: jest.fn(),
   isValidTransition: jest.fn().mockReturnValue(true),
   BOOKING_VALID_TRANSITIONS: {
@@ -1255,6 +1266,12 @@ describe('HAWK E2E Flow & Stress Tests', () => {
       const { flexHoldService } = require('../modules/truck-hold/flex-hold.service');
 
       mockPrismaTruckHoldLedgerFindFirst.mockResolvedValue(null);
+      // AB-2: createFlexHold now validates order existence before lock;
+      // provide a valid order so the test reaches the lock code path.
+      mockPrismaOrderFindUnique.mockResolvedValue({
+        expiresAt: new Date(Date.now() + 60_000),
+        status: 'active',
+      });
       mockRedisAcquireLock.mockResolvedValue({ acquired: false });
 
       const result = await flexHoldService.createFlexHold({
@@ -1727,10 +1744,11 @@ describe('HAWK E2E Flow & Stress Tests', () => {
         booking: { customerId: 'customer-1', customerName: 'Test', id: 'booking-1', pickup: {} },
       });
 
-      // Trying to go backward from in_transit to at_pickup
+      // H-22: Tracking now uses ASSIGNMENT_VALID_TRANSITIONS instead of ordinal STATUS_ORDER.
+      // Trying to go backward from in_transit to at_pickup is an invalid transition.
       await expect(
         trackingTripService.updateTripStatus('trip-1', 'driver-1', { status: 'at_pickup' })
-      ).rejects.toThrow('can only move forward');
+      ).rejects.toThrow('Cannot go from in_transit to at_pickup');
     });
 
     test('3.18 - Tracking trip status is idempotent for same status', async () => {
@@ -1989,11 +2007,15 @@ describe('HAWK E2E Flow & Stress Tests', () => {
       const { flexHoldService } = require('../modules/truck-hold/flex-hold.service');
 
       mockPrismaTruckHoldLedgerUpdate.mockResolvedValue({ phase: 'CONFIRMED' });
-      // Specifically mock for the update call inside transitionToConfirmed
-      const { prismaClient } = require('../shared/database/prisma.service');
-      prismaClient.truckHoldLedger.update = mockPrismaTruckHoldLedgerUpdate;
-      // FIX-6: findUnique must return hold with matching transporterId for ownership check
-      prismaClient.truckHoldLedger.findUnique = jest.fn().mockResolvedValue({ holdId: 'hold-1', transporterId: 'trans-1', phase: 'FLEX' });
+      // F-M12: transitionToConfirmed now runs inside $transaction.
+      // Mock the findUnique/update on the TX-level mock (via mockPrismaTruckHoldLedger*).
+      mockPrismaTruckHoldLedgerFindUnique.mockResolvedValue({
+        holdId: 'hold-1', transporterId: 'trans-1', phase: 'FLEX', orderId: 'order-1',
+      });
+      // AB3: transitionToConfirmed also reads order.findUnique for expiry cap
+      mockPrismaOrderFindUnique.mockResolvedValue({
+        expiresAt: new Date(Date.now() + 300_000),
+      });
 
       const result = await flexHoldService.transitionToConfirmed('hold-1', 'trans-1');
 
@@ -2147,9 +2169,10 @@ describe('HAWK E2E Flow & Stress Tests', () => {
     test('5.16 - Vehicle release on trip completion uses releaseVehicle service', async () => {
       const { trackingTripService } = require('../modules/tracking/tracking-trip.service');
 
+      // M-20: in_transit -> completed is no longer valid; must be arrived_at_drop -> completed
       mockPrismaAssignmentFindUnique.mockResolvedValue({
         ...SAMPLE_ASSIGNMENT,
-        status: 'in_transit',
+        status: 'arrived_at_drop',
         driverId: 'driver-1',
         vehicleId: 'vehicle-1',
         booking: { customerId: 'customer-1', customerName: 'Test', id: 'booking-1', pickup: {} },
@@ -2173,9 +2196,10 @@ describe('HAWK E2E Flow & Stress Tests', () => {
       const { releaseVehicle } = require('../shared/services/vehicle-lifecycle.service');
       (releaseVehicle as jest.Mock).mockRejectedValueOnce(new Error('DB timeout'));
 
+      // M-20: in_transit -> completed is no longer valid; must be arrived_at_drop -> completed
       mockPrismaAssignmentFindUnique.mockResolvedValue({
         ...SAMPLE_ASSIGNMENT,
-        status: 'in_transit',
+        status: 'arrived_at_drop',
         driverId: 'driver-1',
         vehicleId: 'vehicle-1',
         booking: { customerId: 'customer-1', customerName: 'Test', id: 'booking-1', pickup: {} },
@@ -2203,9 +2227,10 @@ describe('HAWK E2E Flow & Stress Tests', () => {
         .mockResolvedValueOnce({ acquired: true })
         .mockResolvedValueOnce({ acquired: false });
 
+      // M-20: in_transit -> completed is no longer valid; must be arrived_at_drop -> completed
       mockPrismaAssignmentFindUnique.mockResolvedValue({
         ...SAMPLE_ASSIGNMENT,
-        status: 'in_transit',
+        status: 'arrived_at_drop',
         driverId: 'driver-1',
         booking: { customerId: 'customer-1', customerName: 'Test', id: 'booking-1', pickup: {} },
       });
@@ -2219,7 +2244,7 @@ describe('HAWK E2E Flow & Stress Tests', () => {
       // Second complete (double-tap)
       mockPrismaAssignmentFindUnique.mockResolvedValue({
         ...SAMPLE_ASSIGNMENT,
-        status: 'in_transit',
+        status: 'arrived_at_drop',
         driverId: 'driver-1',
         booking: { customerId: 'customer-1', customerName: 'Test', id: 'booking-1', pickup: {} },
       });

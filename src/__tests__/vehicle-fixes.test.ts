@@ -807,10 +807,10 @@ describe('P18 — Cancel Bypass Fixes', () => {
       // Redis was attempted for both
       expect(mockOnVehicleStatusChange).toHaveBeenCalledTimes(2);
 
-      // First Redis failure was logged as warning
+      // First Redis failure was logged as warning (vehicle-lifecycle.service logs structured object)
       expect(logger.warn).toHaveBeenCalledWith(
-        expect.stringContaining('Redis sync failed'),
-        expect.any(Error)
+        expect.stringContaining('Redis availability sync failed'),
+        expect.objectContaining({ error: expect.any(String) })
       );
 
       // Second vehicle still released successfully

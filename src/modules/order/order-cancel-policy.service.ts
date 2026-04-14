@@ -19,6 +19,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import { db, OrderRecord } from '../../shared/database/db';
 import { prismaClient, AssignmentStatus } from '../../shared/database/prisma.service';
+import { redisService } from '../../shared/services/redis.service';
 import { metrics } from '../../shared/monitoring/metrics.service';
 import type {
   TruckCancelPolicyStage,
@@ -168,6 +169,7 @@ export function evaluateTruckCancelPolicy(
       ? 'pending'
       : 'settled';
 
+  // TODO(M-18): Penalty amounts computed but not collected — integrate payment gateway (Razorpay/Stripe) to charge cancellation fees
   return {
     stage,
     decision,
@@ -259,6 +261,8 @@ export async function createCancelDispute(
   }
 
   const disputeId = uuidv4();
+  const slaDeadline = new Date(Date.now() + 48 * 3600 * 1000); // 48 hours from now
+
   await prismaClient.cancelDispute.create({
     data: {
       id: disputeId,
@@ -271,6 +275,67 @@ export async function createCancelDispute(
     }
   });
 
+  // H-26: Set SLA deadline in DB (non-fatal if column doesn't exist yet)
+  await prismaClient.cancelDispute.update({
+    where: { id: disputeId },
+    data: { slaDeadline } as any,
+  }).catch(() => {
+    // Column may not exist yet — Redis is the primary SLA tracker
+  });
+
+  // H-26: Redis key for SLA scanning (48h TTL = auto-cleanup)
+  await redisService.set(
+    `dispute:sla:${disputeId}`,
+    JSON.stringify({
+      orderId,
+      disputeId,
+      customerId,
+      slaDeadline: slaDeadline.toISOString(),
+      stage
+    }),
+    48 * 3600
+  ).catch(() => {
+    // Non-fatal: SLA tracking falls back to DB query
+  });
+
   metrics.incrementCounter('cancel_dispute_created_total', { stage: stage.toLowerCase() });
-  return { success: true, disputeId, message: 'Dispute created successfully', stage };
+  return { success: true, disputeId, message: 'Dispute created successfully. SLA: 48 hours.', stage };
+}
+
+// =============================================================================
+// H-26: ADMIN DISPUTE RESOLUTION
+// =============================================================================
+
+export async function adminResolveDispute(
+  disputeId: string,
+  resolution: 'resolved' | 'rejected',
+  adminNotes?: string
+): Promise<{ success: boolean; message: string }> {
+  const dispute = await prismaClient.cancelDispute.findUnique({
+    where: { id: disputeId }
+  });
+
+  if (!dispute) {
+    return { success: false, message: 'Dispute not found' };
+  }
+
+  if (dispute.status !== 'open' && dispute.status !== 'under_review') {
+    return { success: false, message: `Dispute already ${dispute.status}` };
+  }
+
+  await prismaClient.cancelDispute.update({
+    where: { id: disputeId },
+    data: {
+      status: resolution,
+      notes: adminNotes
+        ? `${dispute.notes || ''}\n[ADMIN RESOLUTION]: ${adminNotes}`.trim()
+        : dispute.notes,
+    }
+  });
+
+  // Clean up SLA Redis key (no longer needed)
+  await redisService.del(`dispute:sla:${disputeId}`).catch(() => {});
+
+  metrics.incrementCounter('cancel_dispute_resolved_total', { resolution });
+  return { success: true, message: `Dispute ${resolution} successfully` };
 }

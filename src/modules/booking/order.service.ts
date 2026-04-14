@@ -36,6 +36,7 @@ import { queueService } from '../../shared/services/queue.service';
 import { redisService } from '../../shared/services/redis.service';
 import { CreateOrderInput, TruckSelection } from './booking.schema';
 import { transporterOnlineService } from '../../shared/services/transporter-online.service';
+import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
 
 // =============================================================================
 // CONFIGURATION
@@ -166,8 +167,13 @@ async function processExpiredOrders(): Promise<void> {
   }
 }
 
-// Start expiry checker when module loads
-startOrderExpiryChecker();
+// F-M3 FIX: Feature flag for legacy expiry checker — allows disabling without code removal.
+// Default: ON (no behavior change). Set FF_LEGACY_ORDER_EXPIRY_CHECKER=false to disable.
+if (process.env.FF_LEGACY_ORDER_EXPIRY_CHECKER !== 'false') {
+  startOrderExpiryChecker();
+} else {
+  logger.info('[DEPRECATED] Legacy order expiry checker disabled by feature flag FF_LEGACY_ORDER_EXPIRY_CHECKER');
+}
 
 /** Stop the order expiry checker (for graceful shutdown) */
 export function stopOrderExpiryChecker(): void {
@@ -222,7 +228,7 @@ class OrderService {
     logger.info(`║  🚛 NEW ORDER REQUEST                                        ║`);
     logger.info(`╠══════════════════════════════════════════════════════════════╣`);
     logger.info(`║  Order ID: ${orderId}`);
-    logger.info(`║  Customer: ${customerName} (${customerPhone})`);
+    logger.info(`║  Customer: ${customerName} (${maskPhoneForExternal(customerPhone)})`);
     logger.info(`║  Total Trucks: ${totalTrucks}`);
     logger.info(`║  Total Amount: ₹${totalAmount}`);
     logger.info(`║  Truck Types: ${data.trucks.map(t => `${t.quantity}x ${t.vehicleType} ${t.vehicleSubtype}`).join(', ')}`);
@@ -230,6 +236,9 @@ class OrderService {
 
     // ==========================================================================
     // STEP 1: Create parent Order record
+    // F-H3 FIX: Order creation should be atomic with truck request creation.
+    // db.createOrder and db.createTruckRequestsBatch don't accept a TX client.
+    // Using compensating pattern: if truck request creation fails, delete the order.
     // ==========================================================================
     const order = await db.createOrder({
       id: orderId,
@@ -266,9 +275,24 @@ class OrderService {
     // STEP 2: Expand truck selections into individual TruckRequests
     // ==========================================================================
     const truckRequests = this.expandTruckSelections(orderId, data.trucks);
-    
+
     // Batch create all truck requests
-    const createdRequests = await db.createTruckRequestsBatch(truckRequests);
+    // F-H3 FIX: Compensating transaction — if batch creation fails, delete the orphan order
+    let createdRequests: TruckRequestRecord[];
+    try {
+      createdRequests = await db.createTruckRequestsBatch(truckRequests);
+    } catch (err) {
+      logger.error(`[F-H3] Truck request batch creation failed for order ${orderId}, compensating by deleting order`, {
+        orderId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      await prismaClient.order.delete({ where: { id: orderId } }).catch((delErr) => {
+        logger.error(`[F-H3] Compensating order delete also failed for ${orderId}`, {
+          error: delErr instanceof Error ? delErr.message : String(delErr),
+        });
+      });
+      throw err;
+    }
     
     // ==========================================================================
     // STEP 3: Group requests by vehicle type for efficient broadcasting
@@ -462,13 +486,13 @@ class OrderService {
           distanceKm,
           // H-8 FIX: Unified location format — nested objects for new Captain app, flat for legacy
           pickupLocation: {
-            lat: order.pickup.latitude ?? order.pickup.lat,
-            lng: order.pickup.longitude ?? order.pickup.lng,
+            lat: order.pickup.latitude,
+            lng: order.pickup.longitude,
             address: order.pickup.address || '',
           },
           dropLocation: {
-            lat: order.drop.latitude ?? order.drop.lat,
-            lng: order.drop.longitude ?? order.drop.lng,
+            lat: order.drop.latitude,
+            lng: order.drop.longitude,
             address: order.drop.address || '',
           },
 
@@ -603,6 +627,16 @@ class OrderService {
       await db.updateOrder(orderId, { status: 'expired' });
       
       emitToUser(customerId, SocketEvent.BOOKING_EXPIRED, {
+        orderId,
+        status: 'partially_filled_expired',
+        totalTrucks: order.totalTrucks,
+        trucksFilled: filledCount,
+        message: `Only ${filledCount} of ${order.totalTrucks} trucks were assigned. Would you like to continue with partial fulfillment?`,
+        options: ['continue_partial', 'search_again', 'cancel']
+      });
+
+      // Also emit order_expired for customer app compatibility (C1 fix)
+      emitToUser(customerId, 'order_expired', {
         orderId,
         status: 'partially_filled_expired',
         totalTrucks: order.totalTrucks,

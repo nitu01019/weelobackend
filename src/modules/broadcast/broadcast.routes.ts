@@ -16,11 +16,13 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import { broadcastService } from './broadcast.service';
+import { acceptBroadcast as acceptBroadcastSafe } from './broadcast-accept.service';
 import { authMiddleware, roleGuard } from '../../shared/middleware/auth.middleware';
 import { validateSchema } from '../../shared/utils/validation.utils';
 import { logger } from '../../shared/services/logger.service';
 import { redisService } from '../../shared/services/redis.service';
 import { AppError } from '../../shared/types/error.types';
+import { buildAcceptResponse } from '../../shared/api-response.builder';
 
 const router = Router();
 
@@ -114,6 +116,39 @@ router.get(
 );
 
 /**
+ * @route   GET /broadcasts/history
+ * @desc    Get broadcast history for driver
+ * @access  Driver, Transporter
+ * @query   driverId, page, limit, status
+ */
+router.get(
+  '/history',
+  authMiddleware,
+  roleGuard(['driver', 'transporter']),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      // H-S3 FIX: Use authenticated user ID — never trust client-supplied driverId
+      const { page = '1', limit = '20', status } = req.query;
+
+      const result = await broadcastService.getBroadcastHistory({
+        actorId: req.user!.userId,
+        page: parseInt(page as string),
+        limit: parseInt(limit as string),
+        status: status as string
+      });
+
+      res.json({
+        success: true,
+        broadcasts: result.broadcasts,
+        pagination: result.pagination
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
  * @route   GET /broadcasts/:broadcastId
  * @desc    Get broadcast details
  * @access  Driver, Transporter
@@ -160,7 +195,7 @@ router.post(
         ? actorUserId
         : (body.driverId || actorUserId);
 
-      const result = await broadcastService.acceptBroadcast(
+      const result = await acceptBroadcastSafe(
         req.params.broadcastId,
         {
           driverId: effectiveDriverId,
@@ -174,14 +209,22 @@ router.post(
         }
       );
 
-      res.json({
-        success: true,
-        message: 'Broadcast accepted successfully',
+      // F-M7: Use unified response builder (keeps backward-compatible top-level fields)
+      const structured = buildAcceptResponse({
         assignmentId: result.assignmentId,
         tripId: result.tripId,
         status: 'ASSIGNED',
         resultCode: result.resultCode || 'ASSIGNED',
-        replayed: result.replayed === true
+        replayed: result.replayed === true,
+      });
+      res.json({
+        ...structured,
+        // Backward-compatible top-level fields for existing clients
+        assignmentId: result.assignmentId,
+        tripId: result.tripId,
+        status: 'ASSIGNED',
+        resultCode: result.resultCode || 'ASSIGNED',
+        replayed: result.replayed === true,
       });
     } catch (error) {
       next(error);
@@ -224,63 +267,12 @@ router.post(
 );
 
 /**
- * @route   GET /broadcasts/history
- * @desc    Get broadcast history for driver
- * @access  Driver, Transporter
- * @query   driverId, page, limit, status
- */
-router.get(
-  '/history',
-  authMiddleware,
-  roleGuard(['driver', 'transporter']),
-  async (req: Request, res: Response, next: NextFunction) => {
-    try {
-      // H-S3 FIX: Use authenticated user ID — never trust client-supplied driverId
-      const { page = '1', limit = '20', status } = req.query;
-
-      const result = await broadcastService.getBroadcastHistory({
-        actorId: req.user!.userId,
-        page: parseInt(page as string),
-        limit: parseInt(limit as string),
-        status: status as string
-      });
-
-      res.json({
-        success: true,
-        broadcasts: result.broadcasts,
-        pagination: result.pagination
-      });
-    } catch (error) {
-      next(error);
-    }
-  }
-);
-
-/**
  * @route   POST /broadcasts/create
- * @desc    Create broadcast (transporter only)
+ * @desc    DEPRECATED — Use POST /api/v1/bookings/orders instead
  * @access  Transporter
  */
-router.post(
-  '/create',
-  authMiddleware,
-  roleGuard(['transporter']),
-  async (req: Request, res: Response, next: NextFunction) => {
-    try {
-      const result = await broadcastService.createBroadcast({
-        ...req.body,
-        transporterId: req.user!.userId
-      });
-
-      res.status(201).json({
-        success: true,
-        broadcast: result.broadcast,
-        notifiedDrivers: result.notifiedDrivers
-      });
-    } catch (error) {
-      next(error);
-    }
-  }
-);
+router.post('/create', authMiddleware, (req: Request, res: Response) => {
+  res.status(410).json({ success: false, error: 'ENDPOINT_DEPRECATED', message: 'Use POST /api/v1/bookings/orders instead' });
+});
 
 export { router as broadcastRouter };

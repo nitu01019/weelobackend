@@ -327,10 +327,10 @@ describe('Vehicle Lifecycle — releaseVehicle', () => {
         data: expect.objectContaining({ status: 'available' }),
       })
     );
-    // Redis error caught and logged
+    // Redis error caught and logged (vehicle-lifecycle.service now logs structured object, not Error)
     expect(logger.warn).toHaveBeenCalledWith(
-      expect.stringContaining('Redis sync failed'),
-      expect.any(Error)
+      expect.stringContaining('Redis availability sync failed'),
+      expect.objectContaining({ error: expect.any(String) })
     );
   });
 });

@@ -404,7 +404,7 @@ describe('Scenario 5: Broadcast resilience — dispatch outbox + retry + adaptiv
   it('5.7 broadcast sends both Socket.IO events and FCM push notifications', () => {
     const src = readSource('../modules/order/order-broadcast.service.ts');
     expect(src).toContain("import { sendPushNotification }");
-    expect(src).toContain("import { emitToUser, emitToUsers }");
+    expect(src).toContain("import { emitToUser, emitToUsers, isUserConnectedAsync }");
   });
 
   it('5.8 dispatch outbox emits status events for observability', () => {

@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { ratingService } from './rating.service';
-import { submitRatingSchema, driverRatingsQuerySchema } from './rating.schema';
+import { submitRatingSchema, driverRatingsQuerySchema, submitDriverRatingSchema } from './rating.schema';
 import { authenticate } from '../../shared/middleware/auth.middleware';
 import { AppError } from '../../shared/types/error.types';
 import { logger } from '../../shared/services/logger.service';
@@ -172,6 +172,52 @@ router.get('/driver', async (req: Request, res: Response) => {
       res.status(500).json({
         success: false,
         error: { code: 'INTERNAL_ERROR', message: 'Failed to get rating history' }
+      });
+    }
+  }
+});
+
+// =============================================================================
+// POST /api/v1/rating/driver — Driver rates a customer (bidirectional, F-M22)
+// Role: Driver only
+// =============================================================================
+router.post('/driver', async (req: Request, res: Response) => {
+  try {
+    const userId = req.userId;
+    const userRole = req.userRole;
+    if (!userId) {
+      throw new AppError(401, 'UNAUTHORIZED', 'Authentication required');
+    }
+
+    if (userRole && userRole !== 'driver') {
+      throw new AppError(403, 'ROLE_NOT_ALLOWED', 'Only drivers can rate customers');
+    }
+
+    await ratingRateLimit(userId);
+
+    const parsed = submitDriverRatingSchema.safeParse(req.body);
+    if (!parsed.success) {
+      const firstError = parsed.error.errors[0];
+      throw new AppError(400, 'VALIDATION_ERROR', firstError.message);
+    }
+
+    await ratingService.submitDriverRating(parsed.data.assignmentId, userId, parsed.data.rating, parsed.data.feedback ?? undefined);
+
+    res.status(201).json({ success: true, data: { message: 'Rating submitted' } });
+  } catch (error: any) {
+    if (error instanceof AppError) {
+      res.status(error.statusCode).json({
+        success: false,
+        error: { code: error.code, message: error.message }
+      });
+    } else {
+      logger.error('[RATING] Submit driver rating failed', {
+        error: error.message,
+        stack: error.stack?.substring(0, 300)
+      });
+      res.status(500).json({
+        success: false,
+        error: { code: 'INTERNAL_ERROR', message: 'Failed to submit rating' }
       });
     }
   }

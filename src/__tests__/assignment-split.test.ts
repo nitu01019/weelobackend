@@ -74,7 +74,10 @@ const mockTxAssignmentCreate = jest.fn();
 const mockTxVehicleUpdateMany = jest.fn();
 const mockTxAssignmentUpdate = jest.fn();
 
-const mockTx = {
+const mockTx: Record<string, any> = {
+  $queryRaw: jest.fn().mockResolvedValue([]),
+  $executeRaw: (...args: any[]) => mockPrismaExecuteRaw(...args),
+  $executeRawUnsafe: jest.fn().mockResolvedValue(0),
   assignment: {
     updateMany: (...args: any[]) => mockTxAssignmentUpdateMany(...args),
     findUnique: (...args: any[]) => mockTxAssignmentFindUnique(...args),
@@ -85,6 +88,9 @@ const mockTx = {
   vehicle: {
     updateMany: (...args: any[]) => mockTxVehicleUpdateMany(...args),
     findUnique: jest.fn(),
+  },
+  truckRequest: {
+    updateMany: (...args: any[]) => mockPrismaTruckRequestUpdateMany(...args),
   },
 };
 
@@ -210,6 +216,7 @@ jest.mock('../modules/tracking/tracking.service', () => ({
 const mockReleaseVehicle = jest.fn().mockResolvedValue(undefined);
 
 jest.mock('../shared/services/vehicle-lifecycle.service', () => ({
+  onVehicleTransition: jest.fn().mockResolvedValue(undefined),
   releaseVehicle: (...args: any[]) => mockReleaseVehicle(...args),
 }));
 
@@ -321,12 +328,20 @@ function resetMocksAndDefaults(): void {
   });
 
   prismaService.prismaClient.$transaction.mockImplementation(async (fn: any) => fn({
+      $queryRaw: jest.fn().mockResolvedValue([]),
+      $executeRaw: (...a: any[]) => mockPrismaExecuteRaw(...a),
+      $executeRawUnsafe: jest.fn().mockResolvedValue(0),
     assignment: {
       update: (...a: any[]) => mockTxAssignmentUpdate(...a),
       updateMany: (...a: any[]) => mockTxAssignmentUpdateMany(...a),
+      findFirst: (...a: any[]) => mockTxAssignmentFindFirst(...a),
+      create: (...a: any[]) => mockTxAssignmentCreate(...a),
     },
     vehicle: {
       updateMany: (...a: any[]) => mockTxVehicleUpdateMany(...a),
+    },
+    truckRequest: {
+      updateMany: (...a: any[]) => mockPrismaTruckRequestUpdateMany(...a),
     },
   }));
 
@@ -696,7 +711,7 @@ describe('2. Dispatch (assignment-dispatch.service.ts)', () => {
     );
   });
 
-  test('2.19 createAssignment - increments trucks filled on booking', async () => {
+  test('2.19 createAssignment - increments trucks filled on booking via raw SQL in tx', async () => {
     mockGetBookingById.mockResolvedValue(buildBooking());
     mockGetVehicleById.mockResolvedValue(buildVehicle());
     mockGetUserById
@@ -708,7 +723,9 @@ describe('2. Dispatch (assignment-dispatch.service.ts)', () => {
       { bookingId: BOOKING_ID, vehicleId: VEHICLE_ID, driverId: DRIVER_ID }
     );
 
-    expect(mockIncrementTrucksFilled).toHaveBeenCalledWith(BOOKING_ID);
+    // H-10 FIX: trucksFilled increment now happens via tx.$queryRaw inside the transaction
+    // instead of calling bookingService.incrementTrucksFilled
+    expect(mockTx.$queryRaw).toHaveBeenCalled();
   });
 
   test('2.20 createAssignment - sets vehicle to on_hold inside transaction', async () => {
@@ -1246,8 +1263,9 @@ describe('5. Lifecycle (assignment-lifecycle.service.ts)', () => {
     );
   });
 
-  test('5.4 updateStatus - valid transition in_transit to completed sets completedAt', async () => {
-    mockGetAssignmentById.mockResolvedValue(buildAssignment({ status: 'in_transit' }));
+  test('5.4 updateStatus - valid transition arrived_at_drop to completed sets completedAt', async () => {
+    // M-20: in_transit cannot go directly to completed; must go through arrived_at_drop
+    mockGetAssignmentById.mockResolvedValue(buildAssignment({ status: 'arrived_at_drop' }));
     mockUpdateAssignment.mockResolvedValue(buildAssignment({ status: 'completed' }));
     mockGetBookingById.mockResolvedValue(null);
 
@@ -1305,7 +1323,8 @@ describe('5. Lifecycle (assignment-lifecycle.service.ts)', () => {
   });
 
   test('5.10 updateStatus - completed triggers vehicle release', async () => {
-    mockGetAssignmentById.mockResolvedValue(buildAssignment({ status: 'in_transit' }));
+    // M-20: must be arrived_at_drop -> completed
+    mockGetAssignmentById.mockResolvedValue(buildAssignment({ status: 'arrived_at_drop' }));
     mockUpdateAssignment.mockResolvedValue(buildAssignment({ status: 'completed' }));
     mockGetBookingById.mockResolvedValue(null);
 
@@ -1317,7 +1336,7 @@ describe('5. Lifecycle (assignment-lifecycle.service.ts)', () => {
   });
 
   test('5.11 updateStatus - completed emits notifications to booking room', async () => {
-    mockGetAssignmentById.mockResolvedValue(buildAssignment({ status: 'in_transit' }));
+    mockGetAssignmentById.mockResolvedValue(buildAssignment({ status: 'arrived_at_drop' }));
     mockUpdateAssignment.mockResolvedValue(buildAssignment({ status: 'completed' }));
     mockGetBookingById.mockResolvedValue(null);
 
@@ -1333,7 +1352,7 @@ describe('5. Lifecycle (assignment-lifecycle.service.ts)', () => {
   });
 
   test('5.12 updateStatus - completed notifies transporter directly', async () => {
-    mockGetAssignmentById.mockResolvedValue(buildAssignment({ status: 'in_transit' }));
+    mockGetAssignmentById.mockResolvedValue(buildAssignment({ status: 'arrived_at_drop' }));
     mockUpdateAssignment.mockResolvedValue(buildAssignment({ status: 'completed' }));
     mockGetBookingById.mockResolvedValue(null);
 
@@ -1356,7 +1375,8 @@ describe('5. Lifecycle (assignment-lifecycle.service.ts)', () => {
 
     await assignmentLifecycleService.cancelAssignment(ASSIGNMENT_ID, TRANSPORTER_ID);
 
-    expect(mockTxAssignmentUpdate).toHaveBeenCalled();
+    // M-2: cancel now uses tx.assignment.updateMany inside $transaction
+    expect(mockTxAssignmentUpdateMany).toHaveBeenCalled();
   });
 
   test('5.14 cancelAssignment - driver can cancel', async () => {
@@ -1365,7 +1385,8 @@ describe('5. Lifecycle (assignment-lifecycle.service.ts)', () => {
 
     await assignmentLifecycleService.cancelAssignment(ASSIGNMENT_ID, DRIVER_ID);
 
-    expect(mockTxAssignmentUpdate).toHaveBeenCalled();
+    // M-2: cancel now uses tx.assignment.updateMany inside $transaction
+    expect(mockTxAssignmentUpdateMany).toHaveBeenCalled();
   });
 
   test('5.15 cancelAssignment - throws ASSIGNMENT_NOT_FOUND when missing', async () => {
@@ -1801,11 +1822,12 @@ describe('5. Lifecycle (assignment-lifecycle.service.ts)', () => {
 
   test('5.42 full lifecycle: accepted -> en_route_pickup -> at_pickup -> in_transit -> completed', async () => {
     type AssignmentStatus = 'pending' | 'driver_accepted' | 'en_route_pickup' | 'at_pickup' | 'in_transit' | 'completed' | 'cancelled';
-    const transitions: { from: AssignmentStatus; to: AssignmentStatus }[] = [
+    const transitions: { from: string; to: string }[] = [
       { from: 'driver_accepted', to: 'en_route_pickup' },
       { from: 'en_route_pickup', to: 'at_pickup' },
       { from: 'at_pickup', to: 'in_transit' },
-      { from: 'in_transit', to: 'completed' },
+      { from: 'in_transit', to: 'arrived_at_drop' },
+      { from: 'arrived_at_drop', to: 'completed' },
     ];
 
     for (const { from, to } of transitions) {
@@ -1817,7 +1839,7 @@ describe('5. Lifecycle (assignment-lifecycle.service.ts)', () => {
       }
 
       const result = await assignmentLifecycleService.updateStatus(
-        ASSIGNMENT_ID, DRIVER_ID, { status: to }
+        ASSIGNMENT_ID, DRIVER_ID, { status: to as any }
       );
 
       expect(result.status).toBe(to);
@@ -2016,7 +2038,8 @@ describe('6. Edge Cases & Race Conditions', () => {
   });
 
   test('6.11 vehicle release failure during completion - logged but not thrown', async () => {
-    mockGetAssignmentById.mockResolvedValue(buildAssignment({ status: 'in_transit' }));
+    // M-20: must be arrived_at_drop -> completed
+    mockGetAssignmentById.mockResolvedValue(buildAssignment({ status: 'arrived_at_drop' }));
     mockUpdateAssignment.mockResolvedValue(buildAssignment({ status: 'completed' }));
     mockReleaseVehicle.mockRejectedValue(new Error('Vehicle service down'));
     mockGetBookingById.mockResolvedValue(null);

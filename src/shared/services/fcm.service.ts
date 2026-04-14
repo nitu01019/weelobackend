@@ -88,6 +88,7 @@ const FCM_TOKEN_TTL_SECONDS = 90 * 24 * 60 * 60; // 90 days
 class FCMService {
   private isInitialized = false;
   private admin: any = null;
+  private mockModeReason?: string;
 
   /** FCM error codes that should never be retried (token invalid, credential mismatch, etc.) */
   private static readonly NON_RETRYABLE_FCM_ERRORS = new Set([
@@ -101,42 +102,103 @@ class FCMService {
   /**
    * Initialize Firebase Admin SDK
    * Call this on server startup
+   *
+   * Credential resolution order:
+   * 1. File-based: FIREBASE_SERVICE_ACCOUNT_PATH (local dev, existing behavior)
+   * 2. Inline env vars: FIREBASE_PROJECT_ID + FIREBASE_PRIVATE_KEY + FIREBASE_CLIENT_EMAIL (production ECS)
+   * 3. Mock mode: no credentials — notifications logged to console only
    */
   async initialize(): Promise<void> {
     const serviceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
+    const projectId = process.env.FIREBASE_PROJECT_ID;
+    const privateKey = process.env.FIREBASE_PRIVATE_KEY;
+    const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
     const isProduction = process.env.NODE_ENV === 'production';
 
-    if (!serviceAccountPath) {
-      if (isProduction) {
-        // Fix M-9: In production, missing Firebase config is a critical operational issue.
-        // Don't crash (other features still work), but make it very visible.
-        logger.error('[FCM] CRITICAL: FIREBASE_SERVICE_ACCOUNT_PATH not set in production. Push notifications DISABLED.');
-        try {
-          const { metrics } = require('../monitoring/metrics.service');
-          metrics.incrementCounter('fcm_init_missing_config');
-        } catch { /* metrics not available */ }
-      } else {
-        logger.warn('[FCM] FIREBASE_SERVICE_ACCOUNT_PATH not set. Running in mock mode (console only).');
+    const hasFileCreds = !!serviceAccountPath;
+    const hasInlineCreds = !!(projectId && privateKey && clientEmail);
+
+    // --- Strategy 1: File-based credentials ---
+    if (hasFileCreds) {
+      try {
+        const firebaseAdmin = await import('firebase-admin');
+        const serviceAccount = JSON.parse(fs.readFileSync(serviceAccountPath, 'utf8'));
+        firebaseAdmin.initializeApp({
+          credential: firebaseAdmin.credential.cert(serviceAccount)
+        });
+        this.admin = firebaseAdmin;
+        this.isInitialized = true;
+        logger.info('[FCM] Firebase: file credentials — SDK initialized');
+        return;
+      } catch (error) {
+        logger.warn('[FCM] File-based init failed, trying inline credentials...', error);
+        // Fall through to inline
       }
-      return;
     }
 
-    try {
-      // Dynamic import of firebase-admin (optional dependency)
-      const firebaseAdmin = await import('firebase-admin');
-      
-      const serviceAccount = JSON.parse(fs.readFileSync(serviceAccountPath, 'utf8'));
-      
-      firebaseAdmin.initializeApp({
-        credential: firebaseAdmin.credential.cert(serviceAccount)
-      });
-      
-      this.admin = firebaseAdmin;
-      this.isInitialized = true;
-      logger.info('✅ FCM: Firebase Admin SDK initialized');
-    } catch (error) {
-      logger.warn('⚠️ FCM: Firebase Admin SDK not available. Using mock mode.', error);
+    // --- Strategy 2: Inline environment variable credentials ---
+    if (hasInlineCreds) {
+      try {
+        const firebaseAdmin = await import('firebase-admin');
+        firebaseAdmin.initializeApp({
+          credential: firebaseAdmin.credential.cert({
+            projectId: projectId!,
+            // FIREBASE_PRIVATE_KEY arrives with literal \n — convert to real newlines
+            privateKey: privateKey!.replace(/\\n/g, '\n'),
+            clientEmail: clientEmail!,
+          } as any)
+        });
+        this.admin = firebaseAdmin;
+        this.isInitialized = true;
+        logger.info('[FCM] Firebase: inline credentials — SDK initialized');
+        return;
+      } catch (error) {
+        logger.warn('[FCM] Inline credential init failed. Falling back to mock mode.', error);
+      }
     }
+
+    // --- Strategy 3: Mock mode ---
+    if (isProduction) {
+      this.mockModeReason = 'No Firebase credentials found in production environment';
+      logger.error('[FCM] Firebase: MOCK MODE — no credentials found in production. Push notifications DISABLED.');
+      try {
+        const { metrics } = require('../monitoring/metrics.service');
+        metrics.incrementCounter('fcm_init_missing_config');
+      } catch { /* metrics not available */ }
+    } else {
+      this.mockModeReason = 'Development mode — no Firebase credentials configured';
+      logger.warn('[FCM] Firebase: MOCK MODE (console only). Set FIREBASE_SERVICE_ACCOUNT_PATH or FIREBASE_PROJECT_ID+FIREBASE_PRIVATE_KEY+FIREBASE_CLIENT_EMAIL to enable.');
+    }
+  }
+
+  // ===========================================================================
+  // HEALTH / STATUS (C-1, H-2)
+  // ===========================================================================
+
+  /**
+   * Returns true when the Firebase Admin SDK initialized successfully.
+   * Use in health-check endpoints to gate readiness.
+   */
+  isReady(): boolean {
+    return this.isInitialized;
+  }
+
+  /**
+   * Returns true when running in mock mode (notifications are logged, not sent).
+   */
+  getMockModeActive(): boolean {
+    return !this.isInitialized;
+  }
+
+  /**
+   * Structured status for health-check and diagnostics endpoints.
+   */
+  getStatus(): { initialized: boolean; mockMode: boolean; reason?: string } {
+    return {
+      initialized: this.isInitialized,
+      mockMode: !this.isInitialized,
+      ...(this.mockModeReason ? { reason: this.mockModeReason } : {}),
+    };
   }
 
   // ===========================================================================
@@ -219,14 +281,19 @@ class FCMService {
         const key = FCM_TOKEN_KEY(userId);
         await redisService.sRem(key, token);
         logger.info(`FCM: Token removed for user ${userId} [Redis]`);
-        return;
       } catch (error: any) {
         logger.warn(`FCM: Redis removeToken failed: ${error.message}. Using fallback.`);
       }
+    } else {
+      logger.warn(`[FCM] Redis unavailable — cannot remove token from Redis for user ${userId}`);
     }
 
-    // Redis unavailable — token removal cannot proceed
-    logger.warn(`[FCM] Redis unavailable — cannot remove token for user ${userId}`);
+    // Also clean PostgreSQL (prevents stale token resurrection after Redis restart)
+    try {
+      await prismaClient.deviceToken.deleteMany({ where: { userId, token } });
+    } catch (dbErr: any) {
+      logger.warn(`FCM: DB token cleanup failed: ${dbErr.message}`, { userId });
+    }
   }
 
   /**
@@ -240,14 +307,19 @@ class FCMService {
       try {
         await redisService.del(FCM_TOKEN_KEY(userId));
         logger.info(`FCM: All tokens removed for user ${userId} [Redis]`);
-        return;
       } catch (error: any) {
         logger.warn(`FCM: Redis removeAllTokens failed: ${error.message}. Using fallback.`);
       }
+    } else {
+      logger.warn(`[FCM] Redis unavailable — cannot remove all tokens from Redis for user ${userId}`);
     }
 
-    // Redis unavailable — token removal cannot proceed
-    logger.warn(`[FCM] Redis unavailable — cannot remove all tokens for user ${userId}`);
+    // Also clean PostgreSQL (prevents stale token resurrection after Redis restart)
+    try {
+      await prismaClient.deviceToken.deleteMany({ where: { userId } });
+    } catch (dbErr: any) {
+      logger.warn(`FCM: DB token cleanup failed: ${dbErr.message}`, { userId });
+    }
   }
 
   /**
@@ -303,8 +375,28 @@ class FCMService {
     userId: string,
     notification: FCMNotification
   ): Promise<boolean> {
+    // H-04 FIX: Check notification preferences before sending.
+    // Transactional types (trip status, payments, security, assignments) always send.
+    // For non-transactional types, respect user opt-out stored in Redis.
+    const notifType = notification.data?.type || 'general';
+    // L-03 FIX: Expanded transactional types list to cover all driver/customer critical notifications.
+    // These always send regardless of notification preferences (user cannot opt out of trip-critical comms).
+    const ALWAYS_SEND = ['trip_status', 'payment', 'security', 'assignment_update', 'trip_assigned', 'driver_timeout', 'driver_assigned', 'trip_update'];
+    if (!ALWAYS_SEND.includes(notifType)) {
+      try {
+        const prefsStr = await redisService.get(`notification_prefs:${userId}`);
+        if (prefsStr) {
+          const prefs = JSON.parse(prefsStr);
+          if (prefs[notifType] === false || prefs.push?.[notifType] === false) {
+            logger.debug(`FCM: User ${userId} opted out of ${notifType}`);
+            return false;
+          }
+        }
+      } catch { /* prefs check non-fatal */ }
+    }
+
     const tokens = await this.getTokens(userId);
-    
+
     if (tokens.length === 0) {
       logger.debug(`FCM: No tokens found for user ${userId}`);
       return false;
@@ -348,48 +440,57 @@ class FCMService {
     if (!this.isInitialized || !this.admin) {
       // Mock mode - log notification instead
       this.logNotification(notification, tokens);
+      // C-1: Track mock-mode drops so dashboards surface silent failures
+      try {
+        const { metrics } = require('../monitoring/metrics.service');
+        metrics.incrementCounter('fcm_mock_mode_drop_total');
+      } catch { /* metrics not available */ }
       // M20 FIX: Mock mode returns false — notification was NOT delivered
       return false;
     }
 
     try {
-      if (tokens.length === 1) {
-        await this.admin.messaging().send({
-          ...message,
-          token: tokens[0]
-        });
-      } else {
-        // =====================================================================
-        // INDUSTRY PATTERN (Uber/Grab): Clean dead FCM tokens on multicast.
-        // FCM returns per-token responses. If a token gets UNREGISTERED or
-        // NOT_FOUND, the app was uninstalled or token rotated — remove it.
-        // Without cleanup, every future notification to this user fails silently.
-        // =====================================================================
-        const sendResult = await this.admin.messaging().sendEachForMulticast({
-          ...message,
-          tokens
-        });
-        // Clean up dead tokens
-        if (sendResult.failureCount > 0 && userId) {
-          const deadTokens: string[] = [];
-          sendResult.responses.forEach((resp: any, idx: number) => {
-            if (
-              resp.error &&
-              (resp.error.code === 'messaging/registration-token-not-registered' ||
-               resp.error.code === 'messaging/invalid-registration-token')
-            ) {
-              deadTokens.push(tokens[idx]);
-            }
+      // H-28 FIX: Wrap Firebase SDK calls with executeWithRetry so transient
+      // errors (503, network hiccups) are retried automatically with backoff.
+      await this.executeWithRetry(async () => {
+        if (tokens.length === 1) {
+          await this.admin.messaging().send({
+            ...message,
+            token: tokens[0]
           });
-          if (deadTokens.length > 0) {
-            logger.info(`FCM: Cleaning ${deadTokens.length} dead token(s) for user ${userId}`);
-            for (const deadToken of deadTokens) {
-              this.removeToken(userId, deadToken).catch((err) => logger.warn('[FCM] Token cleanup failed', { userId, error: err instanceof Error ? err.message : String(err) }));
+        } else {
+          // =====================================================================
+          // INDUSTRY PATTERN (Uber/Grab): Clean dead FCM tokens on multicast.
+          // FCM returns per-token responses. If a token gets UNREGISTERED or
+          // NOT_FOUND, the app was uninstalled or token rotated — remove it.
+          // Without cleanup, every future notification to this user fails silently.
+          // =====================================================================
+          const sendResult = await this.admin.messaging().sendEachForMulticast({
+            ...message,
+            tokens
+          });
+          // Clean up dead tokens
+          if (sendResult.failureCount > 0 && userId) {
+            const deadTokens: string[] = [];
+            sendResult.responses.forEach((resp: any, idx: number) => {
+              if (
+                resp.error &&
+                (resp.error.code === 'messaging/registration-token-not-registered' ||
+                 resp.error.code === 'messaging/invalid-registration-token')
+              ) {
+                deadTokens.push(tokens[idx]);
+              }
+            });
+            if (deadTokens.length > 0) {
+              logger.info(`FCM: Cleaning ${deadTokens.length} dead token(s) for user ${userId}`);
+              for (const deadToken of deadTokens) {
+                this.removeToken(userId, deadToken).catch((err) => logger.warn('[FCM] Token cleanup failed', { userId, error: err instanceof Error ? err.message : String(err) }));
+              }
             }
           }
         }
-      }
-      
+      }, 2);
+
       logger.info(`FCM: Notification sent to ${tokens.length} device(s)`);
       return true;
     } catch (error: any) {
@@ -413,42 +514,29 @@ class FCMService {
   }
 
   /**
-   * Send push notification with retry and exponential backoff.
-   * Non-retryable errors (invalid token, etc.) fail immediately.
-   * Uses AWS jitter pattern: sleep = random(0, min(cap, base * 2^attempt))
+   * H-28 FIX: Generic retry wrapper with exponential backoff + jitter.
+   * Non-retryable FCM errors (invalid token, credential mismatch) bail immediately.
+   * All primary send paths now route through this to get automatic retries.
    */
-  async sendWithRetry(
-    tokens: string[],
-    title: string,
-    body: string,
-    data?: Record<string, string>,
-    maxRetries: number = 3,
-    type: string = NotificationType.GENERAL
-  ): Promise<boolean> {
+  private async executeWithRetry(
+    fn: () => Promise<void>,
+    maxRetries: number = 2
+  ): Promise<void> {
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
-        const result = await this.sendToTokens(tokens, {
-          type,
-          title,
-          body,
-          data: data || {},
-        });
-        return result;
+        await fn();
+        return;
       } catch (err: any) {
         const code = err?.errorInfo?.code || err?.code || '';
 
         // Non-retryable: don't waste time retrying
         if (FCMService.NON_RETRYABLE_FCM_ERRORS.has(code)) {
-          logger.warn('[FCM] Non-retryable error — skipping retry', { code, tokens: tokens.length });
-          return false;
+          throw err; // Let caller handle token cleanup
         }
 
-        // Last attempt: give up
+        // Last attempt: propagate error
         if (attempt === maxRetries) {
-          logger.error('[FCM] All retry attempts exhausted', {
-            maxRetries, code, tokens: tokens.length,
-          });
-          return false;
+          throw err;
         }
 
         // Exponential backoff with jitter (AWS pattern)
@@ -458,6 +546,7 @@ class FCMService {
 
         logger.info('[FCM] Retrying after transient error', {
           attempt: attempt + 1,
+          maxRetries,
           delayMs: Math.round(jitteredDelay),
           code,
         });
@@ -465,7 +554,32 @@ class FCMService {
         await new Promise(resolve => setTimeout(resolve, jitteredDelay));
       }
     }
-    return false;
+  }
+
+  /**
+   * Send push notification with retry and exponential backoff.
+   * Non-retryable errors (invalid token, etc.) fail immediately.
+   *
+   * NOTE: sendToTokens now internally uses executeWithRetry (H-28 fix).
+   * This method remains as a public convenience API — it delegates to
+   * sendToTokens which handles its own retry loop. The maxRetries param
+   * is kept for backward compatibility but the inner retry count is
+   * controlled by executeWithRetry (2 retries).
+   */
+  async sendWithRetry(
+    tokens: string[],
+    title: string,
+    body: string,
+    data?: Record<string, string>,
+    maxRetries: number = 3,
+    type: string = NotificationType.GENERAL
+  ): Promise<boolean> {
+    return this.sendToTokens(tokens, {
+      type,
+      title,
+      body,
+      data: data || {},
+    });
   }
 
   /**
@@ -550,6 +664,18 @@ class FCMService {
   /**
    * Build FCM message payload
    */
+  /** Notification types that target drivers and should wake the screen */
+  private static readonly FULLSCREEN_TYPES = new Set([
+    'trip_assigned',
+    'assignment_update',
+    'driver_assigned',
+    'driver_timeout',
+    'new_broadcast',
+  ]);
+
+  /**
+   * Build FCM message payload
+   */
   private buildMessage(notification: FCMNotification, tokens?: string[]): any {
     // FCM 4KB hard limit -- truncate long fields to stay safe
     const truncate = (s: string | undefined, max: number): string | undefined =>
@@ -566,6 +692,10 @@ class FCMService {
         )
       : {};
 
+    // H11 FIX: Driver-targeted notifications include fullScreen flag so Android
+    // can launch a full-screen intent (wake screen + heads-up overlay).
+    const isFullScreen = FCMService.FULLSCREEN_TYPES.has(notification.type);
+
     return {
       notification: {
         title: truncate(notification.title, 100) || '',
@@ -574,13 +704,16 @@ class FCMService {
       data: {
         type: notification.type,
         ...truncatedData,
+        ...(isFullScreen ? { fullScreen: 'true' } : {}),
       },
       android: {
         priority: notification.priority === 'high' ? 'high' : 'normal',
         notification: {
           channelId: this.getChannelId(notification.type),
           sound: 'default',
-          clickAction: 'FLUTTER_NOTIFICATION_CLICK'
+          clickAction: 'FLUTTER_NOTIFICATION_CLICK',
+          // H11: Lock-screen visibility for driver notifications
+          ...(isFullScreen ? { visibility: 'public' as const } : {}),
         }
       },
       apns: {
@@ -600,7 +733,9 @@ class FCMService {
   private getChannelId(type: string): string {
     switch (type) {
       case NotificationType.NEW_BROADCAST:
-        return 'broadcasts';
+        return 'broadcasts_v2';
+      case NotificationType.ASSIGNMENT_UPDATE:
+        return 'trips';
       case NotificationType.TRIP_UPDATE:
         return 'trips';
       case NotificationType.PAYMENT:

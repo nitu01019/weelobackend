@@ -1,5 +1,10 @@
 export {};
 
+// Force the legacy inline $transaction path for completion tests (C-12 + C-15).
+// FF_COMPLETION_ORCHESTRATOR defaults to ON, which delegates to completeTrip().
+// These tests verify the legacy atomic TX path.
+process.env.FF_COMPLETION_ORCHESTRATOR = 'false';
+
 /**
  * =============================================================================
  * CRITICAL FIXES TX + FCM -- Phase 3 Tests
@@ -268,6 +273,7 @@ jest.mock('../core/config/hold-config', () => ({
 // Vehicle lifecycle mock
 // ---------------------------------------------------------------------------
 jest.mock('../shared/services/vehicle-lifecycle.service', () => ({
+  onVehicleTransition: jest.fn().mockResolvedValue(undefined),
   releaseVehicle: jest.fn().mockResolvedValue(undefined),
 }));
 
@@ -299,6 +305,7 @@ jest.mock('../shared/utils/geo.utils', () => ({
   roundCoord: (c: number) => Math.round(c * 100) / 100,
 }));
 jest.mock('../shared/utils/geospatial.utils', () => ({
+  ...jest.requireActual('../shared/utils/geospatial.utils'),
   haversineDistanceKm: jest.fn().mockReturnValue(10),
 }));
 jest.mock('../modules/pricing/vehicle-catalog', () => ({
@@ -312,6 +319,7 @@ jest.mock('../core/constants', () => ({
   ErrorCode: { BOOKING_NOT_FOUND: 'BOOKING_NOT_FOUND', FARE_TOO_LOW: 'FARE_TOO_LOW' },
 }));
 jest.mock('../core/state-machines', () => ({
+  ...jest.requireActual('../core/state-machines'),
   BOOKING_VALID_TRANSITIONS: {},
   isValidTransition: jest.fn().mockReturnValue(true),
   assertValidTransition: jest.fn(),
@@ -336,7 +344,8 @@ jest.mock('../modules/order/progressive-radius-matcher', () => ({
 // HELPERS
 // =============================================================================
 
-/** Build a mock assignment record at in_transit status (ready for completion). */
+/** Build a mock assignment record at arrived_at_drop status (ready for completion).
+ *  M-20 FIX: VALID_TRANSITIONS now requires in_transit -> arrived_at_drop -> completed */
 function makeInTransitAssignment(overrides: Record<string, any> = {}) {
   return {
     id: 'assign-001',
@@ -350,7 +359,7 @@ function makeInTransitAssignment(overrides: Record<string, any> = {}) {
     vehicleType: 'Open',
     vehicleSubtype: '17ft',
     driverName: 'Test Driver',
-    status: 'in_transit',
+    status: 'arrived_at_drop',
     startedAt: new Date().toISOString(),
     completedAt: null,
     createdAt: new Date().toISOString(),

@@ -38,9 +38,43 @@ export const VEHICLE_VALID_TRANSITIONS: Record<string, readonly string[]> = {
   inactive:     ['available', 'maintenance'],
 } as const;
 
+// =============================================================================
+// ASSIGNMENT STATE MACHINE — Single canonical source for all assignment services
+// =============================================================================
+// M-20 FIX ENFORCED: in_transit CANNOT go directly to completed.
+// Must pass through arrived_at_drop first.
+// L-17: partial_delivery is a terminal state (same as completed).
+// =============================================================================
+
+export const ASSIGNMENT_VALID_TRANSITIONS: Record<string, readonly string[]> = {
+  pending:          ['driver_accepted', 'driver_declined', 'cancelled'],
+  driver_accepted:  ['en_route_pickup', 'cancelled'],
+  en_route_pickup:  ['at_pickup', 'cancelled'],
+  at_pickup:        ['in_transit', 'cancelled'],
+  in_transit:       ['arrived_at_drop', 'cancelled'],  // M-20: NO direct in_transit→completed
+  arrived_at_drop:  ['completed', 'partial_delivery', 'cancelled'],
+  completed:        [],  // Terminal
+  partial_delivery: [],  // Terminal (L-17)
+  driver_declined:  [],  // Terminal
+  cancelled:        [],  // Terminal
+} as const;
+
+/**
+ * Validates an assignment status transition against the canonical state machine.
+ * Throws if the transition is invalid.
+ */
+export function validateAssignmentTransition(currentStatus: string, targetStatus: string): void {
+  if (!isValidTransition(ASSIGNMENT_VALID_TRANSITIONS, currentStatus, targetStatus)) {
+    throw new Error(
+      `Invalid assignment transition: ${currentStatus} → ${targetStatus}. ` +
+      `Allowed: [${(ASSIGNMENT_VALID_TRANSITIONS[currentStatus] || []).join(', ')}]`
+    );
+  }
+}
+
 export const TERMINAL_BOOKING_STATUSES = ['completed', 'cancelled', 'expired'] as const;
 export const TERMINAL_ORDER_STATUSES = ['completed', 'cancelled', 'expired'] as const;
-export const TERMINAL_ASSIGNMENT_STATUSES = ['completed', 'cancelled', 'driver_declined'] as const;
+export const TERMINAL_ASSIGNMENT_STATUSES = ['completed', 'cancelled', 'driver_declined', 'partial_delivery'] as const;
 
 /**
  * Validates a state transition against a state machine.

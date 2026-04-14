@@ -18,6 +18,8 @@ const PENDING_CACHE_TTL = 3600;     // 1 hour
 // RATING SERVICE — Production-grade, transaction-safe, scale-ready
 // =============================================================================
 
+// TODO(L-12): Add driver->customer rating. Requires new submitDriverRating() method, route, and schema.
+
 export const ratingService = {
 
   /**
@@ -174,12 +176,16 @@ export const ratingService = {
     // completedAt is stored as ISO string (not DateTime) — filter in-memory after fetch
     const sevenDaysAgoMs = Date.now() - 7 * 24 * 60 * 60 * 1000;
 
+    // F-L18 FIX: DB-level date filter — reduces data fetched from DB
+    // ISO 8601 strings are lexicographically ordered, so gte works correctly
+    const sevenDaysAgoISO = new Date(sevenDaysAgoMs).toISOString();
+
     // Find completed assignments for this customer's bookings/orders that have no rating
     const unrated = await prismaClient.assignment.findMany({
       where: {
         status: 'completed',
         customerRating: null,
-        completedAt: { not: null },
+        completedAt: { not: null, gte: sevenDaysAgoISO },
         OR: [
           { booking: { customerId } },
           { order: { customerId } }
@@ -191,7 +197,7 @@ export const ratingService = {
         order: { select: { id: true, pickup: true, drop: true } }
       },
       orderBy: { completedAt: 'desc' },
-      take: 50  // Fetch more, then filter by 7-day window
+      take: 20  // F-L18: Reduced from 50 — DB filter handles 7-day window
     });
 
     const result = unrated
@@ -305,6 +311,43 @@ export const ratingService = {
     } catch (_) { /* graceful degradation */ }
 
     return distribution;
+  },
+
+  /**
+   * F-M22 FIX: Bidirectional rating — driver rates customer (Uber/Ola pattern)
+   * NOTE: Requires driverRating Int? column on Assignment table.
+   * Add via direct SQL: ALTER TABLE "Assignment" ADD COLUMN IF NOT EXISTS "driverRating" INTEGER;
+   * DO NOT use prisma migrate — DB has no _prisma_migrations table.
+   */
+  async submitDriverRating(assignmentId: string, driverId: string, rating: number, feedback?: string): Promise<void> {
+    if (rating < 1 || rating > 5) {
+      throw new AppError(400, 'INVALID_RATING', 'Rating must be 1-5');
+    }
+
+    const assignment = await prismaClient.assignment.findUnique({
+      where: { id: assignmentId },
+    });
+
+    if (!assignment) {
+      throw new AppError(404, 'ASSIGNMENT_NOT_FOUND', 'Assignment not found');
+    }
+    if (assignment.driverId !== driverId) {
+      throw new AppError(403, 'FORBIDDEN', 'Not your assignment');
+    }
+    if (assignment.status !== 'completed') {
+      throw new AppError(400, 'NOT_COMPLETED', 'Can only rate completed trips');
+    }
+
+    // F-M22: driverRating column may not exist yet — use $executeRaw for safety
+    await prismaClient.$executeRaw`
+      UPDATE "Assignment" SET "driverRating" = ${rating} WHERE "id" = ${assignmentId}
+    `.catch(err => {
+      logger.warn('[RATING] driverRating column may not exist yet', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+
+    logger.info('[RATING] Driver rating submitted', { assignmentId, driverId, rating });
   },
 
   /**

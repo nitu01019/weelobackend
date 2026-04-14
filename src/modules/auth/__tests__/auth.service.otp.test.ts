@@ -38,7 +38,9 @@ const mockRedisService = {
   sAdd: jest.fn(),
   getJSON: jest.fn(),
   sMembers: jest.fn(),
-  del: jest.fn()
+  del: jest.fn(),
+  exists: jest.fn().mockResolvedValue(false),  // M1: OTP cooldown check
+  set: jest.fn().mockResolvedValue(undefined),  // M1: OTP cooldown write
 };
 
 const mockDb = {

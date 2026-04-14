@@ -18,14 +18,22 @@ import { emitToUser, emitToBooking, SocketEvent } from '../../shared/services/so
 import { queueService } from '../../shared/services/queue.service';
 import { redisService } from '../../shared/services/redis.service';
 import { liveAvailabilityService } from '../../shared/services/live-availability.service';
+import { invalidateVehicleCache } from '../../shared/services/fleet-cache-write.service';
 // Fix H-A1: Lazy require() to break inverted dependency (assignment→booking circular)
+// L-02: Lazy require to break circular dependency (assignment<->booking). Refactor to dependency injection when module system is restructured.
 // bookingService is imported at call sites via require() to avoid module load cycle.
 import { trackingService } from '../tracking/tracking.service';
 import { CreateAssignmentInput, UpdateStatusInput, GetAssignmentsQuery } from './assignment.schema';
 import { HOLD_CONFIG } from '../../core/config/hold-config';
+import { TERMINAL_ASSIGNMENT_STATUSES, ASSIGNMENT_VALID_TRANSITIONS } from '../../core/state-machines';
 import { enqueueCompletionLifecycleOutbox } from '../order/order-lifecycle-outbox.service';
 import type { TripCompletedOutboxPayload } from '../order/order-types';
 import { tryAutoRedispatch } from './auto-redispatch.service';
+import { completeTrip } from './completion-orchestrator';
+
+// Feature flag: when true, use the unified completion orchestrator instead of inline logic.
+// Default ON for new code. Set FF_COMPLETION_ORCHESTRATOR=false to roll back.
+const FF_COMPLETION_ORCHESTRATOR = process.env.FF_COMPLETION_ORCHESTRATOR !== 'false';
 
 // =============================================================================
 // ASSIGNMENT TIMEOUT — Queue-based (replaces setInterval polling)
@@ -116,6 +124,11 @@ class AssignmentService {
         vehicle.status,
         'available'
       ).catch(err => logger.warn(`[${contextLabel}] Redis update failed`, err));
+    }
+    // M7 FIX: Also invalidate fleet cache so transporter's vehicle list reflects release
+    if (transporterId) {
+      invalidateVehicleCache(transporterId, vehicleId)
+        .catch(err => logger.warn(`[${contextLabel}] Fleet cache invalidation failed`, err));
     }
   }
 
@@ -261,7 +274,36 @@ class AssignmentService {
           lastStatusChange: new Date().toISOString()
         }
       });
+
+      // H-14 FIX: Increment trucksFilled INSIDE the transaction so the count
+      // rolls back if any subsequent step fails. Uses raw SQL to avoid circular
+      // dependency on bookingService while staying within the TX boundary.
+      if (data.bookingId) {
+        await tx.$queryRaw`
+          UPDATE "Booking"
+          SET "trucksFilled" = "trucksFilled" + 1,
+              "stateChangedAt" = NOW()
+          WHERE id = ${data.bookingId}
+            AND "trucksFilled" < "trucksNeeded"
+        `;
+      }
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable, timeoutMs: 8000 });
+
+    // =========================================================================
+    // C5 FIX: Sync Redis after TX commit — vehicle moved to on_hold in DB,
+    // so Redis must reflect this to prevent phantom-available in matching.
+    // Pattern: same .catch() as releaseVehicleIfBusy (lines 114-121)
+    // =========================================================================
+    if (vehicle.vehicleKey) {
+      liveAvailabilityService.onVehicleStatusChange(
+        transporterId,
+        vehicle.vehicleKey,
+        'available',
+        'on_hold'
+      ).catch(err => logger.warn('[createAssignment] Redis availability sync failed', err));
+    }
+    invalidateVehicleCache(transporterId, data.vehicleId)
+      .catch(err => logger.warn('[createAssignment] Fleet cache invalidation failed', err));
 
     // =========================================================================
     // START ASSIGNMENT TIMEOUT TIMER (In-process self-destruct)
@@ -286,17 +328,46 @@ class AssignmentService {
       await queueService.scheduleAssignmentTimeout(timerData, ASSIGNMENT_CONFIG.TIMEOUT_MS);
       logger.info(`⏱️ Assignment timeout started: ${assignment.id} (${ASSIGNMENT_CONFIG.TIMEOUT_MS / 1000}s)`);
     } catch (timeoutErr) {
-      logger.error('[CRITICAL] Failed to schedule assignment timeout — manual intervention needed', {
+      logger.error('[CRITICAL] Failed to schedule assignment timeout — retrying once after 500ms', {
         assignmentId: assignment.id,
         error: timeoutErr instanceof Error ? timeoutErr.message : String(timeoutErr)
       });
+
+      // M-07 FIX: Single retry after 500ms delay. If retry also fails, release the
+      // assignment to prevent an orphaned pending assignment with no timeout.
+      try {
+        await new Promise(resolve => setTimeout(resolve, 500));
+        await queueService.scheduleAssignmentTimeout(timerData, ASSIGNMENT_CONFIG.TIMEOUT_MS);
+        logger.info(`⏱️ Assignment timeout started on retry: ${assignment.id}`);
+      } catch (retryErr) {
+        logger.error('[CRITICAL] Retry also failed — releasing assignment to prevent orphan', {
+          assignmentId: assignment.id,
+          error: retryErr instanceof Error ? retryErr.message : String(retryErr)
+        });
+        // Compensate: mark assignment as declined so it doesn't stay pending forever
+        await prismaClient.assignment.updateMany({
+          where: { id: assignment.id, status: 'pending' },
+          data: { status: 'driver_declined' }
+        }).catch(compErr => {
+          logger.error('[CRITICAL] Compensation update also failed', {
+            assignmentId: assignment.id,
+            error: compErr instanceof Error ? compErr.message : String(compErr)
+          });
+        });
+        await this.releaseVehicleIfBusy(data.vehicleId, transporterId, 'timeout_schedule_failed')
+          .catch(relErr => {
+            logger.error('[CRITICAL] Vehicle release after compensation failed', {
+              vehicleId: data.vehicleId,
+              error: relErr instanceof Error ? relErr.message : String(relErr)
+            });
+          });
+        await this.persistAssignmentReason(assignment.id, 'timeout_schedule_failed');
+      }
     }
 
-    // Update booking trucks filled (Fix H-A1: lazy require to break circular dep)
-    if (data.bookingId) {
-      const { bookingService }: typeof import('../booking/booking.service') = require('../booking/booking.service');
-      await bookingService.incrementTrucksFilled(data.bookingId);
-    }
+    // H-14: incrementTrucksFilled now happens inside the transaction above (raw SQL).
+    // The external bookingService.incrementTrucksFilled call has been removed to
+    // prevent the count from persisting when the transaction rolls back.
 
     // Notify customer
     emitToBooking(data.bookingId, SocketEvent.TRUCK_ASSIGNED, {
@@ -550,6 +621,9 @@ class AssignmentService {
       throw new AppError(403, 'FORBIDDEN', 'This assignment is not for you');
     }
 
+    // F-L11: Pre-check is optimistic early-exit. CAS inside TX at line ~648 is the real guard.
+    // TOCTOU is intentional — pre-check avoids expensive TX for obvious failures.
+    // See WEELO-FINAL-INDEX.md F-L11.
     if (assignment.status !== 'pending') {
       // =====================================================================
       // FIX: Include currentStatus in error so app can show helpful message
@@ -565,7 +639,8 @@ class AssignmentService {
         'en_route_pickup': 'You have already accepted this trip',
         'at_pickup': 'You have already accepted this trip',
         'in_transit': 'This trip is already in progress',
-        'completed': 'This trip has already been completed'
+        'completed': 'This trip has already been completed',
+        'partial_delivery': 'This trip has already been completed (partial delivery)'
       };
       const message = statusMessages[assignment.status] || `Assignment cannot be accepted (current status: ${assignment.status})`;
       const error = new AppError(400, 'INVALID_STATUS', message);
@@ -580,6 +655,8 @@ class AssignmentService {
     // =================================================================
     // H9 FIX: Direct DB query for safety-critical double-assignment check
     // (15s cache was allowing stale reads that could permit double-assignment)
+    // F-L11: This pre-check is also optimistic. CAS guard inside TX (updateMany where status:'pending')
+    // at line ~651 is the real atomicity boundary. See WEELO-FINAL-INDEX.md F-L11.
     const activeAssignment = await db.getActiveAssignmentByDriver(driverId);
     if (activeAssignment && activeAssignment.id !== assignmentId) {
       logger.warn(`⚠️ Driver ${driverId} tried to accept ${assignmentId} but already has active trip: ${activeAssignment.tripId}`);
@@ -631,7 +708,7 @@ class AssignmentService {
 
       // Return the updated assignment
       return await tx.assignment.findUnique({ where: { id: assignmentId } });
-    }, { timeoutMs: 8000 });
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable, timeoutMs: 8000 });
 
     if (!updated) {
       throw new AppError(500, 'ACCEPT_FAILED', 'Failed to accept assignment');
@@ -669,6 +746,11 @@ class AssignmentService {
             'on_hold',            // Was on_hold while pending
             'in_transit'          // Now in transit after driver accepted
           ).catch(err => logger.warn('[acceptAssignment] Redis update failed', err));
+
+          // H-20 FIX: Port fleet cache invalidation from assignment-response.service.ts
+          // Without this, transporter dashboard shows stale vehicle status until next cache TTL.
+          invalidateVehicleCache(vehicle.transporterId, assignment.vehicleId)
+            .catch(err => logger.warn('[acceptAssignment] Fleet cache invalidation failed (non-fatal)', err));
         }
         logger.info(`[ASSIGNMENT] Vehicle set to in_transit: ${assignment.vehicleNumber} (driver accepted)`);
       } catch (err: any) {
@@ -836,18 +918,8 @@ class AssignmentService {
     return updated!;
   }
 
-  // Valid assignment status transitions (prevents backward/invalid moves)
-  private static readonly VALID_TRANSITIONS: Record<string, string[]> = {
-    pending: ['driver_accepted', 'driver_declined', 'cancelled'],
-    driver_accepted: ['en_route_pickup', 'cancelled'],
-    en_route_pickup: ['at_pickup', 'cancelled'],
-    at_pickup: ['in_transit', 'cancelled'],
-    in_transit: ['arrived_at_drop', 'completed', 'cancelled'],
-    arrived_at_drop: ['completed', 'cancelled'],
-    completed: [],
-    driver_declined: [],
-    cancelled: [],
-  };
+  // H13: Use canonical ASSIGNMENT_VALID_TRANSITIONS from src/core/state-machines.ts
+  // (single source of truth — M-20 fix enforced, L-17 partial_delivery included)
 
   async updateStatus(
     assignmentId: string,
@@ -864,11 +936,53 @@ class AssignmentService {
       throw new AppError(403, 'FORBIDDEN', 'This assignment is not for you');
     }
 
-    // Validate status transition
-    const allowedNext = AssignmentService.VALID_TRANSITIONS[assignment.status] ?? [];
+    // Validate status transition against canonical state machine
+    const allowedNext = ASSIGNMENT_VALID_TRANSITIONS[assignment.status] ?? [];
     if (!allowedNext.includes(data.status)) {
       throw new AppError(400, 'INVALID_TRANSITION',
         `Cannot transition assignment from '${assignment.status}' to '${data.status}'`);
+    }
+
+    // H-33 FIX: Soft geofence validation for at_pickup and arrived_at_drop.
+    // Warns if driver GPS is more than 500m from the target location.
+    // Does NOT block the status update — soft enforcement only (log + metric).
+    if (['at_pickup', 'arrived_at_drop'].includes(data.status) && data.location) {
+      try {
+        const geoBooking = assignment.bookingId
+          ? await prismaClient.booking.findUnique({ where: { id: assignment.bookingId }, select: { pickup: true, drop: true } })
+          : null;
+        const geoOrder = assignment.orderId
+          ? await prismaClient.order.findUnique({ where: { id: assignment.orderId }, select: { pickup: true, drop: true } })
+          : null;
+
+        const rawTarget = data.status === 'at_pickup'
+          ? (geoBooking?.pickup || geoOrder?.pickup)
+          : (geoBooking?.drop || geoOrder?.drop);
+
+        // Parse JSON if stored as string
+        const target = typeof rawTarget === 'string' ? JSON.parse(rawTarget) : rawTarget;
+
+        if (target && typeof target === 'object' && 'latitude' in target) {
+          const targetCoords = target as { latitude: number; longitude: number };
+          // Haversine distance calculation
+          const R = 6371000; // Earth radius in meters
+          const dLat = (targetCoords.latitude - data.location.latitude) * Math.PI / 180;
+          const dLon = (targetCoords.longitude - data.location.longitude) * Math.PI / 180;
+          const a = Math.sin(dLat / 2) ** 2
+            + Math.cos(data.location.latitude * Math.PI / 180)
+            * Math.cos(targetCoords.latitude * Math.PI / 180)
+            * Math.sin(dLon / 2) ** 2;
+          const distMeters = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+          if (distMeters > 500) {
+            logger.warn('[ASSIGNMENT] Geofence violation', {
+              assignmentId, status: data.status, distMeters: Math.round(distMeters)
+            });
+          }
+        }
+      } catch (geoErr) {
+        logger.warn('[ASSIGNMENT] Geofence check failed', { assignmentId, err: geoErr });
+      }
     }
 
     const updates: Partial<AssignmentRecord> = {
@@ -885,12 +999,81 @@ class AssignmentService {
       });
     }
 
-    if (data.status === 'in_transit') {
-      updates.startedAt = new Date().toISOString();
+    // L-14 FIX: Record per-stage timestamps in Redis hash for duration analytics.
+    // DB columns don't exist for these intermediate stages, so we use a Redis hash
+    // with 7-day TTL. Key: assignment:stages:{assignmentId}
+    const STAGE_TIMESTAMP_FIELDS: Record<string, string> = {
+      en_route_pickup: 'enRoutePickupAt',
+      at_pickup: 'atPickupAt',
+      arrived_at_drop: 'arrivedAtDropAt',
+    };
+    const stageField = STAGE_TIMESTAMP_FIELDS[data.status];
+    if (stageField) {
+      const stageKey = `assignment:stages:${assignmentId}`;
+      redisService.hSet(stageKey, stageField, new Date().toISOString())
+        .then(() => redisService.expire(stageKey, 7 * 86400))
+        .catch(err => logger.warn('[ASSIGNMENT] Stage timestamp write failed (non-fatal)', {
+          assignmentId, stage: data.status, error: err instanceof Error ? err.message : String(err)
+        }));
     }
 
-    if (data.status === 'completed') {
+    if (data.status === 'in_transit') {
+      updates.startedAt = new Date().toISOString();
+
+      // H-36 FIX: Wire parent Order/Booking to in_progress when first assignment
+      // hits in_transit. CAS pattern: only transitions if currently in an expected
+      // pre-transit state. Non-fatal: failure here must NOT block the assignment
+      // status update itself.
+      try {
+        if (assignment.orderId) {
+          await prismaClient.order.updateMany({
+            where: {
+              id: assignment.orderId,
+              status: { in: ['fully_filled', 'partially_filled'] },
+            },
+            data: { status: 'in_progress' },
+          });
+        }
+        if (assignment.bookingId) {
+          await prismaClient.booking.updateMany({
+            where: {
+              id: assignment.bookingId,
+              status: { in: ['fully_filled', 'partially_filled'] },
+            },
+            data: { status: 'in_progress' },
+          });
+        }
+      } catch (err) {
+        logger.warn('[ASSIGNMENT] Failed to transition parent to in_progress', {
+          assignmentId, error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    if (data.status === 'completed' || data.status === 'partial_delivery') {
       updates.completedAt = new Date().toISOString();
+    }
+
+    // =====================================================================
+    // L-17: Store partial delivery metadata in Redis (not DB columns)
+    // =====================================================================
+    // Avoids schema migration. 30-day TTL gives ops team time to review.
+    // Key: assignment:delivery:{assignmentId}
+    // =====================================================================
+    if (data.status === 'partial_delivery') {
+      const deliveryKey = `assignment:delivery:${assignmentId}`;
+      const THIRTY_DAYS = 30 * 86400;
+      const deliveryMeta = {
+        partialReason: data.partialReason || 'OTHER',
+        deliveryNotes: data.deliveryNotes || '',
+        driverId,
+        completedAt: updates.completedAt,
+        status: 'partial_delivery',
+      };
+      redisService.set(deliveryKey, JSON.stringify(deliveryMeta), THIRTY_DAYS)
+        .catch(err => logger.warn('[ASSIGNMENT] Failed to store partial delivery metadata (non-fatal)', {
+          assignmentId, error: err instanceof Error ? err.message : String(err)
+        }));
     }
 
     // =====================================================================
@@ -905,8 +1088,24 @@ class AssignmentService {
     //   release needed, so no atomicity concern).
     // =====================================================================
     let updated: AssignmentRecord;
-    if (data.status === 'completed') {
-      // Read actual vehicle status before transaction for Redis sync
+    const isCompletionStatus = data.status === 'completed' || data.status === 'partial_delivery';
+    if (isCompletionStatus && FF_COMPLETION_ORCHESTRATOR) {
+      // =====================================================================
+      // C1 FIX: Unified completion orchestrator — all side-effects in one place
+      // Handles: atomic TX, vehicle release, Redis sync, outbox, rating prompt,
+      // rating reminders, booking cascade, fleet cache invalidation,
+      // driver:active-assignment cleanup, WebSocket + FCM notifications.
+      // Also fixes H16 (driver:active-assignment) and M7 (fleet cache).
+      // =====================================================================
+      const terminalStatus = data.status as 'completed' | 'partial_delivery';
+      await completeTrip(assignmentId, 'admin', terminalStatus, data.partialReason);
+
+      // Re-fetch the updated assignment to return to caller
+      updated = (await db.getAssignmentById(assignmentId))!;
+    } else if (isCompletionStatus) {
+      // Legacy inline path — kept behind feature flag for rollback safety
+      const dbStatus = data.status as string;
+
       let actualVehicleStatus = 'in_transit';
       if (assignment.vehicleId) {
         const veh = await prismaClient.vehicle.findUnique({
@@ -920,7 +1119,7 @@ class AssignmentService {
         await tx.assignment.update({
           where: { id: assignmentId },
           data: {
-            status: 'completed',
+            status: dbStatus as any,
             completedAt: updates.completedAt
           }
         });
@@ -937,29 +1136,21 @@ class AssignmentService {
         }
       });
 
-      // Post-transaction: Redis sync (non-fatal, same pattern as cancel/decline)
       if (assignment.vehicleId) {
         const vehicle = await prismaClient.vehicle.findUnique({
           where: { id: assignment.vehicleId },
           select: { vehicleKey: true, transporterId: true }
         });
         if (vehicle?.vehicleKey && assignment.transporterId) {
-          liveAvailabilityService.onVehicleStatusChange(
-            assignment.transporterId, vehicle.vehicleKey, actualVehicleStatus, 'available'
-          ).catch(err => logger.warn('[updateStatus:completed] Redis sync failed', err));
+          const { onVehicleTransition } = require('../../shared/services/vehicle-lifecycle.service');
+          onVehicleTransition(
+            assignment.transporterId, assignment.vehicleId, vehicle.vehicleKey,
+            actualVehicleStatus, 'available', `updateStatus:${dbStatus}`
+          ).catch((err: any) => logger.warn(`[updateStatus:${dbStatus}] Vehicle transition failed`, err));
         }
       }
-      logger.info(`[ASSIGNMENT] Vehicle released on trip completion: ${assignment.vehicleNumber}`);
+      logger.info(`[ASSIGNMENT] Vehicle released on trip ${dbStatus}: ${assignment.vehicleNumber}`);
 
-      // =====================================================================
-      // FIX C-18: Write trip_completed outbox row (payment trigger)
-      // =====================================================================
-      // Pattern: Transactional outbox (Uber/Spotify standard).
-      // The outbox row signals "a trip completed, payment should happen".
-      // The lifecycle outbox poller picks it up and emits payment_pending
-      // Socket.IO event + FCM notification. No actual payment module yet.
-      // Non-fatal: outbox write failure must NOT break the completion flow.
-      // =====================================================================
       try {
         let completionCustomerId = '';
         if (assignment.bookingId) {
@@ -998,7 +1189,6 @@ class AssignmentService {
           customerId: completionCustomerId
         });
       } catch (outboxErr: unknown) {
-        // Non-fatal: trip completion succeeds even if outbox write fails
         const outboxErrMsg = outboxErr instanceof Error ? outboxErr.message : String(outboxErr);
         logger.warn('[ASSIGNMENT] Failed to write trip_completed outbox row (non-fatal)', {
           assignmentId,
@@ -1007,13 +1197,81 @@ class AssignmentService {
         });
       }
 
-      // Re-fetch the updated assignment to return to caller
       updated = (await db.getAssignmentById(assignmentId))!;
+
+      // Legacy: inline notifications (orchestrator handles these when FF is on)
+      const isPartial = data.status === 'partial_delivery';
+      const transporterMsg = isPartial
+        ? `${assignment.driverName} partially delivered (${assignment.vehicleNumber}). Reason: ${data.partialReason || 'N/A'}`
+        : `${assignment.driverName} completed the trip (${assignment.vehicleNumber})`;
+      const pushTitle = isPartial ? 'Partial Delivery' : 'Trip Completed';
+      const customerPushBody = isPartial
+        ? `Your delivery was partially completed. Vehicle: ${assignment.vehicleNumber}`
+        : `Your delivery has arrived! Vehicle: ${assignment.vehicleNumber}`;
+
+      emitToUser(assignment.transporterId, SocketEvent.ASSIGNMENT_STATUS_CHANGED, {
+        assignmentId,
+        tripId: assignment.tripId,
+        status: data.status,
+        vehicleNumber: assignment.vehicleNumber,
+        driverName: assignment.driverName,
+        ...(isPartial && { partialReason: data.partialReason }),
+        message: transporterMsg
+      });
+
+      queueService.queuePushNotification(assignment.transporterId, {
+        title: pushTitle,
+        body: transporterMsg,
+        data: { type: 'assignment_update', assignmentId, tripId: assignment.tripId, status: data.status }
+      }).catch(err => {
+        logger.warn(`FCM: Failed to notify transporter of ${data.status}`, err);
+      });
+
+      const booking = assignment.bookingId
+        ? await db.getBookingById(assignment.bookingId)
+        : undefined;
+      if (booking?.customerId) {
+        const customerMsg = isPartial
+          ? `Your delivery has been partially completed (${assignment.vehicleNumber})`
+          : `Your delivery has been completed (${assignment.vehicleNumber})`;
+        emitToUser(booking.customerId, SocketEvent.ASSIGNMENT_STATUS_CHANGED, {
+          assignmentId, tripId: assignment.tripId, bookingId: assignment.bookingId,
+          status: data.status, vehicleNumber: assignment.vehicleNumber,
+          ...(isPartial && { partialReason: data.partialReason }),
+          message: customerMsg
+        });
+        queueService.queuePushNotification(booking.customerId, {
+          title: pushTitle, body: customerPushBody,
+          data: { type: 'assignment_update', assignmentId, tripId: assignment.tripId, bookingId: assignment.bookingId, status: data.status }
+        }).catch(err => { logger.warn(`FCM: Failed to notify customer of ${data.status}`, err); });
+      }
+
+      const ratingCustomerId = booking?.customerId
+        || (assignment.orderId
+          ? (await prismaClient.order.findUnique({ where: { id: assignment.orderId }, select: { customerId: true } }).catch(() => null))?.customerId
+          : undefined);
+      if (ratingCustomerId) {
+        setTimeout(async () => {
+          try {
+            await queueService.queuePushNotification(ratingCustomerId, {
+              title: 'How was your delivery?',
+              body: `Rate your experience with ${assignment.driverName || 'your driver'}`,
+              data: { type: 'rating_prompt', assignmentId, tripId: assignment.tripId, screen: 'RATING' }
+            });
+          } catch (err) { logger.warn('Rating prompt FCM failed', { assignmentId }); }
+        }, 3 * 60 * 1000);
+        try {
+          const reminderData = JSON.stringify({ customerId: ratingCustomerId, assignmentId, driverName: assignment.driverName || 'your driver' });
+          redisService.set(`rating:remind:24h:${assignmentId}`, reminderData, 24 * 3600).catch(() => {});
+          redisService.set(`rating:remind:72h:${assignmentId}`, reminderData, 72 * 3600).catch(() => {});
+        } catch (reminderErr) { logger.warn('[ASSIGNMENT] Rating reminder scheduling failed (non-fatal)', { assignmentId }); }
+      }
     } else {
+      // M-16: Non-completed transitions intentionally use non-transactional update — no vehicle release or multi-table write needed
       updated = await db.updateAssignment(assignmentId, updates);
     }
 
-    // Notify booking room
+    // Notify booking room (for all statuses, including non-completion)
     const updateStreamId = this.resolveAssignmentStreamId(assignment);
     if (updateStreamId) {
       emitToBooking(updateStreamId, SocketEvent.ASSIGNMENT_STATUS_CHANGED, {
@@ -1027,63 +1285,40 @@ class AssignmentService {
     }
 
     // =====================================================================
-    // FIX: Direct notifications on trip completion
+    // H-21 + H-29 FIX: Mid-trip direct customer push notifications
     // =====================================================================
-    // BEFORE: Only emitted to booking room. Transporter/customer may not
-    //   be in that room → they never learn the trip finished.
-    // NOW: Direct WebSocket + FCM push (same pattern as cancel/decline).
-    // =====================================================================
-    if (data.status === 'completed') {
-      // Notify transporter directly
-      emitToUser(assignment.transporterId, SocketEvent.ASSIGNMENT_STATUS_CHANGED, {
-        assignmentId,
-        tripId: assignment.tripId,
-        status: 'completed',
-        vehicleNumber: assignment.vehicleNumber,
-        driverName: assignment.driverName,
-        message: `${assignment.driverName} completed the trip (${assignment.vehicleNumber})`
-      });
+    if (!isCompletionStatus) {
+      const MID_TRIP_PUSH: Record<string, { title: string; body: string }> = {
+        en_route_pickup: { title: 'Driver En Route', body: 'Your driver is heading to the pickup point' },
+        at_pickup: { title: 'Driver at Pickup', body: 'Your driver has arrived at the pickup location' },
+        in_transit: { title: 'Delivery In Transit', body: 'Your goods are on the way!' },
+        arrived_at_drop: { title: 'Driver Arriving', body: 'Your driver is at the drop location' },
+      };
 
-      queueService.queuePushNotification(assignment.transporterId, {
-        title: '✅ Trip Completed',
-        body: `${assignment.driverName} completed the trip (${assignment.vehicleNumber})`,
-        data: {
-          type: 'assignment_update',
-          assignmentId,
-          tripId: assignment.tripId,
-          status: 'completed'
-        }
-      }).catch(err => {
-        logger.warn(`FCM: Failed to notify transporter of completion`, err);
-      });
-
-      // Notify customer if booking exists
-      const booking = assignment.bookingId
-        ? await db.getBookingById(assignment.bookingId)
-        : undefined;
-      if (booking?.customerId) {
-        emitToUser(booking.customerId, SocketEvent.ASSIGNMENT_STATUS_CHANGED, {
-          assignmentId,
-          tripId: assignment.tripId,
-          bookingId: assignment.bookingId,
-          status: 'completed',
-          vehicleNumber: assignment.vehicleNumber,
-          message: `Your delivery has been completed (${assignment.vehicleNumber})`
-        });
-
-        queueService.queuePushNotification(booking.customerId, {
-          title: '📦 Delivery Completed',
-          body: `Your delivery has arrived! Vehicle: ${assignment.vehicleNumber}`,
-          data: {
-            type: 'assignment_update',
-            assignmentId,
-            tripId: assignment.tripId,
-            bookingId: assignment.bookingId,
-            status: 'completed'
+      const pushConfig = MID_TRIP_PUSH[data.status];
+      if (pushConfig) {
+        try {
+          const midTripBooking = assignment.bookingId
+            ? await prismaClient.booking.findUnique({ where: { id: assignment.bookingId }, select: { customerId: true } })
+            : null;
+          const midTripOrder = assignment.orderId
+            ? await prismaClient.order.findUnique({ where: { id: assignment.orderId }, select: { customerId: true } })
+            : null;
+          const midTripCustomerId = midTripBooking?.customerId || midTripOrder?.customerId;
+          if (midTripCustomerId) {
+            emitToUser(midTripCustomerId, 'assignment_status_changed', {
+              assignmentId, tripId: assignment.tripId, status: data.status,
+              vehicleNumber: assignment.vehicleNumber,
+            });
+            queueService.queuePushNotification(midTripCustomerId, {
+              title: pushConfig.title,
+              body: `${pushConfig.body} (${assignment.vehicleNumber || ''})`,
+              data: { type: 'assignment_update', assignmentId, status: data.status }
+            }).catch(err => logger.warn('Mid-trip FCM failed', { err }));
           }
-        }).catch(err => {
-          logger.warn(`FCM: Failed to notify customer of completion`, err);
-        });
+        } catch (err) {
+          logger.warn('[updateStatus] Mid-trip customer push failed', { assignmentId, err });
+        }
       }
     }
 
@@ -1106,6 +1341,12 @@ class AssignmentService {
       throw new AppError(403, 'FORBIDDEN', 'Access denied');
     }
 
+    // F-H11 FIX: Terminal state guard — prevent cancelling already-completed/cancelled assignments
+    const TERMINAL_SET = new Set<string>(TERMINAL_ASSIGNMENT_STATUSES);
+    if (TERMINAL_SET.has(assignment.status)) {
+      throw new AppError(409, 'ASSIGNMENT_ALREADY_TERMINAL', `Assignment is already ${assignment.status}`);
+    }
+
     // Queue job is idempotent: if assignment is cancelled, handleAssignmentTimeout() no-ops.
 
     // =====================================================================
@@ -1115,10 +1356,18 @@ class AssignmentService {
     // NOW: Single Prisma transaction — both succeed or both roll back.
     // =====================================================================
     await prismaClient.$transaction(async (tx) => {
-      await tx.assignment.update({
-        where: { id: assignmentId },
+      // F-H11 FIX: CAS — only cancel if not already terminal
+      const cancelResult = await tx.assignment.updateMany({
+        where: {
+          id: assignmentId,
+          status: { notIn: [...TERMINAL_ASSIGNMENT_STATUSES] as any }
+        },
         data: { status: 'cancelled' }
       });
+      if (cancelResult.count === 0) {
+        logger.info('[ASSIGNMENT] Cancel skipped — already terminal (CAS)', { assignmentId });
+        return; // Idempotent — assignment was already terminal
+      }
       if (assignment.vehicleId) {
         await tx.vehicle.updateMany({
           where: { id: assignment.vehicleId, status: { not: 'available' } },
@@ -1132,16 +1381,18 @@ class AssignmentService {
       }
     });
 
-    // Post-transaction: Redis cache sync (non-transactional, fail-safe)
+    // Post-transaction: Redis + fleet cache sync (non-transactional, fail-safe)
     if (assignment.vehicleId) {
       const vehicle = await prismaClient.vehicle.findUnique({
         where: { id: assignment.vehicleId },
         select: { vehicleKey: true, transporterId: true }
       });
       if (vehicle?.vehicleKey && assignment.transporterId) {
-        liveAvailabilityService.onVehicleStatusChange(
-          assignment.transporterId, vehicle.vehicleKey, 'in_transit', 'available'
-        ).catch(err => logger.warn('[cancelAssignment] Redis sync failed', err));
+        const { onVehicleTransition } = require('../../shared/services/vehicle-lifecycle.service');
+        onVehicleTransition(
+          assignment.transporterId, assignment.vehicleId, vehicle.vehicleKey,
+          'in_transit', 'available', 'cancelAssignment'
+        ).catch((err: any) => logger.warn('[cancelAssignment] Vehicle transition failed', err));
       }
     }
 
@@ -1299,16 +1550,18 @@ class AssignmentService {
       logger.warn(`[declineAssignment] Failed to cancel timeout timer: ${cancelErr?.message}`);
     });
 
-    // Post-transaction: Redis cache sync (non-transactional, fail-safe)
+    // Post-transaction: Redis + fleet cache sync (non-transactional, fail-safe)
     if (assignment.vehicleId) {
       const vehicle = await prismaClient.vehicle.findUnique({
         where: { id: assignment.vehicleId },
         select: { vehicleKey: true, transporterId: true }
       });
       if (vehicle?.vehicleKey && assignment.transporterId) {
-        liveAvailabilityService.onVehicleStatusChange(
-          assignment.transporterId, vehicle.vehicleKey, actualVehicleStatus, 'available'
-        ).catch(err => logger.warn('[declineAssignment] Redis sync failed', err));
+        const { onVehicleTransition } = require('../../shared/services/vehicle-lifecycle.service');
+        onVehicleTransition(
+          assignment.transporterId, assignment.vehicleId, vehicle.vehicleKey,
+          actualVehicleStatus, 'available', 'declineAssignment'
+        ).catch((err: any) => logger.warn('[declineAssignment] Vehicle transition failed', err));
       }
     }
 
@@ -1405,11 +1658,35 @@ class AssignmentService {
       declineCustomerId = ord?.customerId ?? null;
     }
     if (declineCustomerId) {
+      // H-32 FIX: Structured order_progress payload on decline
+      // BEFORE: Generic text-only payload — client couldn't show truck progress UI.
+      // NOW: Includes eventType, truck counts, and reassignment flag so customer
+      // app can render a meaningful progress bar (e.g., "2 of 3 trucks assigned").
+      let trucksAssigned = 0;
+      let trucksRequired = 0;
+      try {
+        if (assignment.orderId) {
+          const truckRequests = await prismaClient.truckRequest.findMany({
+            where: { orderId: assignment.orderId },
+            select: { status: true },
+          });
+          trucksRequired = truckRequests.length;
+          trucksAssigned = truckRequests.filter(r =>
+            ['assigned', 'accepted', 'in_progress', 'completed'].includes(r.status)
+          ).length;
+        }
+      } catch { /* non-fatal: fall back to 0/0 counts */ }
+
       emitToUser(declineCustomerId, 'order_progress', {
+        eventType: 'driver_declined',
         orderId: assignment.orderId,
         bookingId: assignment.bookingId,
         status: 'searching',
-        message: 'Finding another driver for your order...'
+        trucksAssigned,
+        trucksRequired,
+        reassignmentInProgress: true,
+        message: 'Finding another driver for your order...',
+        timestamp: new Date().toISOString(),
       });
     }
 
@@ -1458,50 +1735,106 @@ class AssignmentService {
 
     logger.info(`⏰ TIMEOUT: Assignment ${assignmentId} — driver ${driverName} didn't respond`);
 
-    // 1. Atomic status update with precondition — prevents race with concurrent accept/decline
-    // If driver accepted concurrently, this no-ops (count === 0) and we skip gracefully
-    const updated = await prismaClient.assignment.updateMany({
-      where: { id: assignmentId, status: 'pending' },
-      data: { status: 'driver_declined' }
+    // =====================================================================
+    // FIX M5: Atomic transaction — decline + release vehicle + decrement trucksFilled
+    // BEFORE: Three separate DB writes; partial failure left vehicle stuck
+    //   or trucksFilled out of sync.
+    // NOW: Single Prisma transaction — all succeed or all roll back.
+    // Pattern: follows cancelAssignment (line ~1366).
+    // =====================================================================
+
+    // Pre-fetch vehicle data for post-TX Redis/cache sync
+    const vehicle = vehicleId
+      ? await prismaClient.vehicle.findUnique({
+          where: { id: vehicleId },
+          select: { vehicleKey: true, transporterId: true, status: true }
+        })
+      : null;
+
+    const txResult = await prismaClient.$transaction(async (tx) => {
+      // 1. Atomic status update with CAS — prevents race with concurrent accept/decline
+      // M-08 FIX: Add declineType:'timeout' to distinguish from explicit driver decline.
+      const updated = await tx.assignment.updateMany({
+        where: { id: assignmentId, status: 'pending' },
+        data: { status: 'driver_declined', declineType: 'timeout', declinedAt: new Date() }
+      });
+
+      if (updated.count === 0) {
+        return { skipped: true } as const;
+      }
+
+      // 2. Release vehicle back to available (DB part only — Redis/cache after TX)
+      if (vehicleId) {
+        await tx.vehicle.updateMany({
+          where: { id: vehicleId, status: { not: 'available' } },
+          data: {
+            status: 'available',
+            currentTripId: null,
+            assignedDriverId: null,
+            lastStatusChange: new Date().toISOString()
+          }
+        });
+      }
+
+      // 3. Decrement trucks filled
+      if (bookingId) {
+        // Fix H-A1: lazy require to break circular dep
+        const { bookingService }: typeof import('../booking/booking.service') = require('../booking/booking.service');
+        await bookingService.decrementTrucksFilled(bookingId);
+      } else if (orderId) {
+        // Floor guard: GREATEST(0, ...) prevents negative trucksFilled on concurrent timeouts
+        // Order status guard: skip decrement on already-cancelled/completed orders
+        await tx.$executeRaw`
+          UPDATE "Order"
+          SET "trucksFilled" = GREATEST(0, "trucksFilled" - 1),
+              "updatedAt" = NOW()
+          WHERE "id" = ${orderId}
+            AND "status" NOT IN ('cancelled', 'completed')
+        `;
+        // Also update TruckRequest status back to searching
+        if (truckRequestId) {
+          await tx.truckRequest.updateMany({
+            where: { id: truckRequestId, orderId },
+            data: {
+              status: 'searching',
+              assignedVehicleId: null,
+              assignedVehicleNumber: null,
+              assignedDriverId: null,
+              assignedDriverName: null,
+              assignedDriverPhone: null,
+              tripId: null,
+              assignedAt: null
+            }
+          });
+        }
+      }
+
+      return { skipped: false } as const;
     });
 
-    if (updated.count === 0) {
+    if (txResult.skipped) {
       // Driver already accepted/declined before timeout fired — skip
       const assignment = await db.getAssignmentById(assignmentId);
       logger.info(`Assignment ${assignmentId} already ${assignment?.status ?? 'gone'}, timeout no-op`);
       return;
     }
-    await this.persistAssignmentReason(assignmentId, 'timeout');
+
+    // Post-transaction: Redis/cache sync (non-transactional, fail-safe)
+    this.persistAssignmentReason(assignmentId, 'timeout').catch(() => {});
+
+    if (vehicleId && vehicle?.vehicleKey && transporterId && vehicle.status !== 'available') {
+      const { onVehicleTransition } = require('../../shared/services/vehicle-lifecycle.service');
+      onVehicleTransition(
+        transporterId, vehicleId, vehicle.vehicleKey,
+        vehicle.status, 'available', 'assignmentTimeout'
+      ).catch((err: any) => logger.warn('[timeout] Vehicle transition failed', err));
+    }
 
     // Fetch assignment for notification data
     const assignment = await db.getAssignmentById(assignmentId);
     if (!assignment) {
       logger.warn(`Assignment ${assignmentId} not found after timeout update`);
       return;
-    }
-
-    // 2. Release vehicle back to available
-    await this.releaseVehicleIfBusy(vehicleId, transporterId, 'timeout');
-
-    // 3. Decrement trucks filled (Fix H-A1: lazy require to break circular dep)
-    // For multi-truck system: use orderId instead of bookingId
-    if (bookingId) {
-      const { bookingService }: typeof import('../booking/booking.service') = require('../booking/booking.service');
-      await bookingService.decrementTrucksFilled(bookingId);
-    } else if (orderId) {
-      // Multi-truck system: decrement trucksFilled on Order
-      // Floor guard: GREATEST(0, ...) prevents negative trucksFilled on concurrent timeouts
-      // Order status guard: skip decrement on already-cancelled/completed orders
-      // DB migration needed: ALTER TABLE "Order" ADD CONSTRAINT chk_order_trucks_filled_nonneg CHECK ("trucksFilled" >= 0);
-      await prismaClient.$executeRaw`
-        UPDATE "Order"
-        SET "trucksFilled" = GREATEST(0, "trucksFilled" - 1),
-            "updatedAt" = NOW()
-        WHERE "id" = ${orderId}
-          AND "status" NOT IN ('cancelled', 'completed')
-      `;
-      // Also update TruckRequest status back to held
-      await this.restoreOrderTruckRequest({ orderId, truckRequestId });
     }
 
     // 4. Notify transporter: driver timed out (WebSocket)

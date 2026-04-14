@@ -113,11 +113,11 @@ export const config = {
   host: getOptional('HOST', 'localhost'),
 
   // Database
-  databaseUrl: getOptional('DATABASE_URL', 'postgresql://localhost:5432/weelo_db'),
+  databaseUrl: getRequired('DATABASE_URL', 'postgresql://localhost:5432/weelo_db'),
 
   // Redis (Required for production scalability)
   redis: {
-    enabled: getBoolean('REDIS_ENABLED', false),
+    enabled: getBoolean('REDIS_ENABLED', process.env.NODE_ENV === 'production'),
     url: getOptional('REDIS_URL', 'redis://localhost:6379'),
   },
 
@@ -125,7 +125,7 @@ export const config = {
   // These are auto-generated in development, REQUIRED in production
   jwt: {
     secret: getRequired('JWT_SECRET'),
-    expiresIn: getOptional('JWT_EXPIRES_IN', '7d'),
+    expiresIn: getOptional('JWT_EXPIRES_IN', '5m'),
     refreshSecret: getRequired('JWT_REFRESH_SECRET'),
     refreshExpiresIn: getOptional('JWT_REFRESH_EXPIRES_IN', '30d'),
   },
@@ -163,6 +163,17 @@ export const config = {
     },
   },
 
+  // Firebase (for FCM push notifications)
+  // Option A: file path to service account JSON (local dev)
+  // Option B: inline credentials (production ECS — no file on disk)
+  // If none set, FCM runs in mock mode (notifications logged only)
+  firebase: {
+    serviceAccountPath: getOptional('FIREBASE_SERVICE_ACCOUNT_PATH', ''),
+    projectId: getOptional('FIREBASE_PROJECT_ID', ''),
+    privateKey: getOptional('FIREBASE_PRIVATE_KEY', ''),
+    clientEmail: getOptional('FIREBASE_CLIENT_EMAIL', ''),
+  },
+
   // Google Maps
   googleMaps: {
     apiKey: getOptional('GOOGLE_MAPS_API_KEY', ''),
@@ -182,6 +193,12 @@ export const config = {
   cors: {
     origin: parseCorsOrigins(getOptional('CORS_ORIGIN', '*')),
   },
+
+  // Booking backpressure
+  bookingConcurrencyLimit: getNumber('BOOKING_CONCURRENCY_LIMIT', 200),
+
+  // Geo Query
+  geoQueryMaxCandidates: getNumber('GEO_QUERY_MAX_CANDIDATES', 250),
 
   // Helpers
   isProduction: getOptional('NODE_ENV', 'development') === 'production',
@@ -210,9 +227,9 @@ function validateConfig(): void {
 
   // Production-specific checks
   if (config.isProduction) {
-    // CORS should not be wildcard in production (warn, don't block — mobile API backend)
+    // CORS wildcard is unsafe in production — fail loudly so it gets fixed
     if (config.cors.origin === '*') {
-      warnings.push('CORS_ORIGIN is set to "*" — consider restricting in production. Set CORS_ORIGIN=https://yourdomain.com');
+      errors.push('CORS_ORIGIN is set to "*" in production. Set CORS_ORIGIN to specific origins (e.g., https://weelo.app,https://captain.weelo.app)');
     }
 
     // Google Maps should be configured for Places search

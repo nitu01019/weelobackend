@@ -64,6 +64,8 @@ import {
   blockSuspiciousRequests,
   securityResponseHeaders
 } from './shared/middleware/security.middleware';
+import { backwardCompatMiddleware } from './shared/middleware/backward-compat.middleware';
+import { correlationMiddleware } from './shared/context/correlation';
 // import { cache } from './shared/middleware/cache.middleware'; // TODO: Create cache middleware
 
 // Database
@@ -77,6 +79,7 @@ import { vehicleRouter } from './modules/vehicle/vehicle.routes';
 import { bookingRouter } from './modules/booking/booking.routes';
 import { assignmentRouter } from './modules/assignment/assignment.routes';
 import { trackingRouter } from './modules/tracking/tracking.routes';
+import { podRouter } from './modules/tracking/pod.routes';
 import { pricingRouter } from './modules/pricing/pricing.routes';
 import { driverRouter } from './modules/driver/driver.routes';
 import { broadcastRouter } from './modules/broadcast/broadcast.routes';
@@ -201,18 +204,13 @@ if (config.isProduction && hasSSLCertificates()) {
   }
 }
 
-// Initialize Socket.IO
-initializeSocket(server);
+// NOTE: Socket.IO initialization moved into bootstrap() AFTER Redis is ready (Fix H14).
+// This ensures the Redis adapter is connected before Socket.IO starts accepting connections.
 
 // Register hold expiry cleanup processor (Layer 1)
+// Safe to register before Redis — just stores a callback, doesn't use Socket.IO yet.
 registerHoldExpiryProcessor();
 logger.info('✅ Hold expiry cleanup processor registered (Layer 1)');
-
-// Start hold reconciliation worker in production (Layer 2 - defense in depth)
-if (process.env.NODE_ENV === 'production') {
-  holdReconciliationService.start();
-  logger.info('✅ Hold reconciliation worker started (Layer 2) - Periodic scans every 30s');
-}
 
 // Initialize FCM Service for Push Notifications
 fcmService.initialize().then(() => {
@@ -231,6 +229,10 @@ app.set('trust proxy', 1);
 
 // Request ID for tracking (must be first)
 app.use(requestIdMiddleware);
+
+// C-5 FIX: Correlation context — wraps each request in AsyncLocalStorage.run()
+// so getCorrelationId() returns a real trace ID instead of 'no-ctx:...' fallback.
+app.use(correlationMiddleware);
 
 // ⚡ GZIP Compression - Reduces response size by ~70%
 app.use(compression({
@@ -270,7 +272,9 @@ app.use(cors({
     'Authorization',
     'X-Request-ID',
     'X-Trace-ID',
-    'X-Load-Test-Run-Id'
+    'X-Load-Test-Run-Id',
+    'X-Device-Id',
+    'X-Idempotency-Key'
   ],
   credentials: true,
   maxAge: 86400 // 24 hours preflight cache
@@ -287,6 +291,10 @@ app.use(sanitizeInput);
 
 // Prevent parameter pollution
 app.use(preventParamPollution);
+
+// Backward compatibility: rewrite legacy Captain app paths to canonical routes
+// Fixes BRK-4 (/trips/*), BRK-2 (plural /tracking/trips/), and general path normalization
+app.use(backwardCompatMiddleware);
 
 // Request logging
 app.use(requestLogger);
@@ -380,6 +388,7 @@ app.use(`${API_PREFIX}/assignments`, assignmentRouter);
 
 // Tracking routes (live location)
 app.use(`${API_PREFIX}/tracking`, trackingRouter);
+app.use(`${API_PREFIX}/tracking`, podRouter);
 
 // Pricing routes (fare estimation)
 app.use(`${API_PREFIX}/pricing`, pricingRouter);
@@ -411,59 +420,6 @@ app.use(`${API_PREFIX}/geocoding`, geocodingRouter);
 // Rating routes (customer submits ratings, driver views ratings)
 import ratingRouter from './modules/rating/rating.routes';
 app.use(`${API_PREFIX}/rating`, ratingRouter);
-
-// =============================================================================
-// DATABASE DEBUG ROUTES (Development only)
-// =============================================================================
-
-if (config.isDevelopment) {
-  // View all data (for debugging)
-  app.get(`${API_PREFIX}/debug/database`, async (_req, res) => {
-    res.json({
-      success: true,
-      data: await db.getRawData()
-    });
-  });
-
-  // View stats
-  app.get(`${API_PREFIX}/debug/stats`, async (_req, res) => {
-    res.json({
-      success: true,
-      data: await db.getStats()
-    });
-  });
-
-  // L6 FIX: Moved from after 404 handler to here (before it) so it's reachable
-  // DEBUG: Socket connections endpoint
-  // SECURITY: Only available in development — exposes connected user data
-  app.get(`${API_PREFIX}/debug/sockets`, (_req, res) => {
-    const { getConnectionStats: getConnStats }: typeof import('./shared/services/socket.service') = require('./shared/services/socket.service');
-    const debugStats = getConnStats();
-
-    // Get all connected user IDs
-    const connectedUsers: any[] = [];
-    const socketMod: typeof import('./shared/services/socket.service') = require('./shared/services/socket.service');
-    const ioInstance = socketMod.getIO();
-    if (ioInstance) {
-      ioInstance.sockets.sockets.forEach((socket: any) => {
-        connectedUsers.push({
-          socketId: socket.id,
-          userId: socket.data.userId,
-          role: socket.data.role,
-          phone: socket.data.phone ? `***${String(socket.data.phone).slice(-4)}` : ''
-        });
-      });
-    }
-
-    res.json({
-      success: true,
-      data: {
-        stats: debugStats,
-        connectedUsers
-      }
-    });
-  });
-}
 
 // =============================================================================
 // ERROR HANDLING
@@ -513,6 +469,22 @@ async function bootstrap(): Promise<void> {
   } catch (err) {
     logger.error('RedisService initialization failed:', err);
     // Continue — redisService falls back to in-memory mode
+  }
+
+  // -------------------------------------------------------------------------
+  // 1b. Socket.IO initialization (Fix H14: AFTER Redis is ready)
+  // -------------------------------------------------------------------------
+  // The Redis adapter must be connected before Socket.IO starts accepting
+  // connections, otherwise pub/sub events are silently lost on multi-instance
+  // deployments. Previous location was before bootstrap() — moved here.
+  initializeSocket(server);
+  logger.info('Socket.IO initialized (Redis adapter ready)');
+
+  // Start hold reconciliation worker in production (Layer 2 - defense in depth)
+  // Must be after Socket.IO init since it emits events to connected clients.
+  if (process.env.NODE_ENV === 'production') {
+    holdReconciliationService.start();
+    logger.info('Hold reconciliation worker started (Layer 2) - Periodic scans every 30s');
   }
 
   // -------------------------------------------------------------------------
@@ -580,6 +552,15 @@ async function bootstrap(): Promise<void> {
     logger.error(`[Startup] Geo rebuild failed: ${(err as Error).message}`);
   });
 
+  // H4 FIX: Periodic geo index pruning — removes stale transporter entries from
+  // geo:transporters:* sorted sets whose transporters are no longer in the online SET.
+  // Prevents phantom entries from accumulating between TTL expiry and heartbeat refresh.
+  // Distributed lock ensures only one ECS instance prunes at a time.
+  setInterval(() => {
+    availabilityService.pruneStaleGeoEntries()
+      .catch(err => logger.warn('[GeoPrune] Pruning cycle failed:', (err as Error).message));
+  }, 5 * 60 * 1000).unref();
+
   // -------------------------------------------------------------------------
   // 3. Start background jobs that depend on Redis
   // -------------------------------------------------------------------------
@@ -589,6 +570,19 @@ async function bootstrap(): Promise<void> {
   // M12 FIX: Explicitly start driver offline checker (was auto-started on import)
   const { trackingService: trackingSvc } = await import('./modules/tracking/tracking.service');
   trackingSvc.startDriverOfflineChecker();
+
+  // M22 FIX: Start rating reminder poller (processes expired rating reminder timers)
+  try {
+    const { processExpiredRatingReminders } = await import('./modules/rating/rating-reminder.service');
+    setInterval(() => {
+      processExpiredRatingReminders()
+        .catch(err => logger.warn('[RatingReminder] Poll cycle failed:', (err as Error).message));
+    }, 60_000).unref();
+    logger.info('[Startup] Rating reminder poller started (every 60s)');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn(`[Startup] Rating reminder poller failed to start (non-fatal): ${msg}`);
+  }
 
   // C-8 FIX: Recover orphaned progressive step timers after server restart.
   // Timer keys may exist in Redis but be missing from the timers:pending sorted
@@ -735,6 +729,8 @@ const gracefulShutdown = async (signal: string) => {
     broadcastService?.stopExpiryChecker?.();
     stopStaleTransporterCleanup();
     trackingService?.stopDriverOfflineChecker?.();
+    // H-15 FIX: Stop hold reconciliation worker (was never called during shutdown)
+    holdReconciliationService.stop();
     logger.info('All background intervals stopped');
   } catch (err) {
     logger.error('Error stopping background intervals', err);
@@ -805,12 +801,13 @@ const gracefulShutdown = async (signal: string) => {
     process.exit(0);
   });
 
-  // Force shutdown after 30 seconds
+  // Force shutdown after 25 seconds (H-10 FIX: 25s < ECS default 30s SIGKILL,
+  // giving 5s buffer for clean exit before ECS force-kills the container)
   // L1 FIX: unref() so this doesn't prevent Node.js from exiting if everything else is done
   setTimeout(() => {
     logger.error('Forced shutdown after timeout');
     process.exit(1);
-  }, 30000).unref();
+  }, 25000).unref();
 };
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));

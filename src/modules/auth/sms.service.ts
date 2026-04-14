@@ -16,6 +16,7 @@
 import { config } from '../../config/environment';
 import { logger } from '../../shared/services/logger.service';
 import { AppError } from '../../shared/types/error.types';
+import { metrics } from '../../shared/monitoring/metrics.service';
 
 interface SmsProvider {
   sendOtp(phone: string, otp: string): Promise<void>;
@@ -181,49 +182,46 @@ class AWSSNSProvider implements SmsProvider {
  */
 class ConsoleProvider implements SmsProvider {
   async sendOtp(phone: string, otp: string): Promise<void> {
-    if (config.isProduction) {
-      throw new AppError(500, 'SMS_PROVIDER_DISABLED', 'Console SMS provider is disabled in production');
+    if (!config.isDevelopment) {
+      throw new AppError(500, 'SMS_PROVIDER_DISABLED', 'Console SMS provider is disabled outside development');
     }
-    console.log('\n===========================================');
-    console.log('📱 SMS (CONSOLE MODE - DEV ONLY)');
-    console.log('===========================================');
-    console.log(`Phone: ${phone}`);
-    console.log(`OTP: ${otp}`);
-    console.log(`Valid for: ${config.otp.expiryMinutes} minutes`);
-    console.log('===========================================\n');
-    
-    logger.warn('SMS sent via CONSOLE (development mode)', {
-      phone: phone.slice(-4)
+    logger.info('[SMS] OTP sent via console provider', {
+      phoneLast4: phone.slice(-4),
+      otpGenerated: true,
+      expiryMinutes: config.otp.expiryMinutes
     });
   }
 }
 
 /**
- * SMS Service - uses configured provider with automatic fallback
- * 
+ * SMS Service - uses configured provider with retry logic and automatic fallback
+ *
  * SCALABILITY:
  * - Primary provider handles millions of SMS via AWS SNS / Twilio / MSG91
- * - Automatic fallback to console logging if primary provider fails
+ * - Retry logic: up to 2 attempts with exponential back-off before giving up
+ * - Secondary real provider fallback (if configured) before console fallback
  * - OTP is always retrievable from CloudWatch logs on failure
  * - Non-blocking: SMS failure does NOT block OTP storage
- * 
+ *
  * MODULARITY:
  * - Each provider is independent and interchangeable
- * - Fallback chain: Primary → Console (OTP visible in logs)
- * 
+ * - Fallback chain: Primary (with retries) → Secondary (with retries) → Console (dev only)
+ *
  * CODING STANDARDS:
  * - Detailed error logging with provider name and error code
  * - Metrics tracking for SMS delivery success/failure rates
- * 
+ *
  * EASY UNDERSTANDING:
  * - Single sendOtp() method handles all complexity internally
  * - Caller never needs to know which provider is used
  */
 class SmsService {
   private provider: SmsProvider;
+  private secondaryProvider: SmsProvider | null = null;
   private fallbackProvider: ConsoleProvider;
   private providerName: string;
-  
+  private secondaryProviderName: string | null = null;
+
   // SCALABILITY: Track SMS delivery metrics for monitoring
   private metrics = {
     sent: 0,
@@ -232,24 +230,36 @@ class SmsService {
     lastFailure: null as string | null,
     lastFailureTime: null as Date | null,
   };
-  
+
   constructor() {
     const { provider, twilio, msg91, awsSns } = config.sms;
-    
+
     // Always create a console fallback provider
     this.fallbackProvider = new ConsoleProvider();
-    
+
     // Check if AWS SNS is configured (recommended for AWS deployments)
     if (provider === 'aws-sns' && awsSns.region) {
       this.provider = new AWSSNSProvider();
       this.providerName = 'AWS SNS';
       logger.info('SMS Service initialized with AWS SNS provider');
+      // Wire MSG91 as secondary if also configured
+      if (msg91.authKey && msg91.templateId) {
+        this.secondaryProvider = new MSG91Provider();
+        this.secondaryProviderName = 'MSG91';
+        logger.info('SMS Service: MSG91 configured as secondary provider');
+      }
     }
     // Check if Twilio is configured
     else if (provider === 'twilio' && twilio.accountSid && twilio.authToken && twilio.phoneNumber) {
       this.provider = new TwilioProvider();
       this.providerName = 'Twilio';
       logger.info('SMS Service initialized with Twilio provider');
+      // Wire MSG91 as secondary if also configured
+      if (msg91.authKey && msg91.templateId) {
+        this.secondaryProvider = new MSG91Provider();
+        this.secondaryProviderName = 'MSG91';
+        logger.info('SMS Service: MSG91 configured as secondary provider');
+      }
     }
     // Check if MSG91 is configured
     else if (provider === 'msg91' && msg91.authKey && msg91.templateId) {
@@ -264,12 +274,42 @@ class SmsService {
       logger.warn('⚠️  SMS Service: Using CONSOLE mode (development only). Configure AWS SNS/Twilio/MSG91 for production.');
     }
   }
-  
+
   /**
-   * Send OTP via SMS with automatic fallback
-   * 
+   * Attempt sendFn up to maxRetries times with exponential back-off.
+   * Logs a warn on each failed attempt and returns true on first success.
+   * Returns false if all attempts are exhausted without success.
+   */
+  private async sendWithRetry(
+    sendFn: () => Promise<void>,
+    providerName: string,
+    phone: string,
+    maxRetries: number = 2,
+  ): Promise<boolean> {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        await sendFn();
+        return true;
+      } catch (error) {
+        logger.warn(`SMS ${providerName} attempt ${attempt}/${maxRetries} failed`, {
+          phone: phone.slice(-4),
+          error: (error as Error).message,
+          attempt,
+        });
+        if (attempt < maxRetries) {
+          // 1-second delay before attempt 2, 2-second before attempt 3, etc.
+          await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+        }
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Send OTP via SMS with retry logic and automatic fallback
+   *
    * SCALABILITY: Non-blocking, handles provider failures gracefully
-   * EASY UNDERSTANDING: Try primary → fallback to console on failure
+   * EASY UNDERSTANDING: Try primary (with retries) → secondary (with retries) → console (dev)
    * MODULARITY: Provider-agnostic, same interface for all
    * CODING STANDARDS: Detailed error logging for debugging
    */
@@ -278,36 +318,98 @@ class SmsService {
       throw new AppError(500, 'SMS_PROVIDER_DISABLED', 'No production SMS provider is configured');
     }
 
-    try {
-      await this.provider.sendOtp(phone, otp);
+    // --- Primary provider with retries ---
+    const primarySent = await this.sendWithRetry(
+      () => this.provider.sendOtp(phone, otp),
+      this.providerName,
+      phone,
+    );
+
+    if (primarySent) {
       this.metrics.sent++;
-    } catch (error: any) {
-      this.metrics.failed++;
-      this.metrics.lastFailure = error.message;
-      this.metrics.lastFailureTime = new Date();
-      
-      logger.error(`❌ SMS delivery failed via ${this.providerName}`, {
-        error: error.message,
-        errorCode: error.code || 'UNKNOWN',
+      metrics.incrementCounter('sms_delivery_total', { status: 'success', provider: this.providerName });
+      return;
+    }
+
+    // --- Secondary real provider with retries (if configured) ---
+    if (this.secondaryProvider && this.secondaryProviderName) {
+      logger.warn(`SMS primary provider (${this.providerName}) exhausted retries — trying secondary (${this.secondaryProviderName})`, {
         phone: phone.slice(-4),
-        provider: this.providerName,
-        totalFailures: this.metrics.failed,
       });
-      
-      // Non-production only: fallback to console logging for local/dev debugging.
-      if (!config.isProduction && this.provider !== this.fallbackProvider) {
-        logger.warn(`⚠️  Falling back to console logging for OTP delivery`);
+
+      const secondarySent = await this.sendWithRetry(
+        () => this.secondaryProvider!.sendOtp(phone, otp),
+        this.secondaryProviderName,
+        phone,
+      );
+
+      if (secondarySent) {
+        this.metrics.sent++;
+        this.metrics.fallbackUsed++;
+        metrics.incrementCounter('sms_delivery_total', { status: 'success', provider: this.secondaryProviderName });
+        return;
+      }
+
+      // Both providers failed
+      this.metrics.failed++;
+      this.metrics.lastFailure = `Both ${this.providerName} and ${this.secondaryProviderName} failed`;
+      this.metrics.lastFailureTime = new Date();
+      metrics.incrementCounter('sms_delivery_total', {
+        status: 'failure',
+        provider: 'all',
+        reason: 'ALL_PROVIDERS_FAILED',
+      });
+      logger.error('SMS delivery failed on ALL providers', {
+        phone: phone.slice(-4),
+        primaryProvider: this.providerName,
+        secondaryProvider: this.secondaryProviderName,
+      });
+
+      // Development only: last-resort console fallback
+      if (config.isDevelopment) {
+        logger.warn('Falling back to console logging for OTP delivery (dev only)');
         try {
           await this.fallbackProvider.sendOtp(phone, otp);
           this.metrics.fallbackUsed++;
+          metrics.incrementCounter('sms_delivery_total', { status: 'fallback', provider: 'console' });
+          return;
         } catch (fallbackError: any) {
           logger.error('Console fallback also failed', { error: fallbackError.message });
         }
       }
-      
-      // Re-throw so caller decides whether to fail closed (production) or degrade (non-prod).
-      throw error;
+
+      throw new AppError(503, 'SMS_DELIVERY_FAILED', 'Unable to send SMS. Please try again.');
     }
+
+    // --- No secondary provider: primary failed all retries ---
+    this.metrics.failed++;
+    this.metrics.lastFailure = `${this.providerName} failed all retries`;
+    this.metrics.lastFailureTime = new Date();
+    metrics.incrementCounter('sms_delivery_total', {
+      status: 'failure',
+      provider: this.providerName,
+      reason: 'RETRIES_EXHAUSTED',
+    });
+    logger.error(`SMS delivery failed via ${this.providerName} after all retries`, {
+      phone: phone.slice(-4),
+      provider: this.providerName,
+      totalFailures: this.metrics.failed,
+    });
+
+    // Development only: fallback to console logging for local dev debugging.
+    if (config.isDevelopment && this.provider !== this.fallbackProvider) {
+      logger.warn('Falling back to console logging for OTP delivery (dev only)');
+      try {
+        await this.fallbackProvider.sendOtp(phone, otp);
+        this.metrics.fallbackUsed++;
+        metrics.incrementCounter('sms_delivery_total', { status: 'fallback', provider: 'console' });
+        return;
+      } catch (fallbackError: any) {
+        logger.error('Console fallback also failed', { error: fallbackError.message });
+      }
+    }
+
+    throw new AppError(503, 'SMS_DELIVERY_FAILED', 'Unable to send SMS. Please try again.');
   }
   
   /**

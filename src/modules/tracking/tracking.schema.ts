@@ -56,7 +56,7 @@ export const updateLocationSchema = z.object({
   tripId: z.string().uuid(),
   latitude: z.number().min(-90).max(90),
   longitude: z.number().min(-180).max(180),
-  speed: z.number().min(0).max(200).optional().default(0),      // m/s
+  speed: z.number().min(0).max(110).optional().default(0),      // F-M17 FIX: 2x MAX_REALISTIC_SPEED_MS (55 m/s) — defense-in-depth
   bearing: z.number().min(0).max(360).optional().default(0),    // degrees
   accuracy: z.number().min(0).max(500).optional(),              // meters (GPS accuracy)
   timestamp: z.string().datetime().optional(),                   // Device timestamp (ISO)
@@ -81,7 +81,7 @@ export const updateLocationSchema = z.object({
 export const batchLocationPointSchema = z.object({
   latitude: z.number().min(-90).max(90),
   longitude: z.number().min(-180).max(180),
-  speed: z.number().min(0).max(200).optional().default(0),
+  speed: z.number().min(0).max(110).optional().default(0),  // F-M17 FIX: match updateLocationSchema cap
   bearing: z.number().min(0).max(360).optional().default(0),
   accuracy: z.number().min(0).max(500).optional(),
   timestamp: z.string().datetime(),  // REQUIRED for batch - when point was captured
@@ -210,3 +210,31 @@ export const tripStatusUpdateSchema = z.object({
 });
 
 export type TripStatusUpdateInput = z.infer<typeof tripStatusUpdateSchema>;
+
+// =============================================================================
+// POD (Proof of Delivery) SCHEMAS
+// =============================================================================
+
+/**
+ * POD Generate OTP - params validation
+ * Driver triggers OTP generation when arrived at drop location.
+ */
+export const podGenerateParamsSchema = z.object({
+  tripId: z.string().uuid(),
+});
+
+/**
+ * POD Verify OTP - params + body validation
+ * Driver enters customer-provided 4-digit OTP to confirm delivery.
+ */
+export const podVerifyParamsSchema = z.object({
+  tripId: z.string().uuid(),
+});
+
+export const podVerifyBodySchema = z.object({
+  otp: z.string().length(4, 'OTP must be exactly 4 digits'),
+});
+
+export type PodGenerateParams = z.infer<typeof podGenerateParamsSchema>;
+export type PodVerifyParams = z.infer<typeof podVerifyParamsSchema>;
+export type PodVerifyBody = z.infer<typeof podVerifyBodySchema>;

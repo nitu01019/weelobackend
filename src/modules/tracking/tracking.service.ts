@@ -28,6 +28,7 @@
  * - Stateless service - horizontal scaling ready
  * 
  * @author Weelo Team
+ * @see src/core/state-machines.ts for canonical terminal statuses
  * @version 2.0.0 (Redis-powered for production scale)
  * =============================================================================
  */
@@ -40,6 +41,12 @@ import { queueService } from '../../shared/services/queue.service';
 import { liveAvailabilityService } from '../../shared/services/live-availability.service';
 import { generateVehicleKey } from '../../shared/services/vehicle-key.service';
 import { releaseVehicle } from '../../shared/services/vehicle-lifecycle.service';
+import { completeTrip } from '../assignment/completion-orchestrator';
+import { TERMINAL_ASSIGNMENT_STATUSES, ASSIGNMENT_VALID_TRANSITIONS } from '../../core/state-machines';
+
+// Feature flag: when true, use the unified completion orchestrator instead of inline logic.
+// Default ON for new code. Set FF_COMPLETION_ORCHESTRATOR=false to roll back.
+const FF_COMPLETION_ORCHESTRATOR = process.env.FF_COMPLETION_ORCHESTRATOR !== 'false';
 import { haversineDistanceMeters } from '../../shared/utils/geospatial.utils';
 import { safeJsonParse } from '../../shared/utils/safe-json.utils';
 import { prismaClient } from '../../shared/database/prisma.service';
@@ -206,6 +213,7 @@ class TrackingService {
       // Redis flag tracks mock usage per trip for post-trip review.
       // Broadcast includes isMockLocation so customer app can show "⚠️ GPS accuracy low".
       // =====================================================================
+      // TODO(L-15): Add admin review queue for flagged mock-GPS trips. Current: per-trip counter + point-dropping (H-24). Missing: admin dashboard, alert, manual review endpoint.
       if (data.isMockLocation === true) {
         logger.warn('🚨 [SPOOF] Mock GPS location detected', {
           tripId: data.tripId, driverId,
@@ -214,6 +222,18 @@ class TrackingService {
         });
         // Flag the trip in Redis (expires with trip data — 24h)
         redisService.set(`mock_gps:${data.tripId}`, 'true', TTL.TRIP).catch(() => {});
+
+        // H-24 FIX: Tiered spoof enforcement — drop points after 5+ mock detections per trip
+        const mockCountKey = `spoof:trip_count:${data.tripId}`;
+        const mockCount = await redisService.incr(mockCountKey);
+        if (mockCount === 1) await redisService.expire(mockCountKey, 86400);
+
+        if (mockCount >= 5) {
+          logger.warn('[SPOOF] Throttling mock GPS — count exceeded threshold', {
+            tripId: data.tripId, driverId, mockCount
+          });
+          return; // Drop the point after 5+ mock detections
+        }
       }
 
       // =====================================================================
@@ -236,6 +256,21 @@ class TrackingService {
           tripId: data.tripId, driverId, lat: data.latitude, lng: data.longitude
         });
         return;
+      }
+
+      // H-22 FIX: Speed-jump filter for single GPS updates (matching batch path logic)
+      // F-M18 FIX: Now uses shared isSpeedJumpUnrealistic method (DRY)
+      if (existing && existing.lastUpdated) {
+        if (this.isSpeedJumpUnrealistic(
+          existing.latitude, existing.longitude, existing.lastUpdated,
+          data.latitude, data.longitude, new Date().toISOString(),
+          TRACKING_CONFIG.MAX_REALISTIC_SPEED_MS
+        )) {
+          logger.warn('[TRACKING] Unrealistic jump rejected (single-point)', {
+            tripId: data.tripId, driverId,
+          });
+          return; // Drop the point
+        }
       }
 
       // 2. Create location data
@@ -271,6 +306,10 @@ class TrackingService {
 
         // Driver's current location (for fleet tracking)
         redisService.setJSON(REDIS_KEYS.DRIVER_LOCATION(driverId), locationData, TTL.LOCATION),
+
+        // F-H12 FIX: Refresh driver presence heartbeat — prevents false offline alerts
+        // Matches batch path at line ~576 which already does this
+        redisService.expire(`driver:presence:${driverId}`, 35).catch(() => {}),
       ]);
 
       // 4. Add to history (fire-and-forget), but sample to reduce hot-path write load.
@@ -531,10 +570,13 @@ class TrackingService {
         };
 
         // Update Redis
+        // H-25: Extend driver:presence (35s heartbeat) as authoritative source.
+        // Keep driver:status write for backward compat during transition.
         await Promise.all([
           redisService.setJSON(REDIS_KEYS.TRIP_LOCATION(tripId), locationData, TTL.TRIP),
           redisService.setJSON(REDIS_KEYS.DRIVER_LOCATION(driverId), locationData, TTL.LOCATION),
           redisService.set(REDIS_KEYS.DRIVER_LAST_TS(driverId), newestValidPoint.timestamp, TTL.LOCATION),
+          redisService.expire(`driver:presence:${driverId}`, 35).catch(() => {}),
           redisService.set(REDIS_KEYS.DRIVER_STATUS(driverId), 'ONLINE', TTL.LOCATION),
         ]);
 
@@ -591,99 +633,99 @@ class TrackingService {
 
   /**
    * Check if jump between two points is unrealistic (impossibly fast)
-   * 
+   *
    * FORMULA: distance / time > MAX_REALISTIC_SPEED
-   * 
+   *
    * This catches:
    * - GPS glitches (sudden teleportation)
    * - Wrong device clock
    * - Spoofed locations
    */
   private isUnrealisticJump(from: BatchLocationPoint, to: BatchLocationPoint): boolean {
-    const timeDiffMs = new Date(to.timestamp).getTime() - new Date(from.timestamp).getTime();
-
-    // If time difference is too small, can't reliably calculate speed
-    if (timeDiffMs < TRACKING_CONFIG.MIN_INTERVAL_MS) {
-      return false; // Accept but don't flag
-    }
-
-    const distanceMeters = haversineDistanceMeters(
-      from.latitude, from.longitude,
-      to.latitude, to.longitude
+    // F-M18 FIX: Delegate to shared speed-jump detection method (DRY)
+    return this.isSpeedJumpUnrealistic(
+      from.latitude, from.longitude, from.timestamp,
+      to.latitude, to.longitude, to.timestamp,
+      TRACKING_CONFIG.MAX_REALISTIC_SPEED_MS
     );
+  }
 
-    const speedMs = distanceMeters / (timeDiffMs / 1000);
-
-    return speedMs > TRACKING_CONFIG.MAX_REALISTIC_SPEED_MS;
+  // F-M18 FIX: DRY — shared speed-jump detection used by both single-point and batch paths
+  private isSpeedJumpUnrealistic(
+    prevLat: number, prevLng: number, prevTime: string,
+    newLat: number, newLng: number, newTime: string,
+    maxSpeedMs: number = 55
+  ): boolean {
+    const timeDelta = (new Date(newTime).getTime() - new Date(prevTime).getTime()) / 1000;
+    if (timeDelta <= 0) return false;
+    const distance = haversineDistanceMeters(prevLat, prevLng, newLat, newLng);
+    const impliedSpeed = distance / timeDelta;
+    return impliedSpeed > maxSpeedMs;
   }
 
   /**
    * Get driver's online status
    *
-   * STATUS LOGIC:
-   * - ONLINE: Updated within OFFLINE_THRESHOLD
-   * - OFFLINE: Explicitly set (app backgrounded, etc)
-   * - UNKNOWN: No update for > OFFLINE_THRESHOLD (network issue?)
+   * H-25: Consolidated presence check — reads driver:presence (35s heartbeat)
+   * first as the authoritative source, then falls back to driver:status (300s TTL)
+   * for backward compatibility during transition.
    *
-   * BUG-H7 BRIDGE: Also reads from `driver:presence:{driverId}` (the real
-   * heartbeat-based presence system managed by driver.service.ts, 35s TTL).
-   * Logs a warning when the two systems disagree so split-brain is visible
-   * in CloudWatch. Return type unchanged for backward compatibility.
+   * STATUS LOGIC:
+   * - ONLINE: driver:presence key exists (active heartbeat) OR driver:status = ONLINE
+   * - OFFLINE: Explicitly set OR no presence/status/location data
+   * - UNKNOWN: No update for > OFFLINE_THRESHOLD (network issue?)
    */
   async getDriverStatus(driverId: string): Promise<DriverOnlineStatus> {
+    // H-25: Check the real presence key first (35s TTL heartbeat — authoritative)
+    try {
+      const presenceExists = await redisService.exists(`driver:presence:${driverId}`);
+      if (presenceExists) {
+        return 'ONLINE';
+      }
+    } catch {
+      // Non-critical — fall through to legacy check
+    }
+
+    // Backward compat: check legacy driver:status key
     const rawStatus = await redisService.get(REDIS_KEYS.DRIVER_STATUS(driverId));
 
-    let trackingStatus: DriverOnlineStatus;
-
     if (rawStatus === 'ONLINE' || rawStatus === 'OFFLINE') {
-      trackingStatus = rawStatus;
-    } else {
-      // Check if we have recent location data
-      const location = await redisService.getJSON<LocationData>(REDIS_KEYS.DRIVER_LOCATION(driverId));
-
-      if (!location) {
-        trackingStatus = 'OFFLINE';
-      } else {
-        const lastUpdateMs = new Date(location.lastUpdated).getTime();
-        const ageSeconds = (Date.now() - lastUpdateMs) / 1000;
-
-        if (ageSeconds > TRACKING_CONFIG.OFFLINE_THRESHOLD_SECONDS) {
-          trackingStatus = 'UNKNOWN';
-        } else {
-          trackingStatus = 'ONLINE';
-        }
-      }
+      return rawStatus;
     }
 
-    // BUG-H7 BRIDGE: Read the real presence system key (driver.service.ts, 35s TTL heartbeat).
-    // This key exists only while the driver app is actively sending heartbeats.
-    let presenceStatus: string = 'OFFLINE';
-    try {
-      const presenceValue = await redisService.get(`driver:presence:${driverId}`);
-      presenceStatus = presenceValue ? 'ONLINE' : 'OFFLINE';
-    } catch {
-      // Non-critical — if Redis read fails, default to OFFLINE
-      presenceStatus = 'UNKNOWN';
+    // Check if we have recent location data
+    const location = await redisService.getJSON<LocationData>(REDIS_KEYS.DRIVER_LOCATION(driverId));
+
+    if (!location) {
+      return 'OFFLINE';
     }
 
-    // Warn when the two systems disagree so we can detect split-brain in logs
-    if (trackingStatus !== presenceStatus) {
-      logger.warn('[Tracking] Split-brain: tracking says %s but presence says %s', trackingStatus, presenceStatus, { driverId });
+    const lastUpdateMs = new Date(location.lastUpdated).getTime();
+    const ageSeconds = (Date.now() - lastUpdateMs) / 1000;
+
+    if (ageSeconds > TRACKING_CONFIG.OFFLINE_THRESHOLD_SECONDS) {
+      return 'UNKNOWN';
     }
 
-    return trackingStatus;
+    return 'ONLINE';
   }
 
   /**
    * Set driver status explicitly (called by app when going background/foreground)
    *
-   * BUG-H7 NOTE: This endpoint ONLY sets `driver:status:{driverId}` (300s TTL).
-   * It does NOT affect the real presence system (`driver:presence:{driverId}`,
-   * 35s TTL heartbeat managed by driver.service.ts). The two systems can diverge.
+   * H-25: Now manages both driver:status AND driver:presence for consistency.
+   * When ONLINE: extends presence TTL. When OFFLINE: deletes presence key.
    */
   async setDriverStatus(driverId: string, status: DriverOnlineStatus): Promise<void> {
-    logger.warn('[Tracking] setDriverStatus sets driver:status:%s ONLY — does NOT affect driver:presence:%s (real heartbeat presence)', driverId, driverId);
     await redisService.set(REDIS_KEYS.DRIVER_STATUS(driverId), status, TTL.LOCATION);
+
+    // H-25: Keep presence key in sync
+    if (status === 'ONLINE') {
+      await redisService.expire(`driver:presence:${driverId}`, 35).catch(() => {});
+    } else if (status === 'OFFLINE') {
+      await redisService.del(`driver:presence:${driverId}`).catch(() => {});
+    }
+
     logger.debug(`Driver ${driverId} status: ${status}`);
   }
 
@@ -695,8 +737,8 @@ class TrackingService {
       const key = REDIS_KEYS.TRIP_HISTORY(tripId);
       // Use Redis list ops: O(1) append, atomic, no read-modify-write race
       await redisService.rPush(key, JSON.stringify(entry));
-      // Cap at last 1000 points (lTrim keeps indices -1000 to -1)
-      await redisService.lTrim(key, -1000, -1);
+      // Cap at last 5000 points (H-30: supports ~7-14h trips at 10s intervals)
+      await redisService.lTrim(key, -5000, -1);
       await redisService.expire(key, TTL.HISTORY);
     } catch (error: any) {
       if (String(error?.message || error).includes('WRONGTYPE')) {
@@ -706,7 +748,7 @@ class TrackingService {
         try {
           await redisService.del(key);
           await redisService.rPush(key, JSON.stringify(entry));
-          await redisService.lTrim(key, -1000, -1);
+          await redisService.lTrim(key, -5000, -1);
           await redisService.expire(key, TTL.HISTORY);
           return;
         } catch (retryError) {
@@ -827,6 +869,7 @@ class TrackingService {
    * 
    * @param tripId    - Trip ID (unique on Assignment table)
    * @param driverId  - Driver making the update (from JWT)
+   * @deprecated Use tracking-trip.service.ts TrackingTripService.updateTripStatus() instead. DO NOT REMOVE. See F-H16.
    * @param data      - { status: 'at_pickup' | 'loading_complete' | 'in_transit' | 'completed' | ... }
    */
   async updateTripStatus(
@@ -863,39 +906,23 @@ class TrackingService {
       //     e.g. driver can't go from in_transit → at_pickup
       //     Already-completed trips are immutable
       // ------------------------------------------------------------------
-      const STATUS_ORDER: Record<string, number> = {
-        'pending': 0,
-        'driver_accepted': 1,
-        'heading_to_pickup': 2,
-        'en_route_pickup': 2,
-        'at_pickup': 3,
-        'loading_complete': 4,
-        'in_transit': 5,
-        'arrived_at_drop': 6,
-        'completed': 7,
-        'cancelled': -1,
-        'driver_declined': -1
-      };
-
-      const currentOrder = STATUS_ORDER[assignment.status] ?? 0;
-      const newOrder = STATUS_ORDER[status] ?? 0;
-
-      if (assignment.status === 'completed') {
-        throw new AppError(400, 'TRIP_ALREADY_COMPLETED', 'This trip is already completed');
-      }
-
-      if (assignment.status === 'cancelled' || assignment.status === 'driver_declined') {
+      const TERMINAL = new Set<string>(TERMINAL_ASSIGNMENT_STATUSES);
+      if (TERMINAL.has(assignment.status)) {
+        if (assignment.status === 'completed') {
+          throw new AppError(400, 'TRIP_ALREADY_COMPLETED', 'This trip is already completed');
+        }
         throw new AppError(400, 'TRIP_NOT_ACTIVE', 'This trip is no longer active');
       }
 
-      if (newOrder <= currentOrder && newOrder > 0) {
-        // Same status = idempotent (return success, don't re-process)
-        if (newOrder === currentOrder) {
-          logger.info('[TRACKING] Idempotent status update — already at this status', { tripId, status });
-          return;
-        }
+      if (assignment.status === status) {
+        logger.info('[TRACKING] Idempotent status update — already at this status', { tripId, status });
+        return;
+      }
+
+      const allowedNext = ASSIGNMENT_VALID_TRANSITIONS[assignment.status] ?? [];
+      if (!allowedNext.includes(status)) {
         throw new AppError(400, 'INVALID_STATUS_TRANSITION',
-          `Cannot go from ${assignment.status} to ${status}. Status can only move forward.`);
+          `Cannot transition from ${assignment.status} to ${status}. Allowed: [${allowedNext.join(', ')}]`);
       }
 
       // ------------------------------------------------------------------
@@ -985,6 +1012,36 @@ class TrackingService {
           data: updates
         });
 
+        // M6 FIX: Wire parent Order/Booking to in_progress when first assignment
+        // hits in_transit (mirrors H-36 fix in assignment.service.ts).
+        // CAS pattern: only transitions from pre-transit states. Non-fatal.
+        if (prismaStatus === 'in_transit') {
+          try {
+            if (assignment.orderId || assignment.order?.id) {
+              await prismaClient.order.updateMany({
+                where: {
+                  id: (assignment.orderId || assignment.order?.id)!,
+                  status: { in: ['fully_filled', 'partially_filled'] },
+                },
+                data: { status: 'in_progress' },
+              });
+            }
+            if (assignment.bookingId || assignment.booking?.id) {
+              await prismaClient.booking.updateMany({
+                where: {
+                  id: (assignment.bookingId || assignment.booking?.id)!,
+                  status: { in: ['fully_filled', 'partially_filled'] },
+                },
+                data: { status: 'in_progress' },
+              });
+            }
+          } catch (err) {
+            logger.warn('[TRACKING] Failed to transition parent to in_progress (non-fatal)', {
+              tripId, error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+
         // Phase 7 (7E): Populate Order timestamps for cancel policy stage detection
         const targetOrderId = assignment.orderId || assignment.order?.id;
         if (targetOrderId) {
@@ -1031,63 +1088,56 @@ class TrackingService {
       //    so we skip the duplicate broadcast below for 'completed'
       // ------------------------------------------------------------------
       if (status === 'completed') {
-        // Phase 9A: Double-tap guard — Redis lock prevents race condition
-        // Scenario: Two rapid "Complete" taps → both pass Postgres idempotent check
-        //           before first one commits → duplicate completion events.
-        // Solution: SETNX lock with 10s TTL. Second tap gets lock-failed → returns silently.
-        const tripCompleteLock = `lock:trip-complete:${tripId}`;
-        const completeLock = await redisService.acquireLock(tripCompleteLock, 'trip-completion', 10);
-        if (!completeLock.acquired) {
-          logger.info('[TRACKING] Trip completion already in progress (double-tap guard)', { tripId });
-          return; // Idempotent — first request will handle everything
-        }
+        if (FF_COMPLETION_ORCHESTRATOR) {
+          // C1 FIX: Unified completion orchestrator — all side-effects in one place
+          const result = await completeTrip(assignment.id, 'driver', 'completed');
+          if (result.alreadyCompleted) {
+            logger.info('[TRACKING] Trip already completed (orchestrator idempotency)', { tripId });
+            return;
+          }
+        } else {
+          // Legacy inline path — kept behind feature flag for rollback safety
+          const tripCompleteLock = `lock:trip-complete:${tripId}`;
+          const completeLock = await redisService.acquireLock(tripCompleteLock, 'trip-completion', 10);
+          if (!completeLock.acquired) {
+            logger.info('[TRACKING] Trip completion already in progress (double-tap guard)', { tripId });
+            return;
+          }
 
-        try {
           try {
-            await this.completeTracking(tripId);
-          } catch (completeErr: any) {
-            logger.warn('[TRACKING] completeTracking cleanup failed (non-fatal)', {
-              tripId, error: completeErr.message
-            });
-          }
-
-          // =================================================================
-          // FIX 7.6: Release vehicle back to 'available' on completion
-          // =================================================================
-          // BEFORE: Only cancelAssignment and declineAssignment released the
-          //   vehicle. Completion path skipped this entirely.
-          //   → vehicle stays as 'busy' forever in transporter's fleet view.
-          // NOW: Same db.updateVehicle() call as cancel/decline uses.
-          // Non-fatal: if this fails, the trip is still complete.
-          // Uber/Grab pattern: vehicle status is always updated atomically
-          // with the trip terminal state (completed/cancelled).
-          // =================================================================
-          if (assignment.vehicleId) {
             try {
-              await releaseVehicle(assignment.vehicleId, 'tripCompletion');
-            } catch (vehErr: any) {
-              logger.error('[TRACKING] releaseVehicle failed, enqueueing retry', {
-                vehicleId: assignment.vehicleId, tripId, error: vehErr.message
+              await this.completeTracking(tripId);
+            } catch (completeErr: any) {
+              logger.warn('[TRACKING] completeTracking cleanup failed (non-fatal)', {
+                tripId, error: completeErr.message
               });
-              queueService.enqueue('vehicle-release', {
-                vehicleId: assignment.vehicleId,
-                context: 'tripCompletion'
-              }).catch(() => {});
             }
-          }
 
-          // Phase 5: Check if ALL trucks for this booking are now completed
-          // If yes → update booking status + notify customer
-          const completedBookingId = assignment.booking?.id || assignment.bookingId;
-          if (completedBookingId) {
-            this.checkBookingCompletion(completedBookingId).catch(err => {
-              logger.warn('[TRACKING] Booking completion check failed (non-fatal)', {
-                bookingId: completedBookingId, error: err.message
+            if (assignment.vehicleId) {
+              try {
+                await releaseVehicle(assignment.vehicleId, 'tripCompletion');
+              } catch (vehErr: any) {
+                logger.error('[TRACKING] releaseVehicle failed, enqueueing retry', {
+                  vehicleId: assignment.vehicleId, tripId, error: vehErr.message
+                });
+                queueService.enqueue('vehicle-release', {
+                  vehicleId: assignment.vehicleId,
+                  context: 'tripCompletion'
+                }).catch(() => {});
+              }
+            }
+
+            const completedBookingId = assignment.booking?.id || assignment.bookingId;
+            if (completedBookingId) {
+              this.checkBookingCompletion(completedBookingId).catch(err => {
+                logger.warn('[TRACKING] Booking completion check failed (non-fatal)', {
+                  bookingId: completedBookingId, error: err.message
+                });
               });
-            });
+            }
+          } finally {
+            await redisService.releaseLock(tripCompleteLock, 'trip-completion').catch(() => { });
           }
-        } finally {
-          await redisService.releaseLock(tripCompleteLock, 'trip-completion').catch(() => { });
         }
       }
 
@@ -1196,6 +1246,7 @@ class TrackingService {
   /**
    * Get current location for a trip
    * Used by: Customer app to track their truck
+   * @deprecated Use trackingQueryService.getTripTracking() instead. DO NOT REMOVE — see F-L16.
    */
   async getTripTracking(
     tripId: string,
@@ -1226,6 +1277,7 @@ class TrackingService {
 
   /**
    * Get current location - alias for getTripTracking
+   * @deprecated Use trackingQueryService.getCurrentLocation() instead. DO NOT REMOVE — see F-L16.
    */
   async getCurrentLocation(
     tripId: string,
@@ -1238,6 +1290,7 @@ class TrackingService {
   /**
    * Get all truck locations for a booking (multi-truck view)
    * Used by: Customer app to see all their trucks on map
+   * @deprecated Use trackingQueryService.getBookingTracking() instead. DO NOT REMOVE — see F-L16.
    */
   async getBookingTracking(
     bookingId: string,
@@ -1289,14 +1342,10 @@ class TrackingService {
    * ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
    * ┃  GET FLEET TRACKING - For Transporter to See All Their Trucks         ┃
    * ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
-   * 
+   *
    * Returns all active driver locations for a transporter's fleet.
    * Used by: Captain app to show fleet map view
-   * 
-   * FRONTEND SHOULD:
-   * - Show all drivers on map
-   * - Interpolate movement for each driver
-   * - Use different colors for different statuses
+   * @deprecated Use trackingQueryService.getFleetTracking() instead. DO NOT REMOVE — see F-L16.
    */
   async getFleetTracking(transporterId: string): Promise<FleetTrackingResponse> {
     // Get all active driver IDs for this transporter
@@ -1336,6 +1385,7 @@ class TrackingService {
 
   /**
    * Get location history for a trip (route replay)
+   * @deprecated Use trackingQueryService.getTripHistory() instead. DO NOT REMOVE — see F-L16.
    */
   async getTripHistory(
     tripId: string,
@@ -1374,6 +1424,7 @@ class TrackingService {
 
   /**
    * Get location history - alias for getTripHistory
+   * @deprecated Use trackingQueryService.getLocationHistory() instead. DO NOT REMOVE — see F-L16.
    */
   async getLocationHistory(
     tripId: string,
@@ -1386,6 +1437,7 @@ class TrackingService {
 
   /**
    * Clean up tracking when trip completes
+   * @deprecated Use tracking-trip.service.ts TrackingTripService.completeTracking() instead. DO NOT REMOVE. See F-H16.
    */
   async completeTracking(tripId: string): Promise<void> {
     const location = await redisService.getJSON<LocationData>(REDIS_KEYS.TRIP_LOCATION(tripId));
@@ -2021,6 +2073,9 @@ class TrackingService {
   // If yes → updates booking status and sends customer notification.
   // ===========================================================================
 
+  /**
+   * @deprecated Use tracking-fleet.service.ts trackingFleetService.checkBookingCompletion() instead. DO NOT REMOVE. See F-H16.
+   */
   async checkBookingCompletion(bookingId: string): Promise<void> {
     try {
       // =====================================================================
@@ -2053,10 +2108,11 @@ class TrackingService {
 
         if (assignments.length === 0) return;
 
-        const allCompleted = assignments.every(a => a.status === 'completed');
+        const TERMINAL_BOOKING_STATUSES = new Set(['completed', 'cancelled', 'partial_delivery']);
+        const allTerminal = assignments.every(a => TERMINAL_BOOKING_STATUSES.has(a.status));
 
-        if (allCompleted) {
-          logger.info(`[BOOKING COMPLETION] All ${assignments.length} trucks completed for booking ${bookingId}`);
+        if (allTerminal) {
+          logger.info(`[BOOKING COMPLETION] All ${assignments.length} trucks terminal for booking ${bookingId}`);
 
           // Update booking status + notify customer
           // Uses db.ts (which wraps Prisma or JSON — handles both)
@@ -2107,8 +2163,8 @@ class TrackingService {
             }
           }
         } else {
-          const completedCount = assignments.filter(a => a.status === 'completed').length;
-          logger.info(`[BOOKING COMPLETION] ${completedCount}/${assignments.length} trucks completed for booking ${bookingId}`);
+          const terminalCount = assignments.filter(a => TERMINAL_BOOKING_STATUSES.has(a.status)).length;
+          logger.info(`[BOOKING COMPLETION] ${terminalCount}/${assignments.length} trucks terminal for booking ${bookingId}`);
         }
       } finally {
         await redisService.releaseLock(lockKey, 'completion-checker');
@@ -2148,7 +2204,7 @@ class TrackingService {
 
       if (assignments.length === 0) return;
 
-      const terminalStatuses = new Set(['completed', 'cancelled']);
+      const terminalStatuses = new Set<string>(TERMINAL_ASSIGNMENT_STATUSES);
       const allTerminal = assignments.every(a => terminalStatuses.has(a.status));
 
       if (!allTerminal) {

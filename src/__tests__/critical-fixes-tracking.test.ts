@@ -165,6 +165,7 @@ jest.mock('../shared/services/google-maps.service', () => ({
 
 // Vehicle lifecycle mock
 jest.mock('../shared/services/vehicle-lifecycle.service', () => ({
+  onVehicleTransition: jest.fn().mockResolvedValue(undefined),
   releaseVehicle: jest.fn(),
 }));
 
@@ -185,6 +186,7 @@ jest.mock('../shared/services/vehicle-key.service', () => ({
 // Geospatial mock
 const mockHaversine = jest.fn();
 jest.mock('../shared/utils/geospatial.utils', () => ({
+  ...jest.requireActual('../shared/utils/geospatial.utils'),
   haversineDistanceMeters: (...args: unknown[]) => mockHaversine(...args),
 }));
 

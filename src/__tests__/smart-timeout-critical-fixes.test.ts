@@ -127,6 +127,12 @@ jest.mock('../shared/services/queue.service', () => ({
   QueueJob: {},
 }));
 
+// ----- Order lifecycle outbox mock (handleOrderExpiry) -----
+const mockHandleOrderExpiry = jest.fn().mockResolvedValue(undefined);
+jest.mock('../modules/order/order-lifecycle-outbox.service', () => ({
+  handleOrderExpiry: (...args: any[]) => mockHandleOrderExpiry(...args),
+}));
+
 // =============================================================================
 // IMPORTS (after mocks)
 // =============================================================================
@@ -232,12 +238,8 @@ describe('C-06: checkAndMarkExpired() — && logic (not ||)', () => {
         data: expect.objectContaining({ isExpired: true }),
       })
     );
-    expect(mockOrderUpdate).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: { id: 'order-stale' },
-        data: { status: 'expired' },
-      })
-    );
+    // H-10 fix: checkAndMarkExpired now delegates to handleOrderExpiry for full cleanup
+    expect(mockHandleOrderExpiry).toHaveBeenCalledWith('order-stale');
   });
 
   it('C-06-3: order with recent progress AND past threshold should NOT be expired', async () => {

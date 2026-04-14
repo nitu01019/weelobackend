@@ -124,11 +124,10 @@ class RedisRateLimitStore {
     const windowSeconds = Math.ceil(this.windowMs / 1000);
 
     try {
-      const totalHits = await redisService.incrementWithTTL(redisKey, windowSeconds);
-      const ttl = await redisService.ttl(redisKey);
+      const { count, ttl } = await redisService.incrementWithTTLAndRemaining(redisKey, windowSeconds);
       const resetTime = new Date(Date.now() + (ttl > 0 ? ttl * 1000 : this.windowMs));
 
-      return { totalHits, resetTime };
+      return { totalHits: count, resetTime };
     } catch (error: any) {
       // Phase 10: FAIL-CLOSED with in-memory backup (Netflix pattern)
       // - NOT throw (causes 500 errors for ALL users)
@@ -355,6 +354,32 @@ export const otpRateLimiter = rateLimit({
   store: createStore(2 * 60 * 1000, 'otp'),
   // Don't skip in production — OTP abuse is critical to prevent
   skip: () => false
+});
+
+/**
+ * Verify-OTP rate limiter - PHONE-BASED brute force protection
+ * 5 verification attempts per 10 minutes per phone+role
+ *
+ * WHY separate from authRateLimiter:
+ *   - authRateLimiter is IP-based — doesn't stop distributed attacks from many IPs
+ *   - This limiter keys by phone+role — 5 wrong guesses per phone = locked for 10 min
+ *   - Combined: IP limit + phone limit = defense in depth
+ *
+ * SECURITY: 6-digit OTP = 1M combinations. 5 attempts in 10 min = 0.0005% chance.
+ *   Even across 10-minute windows, brute force is infeasible within OTP's 5-min TTL.
+ */
+export const verifyOtpRateLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000, // 10 minutes
+  max: 5,
+  keyGenerator: (req: Request) => `verify:${req.body?.phone}:${req.body?.role || 'customer'}`,
+  handler: throttleHandler(
+    'TOO_MANY_ATTEMPTS',
+    'Too many verification attempts. Please try again later.',
+    10 * 60 * 1000
+  ),
+  standardHeaders: true,
+  legacyHeaders: false,
+  store: createStore(10 * 60 * 1000, 'verify-otp'),
 });
 
 /**

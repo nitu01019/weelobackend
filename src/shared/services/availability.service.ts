@@ -273,11 +273,13 @@ class AvailabilityService {
       // Phase 4: TTL refreshes in parallel
       // Fix C5/F-5-15: Safety-net TTL on geo + online keys — refreshed every heartbeat, expires if no heartbeats for 10 min
       // Note: TRANSPORTER_VEHICLE_KEYS TTL is now set atomically inside LUA_HEARTBEAT_SET_UPDATE (M-16)
+      // H-7 FIX: Add jitter (0-59s) to shared-key TTLs to spread EXPIRE calls and reduce Redis hotspot contention
+      const jitteredTtl = 600 + Math.floor(Math.random() * 60);
       await Promise.all([
         redisService.expire(REDIS_KEYS.TRANSPORTER_DETAILS(transporterId), this.TRANSPORTER_TTL_SECONDS),
         ...(!isOnTrip ? [
-          redisService.expire(REDIS_KEYS.GEO_TRANSPORTERS(vehicleKey), 600).catch(() => {}),
-          redisService.expire(REDIS_KEYS.ONLINE_TRANSPORTERS, 600).catch(() => {}),
+          redisService.expire(REDIS_KEYS.GEO_TRANSPORTERS(vehicleKey), jitteredTtl).catch(() => {}),
+          redisService.expire(REDIS_KEYS.ONLINE_TRANSPORTERS, jitteredTtl).catch(() => {}),
         ] : []),
       ]);
 
@@ -634,10 +636,34 @@ class AvailabilityService {
       const detailsMap = await this.loadTransporterDetailsMap(
         nearbyTransporters.map((entry) => entry.member)
       );
+
+      // Online check — filter out offline transporters (same pattern as availability-geo.service.ts)
+      const transporterIds = nearbyTransporters.map(entry => entry.member);
+      let onlineFlags: boolean[];
+      try {
+        onlineFlags = await redisService.smIsMembers(REDIS_KEYS.ONLINE_TRANSPORTERS, transporterIds);
+      } catch (err) {
+        logger.warn('[Availability] Online filter failed in getAvailableTransportersWithDetails, proceeding with all candidates', {
+          error: err instanceof Error ? err.message : String(err),
+          candidateCount: transporterIds.length
+        });
+        onlineFlags = transporterIds.map(() => true); // fail-open
+      }
+
       const result: NearbyTransporter[] = [];
 
-      for (const entry of nearbyTransporters) {
+      for (let i = 0; i < nearbyTransporters.length; i++) {
         if (result.length >= limit) break;
+
+        const entry = nearbyTransporters[i];
+
+        // Filter out offline transporters and clean up stale geo entries
+        if (!onlineFlags[i]) {
+          await redisService.geoRemove(
+            REDIS_KEYS.GEO_TRANSPORTERS(vehicleKey), entry.member
+          ).catch(() => {});
+          continue;
+        }
 
         const details = detailsMap.get(entry.member) || {};
         if (Object.keys(details).length === 0) continue;
@@ -1038,6 +1064,84 @@ class AvailabilityService {
     } catch (err: any) {
       logger.error(`[Availability] rebuildGeoFromDB failed: ${err.message}`);
     }
+  }
+
+  /**
+   * Prune stale geo index entries.
+   *
+   * Scans all `geo:transporters:*` sorted sets, cross-references each member
+   * against the `online:transporters` SET, and removes members whose
+   * transporters are offline. This prevents phantom entries from accumulating
+   * in the geo index after transporter TTL expiry or missed offline events.
+   *
+   * Called every 5 minutes from server.ts bootstrap. Uses a distributed lock
+   * so only one ECS instance prunes at a time.
+   *
+   * Industry pattern: Uber Ringpop periodic index scrub.
+   */
+  async pruneStaleGeoEntries(): Promise<number> {
+    const lockKey = 'prune-stale-geo-entries';
+    let lockAcquired = false;
+    try {
+      const lockResult = await redisService.acquireLock(lockKey, 'geo-pruner', 120);
+      lockAcquired = lockResult.acquired;
+      if (!lockAcquired) return 0;
+    } catch {
+      return 0;
+    }
+
+    let totalPruned = 0;
+    try {
+      const geoKeys = await redisService.keys('geo:transporters:*');
+      if (geoKeys.length === 0) {
+        logger.debug('[Availability] Geo prune: no geo keys found');
+        return 0;
+      }
+
+      for (const geoKey of geoKeys) {
+        try {
+          // Use geoRadius with earth-scale radius to list all members in this sorted set
+          const allMembers = await redisService.geoRadius(geoKey, 0, 0, 40000, 'km');
+          if (allMembers.length === 0) continue;
+
+          const memberIds = allMembers.map(m => m.member);
+
+          // Batch check online status via SMISMEMBER (single round-trip)
+          let onlineFlags: boolean[];
+          try {
+            onlineFlags = await redisService.smIsMembers(REDIS_KEYS.ONLINE_TRANSPORTERS, memberIds);
+          } catch {
+            // If smIsMembers fails, fall back to individual checks
+            onlineFlags = await Promise.all(
+              memberIds.map(id => redisService.sIsMember(REDIS_KEYS.ONLINE_TRANSPORTERS, id).catch(() => true))
+            );
+          }
+
+          for (let i = 0; i < memberIds.length; i++) {
+            if (!onlineFlags[i]) {
+              await redisService.geoRemove(geoKey, memberIds[i]).catch(() => {});
+              totalPruned++;
+            }
+          }
+        } catch (err: any) {
+          logger.warn(`[Availability] Geo prune failed for key ${geoKey}: ${err.message}`);
+        }
+      }
+
+      if (totalPruned > 0) {
+        logger.info(`[Availability] Geo prune complete: removed ${totalPruned} stale entries from ${geoKeys.length} geo keys`);
+      } else {
+        logger.debug(`[Availability] Geo prune complete: 0 stale entries (${geoKeys.length} geo keys scanned)`);
+      }
+    } catch (err: any) {
+      logger.error(`[Availability] Geo prune failed: ${err.message}`);
+    } finally {
+      if (lockAcquired) {
+        redisService.releaseLock(lockKey, 'geo-pruner').catch(() => {});
+      }
+    }
+
+    return totalPruned;
   }
 
   /**

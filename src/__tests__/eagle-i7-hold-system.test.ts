@@ -150,6 +150,7 @@ jest.mock('../shared/database/prisma.service', () => ({
     },
     $executeRaw: (...args: any[]) => mockExecuteRaw(...args),
     $queryRaw: jest.fn(),
+    $transaction: jest.fn(),
   },
   HoldPhase: {
     FLEX: 'FLEX',
@@ -335,11 +336,19 @@ describe('EAGLE I7 — Hold System Fixes', () => {
     it('should return idempotent success when hold is already CONFIRMED', async () => {
       const confirmedExpiresAt = new Date(Date.now() + 60_000);
 
-      mockTruckHoldLedgerFindUnique.mockResolvedValueOnce({
-        holdId: 'hold-dr08',
-        phase: 'CONFIRMED',
-        confirmedExpiresAt,
-        transporterId: 'trans-1',
+      // H-8: initializeConfirmedHold now uses $transaction with $queryRaw FOR UPDATE
+      const prismaServiceMod = require('../shared/database/prisma.service');
+      prismaServiceMod.prismaClient.$transaction.mockImplementation(async (cb: any) => {
+        const txClient = {
+          ...prismaServiceMod.prismaClient,
+          $queryRaw: jest.fn().mockResolvedValue([{
+            holdId: 'hold-dr08',
+            phase: 'CONFIRMED',
+            confirmedExpiresAt,
+            transporterId: 'trans-1',
+          }]),
+        };
+        return cb(txClient);
       });
 
       const result = await confirmedHoldService.initializeConfirmedHold('hold-dr08', 'trans-1', []);

@@ -217,6 +217,7 @@ jest.mock('../shared/services/live-availability.service', () => ({
 }));
 
 jest.mock('../shared/services/vehicle-lifecycle.service', () => ({
+  onVehicleTransition: jest.fn().mockResolvedValue(undefined),
   releaseVehicle: jest.fn().mockResolvedValue(undefined),
 }));
 
@@ -248,6 +249,16 @@ jest.mock('../modules/driver/driver.service', () => ({
 
 jest.mock('../modules/assignment/post-accept.effects', () => ({
   applyPostAcceptSideEffects: jest.fn().mockResolvedValue(undefined),
+}));
+
+jest.mock('../modules/order-timeout/smart-timeout.service', () => ({
+  smartTimeoutService: {
+    extendTimeout: jest.fn().mockResolvedValue(undefined),
+  },
+}));
+
+jest.mock('../modules/assignment/auto-redispatch.service', () => ({
+  tryAutoRedispatch: jest.fn().mockResolvedValue(undefined),
 }));
 
 jest.mock('../shared/database/db', () => ({
@@ -459,6 +470,14 @@ describe('Flex Hold Lifecycle', () => {
   test('11. createFlexHold creates hold with 90s duration', async () => {
     const now = Date.now();
 
+    // AB-2: createFlexHold now checks order existence before acquiring lock
+    const prismaServiceMod = require('../shared/database/prisma.service');
+    prismaServiceMod.prismaClient.order.findUnique.mockResolvedValue({
+      id: TEST_ORDER_ID,
+      status: 'broadcasting',
+      expiresAt: new Date(Date.now() + 300_000),
+    });
+
     mockTruckHoldLedgerCreate.mockResolvedValue({
       holdId: 'test-uuid-1234',
       orderId: TEST_ORDER_ID,
@@ -568,13 +587,13 @@ describe('Flex Hold Lifecycle', () => {
       phase: 'FLEX',
       flexExpiresAt,
       expiresAt: flexExpiresAt,
-      flexExtendedCount: 2,
+      flexExtendedCount: 1,
       createdAt,
     });
 
     mockTruckHoldLedgerUpdate.mockResolvedValue({
       holdId: TEST_HOLD_ID,
-      flexExtendedCount: 3,
+      flexExtendedCount: 2,
     });
 
     const result = await flexHoldService.extendFlexHold({
@@ -651,7 +670,7 @@ describe('Flex Hold Lifecycle', () => {
       status: 'confirmed',
     });
 
-    const result = await flexHoldService.transitionToConfirmed(TEST_HOLD_ID);
+    const result = await flexHoldService.transitionToConfirmed(TEST_HOLD_ID, TEST_TRANSPORTER_ID);
 
     expect(result.success).toBe(true);
     expect(result.message).toContain('confirmed');
@@ -692,6 +711,26 @@ describe('Confirmed Hold Lifecycle', () => {
   });
 
   test('18. initializeConfirmedHold sets 180s timer, schedules driver timeouts', async () => {
+    // H-8: initializeConfirmedHold now uses $transaction with $queryRaw FOR UPDATE
+    // Mock $queryRaw inside the transaction to return the hold row
+    const prismaServiceMod = require('../shared/database/prisma.service');
+    prismaServiceMod.prismaClient.$transaction.mockImplementation(async (cb: any) => {
+      const txClient = {
+        ...prismaServiceMod.prismaClient,
+        $queryRaw: jest.fn().mockResolvedValue([{
+          holdId: TEST_HOLD_ID,
+          phase: 'FLEX',
+          transporterId: TEST_TRANSPORTER_ID,
+          confirmedExpiresAt: null,
+        }]),
+        truckHoldLedger: {
+          ...prismaServiceMod.prismaClient.truckHoldLedger,
+          update: mockTruckHoldLedgerUpdate,
+        },
+      };
+      return cb(txClient);
+    });
+
     mockTruckHoldLedgerUpdate.mockResolvedValue({
       holdId: TEST_HOLD_ID,
       orderId: TEST_ORDER_ID,
@@ -731,6 +770,7 @@ describe('Confirmed Hold Lifecycle', () => {
 
     const result = await confirmedHoldService.initializeConfirmedHold(
       TEST_HOLD_ID,
+      TEST_TRANSPORTER_ID,
       [
         { assignmentId: 'assign-1', driverId: 'driver-1', truckRequestId: 'tr-1' },
         { assignmentId: 'assign-2', driverId: 'driver-2', truckRequestId: 'tr-2' },
@@ -956,11 +996,10 @@ describe('Confirmed Hold Lifecycle', () => {
       status: 'driver_declined',
     });
 
-    // FK traversal
-    mockAssignmentFindUnique.mockResolvedValue({
-      truckRequestId: 'tr-1',
-      orderId: TEST_ORDER_ID,
-    });
+    // handleDriverTimeout first looks up driverId, then delegates to handleDriverDecline
+    mockAssignmentFindUnique
+      .mockResolvedValueOnce({ driverId: TEST_DRIVER_ID })
+      .mockResolvedValueOnce({ truckRequestId: 'tr-1', orderId: TEST_ORDER_ID });
 
     mockTruckRequestFindFirst.mockResolvedValue({
       id: 'tr-1',
@@ -1155,12 +1194,12 @@ describe('Confirmed Hold Lifecycle', () => {
 
     mockHMSet.mockResolvedValue(undefined);
 
-    // First call succeeds
-    const result1 = await confirmedHoldService.handleDriverAcceptance(TEST_ASSIGNMENT_ID);
+    // First call succeeds (driverId required by updated signature)
+    const result1 = await confirmedHoldService.handleDriverAcceptance(TEST_ASSIGNMENT_ID, TEST_DRIVER_ID);
     expect(result1.success).toBe(true);
 
     // Second concurrent call fails due to lock
-    const result2 = await confirmedHoldService.handleDriverAcceptance(TEST_ASSIGNMENT_ID);
+    const result2 = await confirmedHoldService.handleDriverAcceptance(TEST_ASSIGNMENT_ID, TEST_DRIVER_ID);
     expect(result2.success).toBe(false);
     expect(result2.message).toContain('lock');
   });
@@ -1200,11 +1239,19 @@ describe('Core Hold (truck-hold.service.ts)', () => {
   });
 
   test('24. holdTrucks — atomic claim with FOR UPDATE SKIP LOCKED', async () => {
+    // AB-2: holdTrucks now checks order existence before the DB transaction
+    const prismaServiceMod = require('../shared/database/prisma.service');
+    prismaServiceMod.prismaClient.order.findUnique.mockResolvedValue({
+      id: TEST_ORDER_ID,
+      status: 'broadcasting',
+      expiresAt: new Date(Date.now() + 300_000),
+    });
+
     // Set up the withDbTimeout to simulate the atomic transaction
     mockWithDbTimeout.mockImplementation(async (callback: any) => {
       const mockTx = {
         order: {
-          findUnique: jest.fn().mockResolvedValue({ id: TEST_ORDER_ID, status: 'broadcasting' }),
+          findUnique: jest.fn().mockResolvedValue({ id: TEST_ORDER_ID, status: 'broadcasting', expiresAt: new Date(Date.now() + 300_000) }),
         },
         truckRequest: {
           findMany: jest.fn().mockResolvedValue([

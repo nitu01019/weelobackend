@@ -13,7 +13,7 @@ export const vehicleStatusSchema = z.enum(['available', 'on_hold', 'in_transit',
 /**
  * Register Vehicle Schema
  * Note: transporterId comes from auth token, not request body
- * Using passthrough() to allow extra fields from mobile apps
+ * Unknown fields are stripped by default (Zod default behavior)
  */
 export const registerVehicleSchema = z.object({
   vehicleNumber: vehicleNumberSchema,
@@ -40,7 +40,7 @@ export const registerVehicleSchema = z.object({
   // Allow these fields from mobile apps (ignored, we use auth token)
   transporterId: z.string().optional(),
   documents: z.any().optional()
-}).passthrough();
+});
 
 /**
  * Update Vehicle Schema

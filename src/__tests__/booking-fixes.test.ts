@@ -131,6 +131,13 @@ jest.mock('../shared/database/prisma.service', () => {
     user: {
       findUnique: (...args: any[]) => mockUserFindUnique(...args),
     },
+    // H-26: CancellationLedger + CancellationAbuseCounter used in post-cancel transaction
+    cancellationLedger: {
+      create: jest.fn().mockResolvedValue({ id: 'ledger-1' }),
+    },
+    cancellationAbuseCounter: {
+      upsert: jest.fn().mockResolvedValue({ customerId: 'customer-001', cancelCount7d: 1 }),
+    },
     $queryRaw: (...args: any[]) => mockQueryRaw(...args),
   };
   return {
@@ -900,12 +907,12 @@ describe('P9 — Vehicle lock in acceptBroadcast', () => {
 // P20: CANCEL INCLUDES in_transit ASSIGNMENTS
 // =============================================================================
 
-// Fix B3: cancelBooking now only cancels PRE-TRIP assignments.
-// Mid-trip (in_transit, arrived_at_drop) are excluded to prevent releasing moving vehicles.
+// H-25: cancelBooking now cancels ALL active assignments including in_transit and arrived_at_drop.
+// This prevents orphaned assignment records when a booking is cancelled.
 describe('P20 — cancelBooking cancels pre-trip assignments only (Fix B3)', () => {
   beforeEach(resetAllMocks);
 
-  it('cancelBooking cancels pre-trip assignments but NOT in_transit', async () => {
+  it('cancelBooking cancels all active assignments including in_transit (H-25)', async () => {
     const booking = makeBooking({ customerId: 'customer-001', status: 'partially_filled' });
     const pendingAssignment = {
       id: 'assign-001',
@@ -935,7 +942,8 @@ describe('P20 — cancelBooking cancels pre-trip assignments only (Fix B3)', () 
 
     await bookingService.cancelBooking('booking-001', 'customer-001');
 
-    // Fix B3: Verify in_transit is NOT in cancellable statuses
+    // H-25: in_transit and arrived_at_drop are now included in cancellable statuses
+    // to prevent orphaned assignment records when a booking is cancelled.
     expect(mockAssignmentFindMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: expect.objectContaining({
@@ -946,15 +954,17 @@ describe('P20 — cancelBooking cancels pre-trip assignments only (Fix B3)', () 
               'driver_accepted',
               'en_route_pickup',
               'at_pickup',
+              'in_transit',
+              'arrived_at_drop',
             ]),
           }),
         }),
       })
     );
-    // in_transit must NOT be in the cancellable list
+    // H-25: Verify in_transit and arrived_at_drop ARE in the cancellable list
     const findManyCall = mockAssignmentFindMany.mock.calls[0][0];
-    expect(findManyCall.where.status.in).not.toContain('in_transit');
-    expect(findManyCall.where.status.in).not.toContain('arrived_at_drop');
+    expect(findManyCall.where.status.in).toContain('in_transit');
+    expect(findManyCall.where.status.in).toContain('arrived_at_drop');
   });
 
   it('cancelBooking sends trip_cancelled socket event to driver', async () => {

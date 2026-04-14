@@ -109,6 +109,15 @@ function parseCancelledPayload(raw: Record<string, unknown>): OrderCancelledOutb
   const reasonCode = typeof raw.reasonCode === 'string' && raw.reasonCode.trim().length > 0
     ? raw.reasonCode.trim()
     : 'CUSTOMER_CANCELLED';
+  const cancelledBy = raw.cancelledBy === 'customer' || raw.cancelledBy === 'transporter' || raw.cancelledBy === 'system'
+    ? raw.cancelledBy
+    : 'customer';
+  const refundStatus = typeof raw.refundStatus === 'string' && raw.refundStatus.trim().length > 0
+    ? raw.refundStatus.trim()
+    : 'none';
+  const assignmentIds = Array.isArray(raw.assignmentIds)
+    ? raw.assignmentIds.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
   const cancelledAt = typeof raw.cancelledAt === 'string' && raw.cancelledAt.trim().length > 0
     ? raw.cancelledAt
     : new Date().toISOString();
@@ -125,6 +134,9 @@ function parseCancelledPayload(raw: Record<string, unknown>): OrderCancelledOutb
     drivers,
     reason,
     reasonCode,
+    cancelledBy,
+    refundStatus,
+    assignmentIds,
     cancelledAt,
     eventId,
     eventVersion: Number.isFinite(eventVersion) && eventVersion > 0 ? Math.floor(eventVersion) : 1,
@@ -360,6 +372,9 @@ export async function emitCancellationLifecycle(payload: OrderCancelledOutboxPay
     status: 'cancelled',
     reason: payload.reason,
     reasonCode: payload.reasonCode,
+    cancelledBy: payload.cancelledBy,
+    refundStatus: payload.refundStatus,
+    assignmentIds: payload.assignmentIds,
     cancelledAt: payload.cancelledAt,
     stateChangedAt: payload.cancelledAt,
     eventId: payload.eventId,

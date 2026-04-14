@@ -57,8 +57,8 @@ const mockRedisGet = jest.fn();
 const mockRedisSet = jest.fn();
 const mockRedisDel = jest.fn();
 const mockRedisExists = jest.fn();
-const mockRedisAcquireLock = jest.fn();
-const mockRedisReleaseLock = jest.fn();
+const mockRedisAcquireLock = jest.fn().mockResolvedValue({ acquired: true, ttl: 15 });
+const mockRedisReleaseLock = jest.fn().mockResolvedValue(true);
 const mockRedisSMembers = jest.fn();
 const mockRedisSAdd = jest.fn();
 const mockRedisGetJSON = jest.fn();
@@ -288,6 +288,7 @@ jest.mock('../shared/services/fcm.service', () => ({
 jest.mock('../shared/services/queue.service', () => ({
   queueService: {
     addJob: jest.fn(),
+    queuePushNotification: jest.fn().mockResolvedValue(undefined),
     queuePushNotificationBatch: jest.fn().mockResolvedValue(undefined),
   },
 }));
@@ -440,6 +441,7 @@ jest.mock('../modules/driver/driver.service', () => ({
 
 import { orderService } from '../modules/order/order.service';
 import { logger } from '../shared/services/logger.service';
+import { queueService } from '../shared/services/queue.service';
 
 // =============================================================================
 // TEST HELPERS
@@ -567,6 +569,7 @@ function setupSuccessfulAcceptMocks(orderOverrides: Record<string, any> = {}): v
 
   mockVehicleFindUnique.mockResolvedValue(vehicle);
   mockAssignmentFindFirst.mockResolvedValue(null); // no existing assignment for driver
+  mockAssignmentFindMany.mockResolvedValue([]); // M-21: all assignments for fully_filled event
   mockTruckRequestUpdateMany.mockResolvedValue({ count: 1 }); // CAS on truck request succeeds
   mockAssignmentCreate.mockResolvedValue({});
   mockOrderUpdateMany.mockResolvedValue({ count: 1 }); // CAS on order succeeds
@@ -610,6 +613,8 @@ function resetAllMocks(): void {
   mockRedisGet.mockReset();
   mockRedisSet.mockReset();
   mockRedisDel.mockReset();
+  mockRedisAcquireLock.mockReset().mockResolvedValue({ acquired: true, ttl: 15 });
+  mockRedisReleaseLock.mockReset().mockResolvedValue(true);
 }
 
 // =============================================================================
@@ -1107,7 +1112,7 @@ describe('CAS Guard in acceptTruckRequest — FIX #4 + FIX #39', () => {
         'treq-001', 'transporter-001', 'vehicle-001', 'driver-001'
       );
 
-      expect(mockSendPushNotification).toHaveBeenCalledWith(
+      expect(queueService.queuePushNotification).toHaveBeenCalledWith(
         'driver-001',
         expect.objectContaining({
           title: 'New Trip Assigned!',
@@ -1133,7 +1138,7 @@ describe('CAS Guard in acceptTruckRequest — FIX #4 + FIX #39', () => {
 
       // No socket events or push notifications should be sent
       expect(mockEmitToUser).not.toHaveBeenCalled();
-      expect(mockSendPushNotification).not.toHaveBeenCalled();
+      expect(queueService.queuePushNotification).not.toHaveBeenCalled();
     });
   });
 });

@@ -1,3 +1,8 @@
+// Force the legacy inline $transaction path for completion tests (C-18).
+// FF_COMPLETION_ORCHESTRATOR defaults to ON, which delegates to completeTrip().
+// These tests verify the legacy outbox path.
+process.env.FF_COMPLETION_ORCHESTRATOR = 'false';
+
 /**
  * =============================================================================
  * CRITICAL FIXES — C-03 (Auto-Redispatch) + C-18 (Payment Trigger Outbox)
@@ -279,6 +284,7 @@ jest.mock('../modules/tracking/tracking.service', () => ({
 
 // ---------- Vehicle lifecycle mock ----------
 jest.mock('../shared/services/vehicle-lifecycle.service', () => ({
+  onVehicleTransition: jest.fn().mockResolvedValue(undefined),
   releaseVehicle: jest.fn().mockResolvedValue(undefined),
 }));
 
@@ -340,6 +346,7 @@ jest.mock('../shared/utils/geo.utils', () => ({
   roundCoord: (c: number) => Math.round(c * 100) / 100,
 }));
 jest.mock('../shared/utils/geospatial.utils', () => ({
+  ...jest.requireActual('../shared/utils/geospatial.utils'),
   haversineDistanceKm: jest.fn().mockReturnValue(10),
 }));
 jest.mock('../modules/pricing/vehicle-catalog', () => ({
@@ -349,6 +356,7 @@ jest.mock('../shared/services/cache.service', () => ({
   cacheService: { get: jest.fn(), set: jest.fn(), delete: jest.fn() },
 }));
 jest.mock('../core/state-machines', () => ({
+  ...jest.requireActual('../core/state-machines'),
   BOOKING_VALID_TRANSITIONS: {},
   isValidTransition: jest.fn().mockReturnValue(true),
   assertValidTransition: jest.fn(),
@@ -774,6 +782,7 @@ describe('C-18: Payment Trigger Outbox', () => {
   // Test 6: Completion writes trip_completed outbox row
   // -----------------------------------------------------------------------
   it('updateStatus("completed") enqueues a trip_completed outbox row', async () => {
+    // M-20 FIX: VALID_TRANSITIONS now requires arrived_at_drop -> completed
     const assignment = {
       id: 'assignment-complete',
       driverId: 'driver-001',
@@ -785,13 +794,13 @@ describe('C-18: Payment Trigger Outbox', () => {
       tripId: 'trip-001',
       bookingId: 'booking-001',
       orderId: null,
-      status: 'in_transit',
+      status: 'arrived_at_drop',
       driverName: 'Test Driver',
       truckRequestId: null,
     };
     mockGetAssignmentById.mockResolvedValue(assignment);
     mockVehicleFindUnique
-      .mockResolvedValueOnce({ status: 'in_transit' }) // pre-TX read
+      .mockResolvedValueOnce({ status: 'arrived_at_drop' }) // pre-TX read
       .mockResolvedValueOnce({ vehicleKey: 'Open_17ft', transporterId: 'transporter-001' }); // post-TX Redis sync
     mockVehicleUpdateMany.mockResolvedValue({ count: 1 });
     mockAssignmentUpdate.mockResolvedValue({ ...assignment, status: 'completed' });
@@ -908,6 +917,7 @@ describe('C-18: Payment Trigger Outbox', () => {
       new Error('DB connection lost during outbox write')
     );
 
+    // M-20 FIX: VALID_TRANSITIONS now requires arrived_at_drop -> completed
     const assignment = {
       id: 'assignment-outbox-fail',
       driverId: 'driver-001',
@@ -919,7 +929,7 @@ describe('C-18: Payment Trigger Outbox', () => {
       tripId: 'trip-002',
       bookingId: 'booking-002',
       orderId: null,
-      status: 'in_transit',
+      status: 'arrived_at_drop',
       driverName: 'Test Driver',
       truckRequestId: null,
     };
@@ -927,7 +937,7 @@ describe('C-18: Payment Trigger Outbox', () => {
       .mockResolvedValueOnce(assignment) // initial fetch
       .mockResolvedValueOnce({ ...assignment, status: 'completed' }); // re-fetch after TX
     mockVehicleFindUnique
-      .mockResolvedValueOnce({ status: 'in_transit' })
+      .mockResolvedValueOnce({ status: 'arrived_at_drop' })
       .mockResolvedValueOnce({ vehicleKey: 'Open_17ft', transporterId: 'transporter-001' });
     mockVehicleUpdateMany.mockResolvedValue({ count: 1 });
     mockAssignmentUpdate.mockResolvedValue({ ...assignment, status: 'completed' });

@@ -249,10 +249,10 @@ describe('A4#1 -- Centralized releaseVehicle in completion path', () => {
 
     // But Redis was attempted
     expect(mockOnVehicleStatusChange).toHaveBeenCalled();
-    // Logger should have caught the failure
+    // Logger should have caught the failure (vehicle-lifecycle.service logs structured object)
     expect(logger.warn).toHaveBeenCalledWith(
-      expect.stringContaining('Redis sync failed'),
-      expect.anything()
+      expect.stringContaining('Redis availability sync failed'),
+      expect.objectContaining({ error: expect.any(String) })
     );
   });
 });

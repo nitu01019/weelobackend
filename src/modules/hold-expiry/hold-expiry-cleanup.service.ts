@@ -33,7 +33,7 @@ import { HoldPhase } from '@prisma/client';
 import { prismaClient } from '../../shared/database/prisma.service';
 import { logger } from '../../shared/services/logger.service';
 import { redisService } from '../../shared/services/redis.service';
-import { liveAvailabilityService } from '../../shared/services/live-availability.service';
+import { onVehicleTransition } from '../../shared/services/vehicle-lifecycle.service';
 import { queueService, QueueJob } from '../../shared/services/queue.service';
 import { generateVehicleKey } from '../../shared/services/vehicle-key.service';
 
@@ -279,9 +279,11 @@ class HoldExpiryCleanupService {
       }
 
       // Find assignments for this hold's ORDER with pending/accepted status
+      // FIX-7: Scope by transporterId to prevent cancelling other transporters' valid assignments
       const assignments = await prismaClient.assignment.findMany({
         where: {
           orderId: hold.orderId,   // FIX C1: Use hold.orderId (Order PK), not holdId (Hold PK)
+          transporterId: hold.transporterId,  // FIX-7: Only release THIS transporter's assignments
           status: {
             in: Array.from(RELEASE_ASSIGNMENT_STATUSES),
           },
@@ -350,13 +352,15 @@ class HoldExpiryCleanupService {
           });
         }
 
-        // Redis availability update (outside transaction -- Redis is not transactional)
-        if (vehicleUpdated.count > 0 && vehicle.vehicleKey) {
-          await liveAvailabilityService.onVehicleStatusChange(
+        // Redis + fleet cache sync (outside transaction -- Redis is not transactional)
+        if (vehicleUpdated.count > 0) {
+          await onVehicleTransition(
             transporterId,
+            vehicle.id,
             vehicle.vehicleKey,
             oldStatus as string,
-            'available'
+            'available',
+            'holdExpiry'
           );
         }
 

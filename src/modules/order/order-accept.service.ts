@@ -25,13 +25,15 @@ import { OrderRecord } from '../../shared/database/db';
 import { prismaClient, withDbTimeout, OrderStatus, AssignmentStatus } from '../../shared/database/prisma.service';
 import { logger } from '../../shared/services/logger.service';
 import { emitToUser, SocketEvent } from '../../shared/services/socket.service';
-import { sendPushNotification } from '../../shared/services/fcm.service';
+import { queueService } from '../../shared/services/queue.service';
 import { redisService } from '../../shared/services/redis.service';
 import { metrics } from '../../shared/monitoring/metrics.service';
+import { AppError } from '../../shared/types/error.types';
 import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
 import { clearProgressiveStepTimers } from './order-timer.service';
 import { clearCustomerActiveBroadcast } from './order-broadcast.service';
 import { orderExpiryTimerKey } from './order-timer.service';
+import { HOLD_CONFIG } from '../../core/config/hold-config';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -42,6 +44,8 @@ export interface AcceptTruckRequestResult {
   assignmentId?: string;
   tripId?: string;
   message: string;
+  /** H-19: true when the assigned driver appears offline at time of assignment */
+  driverOfflineWarning?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -83,7 +87,20 @@ export async function acceptTruckRequest(
     transporterName: string;
     transporterPhone: string;
     now: string;
+    driverOfflineWarning: boolean;
   } | null = null;
+
+  // Cross-path vehicle mutex (H-11 fix): Acquire a distributed lock on vehicleId
+  // before entering the accept flow. This prevents the same vehicle from being
+  // concurrently assigned via order-accept AND broadcast-accept paths.
+  const vehicleLockKey = `lock:vehicle:${vehicleId}`;
+  const vehicleLockHolder = `order:${Date.now()}:${process.pid}`;
+  const vehicleLock = await redisService.acquireLock(vehicleLockKey, vehicleLockHolder, 15);
+  if (!vehicleLock.acquired) {
+    throw new AppError(409, 'VEHICLE_LOCKED', 'Vehicle is being assigned in another operation');
+  }
+
+  try {
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
@@ -178,10 +195,14 @@ export async function acceptTruckRequest(
         // FIX #32: WARN-ONLY presence check — Weelo allows pre-assignment of
         // en-route drivers (transporter may assign a driver traveling to the depot
         // who is not yet connected to the app). This is informational only.
+        // H-19: Track offline status so API response can include a warning flag
+        // for the transporter app to show a confirmation dialog.
+        let driverOfflineWarning = false;
         try {
           const { driverService: _driverSvc }: typeof import('../driver/driver.service') = require('../driver/driver.service');
           const isDriverOnline = await _driverSvc.isDriverOnline(driverId);
           if (!isDriverOnline) {
+            driverOfflineWarning = true;
             logger.warn('[ACCEPT] Driver may be offline', { driverId, orderId: truckRequest.orderId });
             metrics.incrementCounter('assignment_driver_offline_warn');
             // Continue anyway — Weelo allows pre-assignment of en-route drivers
@@ -345,7 +366,8 @@ export async function acceptTruckRequest(
           driverPhone: driver.phone || '',
           transporterName: transporter.name || transporter.businessName || '',
           transporterPhone: transporter.phone || '',
-          now
+          now,
+          driverOfflineWarning
         };
       // Fix B10(F-2-12): Serializable isolation guarantees fresh reads on retry.
       // When a serialization conflict occurs (P2034/40001), the next retry re-reads
@@ -427,7 +449,8 @@ export async function acceptTruckRequest(
     driverPhone,
     transporterName,
     transporterPhone,
-    now
+    now,
+    driverOfflineWarning
   } = txResult;
 
   metrics.incrementCounter('assignment_success_total');
@@ -436,19 +459,40 @@ export async function acceptTruckRequest(
   logger.info(`   Driver: ${driverName} (${driverPhone})`);
   logger.info(`   Order progress: ${newTrucksFilled}/${orderTotalTrucks}`);
 
-  // C-04 FIX: Redis sync after vehicle set to on_hold in the transaction.
-  // Matches pattern in assignment.service.ts:109-115.
+  // F-H6 FIX: Schedule 45s assignment timeout immediately after creation
+  // Industry standard (Uber): Every assignment gets immediate timeout scheduling.
+  // Without this, vehicles stay stuck up to 3.5 min until the DB reconciliation catches it.
+  try {
+    const timeoutMs = HOLD_CONFIG?.driverAcceptTimeoutMs || 45_000;
+    await queueService.scheduleAssignmentTimeout({
+      assignmentId,
+      driverId,
+      driverName: driverName || 'Driver',
+      transporterId,
+      vehicleId,
+      vehicleNumber: vehicleNumber || '',
+      orderId,
+      tripId,
+      createdAt: new Date().toISOString(),
+    }, timeoutMs);
+  } catch (err: unknown) {
+    // Non-fatal: DB reconciliation will catch within 2 minutes
+    logger.error('[ORDER ACCEPT] Failed to schedule assignment timeout', {
+      assignmentId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  // C-04 FIX: Redis + fleet cache sync after vehicle set to on_hold in the transaction.
   if (vehicleKey) {
     try {
-      const { liveAvailabilityService } = require('../../shared/services/live-availability.service');
-      await liveAvailabilityService.onVehicleStatusChange(
-        transporterId,
-        vehicleKey,
-        'available',
-        'on_hold'
+      const { onVehicleTransition } = require('../../shared/services/vehicle-lifecycle.service');
+      await onVehicleTransition(
+        transporterId, vehicleId, vehicleKey,
+        'available', 'on_hold', 'orderAccept'
       );
     } catch (redisErr: unknown) {
-      logger.warn('[OrderAccept] Redis vehicle status sync failed (non-fatal)', {
+      logger.warn('[OrderAccept] Vehicle transition sync failed (non-fatal)', {
         vehicleId,
         error: redisErr instanceof Error ? redisErr.message : String(redisErr)
       });
@@ -476,8 +520,10 @@ export async function acceptTruckRequest(
   emitToUser(driverId, SocketEvent.TRIP_ASSIGNED, driverNotification);
   logger.info(`Notified driver ${driverName} about trip assignment`);
 
-  // Push notification to driver
-  sendPushNotification(driverId, {
+  // M-09 FIX: Use queued push notification (consistent with assignment.service.ts pattern)
+  // BEFORE: Direct sendPushNotification() — bypasses queue, no retry, no rate limiting.
+  // NOW: queuePushNotification() — matches every other FCM call in the codebase.
+  queueService.queuePushNotification(driverId, {
     title: 'New Trip Assigned!',
     body: `${orderPickup.city || orderPickup.address} → ${orderDrop.city || orderDrop.address}`,
     data: {
@@ -496,6 +542,11 @@ export async function acceptTruckRequest(
   });
 
   // ============== NOTIFY CUSTOMER - PRD 7777: ONLY ON DRIVER ACCEPT ==============
+  // F-H8: INTENTIONAL — Order-accept path does NOT send customer notification per PRD 7777.
+  // Broadcast-accept path DOES send full truck_confirmed notification.
+  // This is a product decision, not a bug. To enable customer notification on order-accept,
+  // set FF_ORDER_ACCEPT_CUSTOMER_NOTIFICATION=true in environment.
+  //
   // REMOVED: Customer notification during truck hold/assignment
   // Customer should ONLY be notified when driver accepts - see assignment.service.ts
   // The customer will be notified in assignment.acceptAssignment() when driver accepts
@@ -561,6 +612,28 @@ export async function acceptTruckRequest(
       driverName,
       driverPhone
     };
+
+    // M-21 FIX: Include ALL assignments for this order, not just the latest one.
+    // Customer app needs the full list to display all assigned trucks.
+    let allAssignments: Array<{
+      id: string; tripId: string; vehicleNumber: string;
+      driverName: string | null; driverPhone: string; status: string;
+    }> = [];
+    try {
+      allAssignments = await prismaClient.assignment.findMany({
+        where: { orderId },
+        select: {
+          id: true, tripId: true, vehicleNumber: true,
+          driverName: true, driverPhone: true, status: true,
+        },
+      });
+    } catch (err: unknown) {
+      // Non-fatal: fall back to just the latest assignment
+      logger.warn('[OrderAccept] Failed to fetch all assignments for fully_filled event', {
+        orderId, error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
     emitToUser(customerId, 'booking_fully_filled', {
       orderId,
       trucksNeeded: orderTotalTrucks,
@@ -568,9 +641,16 @@ export async function acceptTruckRequest(
       filledAt: now,
       emittedAt: now,
       latestAssignment,
-      assignments: [
-        latestAssignment
-      ]
+      assignments: allAssignments.length > 0
+        ? allAssignments.map(a => ({
+            assignmentId: a.id,
+            tripId: a.tripId,
+            vehicleNumber: a.vehicleNumber,
+            driverName: a.driverName || '',
+            driverPhone: a.driverPhone,
+            status: a.status,
+          }))
+        : [latestAssignment]
     });
   }
 
@@ -602,6 +682,13 @@ export async function acceptTruckRequest(
     success: true,
     assignmentId,
     tripId,
-    message: `Successfully assigned. ${newTrucksFilled}/${orderTotalTrucks} trucks filled.`
+    message: `Successfully assigned. ${newTrucksFilled}/${orderTotalTrucks} trucks filled.`,
+    // H-19: Include offline warning so transporter app can show confirmation dialog
+    ...(driverOfflineWarning ? { driverOfflineWarning: true } : {})
   };
+
+  } finally {
+    // H-11: Always release the vehicle mutex
+    await redisService.releaseLock(vehicleLockKey, vehicleLockHolder).catch(() => {});
+  }
 }

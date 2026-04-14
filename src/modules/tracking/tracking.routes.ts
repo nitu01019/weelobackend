@@ -10,6 +10,7 @@
 
 import { Router, Request, Response, NextFunction } from 'express';
 import { trackingService } from './tracking.service';
+import { trackingQueryService } from './tracking-query.service';
 import { authMiddleware, roleGuard } from '../../shared/middleware/auth.middleware';
 import { validateRequest } from '../../shared/utils/validation.utils';
 import { googleMapsService } from '../../shared/services/google-maps.service';
@@ -19,6 +20,7 @@ import { prismaClient } from '../../shared/database/prisma.service';
 
 // Redis key builders (matching tracking.service.ts)
 const DRIVER_LOCATION_KEY = (driverId: string) => `driver:location:${driverId}`;
+import { trackingRateLimiter } from '../../shared/middleware/rate-limiter.middleware';
 import {
   updateLocationSchema,
   getTrackingQuerySchema,
@@ -28,6 +30,21 @@ import {
 } from './tracking.schema';
 import { z } from 'zod';
 import { assertBookingTrackingAccess } from './tracking-access.policy';
+import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
+
+// F-L20 FIX: Type safety for Redis location data
+interface DriverLocationData {
+  tripId: string;
+  driverId: string;
+  latitude: number;
+  longitude: number;
+  speed: number;
+  bearing: number;
+  status: string;
+  lastUpdated: string;
+  vehicleNumber?: string;
+  transporterId?: string;
+}
 
 const router = Router();
 
@@ -40,6 +57,7 @@ router.post(
   '/update',
   authMiddleware,
   roleGuard(['driver']),
+  trackingRateLimiter,  // F-L19 FIX: rate limit GPS updates (120 req/min per user)
   validateRequest(updateLocationSchema),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
@@ -51,32 +69,6 @@ router.post(
       res.json({
         success: true,
         message: 'Location updated'
-      });
-    } catch (error) {
-      next(error);
-    }
-  }
-);
-
-/**
- * @route   GET /tracking/:tripId
- * @desc    Get current location for a trip
- * @access  Customer (own booking), Transporter (own assignment), Driver (own trip)
- */
-router.get(
-  '/:tripId',
-  authMiddleware,
-  async (req: Request, res: Response, next: NextFunction) => {
-    try {
-      const tracking = await trackingService.getTripTracking(
-        req.params.tripId,
-        req.user!.userId,
-        req.user!.role
-      );
-
-      res.json({
-        success: true,
-        data: tracking
       });
     } catch (error) {
       next(error);
@@ -181,7 +173,7 @@ router.get(
         const chunk = activeAssignments.slice(i, i + redisBatchSize);
         const chunkResults = await Promise.all(
           chunk.map(async (assignment) => {
-            const location = await redisService.getJSON<any>(DRIVER_LOCATION_KEY(assignment.driverId));
+            const location = await redisService.getJSON<DriverLocationData>(DRIVER_LOCATION_KEY(assignment.driverId));
             if (!location || !location.latitude || !location.longitude) {
               return null;
             }
@@ -223,7 +215,8 @@ router.get(
   authMiddleware,
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const tracking = await trackingService.getBookingTracking(
+      // F-L16 FIX: Wire to dedicated query service for read-only operations
+      const tracking = await trackingQueryService.getBookingTracking(
         req.params.bookingId,
         req.user!.userId,
         req.user!.role
@@ -250,7 +243,8 @@ router.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const query = getTrackingQuerySchema.parse(req.query);
-      const history = await trackingService.getTripHistory(
+      // F-L16 FIX: Wire to dedicated query service for read-only operations
+      const history = await trackingQueryService.getTripHistory(
         req.params.tripId,
         req.user!.userId,
         req.user!.role,
@@ -292,7 +286,10 @@ router.get(
   roleGuard(['transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const fleet = await trackingService.getFleetTracking(req.user!.userId);
+      // F-L16 + F-L17 FIX: Wire to dedicated query service with pagination
+      const page = Math.max(1, parseInt(req.query.page as string) || 1);
+      const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string) || 50));
+      const fleet = await trackingQueryService.getFleetTracking(req.user!.userId, page, limit);
 
       res.json({
         success: true,
@@ -506,6 +503,18 @@ router.get(
   roleGuard(['transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
+      // Ownership check: driver must belong to this transporter
+      const driver = await prismaClient.user.findFirst({
+        where: { id: req.params.driverId, transporterId: req.user!.userId },
+        select: { id: true }
+      });
+      if (!driver) {
+        return res.status(403).json({
+          success: false,
+          error: 'Access denied: driver does not belong to your fleet'
+        });
+      }
+
       const status = await trackingService.getDriverStatus(req.params.driverId);
 
       res.json({
@@ -593,7 +602,7 @@ router.get(
       }
 
       // Get live location from Redis if available
-      const locationData = await redisService.getJSON<any>(
+      const locationData = await redisService.getJSON<DriverLocationData>(
         `driver:location:${driverId}`
       ).catch(() => null);
 
@@ -615,7 +624,7 @@ router.get(
           currentRouteIndex: activeAssignment.order?.currentRouteIndex || 0,
           distanceKm: activeAssignment.order?.distanceKm || activeAssignment.booking?.distanceKm,
           customerName: activeAssignment.order?.customerName || activeAssignment.booking?.customerName,
-          customerPhone: activeAssignment.order?.customerPhone || activeAssignment.booking?.customerPhone,
+          customerPhone: maskPhoneForExternal(activeAssignment.order?.customerPhone || activeAssignment.booking?.customerPhone),
           assignedAt: activeAssignment.assignedAt,
           lastLocation: locationData ? {
             latitude: locationData.latitude,
@@ -625,6 +634,33 @@ router.get(
             lastUpdated: locationData.lastUpdated
           } : null
         }
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
+ * @route   GET /tracking/:tripId
+ * @desc    Get current location for a trip
+ * @access  Customer (own booking), Transporter (own assignment), Driver (own trip)
+ */
+router.get(
+  '/:tripId',
+  authMiddleware,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      // F-L16 FIX: Wire to dedicated query service for read-only operations
+      const tracking = await trackingQueryService.getTripTracking(
+        req.params.tripId,
+        req.user!.userId,
+        req.user!.role
+      );
+
+      res.json({
+        success: true,
+        data: tracking
       });
     } catch (error) {
       next(error);

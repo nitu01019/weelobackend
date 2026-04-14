@@ -47,6 +47,31 @@
  */
 
 import { logger } from './logger.service';
+import { config } from '../../config/environment';
+
+// =============================================================================
+// UTILITIES
+// =============================================================================
+
+/** Safe JSON.stringify that handles circular references */
+function safeStringify(obj: unknown): string {
+  try {
+    return JSON.stringify(obj);
+  } catch {
+    const seen = new WeakSet();
+    try {
+      return JSON.stringify(obj, (_key, value) => {
+        if (typeof value === 'object' && value !== null) {
+          if (seen.has(value)) return '[Circular]';
+          seen.add(value);
+        }
+        return value;
+      });
+    } catch {
+      return String(obj);
+    }
+  }
+}
 
 // =============================================================================
 // TYPES
@@ -1314,7 +1339,7 @@ class RealRedisClient implements IRedisClient {
     };
   }
 
-  async geoRadius(key: string, longitude: number, latitude: number, radius: number, unit: 'km' | 'm', count: number = 50): Promise<GeoMember[]> {
+  async geoRadius(key: string, longitude: number, latitude: number, radius: number, unit: 'km' | 'm', count: number = config.geoQueryMaxCandidates || 250): Promise<GeoMember[]> {
     // Fix D1/F-3-1: Add COUNT limit to prevent unbounded result sets
     // Use GEOSEARCH (Redis 6.2+) or fallback to GEORADIUS
     try {
@@ -1324,7 +1349,7 @@ class RealRedisClient implements IRedisClient {
         'BYRADIUS', radius, unit,
         'WITHDIST', 'WITHCOORD',
         'ASC',
-        'COUNT', count, 'ANY'
+        'COUNT', count
       );
 
       return this.parseGeoResults(results);
@@ -1461,6 +1486,7 @@ class RedisService {
   private initialized = false;
   private useRedis = false;
   public isDegraded: boolean = false;
+  private reconnectProbeTimer: ReturnType<typeof setInterval> | null = null;
 
   // M-15 FIX: Environment-aware Redis key prefix.
   // Prevents key collisions when dev/staging/prod share the same Redis instance.
@@ -1532,12 +1558,14 @@ class RedisService {
         const rawClient = realClient.getRawClient();
         if (rawClient && typeof rawClient.on === 'function') {
           rawClient.on('ready', () => {
-            this.isDegraded = false;  // FIX F-5-10b: Reset degraded flag on Redis recovery
+            this.isDegraded = false;
+            this.stopReconnectProbe();
             logger.info('[Redis] Connection recovered — isDegraded reset to false');
           });
 
           rawClient.on('close', () => {
-            this.isDegraded = true;  // FIX F-5-10b: Set degraded flag on Redis disconnect
+            this.isDegraded = true;
+            this.startReconnectProbe();
             logger.warn('[Redis] Connection lost — isDegraded set to true');
           });
         }
@@ -1558,7 +1586,7 @@ class RedisService {
         this.client = new InMemoryRedisClient();
         this.useRedis = false;
         this.isDegraded = true;
-        // Don't throw - allow app to start with limited functionality
+        this.startReconnectProbe();
       }
     } else {
       // Redis not enabled
@@ -1580,17 +1608,55 @@ class RedisService {
     return this.useRedis;
   }
 
-  /**
-   * Get the raw underlying ioredis client for Socket.IO Redis Streams adapter.
-   * Returns null if using in-memory mode (adapter won't be init'd without Redis).
-   */
+  private startReconnectProbe(): void {
+    if (this.reconnectProbeTimer) return;
+    const PROBE_INTERVAL_MS = 30_000;
+
+    this.reconnectProbeTimer = setInterval(async () => {
+      try {
+        const { metrics } = require('../monitoring/metrics.service');
+        metrics.incrementCounter('redis_degraded_total');
+      } catch { /* metrics not available */ }
+
+      const redisUrl = process.env.REDIS_URL;
+      if (!redisUrl) return;
+
+      try {
+        const probe = new RealRedisClient({
+          url: redisUrl,
+          maxRetries: 1,
+          retryDelayMs: 500,
+          maxConnections: 1,
+          connectionTimeoutMs: 3000,
+          commandTimeoutMs: 3000,
+        });
+        await probe.connect();
+        this.client = probe;
+        this.useRedis = true;
+        this.isDegraded = false;
+        this.stopReconnectProbe();
+        logger.info('[Redis] Reconnect probe succeeded -- restored real Redis');
+      } catch {
+        logger.debug('[Redis] Reconnect probe failed -- still degraded');
+      }
+    }, PROBE_INTERVAL_MS);
+
+    if (this.reconnectProbeTimer.unref) {
+      this.reconnectProbeTimer.unref();
+    }
+  }
+
+  private stopReconnectProbe(): void {
+    if (this.reconnectProbeTimer) {
+      clearInterval(this.reconnectProbeTimer);
+      this.reconnectProbeTimer = null;
+    }
+  }
+
   getClient(): any {
     return this.client.getRawClient();
   }
 
-  /**
-   * Check if connected
-   */
   isConnected(): boolean {
     return this.client.isConnected();
   }
@@ -1725,7 +1791,8 @@ class RedisService {
       logger.warn(`[Redis] setJSON called before initialization, waiting...`);
       await this.initialize();
     }
-    await this.client.set(key, JSON.stringify(value), ttlSeconds);
+    // #55 FIX: Use safeStringify to avoid crash on circular objects
+    await this.client.set(key, safeStringify(value), ttlSeconds);
   }
 
   // ===========================================================================
@@ -1847,61 +1914,62 @@ class RedisService {
    * Lua-based atomic pattern for rate limiting.
    */
   async incrementWithTTL(key: string, ttlSeconds: number): Promise<number> {
+    const result = await this.incrementWithTTLAndRemaining(key, ttlSeconds);
+    return result.count;
+  }
+
+  async incrementWithTTLAndRemaining(key: string, ttlSeconds: number): Promise<{ count: number; ttl: number }> {
     try {
-      // Atomic Lua script: INCR + conditional EXPIRE in one operation
-      // Self-heals stuck keys (no TTL) from old non-atomic implementation
       const result = await this.client.eval(
         `
         local count = redis.call('INCR', KEYS[1])
         if count == 1 then
           redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
         else
-          -- Self-healing: if key exists but has no TTL (stuck from old bug), fix it
           local currentTtl = redis.call('TTL', KEYS[1])
           if currentTtl == -1 then
             redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
           end
         end
-        return count
+        local ttl = redis.call('TTL', KEYS[1])
+        return {count, ttl}
         `,
-        [key],                   // KEYS[1]
-        [String(ttlSeconds)]     // ARGV[1]
+        [key],
+        [String(ttlSeconds)]
       );
 
-      // InMemoryRedisClient.eval() returns null — fall through to fallback
       if (result === null || result === undefined) {
         throw new Error('eval returned null (in-memory mode)');
       }
 
-      return Number(result);
-    } catch (error: any) {
-      // Fallback for in-memory mode or if Lua eval fails
-      // Uses two-command approach with defensive TTL check
+      if (Array.isArray(result) && result.length >= 2) {
+        return { count: Number(result[0]), ttl: Number(result[1]) };
+      }
+
+      return { count: Number(result), ttl: ttlSeconds };
+    } catch (error: unknown) {
       const count = await this.client.incr(key);
+      let currentTtl = ttlSeconds;
       try {
-        const currentTtl = await this.client.ttl(key);
-        if (currentTtl < 0) {
-          // Key has no TTL — either first increment or stuck key. Fix it.
+        const redisTtl = await this.client.ttl(key);
+        if (redisTtl < 0) {
           await this.client.expire(key, ttlSeconds);
+        } else {
+          currentTtl = redisTtl;
         }
       } catch {
-        // Best effort — counter still incremented correctly
+        // Best effort
       }
-      return count;
+      return { count, ttl: currentTtl };
     }
   }
 
-  /**
-   * Check rate limit
-   * @returns { allowed: boolean, remaining: number, resetIn: number }
-   */
   async checkRateLimit(key: string, limit: number, windowSeconds: number): Promise<{
     allowed: boolean;
     remaining: number;
     resetIn: number;
   }> {
-    const count = await this.incrementWithTTL(key, windowSeconds);
-    const ttl = await this.client.ttl(key);
+    const { count, ttl } = await this.incrementWithTTLAndRemaining(key, windowSeconds);
 
     return {
       allowed: count <= limit,
@@ -2002,7 +2070,8 @@ class RedisService {
       createdAt: new Date().toISOString()
     };
 
-    await this.client.set(timerKey, JSON.stringify(timerData), ttlSeconds + 60); // Extra 60s buffer
+    // #55 FIX: Use safeStringify to avoid crash on circular objects
+    await this.client.set(timerKey, safeStringify(timerData), ttlSeconds + 60); // Extra 60s buffer
 
     // Fix C6/F-5-2: Lua script does ZADD + cap at 10000 entries + 30-day safety TTL
     await this.client.eval(
@@ -2203,7 +2272,8 @@ class RedisService {
   }
 
   async hSetJSON<T>(key: string, field: string, value: T): Promise<void> {
-    await this.client.hSet(key, field, JSON.stringify(value));
+    // #55 FIX: Use safeStringify to avoid crash on circular objects
+    await this.client.hSet(key, field, safeStringify(value));
   }
 
   async hGetJSON<T>(key: string, field: string): Promise<T | null> {
@@ -2332,7 +2402,7 @@ class RedisService {
       try {
         const { prismaClient } = require('../database/prisma.service');
         const pgResult = await prismaClient.$queryRaw<Array<{ locked: boolean }>>`
-          SELECT pg_try_advisory_lock(hashtext(${key})) AS locked
+          SELECT pg_try_advisory_xact_lock(hashtext(${key})) AS locked
         `;
         const acquired = pgResult?.[0]?.locked === true;
         if (acquired) {
@@ -2430,7 +2500,8 @@ class RedisService {
   }
 
   async publishJSON<T>(channel: string, data: T): Promise<number> {
-    return this.client.publish(channel, JSON.stringify(data));
+    // #55 FIX: Use safeStringify to avoid crash on circular objects
+    return this.client.publish(channel, safeStringify(data));
   }
 
   async subscribe(channel: string, callback: (message: string) => void): Promise<void> {
@@ -2476,7 +2547,11 @@ class RedisService {
   // HEALTH CHECK
   // ===========================================================================
 
-  async healthCheck(): Promise<{ status: 'healthy' | 'unhealthy'; mode: string; latencyMs?: number }> {
+  async healthCheck(): Promise<{ status: 'healthy' | 'degraded' | 'unhealthy'; mode: string; latencyMs?: number }> {
+    if (this.isDegraded) {
+      return { status: 'degraded', mode: 'memory-fallback' };
+    }
+
     const start = Date.now();
 
     try {
@@ -2503,6 +2578,7 @@ class RedisService {
 
   async shutdown(): Promise<void> {
     logger.info('[Redis] Shutting down...');
+    this.stopReconnectProbe();
     await this.client.disconnect();
   }
 }

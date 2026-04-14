@@ -453,17 +453,8 @@ ALTER TABLE "TruckHoldLedger" ADD COLUMN IF NOT EXISTS "confirmedAtLegacy" TIMES
 - ❌ `_prisma_migrations` table does NOT exist — DB was set up via prisma db push
 
 ### How to Connect to Production DB
-```bash
-# RDS is currently PUBLICLY ACCESSIBLE (see DB_SECURITY_CHANGES.md on Desktop)
-PGPASSWORD='N1it2is4h' PGCONNECT_TIMEOUT=15 /opt/homebrew/opt/postgresql@18/bin/psql \
-  --host=weelodb-new.cdqoiou8wm0y.ap-south-1.rds.amazonaws.com \
-  --port=5432 \
-  --username=weelo_admin \
-  --dbname=weelo
-
-# Connection string:
-# postgresql://weelo_admin:N1it2is4h@weelodb-new.cdqoiou8wm0y.ap-south-1.rds.amazonaws.com:5432/weelo
-```
+See AWS Secrets Manager for credentials. Connection requires VPN/bastion access.
+RDS should NOT be publicly accessible — see DB_SECURITY_CHANGES.md on Desktop for steps to secure it.
 
 ### How to Check CloudWatch Logs
 ```bash
@@ -501,20 +492,11 @@ aws logs get-log-events \
 - **Impact:** Cache miss every time → DB hit every time → slower performance
 - **Fix needed:** Find where Redis.set() is called without JSON.stringify in `src/shared/services/fleet-cache.service.ts`
 
-### 3. 🟡 Metrics Counters Not Registered (MEDIUM)
-- **What:** `WARN: Counter hold.request.total not found`, `WARN: Histogram hold.latency_ms not found` etc
-- **Root cause:** `truck-hold.service.ts` calls `metrics.incrementCounter('hold.*')` but these counters are never registered in `metrics.service.ts` constructor
-- **Impact:** Noisy WARN logs, monitoring dashboard blind to hold activity
-- **Fix needed:** Register these in `MetricsService` constructor:
-  - Counter: `hold.request.total`
-  - Counter: `hold.success.total`
-  - Counter: `hold.conflict.total`
-  - Counter: `hold.idempotent_replay.total`
-  - Counter: `hold.release.total`
-  - Counter: `hold.cleanup.released_total`
-  - Counter: `hold.idempotency.purged_total`
-  - Histogram: `hold.latency_ms`
-  - Histogram: `confirm.latency_ms`
+### 3. ✅ Metrics Counters Not Registered (RESOLVED 2026-04-11)
+- **What:** CLAUDE.md listed dot-notation names (`hold.request.total`) but actual code uses underscores (`hold_request_total`). All 9 hold metrics were already registered in `initializeDefaultMetrics()` AND duplicated in `metrics-definitions.ts` (which was never imported).
+- **Fix applied:** Removed ~360 lines of duplicated inline registrations from `metrics.service.ts`. Constructor now delegates to `registerDefaultCounters/Gauges/Histograms` from `metrics-definitions.ts` (single source of truth). Additionally, `incrementCounter` and `observeHistogram` auto-create metrics on first use, so no WARN was ever emitted by these methods.
+- **Files changed:** `src/shared/monitoring/metrics.service.ts` (881 -> 523 lines)
+- **Tests:** All 165 metrics tests pass (fix-metrics-service-hardening, phase6-observability, manager-fix-tracking-metrics)
 
 ### 4. 🟢 No `_prisma_migrations` table (LOW — future risk)
 - **What:** DB was set up with `prisma db push` not `prisma migrate deploy`

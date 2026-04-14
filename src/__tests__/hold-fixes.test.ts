@@ -81,28 +81,31 @@ const mockTruckHoldLedgerFindUnique = jest.fn();
 const mockTruckRequestFindMany = jest.fn();
 const mockExecuteRaw = jest.fn();
 
-jest.mock('../shared/database/prisma.service', () => ({
-  prismaClient: {
-    assignment: {
-      update: (...args: any[]) => mockAssignmentUpdate(...args),
-      updateMany: (...args: any[]) => mockAssignmentUpdateMany(...args),
-      findMany: (...args: any[]) => mockAssignmentFindMany(...args),
-      findUnique: (...args: any[]) => mockAssignmentFindUnique(...args),
-      findUniqueOrThrow: (...args: any[]) => mockAssignmentFindUniqueOrThrow(...args),
-    },
-    truckRequest: {
-      findUnique: (...args: any[]) => mockTruckRequestFindUnique(...args),
-      findFirst: (...args: any[]) => mockTruckRequestFindFirst(...args),
-      update: (...args: any[]) => mockTruckRequestUpdate(...args),
-      findMany: (...args: any[]) => mockTruckRequestFindMany(...args),
-    },
-    truckHoldLedger: {
-      update: (...args: any[]) => mockTruckHoldLedgerUpdate(...args),
-      findFirst: (...args: any[]) => mockTruckHoldLedgerFindFirst(...args),
-      findUnique: (...args: any[]) => mockTruckHoldLedgerFindUnique(...args),
-    },
-    $executeRaw: (...args: any[]) => mockExecuteRaw(...args),
+const mockPrismaClient: any = {
+  assignment: {
+    update: (...args: any[]) => mockAssignmentUpdate(...args),
+    updateMany: (...args: any[]) => mockAssignmentUpdateMany(...args),
+    findMany: (...args: any[]) => mockAssignmentFindMany(...args),
+    findUnique: (...args: any[]) => mockAssignmentFindUnique(...args),
+    findUniqueOrThrow: (...args: any[]) => mockAssignmentFindUniqueOrThrow(...args),
   },
+  truckRequest: {
+    findUnique: (...args: any[]) => mockTruckRequestFindUnique(...args),
+    findFirst: (...args: any[]) => mockTruckRequestFindFirst(...args),
+    update: (...args: any[]) => mockTruckRequestUpdate(...args),
+    findMany: (...args: any[]) => mockTruckRequestFindMany(...args),
+  },
+  truckHoldLedger: {
+    update: (...args: any[]) => mockTruckHoldLedgerUpdate(...args),
+    findFirst: (...args: any[]) => mockTruckHoldLedgerFindFirst(...args),
+    findUnique: (...args: any[]) => mockTruckHoldLedgerFindUnique(...args),
+  },
+  $executeRaw: (...args: any[]) => mockExecuteRaw(...args),
+  $transaction: async (fn: any) => fn(mockPrismaClient),
+};
+
+jest.mock('../shared/database/prisma.service', () => ({
+  prismaClient: mockPrismaClient,
   HoldPhase: {
     FLEX: 'FLEX',
     CONFIRMED: 'CONFIRMED',
@@ -142,6 +145,7 @@ jest.mock('../modules/hold-expiry/hold-expiry-cleanup.service', () => ({
 // Vehicle lifecycle service mock
 const mockReleaseVehicle = jest.fn();
 jest.mock('../shared/services/vehicle-lifecycle.service', () => ({
+  onVehicleTransition: jest.fn().mockResolvedValue(undefined),
   releaseVehicle: (...args: any[]) => mockReleaseVehicle(...args),
 }));
 
@@ -227,7 +231,9 @@ function setupDeclineHappyPath(assignmentOverrides: Record<string, any> = {}) {
   mockAssignmentUpdateMany.mockResolvedValue({ count: 1 });
   mockAssignmentFindUniqueOrThrow.mockResolvedValue(assignment);
   mockAssignmentUpdate.mockResolvedValue(assignment);
-  // FK traversal: assignment.findUnique to get truckRequestId
+  // F-M14: Inside $transaction, findUnique is called for orderId;
+  // Outside, resolveAssignmentTruckRequest calls findUnique for truckRequestId.
+  // Both go through the same mock since $transaction passes mockPrismaClient.
   mockAssignmentFindUnique.mockResolvedValue({
     truckRequestId: assignment.truckRequestId,
     orderId: assignment.orderId,
@@ -396,12 +402,17 @@ describe('Problem 6 — handleDriverDecline resets truck request and updates sta
     const result1 = await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
     expect(result1.success).toBe(true);
 
-    // Second call — assignment is already declined; prisma update still succeeds
-    // because we query by { tripId } not { tripId, status }
+    // Second call — assignment is already declined; CAS updateMany returns count=0
+    // because status is no longer 'pending'. Service returns success=false gracefully.
     resetAllMocks();
-    setupDeclineHappyPath({ status: 'driver_declined' });
+    mockRedisAcquireLock.mockResolvedValue({ acquired: true });
+    mockRedisReleaseLock.mockResolvedValue(undefined);
+    mockAssignmentUpdateMany.mockResolvedValue({ count: 0 }); // CAS miss
+    mockAssignmentFindUnique.mockResolvedValue({ status: 'driver_declined' });
     const result2 = await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
-    expect(result2.success).toBe(true);
+    // Second call does not crash — idempotent behavior
+    expect(result2.success).toBe(false);
+    expect(result2.message).toContain('no longer pending');
   });
 
   it('handleDriverDecline with no truckRequest found still succeeds', async () => {

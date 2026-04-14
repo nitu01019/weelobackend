@@ -543,7 +543,7 @@ describe('C-08: FLEX conflict guard added to class method holdTrucks()', () => {
 
       const holdTrucksStart = source.indexOf('async holdTrucks(');
       // Use a wide window to capture both the guard and the transaction
-      const holdTrucksWindow = source.substring(holdTrucksStart, holdTrucksStart + 6000);
+      const holdTrucksWindow = source.substring(holdTrucksStart, holdTrucksStart + 8000);
 
       // FLEX_HOLD_CONFLICT must appear BEFORE withDbTimeout
       const conflictIndex = holdTrucksWindow.indexOf('FLEX_HOLD_CONFLICT');

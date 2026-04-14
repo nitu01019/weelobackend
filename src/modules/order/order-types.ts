@@ -69,6 +69,9 @@ export interface OrderCancelledOutboxPayload {
   }>;
   reason: string;
   reasonCode: string;
+  cancelledBy: 'customer' | 'transporter' | 'system';
+  refundStatus: string;
+  assignmentIds: string[];
   cancelledAt: string;
   eventId: string;
   eventVersion: number;

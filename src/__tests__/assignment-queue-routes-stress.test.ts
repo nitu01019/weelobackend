@@ -172,6 +172,7 @@ const mockTxAssignmentUpdate = jest.fn();
 const mockTx = {
   $executeRawUnsafe: jest.fn().mockResolvedValue(0),
   $executeRaw: jest.fn().mockResolvedValue(0),
+  $queryRaw: jest.fn().mockResolvedValue([]),
   assignment: {
     updateMany: (...args: any[]) => mockTxAssignmentUpdateMany(...args),
     findUnique: (...args: any[]) => mockTxAssignmentFindUnique(...args),
@@ -349,6 +350,7 @@ jest.mock('../modules/tracking/tracking.service', () => ({
 }));
 
 jest.mock('../shared/services/vehicle-lifecycle.service', () => ({
+  onVehicleTransition: jest.fn().mockResolvedValue(undefined),
   releaseVehicle: jest.fn().mockResolvedValue(undefined),
 }));
 
@@ -410,6 +412,7 @@ jest.mock('../shared/services/transporter-online.service', () => ({
 }));
 
 jest.mock('../shared/utils/geospatial.utils', () => ({
+  ...jest.requireActual('../shared/utils/geospatial.utils'),
   haversineDistanceKm: jest.fn().mockReturnValue(10),
 }));
 
@@ -947,8 +950,14 @@ describe('Assignment Under Load', () => {
       const inTransit = await assignmentLifecycleService.updateStatus(assignment.id, 'drv-1', { status: 'in_transit' });
       expect(inTransit).toBeDefined();
 
-      // 6. Status -> completed
+      // 6. Status -> arrived_at_drop (M-20: must go through arrived_at_drop before completed)
       mockGetAssignmentById.mockResolvedValue(makeAssignment({ id: assignment.id, status: 'in_transit' }));
+      mockUpdateAssignment.mockResolvedValue(makeAssignment({ status: 'arrived_at_drop' }));
+      const arrivedAtDrop = await assignmentLifecycleService.updateStatus(assignment.id, 'drv-1', { status: 'arrived_at_drop' });
+      expect(arrivedAtDrop).toBeDefined();
+
+      // 7. Status -> completed
+      mockGetAssignmentById.mockResolvedValue(makeAssignment({ id: assignment.id, status: 'arrived_at_drop' }));
       mockUpdateAssignment.mockResolvedValue(makeAssignment({ status: 'completed' }));
       mockGetBookingById.mockResolvedValue(makeBooking({ customerId: 'cust-1' }));
       const completed = await assignmentLifecycleService.updateStatus(assignment.id, 'drv-1', { status: 'completed' });
@@ -996,7 +1005,6 @@ describe('Assignment Under Load', () => {
       ['at_pickup', 'in_transit'],
       ['at_pickup', 'cancelled'],
       ['in_transit', 'arrived_at_drop'],
-      ['in_transit', 'completed'],
       ['in_transit', 'cancelled'],
       ['arrived_at_drop', 'completed'],
       ['arrived_at_drop', 'cancelled'],
@@ -1011,6 +1019,7 @@ describe('Assignment Under Load', () => {
       ['completed', 'pending'],
       ['driver_declined', 'driver_accepted'],
       ['cancelled', 'pending'],
+      ['in_transit', 'completed'],  // M-20: must go through arrived_at_drop first
       ['in_transit', 'pending'],
       ['in_transit', 'driver_accepted'],
     ];

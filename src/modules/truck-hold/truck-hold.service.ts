@@ -216,6 +216,9 @@ const TERMINAL_ORDER_STATUSES = new Set(['cancelled', 'expired', 'completed', 'f
 const HOLD_EVENT_VERSION = 1;
 
 const FF_HOLD_DB_ATOMIC_CLAIM = process.env.FF_HOLD_DB_ATOMIC_CLAIM !== 'false';
+if (!FF_HOLD_DB_ATOMIC_CLAIM) {
+  logger.error('[SAFETY] FF_HOLD_DB_ATOMIC_CLAIM is DISABLED — row locking is OFF. Double-claims possible. Set to true or remove the env var.');
+}
 const FF_HOLD_STRICT_IDEMPOTENCY = process.env.FF_HOLD_STRICT_IDEMPOTENCY !== 'false';
 const FF_HOLD_RECONCILE_RECOVERY = process.env.FF_HOLD_RECONCILE_RECOVERY !== 'false';
 const FF_HOLD_SAFE_RELEASE_GUARD = process.env.FF_HOLD_SAFE_RELEASE_GUARD !== 'false';
@@ -735,22 +738,70 @@ class TruckHoldService {
         return response;
       }
 
+      // AB-2 fix: Reject hold creation if the parent broadcast/order has expired.
+      // Prevents stale broadcasts from locking trucks after expiry.
+      const parentOrder = await prismaClient.order.findUnique({
+        where: { id: orderId },
+        select: { expiresAt: true, status: true },
+      });
+      if (!parentOrder) {
+        response = {
+          success: false,
+          message: 'Order not found. Cannot create hold for a non-existent order.',
+          error: 'ORDER_NOT_FOUND',
+        };
+        this.recordHoldOutcomeMetrics(response, holdStartedAtMs);
+        return response;
+      }
+      if (new Date(parentOrder.expiresAt).getTime() < Date.now()) {
+        response = {
+          success: false,
+          message: 'Cannot create hold — broadcast has expired.',
+          error: 'BROADCAST_EXPIRED',
+        };
+        statusCode = 409;
+        await this.saveIdempotentOperationResponse(transporterId, 'hold', idempotencyKey, payloadHash, statusCode, response);
+        this.recordHoldOutcomeMetrics(response, holdStartedAtMs);
+        return response;
+      }
+      if (parentOrder.status === 'cancelled' || parentOrder.status === 'expired' || parentOrder.status === 'completed') {
+        response = {
+          success: false,
+          message: `Cannot create hold — order is ${parentOrder.status}.`,
+          error: 'ORDER_TERMINAL',
+        };
+        statusCode = 409;
+        await this.saveIdempotentOperationResponse(transporterId, 'hold', idempotencyKey, payloadHash, statusCode, response);
+        this.recordHoldOutcomeMetrics(response, holdStartedAtMs);
+        return response;
+      }
+
       const holdId = `HOLD_${uuidv4().substring(0, 8).toUpperCase()}`;
       const now = new Date();
-      const expiresAt = new Date(now.getTime() + CONFIG.HOLD_DURATION_SECONDS * 1000);
+      const holdDurationMs = CONFIG.HOLD_DURATION_SECONDS * 1000;
+      let expiresAt = new Date(now.getTime() + holdDurationMs);
       let heldCount = 0;
 
       await withDbTimeout(async (tx) => {
         const order = await tx.order.findUnique({
           where: { id: orderId },
-          select: { id: true, status: true }
+          select: { id: true, status: true, expiresAt: true }
         });
 
         if (!order) throw new Error('ORDER_NOT_FOUND');
         if (TERMINAL_ORDER_STATUSES.has(order.status)) throw new Error('ORDER_INACTIVE');
 
-        const claimedRows = FF_HOLD_DB_ATOMIC_CLAIM
-          ? await tx.$queryRaw<Array<{ id: string }>>`
+        // AB3: Cap hold lifetime to broadcast/order remaining time.
+        // A hold must never outlive its parent broadcast.
+        const broadcastRemainingMs = new Date(order.expiresAt).getTime() - now.getTime();
+        if (broadcastRemainingMs > 0) {
+          const cappedDurationMs = Math.min(holdDurationMs, broadcastRemainingMs);
+          expiresAt = new Date(now.getTime() + cappedDurationMs);
+        }
+
+        // H-08 FIX: Always use FOR UPDATE SKIP LOCKED — the findMany fallback
+        // had no row locking, allowing double-claims under concurrent requests.
+        const claimedRows = await tx.$queryRaw<Array<{ id: string }>>`
               SELECT id
               FROM "TruckRequest"
               WHERE "orderId" = ${orderId}
@@ -760,18 +811,7 @@ class TruckHoldService {
               ORDER BY "requestNumber" ASC, "createdAt" ASC
               FOR UPDATE SKIP LOCKED
               LIMIT ${quantity}
-            `
-          : await tx.truckRequest.findMany({
-            where: {
-              orderId,
-              vehicleType: { equals: vehicleType, mode: 'insensitive' },
-              vehicleSubtype: { equals: vehicleSubtype, mode: 'insensitive' },
-              status: TruckRequestStatus.searching
-            },
-            orderBy: [{ requestNumber: 'asc' }, { createdAt: 'asc' }],
-            take: quantity,
-            select: { id: true }
-          });
+            `;
 
         const selectedIds = claimedRows.map((row) => row.id);
         if (selectedIds.length < quantity) {
@@ -1435,6 +1475,8 @@ class TruckHoldService {
           });
         }
 
+        // F-L12: Increment inside interactive TX is safe — Prisma holds row lock for TX duration.
+        // CAS is unnecessary here. See WEELO-FINAL-INDEX.md F-L12.
         const updatedOrder = await tx.order.update({
           where: { id: hold.orderId },
           data: { trucksFilled: { increment: txAssignments.length } },

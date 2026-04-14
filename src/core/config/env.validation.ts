@@ -429,14 +429,14 @@ const ENV_VARS: EnvVar[] = [
   {
     name: 'FF_DIRECTIONS_API_SCORING_ENABLED',
     required: false,
-    default: 'false',
+    default: 'true',
     validator: (v) => ['true', 'false'].includes(v),
     description: 'Enable Google Directions API for candidate scoring'
   },
   {
     name: 'FF_HOLD_DB_ATOMIC_CLAIM',
     required: false,
-    default: 'false',
+    default: 'true',
     validator: (v) => ['true', 'false'].includes(v),
     description: 'Enable DB-level atomic hold claim'
   },

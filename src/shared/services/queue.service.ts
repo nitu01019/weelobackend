@@ -20,6 +20,7 @@
  * =============================================================================
  */
 
+import * as crypto from 'crypto';
 import { logger } from './logger.service';
 import { EventEmitter } from 'events';
 import { redisService } from './redis.service';
@@ -59,17 +60,17 @@ export interface TrackingEventPayload {
   source: 'gps' | 'batch_sync' | 'system';
 }
 
-const TRACKING_QUEUE_HARD_LIMIT = Math.max(1000, parseInt(process.env.TRACKING_QUEUE_HARD_LIMIT || '200000', 10) || 200000);
+export const TRACKING_QUEUE_HARD_LIMIT = Math.max(1000, parseInt(process.env.TRACKING_QUEUE_HARD_LIMIT || '200000', 10) || 200000);
 
 // M-6 FIX: Configurable DLQ cap (was hardcoded 1000, now defaults to 5000)
 // Higher cap preserves more failed jobs for post-mortem debugging.
-const DLQ_MAX_SIZE = Math.max(100, parseInt(process.env.DLQ_MAX_SIZE || '5000', 10) || 5000);
-const TRACKING_QUEUE_DEPTH_SAMPLE_MS = Math.max(100, parseInt(process.env.TRACKING_QUEUE_DEPTH_SAMPLE_MS || '500', 10) || 500);
-const FF_CANCELLED_ORDER_QUEUE_GUARD = process.env.FF_CANCELLED_ORDER_QUEUE_GUARD !== 'false';
+export const DLQ_MAX_SIZE = Math.max(100, parseInt(process.env.DLQ_MAX_SIZE || '5000', 10) || 5000);
+export const TRACKING_QUEUE_DEPTH_SAMPLE_MS = Math.max(100, parseInt(process.env.TRACKING_QUEUE_DEPTH_SAMPLE_MS || '500', 10) || 500);
+export const FF_CANCELLED_ORDER_QUEUE_GUARD = process.env.FF_CANCELLED_ORDER_QUEUE_GUARD !== 'false';
 // FAIL-CLOSED by default: if guard lookup is ambiguous, we prefer dropping stale
 // broadcast emissions to preserve cancellation correctness under race conditions.
-const FF_CANCELLED_ORDER_QUEUE_GUARD_FAIL_OPEN = process.env.FF_CANCELLED_ORDER_QUEUE_GUARD_FAIL_OPEN === 'true';
-const CANCELLED_ORDER_QUEUE_GUARD_CACHE_TTL_MS = Math.max(
+export const FF_CANCELLED_ORDER_QUEUE_GUARD_FAIL_OPEN = process.env.FF_CANCELLED_ORDER_QUEUE_GUARD_FAIL_OPEN === 'true';
+export const CANCELLED_ORDER_QUEUE_GUARD_CACHE_TTL_MS = Math.max(
   250,
   parseInt(process.env.CANCELLED_ORDER_QUEUE_GUARD_CACHE_TTL_MS || '1500', 10) || 1500
 );
@@ -79,22 +80,22 @@ const CANCELLED_ORDER_QUEUE_GUARD_CACHE_TTL_MS = Math.max(
 // =============================================================================
 
 /** Sequence-numbered delivery + unacked queue + replay on reconnect */
-const FF_SEQUENCE_DELIVERY_ENABLED = process.env.FF_SEQUENCE_DELIVERY_ENABLED === 'true';
+export const FF_SEQUENCE_DELIVERY_ENABLED = process.env.FF_SEQUENCE_DELIVERY_ENABLED === 'true';
 
 /** Parallel Socket.IO + FCM delivery for every broadcast */
-const FF_DUAL_CHANNEL_DELIVERY = process.env.FF_DUAL_CHANNEL_DELIVERY === 'true';
+export const FF_DUAL_CHANNEL_DELIVERY = process.env.FF_DUAL_CHANNEL_DELIVERY === 'true';
 
-/** Message TTL enforcement — drop stale messages before emitting */
-const FF_MESSAGE_TTL_ENABLED = process.env.FF_MESSAGE_TTL_ENABLED === 'true';
+/** Message TTL enforcement — drop stale messages before emitting (H5: default ON) */
+export const FF_MESSAGE_TTL_ENABLED = process.env.FF_MESSAGE_TTL_ENABLED !== 'false';
 
 /** Priority drain order — CRITICAL(1) → HIGH(2) → NORMAL(3) → LOW(4) */
-const FF_MESSAGE_PRIORITY_ENABLED = process.env.FF_MESSAGE_PRIORITY_ENABLED === 'true';
+export const FF_MESSAGE_PRIORITY_ENABLED = process.env.FF_MESSAGE_PRIORITY_ENABLED === 'true';
 
 /** Unacked queue TTL in seconds (10 minutes — covers reconnect window) */
-const UNACKED_QUEUE_TTL_SECONDS = 600;
+export const UNACKED_QUEUE_TTL_SECONDS = 600;
 
 /** Message TTL per event type (milliseconds) */
-const MESSAGE_TTL_MS: Record<string, number> = {
+export const MESSAGE_TTL_MS: Record<string, number> = {
   'new_broadcast': 90_000,          // 90s — order expires at 5 min but show only recent
   'new_truck_request': 90_000,      // 90s — same as new_broadcast
   'accept_confirmation': 60_000,    // 60s — must be instant; stale = confusing
@@ -106,7 +107,7 @@ const MESSAGE_TTL_MS: Record<string, number> = {
 };
 
 /** Default TTL for events not in the map above */
-const DEFAULT_MESSAGE_TTL_MS = 120_000;
+export const DEFAULT_MESSAGE_TTL_MS = 120_000;
 
 /** Priority levels for message ordering */
 export const MessagePriority = {
@@ -117,7 +118,7 @@ export const MessagePriority = {
 } as const;
 
 /** Map event types to priority levels */
-const EVENT_PRIORITY: Record<string, number> = {
+export const EVENT_PRIORITY: Record<string, number> = {
   'order_cancelled': MessagePriority.CRITICAL,
   'order_expired': MessagePriority.CRITICAL,
   'trip_cancelled': MessagePriority.CRITICAL,
@@ -132,7 +133,7 @@ const EVENT_PRIORITY: Record<string, number> = {
 };
 
 /** Phase 5: Queue depth cap for broadcast backpressure */
-const FF_QUEUE_DEPTH_CAP = Math.max(
+export const FF_QUEUE_DEPTH_CAP = Math.max(
   100,
   parseInt(process.env.FF_QUEUE_DEPTH_CAP || '10000', 10) || 10000
 );
@@ -141,7 +142,7 @@ const FF_QUEUE_DEPTH_CAP = Math.max(
 // IN-MEMORY QUEUE (Development / Single Server)
 // =============================================================================
 
-class InMemoryQueue extends EventEmitter {
+export class InMemoryQueue extends EventEmitter {
   private queues: Map<string, QueueJob[]> = new Map();
   private processors: Map<string, JobProcessor> = new Map();
   private processing: Set<string> = new Set();
@@ -171,7 +172,7 @@ class InMemoryQueue extends EventEmitter {
     }
   ): Promise<string> {
     const job: QueueJob<T> = {
-      id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      id: crypto.randomUUID(),
       type,
       data,
       priority: options?.priority ?? 0,
@@ -288,9 +289,10 @@ class InMemoryQueue extends EventEmitter {
     processor: JobProcessor,
     _jobIndex: number
   ): Promise<void> {
+    // FIX-41: Create immutable copy instead of mutating the input job object
+    const updatedJob = { ...job, attempts: job.attempts + 1 };
     try {
-      job.attempts++;
-      await processor(job);
+      await processor(updatedJob);
 
       // Success - remove from queue
       const queue = this.queues.get(queueName);
@@ -299,13 +301,13 @@ class InMemoryQueue extends EventEmitter {
         if (idx !== -1) queue.splice(idx, 1);
       }
 
-      this.emit('job:completed', { queueName, job });
-      logger.debug(`Job ${job.id} completed (${queueName})`);
+      this.emit('job:completed', { queueName, job: updatedJob });
+      logger.debug(`Job ${updatedJob.id} completed (${queueName})`);
 
     } catch (error: any) {
-      job.error = error.message;
+      const failedJob = { ...updatedJob, error: error.message };
 
-      if (job.attempts >= job.maxAttempts) {
+      if (failedJob.attempts >= failedJob.maxAttempts) {
         // Max retries reached - move to dead letter
         const queue = this.queues.get(queueName);
         if (queue) {
@@ -313,18 +315,18 @@ class InMemoryQueue extends EventEmitter {
           if (idx !== -1) queue.splice(idx, 1);
         }
 
-        this.emit('job:failed', { queueName, job, error: error.message });
-        logger.error(`Job ${job.id} failed permanently: ${error.message}`);
+        this.emit('job:failed', { queueName, job: failedJob, error: error.message });
+        logger.error(`Job ${failedJob.id} failed permanently: ${error.message}`);
 
         // Persist to Redis DLQ for observability and potential recovery
         try {
           const dlqKey = `dlq:${queueName}`;
           const dlqEntry = JSON.stringify({
-            jobId: job.id,
-            type: job.type,
-            data: job.data,
+            jobId: failedJob.id,
+            type: failedJob.type,
+            data: failedJob.data,
             error: error.message,
-            attempts: job.attempts,
+            attempts: failedJob.attempts,
             failedAt: new Date().toISOString()
           });
           await redisService.lPush(dlqKey, dlqEntry);
@@ -334,16 +336,22 @@ class InMemoryQueue extends EventEmitter {
           await redisService.expire(dlqKey, 7 * 24 * 60 * 60);
         } catch (dlqErr: any) {
           // DLQ persistence is best-effort — don't break the failure handler
-          logger.warn(`[DLQ] Failed to persist dead letter for ${job.id}: ${dlqErr.message}`);
+          logger.warn(`[DLQ] Failed to persist dead letter for ${failedJob.id}: ${dlqErr.message}`);
         }
       } else {
         // Schedule retry with exponential backoff
-        job.processAfter = Date.now() + Math.pow(2, job.attempts) * 1000;
-        this.emit('job:retry', { queueName, job, attempt: job.attempts });
-        logger.warn(`Job ${job.id} failed, retry ${job.attempts}/${job.maxAttempts}`);
+        const retryJob = { ...failedJob, processAfter: Date.now() + Math.pow(2, failedJob.attempts) * 1000 };
+        // Update the original job in the queue so the retry is picked up
+        const queue = this.queues.get(queueName);
+        if (queue) {
+          const idx = queue.indexOf(job);
+          if (idx !== -1) queue[idx] = retryJob;
+        }
+        this.emit('job:retry', { queueName, job: retryJob, attempt: retryJob.attempts });
+        logger.warn(`Job ${retryJob.id} failed, retry ${retryJob.attempts}/${retryJob.maxAttempts}`);
       }
     } finally {
-      this.processing.delete(job.id);
+      this.processing.delete(updatedJob.id);
     }
   }
 
@@ -398,7 +406,7 @@ class InMemoryQueue extends EventEmitter {
  * - Uses existing redisService
  * - Follows same patterns as cache.service.ts
  */
-class RedisQueue extends EventEmitter {
+export class RedisQueue extends EventEmitter {
   private processors: Map<string, JobProcessor> = new Map();
   private processing: Set<string> = new Set();
   private isRunning: boolean = false;
@@ -414,6 +422,15 @@ class RedisQueue extends EventEmitter {
   private readonly processingPrefix: string = 'processing:';
   private readonly delayedPrefix: string = 'delayed:';
   private delayPollerInterval: ReturnType<typeof setInterval> | null = null;
+
+  // H7 FIX: Priority suffixes in drain order (CRITICAL first, LOW last).
+  // Each priority level gets its own Redis LIST for strict ordering.
+  private static readonly PRIORITY_SUFFIXES: ReadonlyArray<{ priority: number; suffix: string }> = [
+    { priority: MessagePriority.CRITICAL, suffix: ':critical' },
+    { priority: MessagePriority.HIGH,     suffix: ':high' },
+    { priority: MessagePriority.NORMAL,   suffix: ':normal' },
+    { priority: MessagePriority.LOW,      suffix: ':low' },
+  ];
 
   // At-least-once delivery: max age (ms) before a processing job is considered stale
   // and re-enqueued on startup. 5 minutes is generous — most jobs complete in <10s.
@@ -455,6 +472,30 @@ class RedisQueue extends EventEmitter {
   }
 
   /**
+   * H7 FIX: Get Redis key for a specific priority level.
+   * Maps numeric priority (1-4) to named suffix lists:
+   *   1 (CRITICAL) → queue:{name}:critical
+   *   2 (HIGH)     → queue:{name}:high
+   *   3 (NORMAL)   → queue:{name}:normal  (default)
+   *   4 (LOW)      → queue:{name}:low
+   * Unknown priorities default to :normal for backward compatibility.
+   */
+  private getPriorityQueueKey(queueName: string, priority: number): string {
+    const base = this.getQueueKey(queueName);
+    const entry = RedisQueue.PRIORITY_SUFFIXES.find(p => p.priority === priority);
+    return entry ? `${base}${entry.suffix}` : `${base}:normal`;
+  }
+
+  /**
+   * H7 FIX: Get all priority list keys for a queue in drain order.
+   * Used by workers to check higher-priority lists first.
+   */
+  private getAllPriorityKeys(queueName: string): string[] {
+    const base = this.getQueueKey(queueName);
+    return RedisQueue.PRIORITY_SUFFIXES.map(p => `${base}${p.suffix}`);
+  }
+
+  /**
    * Add a job to the queue
    * Uses Redis LPUSH for O(1) insertion
    */
@@ -469,7 +510,7 @@ class RedisQueue extends EventEmitter {
     }
   ): Promise<string> {
     const job: QueueJob<T> = {
-      id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      id: crypto.randomUUID(),
       type,
       data,
       priority: options?.priority ?? 0,
@@ -487,10 +528,13 @@ class RedisQueue extends EventEmitter {
         await redisService.zAdd(delayedKey, job.processAfter, JSON.stringify(job));
         logger.debug(`Redis Queue: Job ${job.id} delayed until ${new Date(job.processAfter).toISOString()} in ${queueName}`);
       } else {
-        // Immediate jobs go to main LIST as before (FIFO with BRPOP)
-        const queueKey = this.getQueueKey(queueName);
-        await redisService.lPush(queueKey, JSON.stringify(job));
-        logger.debug(`Redis Queue: Job ${job.id} added to ${queueName} (type: ${type})`);
+        // H7 FIX: Route to priority-specific list instead of single list.
+        // Cancellation messages (CRITICAL) go to queue:{name}:critical,
+        // normal broadcasts go to queue:{name}:normal, etc.
+        // Workers drain critical first, then high, normal, low.
+        const priorityKey = this.getPriorityQueueKey(queueName, job.priority);
+        await redisService.lPush(priorityKey, JSON.stringify(job));
+        logger.debug(`Redis Queue: Job ${job.id} added to ${queueName} priority=${job.priority} (type: ${type})`);
       }
 
       this.emit('job:added', { queueName, job });
@@ -510,28 +554,42 @@ class RedisQueue extends EventEmitter {
     jobs: { type: string; data: T; priority?: number }[]
   ): Promise<string[]> {
     const ids: string[] = [];
-    const queueKey = this.getQueueKey(queueName);
 
     try {
-      const serializedJobs: string[] = [];
+      // H7 FIX: Group jobs by priority level, then lPushMany to each priority list.
+      // This preserves batch efficiency while routing to correct priority queues.
+      const buckets = new Map<string, string[]>();
+
       for (const jobData of jobs) {
+        const priority = jobData.priority ?? MessagePriority.NORMAL;
         const job: QueueJob<T> = {
-          id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+          id: crypto.randomUUID(),
           type: jobData.type,
           data: jobData.data,
-          priority: jobData.priority ?? 0,
+          priority,
           attempts: 0,
           maxAttempts: 3,
           createdAt: Date.now()
         };
 
         ids.push(job.id);
-        serializedJobs.push(JSON.stringify(job));
+        const key = this.getPriorityQueueKey(queueName, priority);
+        const bucket = buckets.get(key);
+        if (bucket) {
+          bucket.push(JSON.stringify(job));
+        } else {
+          buckets.set(key, [JSON.stringify(job)]);
+        }
       }
 
-      if (serializedJobs.length > 0) {
-        await redisService.lPushMany(queueKey, serializedJobs);
+      // Push each priority bucket in parallel
+      const pushOps: Promise<number>[] = [];
+      for (const [key, serializedJobs] of buckets) {
+        if (serializedJobs.length > 0) {
+          pushOps.push(redisService.lPushMany(key, serializedJobs));
+        }
       }
+      await Promise.all(pushOps);
 
       logger.debug(`Redis Queue: Batch of ${ids.length} jobs added to ${queueName}`);
       return ids;
@@ -590,8 +648,10 @@ class RedisQueue extends EventEmitter {
 
   /**
    * Bug #2: Recover jobs that were being processed when ECS crashed.
-   * Scans the processing:{queueName} hash. If a job's createdAt is older
-   * than STALE_PROCESSING_THRESHOLD_MS, re-enqueue it to the main queue.
+   * Scans the processing:{queueName} hash. If a job's processingStartedAt (or createdAt
+   * as fallback) is older than STALE_PROCESSING_THRESHOLD_MS, re-enqueue it to the main queue.
+   * FIX-16: Uses processingStartedAt for accurate staleness detection instead of createdAt,
+   * which may be much older (e.g., delayed jobs that waited before starting).
    * Industry pattern: Sidekiq's "reliable fetch" + Bull's "stalled job recovery".
    */
   private async recoverStaleProcessingJobs(queueName: string): Promise<void> {
@@ -605,13 +665,16 @@ class RedisQueue extends EventEmitter {
 
     for (const jobId of jobIds) {
       try {
-        const job: QueueJob = JSON.parse(staleJobs[jobId]);
-        const processingAgeMs = now - (job.createdAt || 0);
+        const job: QueueJob & { processingStartedAt?: number } = JSON.parse(staleJobs[jobId]);
+        // FIX-16: Prefer processingStartedAt (set when job starts processing) over createdAt
+        // createdAt reflects when the job was enqueued, not when processing began
+        const processingAgeMs = now - (job.processingStartedAt || job.createdAt || 0);
 
         if (processingAgeMs > this.STALE_PROCESSING_THRESHOLD_MS) {
-          // Stale — re-enqueue to main queue for reprocessing
-          const queueKey = this.getQueueKey(queueName);
-          await redisService.lPush(queueKey, staleJobs[jobId]);
+          // Stale — re-enqueue to correct priority list for reprocessing
+          const priority = (typeof job.priority === 'number') ? job.priority : MessagePriority.NORMAL;
+          const targetKey = this.getPriorityQueueKey(queueName, priority);
+          await redisService.lPush(targetKey, staleJobs[jobId]);
           await redisService.hDel(processingKey, jobId);
           recoveredCount++;
           logger.warn(`[Queue] Recovered stale processing job ${jobId} (${queueName}, age: ${Math.round(processingAgeMs / 1000)}s)`);
@@ -637,15 +700,41 @@ class RedisQueue extends EventEmitter {
   }
 
   private async runWorkerLoop(queueName: string, workerId: number, processor: JobProcessor): Promise<void> {
-    const queueKey = this.getQueueKey(queueName);
     const processingKey = this.getProcessingKey(queueName);
+    // H7 FIX: Get all priority list keys in drain order (critical → high → normal → low)
+    const priorityKeys = this.getAllPriorityKeys(queueName);
+    // Legacy key for backward compat — drains jobs enqueued before H7 fix
+    const legacyKey = this.getQueueKey(queueName);
+    // The lowest-priority key is used for BRPOP blocking to avoid busy-spinning
+    const lowestPriorityKey = priorityKeys[priorityKeys.length - 1];
 
     while (this.isRunning && this.processors.get(queueName) === processor) {
       try {
-        const jobStr = await redisService.brPop(queueKey, this.blockingPopTimeoutSec);
+        // H7 FIX: Priority drain — check higher-priority lists first with non-blocking RPOP.
+        // Only block (BRPOP) on the lowest-priority list when all others are empty.
+        // This ensures cancellation messages are always processed before normal broadcasts.
+        let jobStr: string | null = null;
+
+        // First: drain legacy key (backward compat for pre-H7 jobs)
         if (!jobStr) {
-          // Real BRPOP already waited blockingPopTimeoutSec — no sleep needed
-          continue;
+          jobStr = await redisService.rPop(legacyKey);
+        }
+
+        // Then: try priority lists in order (critical, high, normal) with non-blocking RPOP
+        if (!jobStr) {
+          for (let i = 0; i < priorityKeys.length - 1; i++) {
+            jobStr = await redisService.rPop(priorityKeys[i]);
+            if (jobStr) break;
+          }
+        }
+
+        // If no higher-priority jobs, block on lowest-priority list to avoid busy-spin
+        if (!jobStr) {
+          jobStr = await redisService.brPop(lowestPriorityKey, this.blockingPopTimeoutSec);
+          if (!jobStr) {
+            // BRPOP timed out — loop back and check higher-priority lists again
+            continue;
+          }
         }
 
         const job: QueueJob = JSON.parse(jobStr);
@@ -658,7 +747,9 @@ class RedisQueue extends EventEmitter {
         // Bug #2 fix: Save to processing hash BEFORE processing.
         // If ECS crashes after BRPOP but before completion, this job
         // will be recovered from the processing hash on next startup.
-        await redisService.hSet(processingKey, job.id, jobStr).catch(() => {});
+        // FIX-16: Stamp processingStartedAt so stale job recovery uses accurate timing
+        const processingEntry = JSON.stringify({ ...job, processingStartedAt: Date.now() });
+        await redisService.hSet(processingKey, job.id, processingEntry).catch(() => {});
 
         this.processing.add(job.id);
         this.incrementInFlight(queueName);
@@ -710,41 +801,43 @@ class RedisQueue extends EventEmitter {
     processor: JobProcessor
   ): Promise<void> {
     const processingKey = this.getProcessingKey(queueName);
+    // FIX-41: Create immutable copy instead of mutating the input job object
+    // FIX-16: Stamp processingStartedAt when job begins processing for accurate staleness checks
+    const updatedJob = { ...job, attempts: job.attempts + 1, processingStartedAt: Date.now() };
     try {
-      job.attempts++;
-      await processor(job);
+      await processor(updatedJob);
 
       // Bug #2 fix: Remove from processing hash on success
-      await redisService.hDel(processingKey, job.id).catch(() => {});
+      await redisService.hDel(processingKey, updatedJob.id).catch(() => {});
 
-      this.emit('job:completed', { queueName, job });
-      logger.debug(`Redis Queue: Job ${job.id} completed (${queueName})`);
+      this.emit('job:completed', { queueName, job: updatedJob });
+      logger.debug(`Redis Queue: Job ${updatedJob.id} completed (${queueName})`);
 
     } catch (error: any) {
-      job.error = error.message;
+      const failedJob = { ...updatedJob, error: error.message };
 
       // Bug #2 fix: Remove from processing hash on failure too (will be re-enqueued or DLQ'd)
-      await redisService.hDel(processingKey, job.id).catch(() => {});
+      await redisService.hDel(processingKey, failedJob.id).catch(() => {});
 
-      if (job.attempts >= job.maxAttempts) {
+      if (failedJob.attempts >= failedJob.maxAttempts) {
         // Max retries reached - move to dead letter queue
         const dlqKey = this.getDeadLetterKey(queueName);
-        await redisService.lPush(dlqKey, JSON.stringify(job));
+        await redisService.lPush(dlqKey, JSON.stringify(failedJob));
 
-        this.emit('job:failed', { queueName, job, error: error.message });
-        logger.error(`Redis Queue: Job ${job.id} failed permanently, moved to DLQ`);
+        this.emit('job:failed', { queueName, job: failedJob, error: error.message });
+        logger.error(`Redis Queue: Job ${failedJob.id} failed permanently, moved to DLQ`);
       } else {
         // Bug #3 fix: Re-queue with exponential backoff via Sorted Set (not LPUSH)
         // This prevents the retry from being busy-polled in the main queue.
-        job.processAfter = Date.now() + Math.pow(2, job.attempts) * 1000;
+        const retryJob = { ...failedJob, processAfter: Date.now() + Math.pow(2, failedJob.attempts) * 1000 };
         const delayedKey = this.getDelayedKey(queueName);
-        await redisService.zAdd(delayedKey, job.processAfter, JSON.stringify(job));
+        await redisService.zAdd(delayedKey, retryJob.processAfter!, JSON.stringify(retryJob));
 
-        this.emit('job:retry', { queueName, job, attempt: job.attempts });
-        logger.warn(`Redis Queue: Job ${job.id} failed, retry ${job.attempts}/${job.maxAttempts} at ${new Date(job.processAfter).toISOString()}`);
+        this.emit('job:retry', { queueName, job: retryJob, attempt: retryJob.attempts });
+        logger.warn(`Redis Queue: Job ${retryJob.id} failed, retry ${retryJob.attempts}/${retryJob.maxAttempts} at ${new Date(retryJob.processAfter!).toISOString()}`);
       }
     } finally {
-      this.processing.delete(job.id);
+      this.processing.delete(updatedJob.id);
       this.decrementInFlight(queueName);
     }
   }
@@ -798,10 +891,17 @@ class RedisQueue extends EventEmitter {
           const readyJobs = await redisService.zRangeByScore(delayedKey, 0, now);
           if (readyJobs.length === 0) continue;
 
-          // Move each ready job to the main queue
-          const queueKey = this.getQueueKey(queueName);
+          // H7 FIX: Move each ready job to the correct priority list
           for (const jobStr of readyJobs) {
-            await redisService.lPush(queueKey, jobStr);
+            let priority = MessagePriority.NORMAL;
+            try {
+              const parsed = JSON.parse(jobStr);
+              if (typeof parsed.priority === 'number') {
+                priority = parsed.priority;
+              }
+            } catch { /* default to NORMAL */ }
+            const targetKey = this.getPriorityQueueKey(queueName, priority);
+            await redisService.lPush(targetKey, jobStr);
           }
 
           // Remove moved jobs from the sorted set
@@ -822,6 +922,7 @@ class RedisQueue extends EventEmitter {
 
   /**
    * Get queue stats
+   * H7 FIX: Aggregates depth across all priority lists for each queue.
    */
   async getStats(): Promise<{
     queues: { name: string; pending: number; processing: number }[];
@@ -831,8 +932,7 @@ class RedisQueue extends EventEmitter {
     const queueStats: { name: string; pending: number; processing: number }[] = [];
 
     for (const queueName of this.processors.keys()) {
-      const queueKey = this.getQueueKey(queueName);
-      const pending = await redisService.lLen(queueKey);
+      const pending = await this.getQueueDepth(queueName);
 
       queueStats.push({
         name: queueName,
@@ -848,8 +948,23 @@ class RedisQueue extends EventEmitter {
     };
   }
 
+  /**
+   * H7 FIX: Sum depth across all priority lists for a queue.
+   * Also checks the legacy non-suffixed key for backward compatibility
+   * with any jobs enqueued before the priority fix was deployed.
+   */
   async getQueueDepth(queueName: string): Promise<number> {
-    return redisService.lLen(this.getQueueKey(queueName));
+    const priorityKeys = this.getAllPriorityKeys(queueName);
+    const legacyKey = this.getQueueKey(queueName);
+
+    const depths = await Promise.all([
+      // Legacy key (jobs enqueued before H7 fix)
+      redisService.lLen(legacyKey),
+      // Priority-specific keys
+      ...priorityKeys.map(k => redisService.lLen(k))
+    ]);
+
+    return depths.reduce((sum, d) => sum + d, 0);
   }
 }
 
@@ -871,7 +986,7 @@ interface IQueue {
 // QUEUE SERVICE (Unified Interface - Auto-selects Redis in Production)
 // =============================================================================
 
-class QueueService {
+export class QueueService {
   private queue: IQueue;
   private isRedisMode: boolean = false;
   private readonly trackingStreamSink = createTrackingStreamSink();
@@ -884,6 +999,8 @@ class QueueService {
   private readonly inactiveOrderStatuses = new Set(['cancelled', 'expired', 'completed', 'fully_filled']);
   private readonly orderStatusCacheTtlMs = CANCELLED_ORDER_QUEUE_GUARD_CACHE_TTL_MS;
   private readonly orderStatusCache = new Map<string, { status: string | null; expiresAt: number }>();
+  // FIX-42: Store setTimeout handles for assignment timeouts so they can be cleared on cancel/complete
+  private assignmentTimers = new Map<string, NodeJS.Timeout>();
 
   // Queue names for organization
   static readonly QUEUES = {
@@ -1260,10 +1377,10 @@ class QueueService {
             logger.info(`[FCM_BATCH] Sent to ${tokens.length} drivers: ${successCount} succeeded, ${failureCount} failed`);
 
             // Remove invalid tokens from Redis
-            for (const token of tokens) {
-              const index = batchResponse.responses.findIndex(r => r.success === false);
-              if (index !== -1 && batchResponse.responses[index].error?.code === 'messaging/registration-token-not-registered') {
-                await redisService.del(`fcm_token:${token}`);
+            for (let i = 0; i < tokens.length; i++) {
+              if (batchResponse.responses[i] && !batchResponse.responses[i].success &&
+                  batchResponse.responses[i].error?.code === 'messaging/registration-token-not-registered') {
+                await redisService.del(`fcm_token:${tokens[i]}`);
               }
             }
           }
@@ -1387,7 +1504,6 @@ class QueueService {
         let totalAbandoned = 0;
         let cursor: string | undefined;
 
-        const { liveAvailabilityService }: typeof import('./live-availability.service') = require('./live-availability.service');
         // FIX A4#18: Lazy require to avoid circular dependency
         const { emitToUser, SocketEvent }: typeof import('./socket.service') = require('./socket.service');
 
@@ -1454,16 +1570,15 @@ class QueueService {
                   }
                 });
 
-                // 3. Update Redis availability (hot path sync)
+                // 3. Update Redis + fleet cache via centralized wrapper
                 const vehicleKey = assignment.vehicle?.vehicleKey;
                 const transporterId = assignment.vehicle?.transporterId || assignment.transporterId;
                 if (vehicleKey && transporterId) {
-                  await liveAvailabilityService.onVehicleStatusChange(
-                    transporterId,
-                    vehicleKey,
-                    prevStatus,
-                    'available'
-                  ).catch((err: any) => logger.warn('[RECONCILIATION] Redis update failed', err));
+                  const { onVehicleTransition }: typeof import('./vehicle-lifecycle.service') = require('./vehicle-lifecycle.service');
+                  await onVehicleTransition(
+                    transporterId, assignment.vehicleId, vehicleKey,
+                    prevStatus, 'available', 'queueReconciliation'
+                  ).catch((err: any) => logger.warn('[RECONCILIATION] Vehicle transition failed', err));
                 }
               }
 
@@ -1681,9 +1796,21 @@ class QueueService {
       where: { id: orderId },
       select: { status: true }
     });
-    const normalizedStatus = typeof order?.status === 'string'
+    let normalizedStatus = typeof order?.status === 'string'
       ? order.status.toLowerCase()
       : null;
+
+    // H6 FIX: Booking broadcasts set orderId = booking.id, which won't exist in Order table.
+    // Fall back to Booking table so the cancellation guard covers booking broadcasts too.
+    if (normalizedStatus === null) {
+      const booking = await prismaClient.booking.findUnique({
+        where: { id: orderId },
+        select: { status: true }
+      });
+      normalizedStatus = typeof booking?.status === 'string'
+        ? booking.status.toLowerCase()
+        : null;
+    }
 
     this.orderStatusCache.set(orderId, {
       status: normalizedStatus,
@@ -1893,7 +2020,8 @@ class QueueService {
     } catch (err: any) {
       // Fallback: use in-process setTimeout if Redis is unavailable
       logger.warn(`[TIMER] Redis setTimer failed, falling back to setTimeout: ${err?.message}`);
-      setTimeout(async () => {
+      // FIX-42: Store the setTimeout handle so it can be cleared on cancel/complete
+      const handle = setTimeout(async () => {
         try {
           const { assignmentService }: typeof import('../../modules/assignment/assignment.service') = require('../../modules/assignment/assignment.service');
           await assignmentService.handleAssignmentTimeout(data);
@@ -1903,8 +2031,11 @@ class QueueService {
             assignmentId: data.assignmentId,
             error: timeoutErr?.message
           });
+        } finally {
+          this.assignmentTimers.delete(data.assignmentId);
         }
       }, delayMs);
+      this.assignmentTimers.set(data.assignmentId, handle);
     }
 
     return timerKey;
@@ -1913,6 +2044,7 @@ class QueueService {
   /**
    * Cancel a scheduled assignment timeout (driver accepted or assignment cancelled).
    * FIX Problem 16: Replaces old clearTimeout pattern with Redis cancelTimer.
+   * FIX-42: Also clears the in-memory setTimeout fallback handle if one exists.
    */
   async cancelAssignmentTimeout(assignmentId: string): Promise<void> {
     const timerKey = `timer:assignment-timeout:${assignmentId}`;
@@ -1921,6 +2053,13 @@ class QueueService {
       logger.info(`[TIMER] Assignment timeout cancelled: ${assignmentId}`);
     } catch (err: any) {
       logger.warn(`[TIMER] Failed to cancel assignment timeout: ${assignmentId} - ${err?.message}`);
+    }
+    // FIX-42: Clear in-memory setTimeout fallback handle if it exists
+    const timer = this.assignmentTimers.get(assignmentId);
+    if (timer) {
+      clearTimeout(timer);
+      this.assignmentTimers.delete(assignmentId);
+      logger.debug(`[TIMER] Cleared in-memory setTimeout fallback for: ${assignmentId}`);
     }
   }
 

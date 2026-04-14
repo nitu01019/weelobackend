@@ -22,7 +22,8 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import os from 'os';
 import { metrics, metricsHandler } from '../monitoring/metrics.service';
-import { circuitBreakerRegistry } from '../resilience/circuit-breaker';
+import { circuitBreakerRegistry, databaseCircuitBreaker } from '../resilience/circuit-breaker';
+import { prismaClient } from '../database/prisma.service';
 import { defaultQueue, bookingQueue, trackingQueue, authQueue } from '../resilience/request-queue';
 import { cacheService } from '../services/cache.service';
 import { redisService } from '../services/redis.service';
@@ -134,6 +135,23 @@ router.get('/health/ready', async (_req: Request, res: Response) => {
       }
     } catch {
       checks.redis = false;
+    }
+
+    // Check database connectivity (C-3 fix: was missing entirely)
+    // Wrapped in databaseCircuitBreaker for fail-fast when DB is down (H-27 fix)
+    try {
+      const DB_TIMEOUT_MS = 3000;
+      await databaseCircuitBreaker.execute(() =>
+        Promise.race([
+          prismaClient.$queryRaw`SELECT 1`,
+          new Promise((_resolve, reject) =>
+            setTimeout(() => reject(new Error('DB health ping timeout')), DB_TIMEOUT_MS)
+          ),
+        ])
+      );
+      checks.database = true;
+    } catch {
+      checks.database = false;
     }
 
     // Check circuit breakers
@@ -318,7 +336,7 @@ router.get('/health/websocket', healthAuthCheck, (_req: Request, res: Response) 
         socketId: socket.id,
         userId: socket.data.userId || 'unknown',
         role: socket.data.role || 'unknown',
-        phone: socket.data.phone || 'unknown',
+        phone: socket.data.phone ? '***' + String(socket.data.phone).slice(-4) : 'unknown',
         rooms: [...socket.rooms],
         connected: socket.connected
       });

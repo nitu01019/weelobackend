@@ -173,6 +173,20 @@ export const FLAGS = {
     description: 'Smart retry with exponential backoff for FCM push failures',
   },
 
+  // --- Completion orchestrator (pattern: !== 'false') ---
+  COMPLETION_ORCHESTRATOR: {
+    env: 'FF_COMPLETION_ORCHESTRATOR',
+    category: 'ops' as const,
+    description: 'Trip completion orchestrator for multi-step finalization',
+  },
+
+  // --- Legacy order expiry checker (pattern: !== 'false') ---
+  LEGACY_ORDER_EXPIRY_CHECKER: {
+    env: 'FF_LEGACY_ORDER_EXPIRY_CHECKER',
+    category: 'ops' as const,
+    description: 'Legacy order expiry checker job for stale order cleanup',
+  },
+
   // ==========================================================================
   // RELEASE TOGGLES — OFF by default (enable with FF_xxx=true)
   // These are experimental or new features not yet proven in production.
@@ -214,6 +228,9 @@ export const FLAGS = {
   },
 
   // --- Dual channel delivery (queue.service.ts:81) ---
+  // PRODUCTION: Set FF_DUAL_CHANNEL_DELIVERY=true in .env to enable
+  // dual delivery (Socket.IO + FCM) for critical broadcast events.
+  // Implementation: broadcast.processor.ts lines 237-284.
   DUAL_CHANNEL_DELIVERY: {
     env: 'FF_DUAL_CHANNEL_DELIVERY',
     category: 'release' as const,
@@ -221,9 +238,11 @@ export const FLAGS = {
   },
 
   // --- Message TTL (queue.service.ts:84) ---
+  // H5 fix: Promoted from release -> ops. TTL is a safety feature that prevents
+  // stale messages from being delivered. Default ON; disable with FF_MESSAGE_TTL_ENABLED=false.
   MESSAGE_TTL_ENABLED: {
     env: 'FF_MESSAGE_TTL_ENABLED',
-    category: 'release' as const,
+    category: 'ops' as const,
     description: 'Time-to-live expiry on queued messages',
   },
 
@@ -232,6 +251,27 @@ export const FLAGS = {
     env: 'FF_MESSAGE_PRIORITY_ENABLED',
     category: 'release' as const,
     description: 'Priority-based message ordering in broadcast queue',
+  },
+
+  // --- POD OTP requirement (pattern: === 'true') ---
+  POD_OTP_REQUIRED: {
+    env: 'FF_POD_OTP_REQUIRED',
+    category: 'release' as const,
+    description: 'Require OTP verification for proof-of-delivery confirmation',
+  },
+
+  // --- Masked calling (pattern: === 'true') ---
+  MASKED_CALLING: {
+    env: 'FF_MASKED_CALLING',
+    category: 'release' as const,
+    description: 'Enable masked/anonymous calling between driver and customer',
+  },
+
+  // --- Behavioral scoring (pattern: === 'true') ---
+  BEHAVIORAL_SCORING: {
+    env: 'FF_BEHAVIORAL_SCORING',
+    category: 'release' as const,
+    description: 'Enable behavioral scoring for driver/transporter ranking',
   },
 
   // --- Queue guard fail-open (queue.service.ts:67) ---

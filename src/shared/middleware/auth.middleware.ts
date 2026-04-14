@@ -17,6 +17,9 @@ import jwt from 'jsonwebtoken';
 import { config } from '../../config/environment';
 import { AppError } from '../types/error.types';
 import { logger } from '../services/logger.service';
+import { redisService } from '../services/redis.service';
+import { prismaClient } from '../database/prisma.service';
+import { metrics } from '../monitoring/metrics.service';
 
 /**
  * User roles enum
@@ -39,6 +42,7 @@ declare global {
         role: string;
         phone: string;
         name?: string;
+        jti?: string;
       };
       userId?: string;
       userRole?: string;
@@ -50,7 +54,7 @@ declare global {
 /**
  * Type guard: validates that a JWT payload has the expected shape.
  */
-function isValidJwtPayload(p: unknown): p is { userId: string; role: string; phone?: string } {
+function isValidJwtPayload(p: unknown): p is { userId: string; role: string; phone?: string; jti?: string; deviceId?: string } {
   return (
     typeof p === 'object' &&
     p !== null &&
@@ -61,15 +65,23 @@ function isValidJwtPayload(p: unknown): p is { userId: string; role: string; pho
   );
 }
 
+// F-L5 FIX: Configurable fail policy when Redis is unavailable
+// Set AUTH_REDIS_FAIL_POLICY=closed to reject requests when Redis is down (safer for high-security deployments).
+// Default: 'open' — existing behavior, allows requests through with a warning.
+const AUTH_REDIS_FAIL_POLICY = process.env.AUTH_REDIS_FAIL_POLICY || 'open';
+
+// F-L5: Track consecutive Redis failures for auto-escalation
+let consecutiveRedisFailures = 0;
+
 /**
  * Auth middleware - validates JWT token
  * Must be applied to all protected routes
  */
-export function authMiddleware(
+export async function authMiddleware(
   req: Request,
-  _res: Response,
+  res: Response,
   next: NextFunction
-): void {
+): Promise<void> {
   try {
     // Get token from header
     const authHeader = req.headers.authorization;
@@ -80,24 +92,101 @@ export function authMiddleware(
 
     const token = authHeader.substring(7); // Remove 'Bearer '
 
-    // Verify token
-    const decoded = jwt.verify(token, config.jwt.secret);
+    // Verify token with algorithm restriction to prevent algorithm confusion attacks
+    const decoded = jwt.verify(token, config.jwt.secret, { algorithms: ['HS256'] });
 
     // Runtime validation of JWT payload shape
     if (!isValidJwtPayload(decoded)) {
       throw new AppError(401, 'INVALID_TOKEN', 'Invalid token payload');
     }
 
+    // Check JTI blacklist for token revocation
+    if (decoded.jti) {
+      try {
+        const isBlacklisted = await redisService.exists(`blacklist:${decoded.jti}`);
+        if (isBlacklisted) {
+          return next(new AppError(401, 'TOKEN_REVOKED', 'Token has been revoked'));
+        }
+      } catch (err) {
+        consecutiveRedisFailures++;
+        if (AUTH_REDIS_FAIL_POLICY === 'closed') {
+          logger.error('[AUTH] Redis unavailable, rejecting request (fail-closed policy)', { userId: decoded.userId, path: req.path });
+          return next(new AppError(503, 'SERVICE_UNAVAILABLE', 'Authentication service temporarily unavailable'));
+        }
+        logger.warn('[Auth] JTI blacklist check failed-open', { jti: decoded.jti, userId: decoded.userId, path: req.path });
+        metrics.incrementCounter('auth_redis_failopen_total', { check_type: 'jti_blacklist' });
+        if (consecutiveRedisFailures >= 10) {
+          logger.error('CRITICAL: 10+ consecutive Redis auth failures — check Redis health', { consecutiveRedisFailures });
+        }
+      }
+    }
+
+    // Customer suspension check (Redis user-ID blacklist)
+    try {
+      const isSuspended = await redisService.exists(`customer:suspended:${decoded.userId}`);
+      if (isSuspended) {
+        return next(new AppError(403, 'ACCOUNT_SUSPENDED', 'Your account has been suspended'));
+      }
+    } catch (err) {
+      consecutiveRedisFailures++;
+      if (AUTH_REDIS_FAIL_POLICY === 'closed') {
+        logger.error('[AUTH] Redis unavailable, rejecting request (fail-closed policy)', { userId: decoded.userId, path: req.path });
+        return next(new AppError(503, 'SERVICE_UNAVAILABLE', 'Authentication service temporarily unavailable'));
+      }
+      logger.warn('[Auth] Suspension check failed-open', { userId: decoded.userId, path: req.path });
+      metrics.incrementCounter('auth_redis_failopen_total', { check_type: 'suspension' });
+      if (consecutiveRedisFailures >= 10) {
+        logger.error('CRITICAL: 10+ consecutive Redis auth failures — check Redis health', { consecutiveRedisFailures });
+      }
+    }
+
+    // F-L5: Reset consecutive failure counter on successful Redis path
+    consecutiveRedisFailures = 0;
+
+    // Resolve user name via Redis cache, falling back to DB lookup
+    let userName: string | undefined;
+    try {
+      const cacheKey = `user:profile:${decoded.userId}`;
+      const cached = await redisService.get(cacheKey);
+      if (cached) {
+        userName = cached;
+      } else {
+        const user = await prismaClient.user.findUnique({
+          where: { id: decoded.userId },
+          select: { name: true }
+        });
+        if (user?.name) {
+          userName = user.name;
+          await redisService.set(cacheKey, user.name, 300).catch(() => {});
+        }
+      }
+    } catch (err) {
+      // Non-blocking: if name lookup fails, proceed without it
+      logger.warn('[Auth] User name lookup failed', { userId: decoded.userId, error: (err as Error).message });
+    }
+
     // Attach user to request (both formats for compatibility)
     req.user = {
       userId: decoded.userId,
       role: decoded.role,
-      phone: decoded.phone || ''
+      phone: decoded.phone || '',
+      name: userName,
+      jti: decoded.jti
     };
     // Legacy format for existing controllers
     req.userId = decoded.userId;
     req.userRole = decoded.role;
     req.userPhone = decoded.phone || '';
+
+    // Device binding check: reject if token was issued for a different device.
+    // Only enforced when BOTH the token carries a deviceId AND the request
+    // includes an x-device-id header. This is backwards-compatible with
+    // existing tokens that were issued before device binding was added.
+    const tokenDeviceId = decoded.deviceId;
+    const requestDeviceId = req.headers['x-device-id'];
+    if (tokenDeviceId && requestDeviceId && tokenDeviceId !== requestDeviceId) {
+      return next(new AppError(401, 'DEVICE_MISMATCH', 'Token was issued for a different device'));
+    }
 
     next();
   } catch (error: unknown) {
@@ -161,14 +250,14 @@ export const authenticate = authMiddleware;
  * Optional auth middleware - validates token if present but doesn't require it
  * Useful for endpoints that work differently for authenticated vs anonymous users
  */
-export function optionalAuthMiddleware(
+export async function optionalAuthMiddleware(
   req: Request,
   _res: Response,
   next: NextFunction
-): void {
+): Promise<void> {
   try {
     const authHeader = req.headers.authorization;
-    
+
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       // No token - continue without user
       next();
@@ -176,8 +265,8 @@ export function optionalAuthMiddleware(
     }
 
     const token = authHeader.substring(7);
-    
-    const decoded = jwt.verify(token, config.jwt.secret);
+
+    const decoded = jwt.verify(token, config.jwt.secret, { algorithms: ['HS256'] });
 
     // Runtime validation of JWT payload shape
     if (!isValidJwtPayload(decoded)) {
@@ -185,10 +274,40 @@ export function optionalAuthMiddleware(
       return;
     }
 
+    // Check JTI blacklist for token revocation
+    if (decoded.jti) {
+      try {
+        const isBlacklisted = await redisService.exists(`blacklist:${decoded.jti}`);
+        if (isBlacklisted) {
+          next(); // optional auth — just treat as unauthenticated instead of erroring
+          return;
+        }
+      } catch (redisErr) {
+        // Redis down — for optional auth, treat as unauthenticated
+        logger.warn('optionalAuth Redis blacklist check failed', { path: req.path, error: (redisErr as Error).message });
+        next();
+        return;
+      }
+    }
+
+    // Customer suspension check — treat suspended as unauthenticated
+    try {
+      const isSuspended = await redisService.exists(`customer:suspended:${decoded.userId}`);
+      if (isSuspended) {
+        next(); // suspended user = unauthenticated for optional auth
+        return;
+      }
+    } catch (_err) {
+      // Redis down — for optional auth, treat as unauthenticated
+      next();
+      return;
+    }
+
     req.user = {
       userId: decoded.userId,
       role: decoded.role,
-      phone: decoded.phone || ''
+      phone: decoded.phone || '',
+      jti: decoded.jti
     };
     // Legacy format for existing controllers
     req.userId = decoded.userId;
@@ -196,8 +315,9 @@ export function optionalAuthMiddleware(
     req.userPhone = decoded.phone || '';
 
     next();
-  } catch {
+  } catch (err) {
     // Invalid token - continue without user (don't fail)
+    logger.warn('optionalAuth JTI check failed', { path: req.path, error: (err as Error).message });
     next();
   }
 }

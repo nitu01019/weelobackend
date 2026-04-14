@@ -93,7 +93,7 @@ describe('booking routes legacy proxy -> canonical order flow', () => {
     jest.doMock('../../order/order.service', () => ({
       orderService: {
         createOrder: (...args: any[]) => mockCreateOrder(...args),
-        checkRateLimit: jest.fn(),
+        checkRateLimit: jest.fn().mockResolvedValue({ allowed: true }),
         getCustomerOrders: jest.fn(),
         getOrderById: jest.fn(),
         getOrderWithRequests: jest.fn(),
@@ -101,6 +101,13 @@ describe('booking routes legacy proxy -> canonical order flow', () => {
         getOrderDetails: jest.fn(),
         getActiveTruckRequestsForTransporter: jest.fn(),
         acceptTruckRequest: jest.fn(),
+      }
+    }));
+
+    jest.doMock('../../../shared/services/redis.service', () => ({
+      redisService: {
+        acquireLock: jest.fn().mockResolvedValue({ acquired: true }),
+        releaseLock: jest.fn().mockResolvedValue(undefined),
       }
     }));
   });
@@ -129,7 +136,7 @@ describe('booking routes legacy proxy -> canonical order flow', () => {
     expect(mockCreateOrder).toHaveBeenCalledTimes(1);
     expect(mockCreateBooking).not.toHaveBeenCalled();
     expect(headers['X-Weelo-Legacy-Proxy']).toBe('true');
-    expect(headers['X-Weelo-Canonical-Path']).toBe('/bookings/orders');
+    expect(headers['X-Weelo-Canonical-Path']).toBe('/api/v1/orders');
     expect(res.status).toHaveBeenCalledWith(201);
     expect(res.json).toHaveBeenCalledWith(
       expect.objectContaining({

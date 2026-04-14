@@ -7,6 +7,7 @@
 
 import { prismaClient } from '../database/prisma.service';
 import { liveAvailabilityService } from './live-availability.service';
+import { invalidateVehicleCache } from './fleet-cache-write.service';
 import { logger } from './logger.service';
 
 /**
@@ -81,15 +82,62 @@ export async function releaseVehicle(
     return;
   }
 
-  // Sync Redis availability count
-  if (vehicle.vehicleKey && vehicle.transporterId) {
-    await liveAvailabilityService.onVehicleStatusChange(
-      vehicle.transporterId,
-      vehicle.vehicleKey,
-      vehicle.status, // Actual old status, not hardcoded
-      'available'
-    ).catch(err => logger.warn(`[vehicleLifecycle:${context}] Redis sync failed`, err));
-  }
+  // Sync Redis + fleet cache via centralized wrapper
+  await onVehicleTransition(
+    vehicle.transporterId,
+    vehicleId,
+    vehicle.vehicleKey,
+    vehicle.status,
+    'available',
+    context
+  );
 
   logger.info(`[vehicleLifecycle:${context}] Vehicle ${vehicleId} released: ${vehicle.status} -> available`);
+}
+
+/**
+ * Centralized post-commit hook for vehicle status transitions.
+ *
+ * ALWAYS calls BOTH:
+ *   1. liveAvailabilityService.onVehicleStatusChange() — Redis availability counters
+ *   2. invalidateVehicleCache() — Fleet cache for transporter dashboard
+ *
+ * Uses Promise.allSettled so one failure does not block the other.
+ * Call this AFTER the DB transaction that changed vehicle status has committed.
+ */
+export async function onVehicleTransition(
+  transporterId: string,
+  vehicleId: string,
+  vehicleKey: string | null | undefined,
+  oldStatus: string,
+  newStatus: string,
+  context: string
+): Promise<void> {
+  if (oldStatus === newStatus) return; // No-op if status didn't actually change
+
+  const tag = `[vehicleTransition:${context}]`;
+
+  const results = await Promise.allSettled([
+    vehicleKey
+      ? liveAvailabilityService.onVehicleStatusChange(transporterId, vehicleKey, oldStatus, newStatus)
+      : Promise.resolve(),
+    invalidateVehicleCache(transporterId, vehicleId),
+  ]);
+
+  if (results[0].status === 'rejected') {
+    logger.warn(`${tag} Redis availability sync failed`, {
+      transporterId: transporterId.substring(0, 8),
+      vehicleId: vehicleId.substring(0, 8),
+      transition: `${oldStatus} -> ${newStatus}`,
+      error: results[0].reason instanceof Error ? results[0].reason.message : String(results[0].reason),
+    });
+  }
+  if (results[1].status === 'rejected') {
+    logger.warn(`${tag} Fleet cache invalidation failed`, {
+      transporterId: transporterId.substring(0, 8),
+      vehicleId: vehicleId.substring(0, 8),
+      transition: `${oldStatus} -> ${newStatus}`,
+      error: results[1].reason instanceof Error ? results[1].reason.message : String(results[1].reason),
+    });
+  }
 }

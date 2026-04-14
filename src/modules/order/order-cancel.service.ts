@@ -17,7 +17,6 @@ import { OrderRecord } from '../../shared/database/db';
 import { prismaClient, withDbTimeout, OrderStatus, AssignmentStatus, VehicleStatus, TruckRequestStatus } from '../../shared/database/prisma.service';
 import { logger } from '../../shared/services/logger.service';
 import { redisService } from '../../shared/services/redis.service';
-import { liveAvailabilityService } from '../../shared/services/live-availability.service';
 import { generateVehicleKey } from '../../shared/services/vehicle-key.service';
 import { AppError } from '../../shared/types/error.types';
 import { metrics } from '../../shared/monitoring/metrics.service';
@@ -194,6 +193,16 @@ export async function cancelOrder(
     if (replay) return replay;
   }
 
+  // F-H2 FIX: Distributed lock prevents concurrent cancellation race conditions
+  const lockKey = `lock:order-cancel:${orderId}`;
+  const lockHolder = `cancel:${process.pid}:${Date.now()}`;
+  const lock = await redisService.acquireLock(lockKey, lockHolder, 15);
+  if (!lock.acquired) {
+    throw new AppError(409, 'CANCEL_IN_PROGRESS', 'Order cancellation is already in progress');
+  }
+
+  try {
+
   let lifecycleOutboxId: string | null = null;
   let lifecyclePayload: OrderCancelledOutboxPayload | null = null;
   let closedHoldsCount = 0;
@@ -205,7 +214,7 @@ export async function cancelOrder(
   };
   let statusCode = 400;
   // Live availability: capture vehicle data from inside transaction for post-commit hook
-  let releasedVehicleData: Array<{ transporterId: string; vehicleType: string; vehicleSubtype: string; previousStatus: string }> = [];
+  let releasedVehicleData: Array<{ transporterId: string; vehicleId: string; vehicleType: string; vehicleSubtype: string; previousStatus: string }> = [];
 
   const cancellableOrderStatuses: OrderStatus[] = [
     OrderStatus.created,
@@ -478,6 +487,7 @@ export async function cancelOrder(
         .filter(a => a.vehicleId && a.transporterId)
         .map(a => ({
           transporterId: a.transporterId,
+          vehicleId: a.vehicleId!,
           vehicleType: a.vehicleType || '',
           vehicleSubtype: a.vehicleSubtype || '',
           previousStatus: vehicleStatusMap.get(a.vehicleId!) || 'in_transit'
@@ -602,6 +612,9 @@ export async function cancelOrder(
         })),
       reason: effectiveReason,
       reasonCode: stageEvaluation.reasonCode,
+      cancelledBy: 'customer',
+      refundStatus: stageEvaluation.settlementState || 'none',
+      assignmentIds: assignmentRows.map((a) => a.id),
       cancelledAt,
       eventId,
       eventVersion: FF_CANCEL_EVENT_VERSION_ENFORCED ? eventVersion : 1,
@@ -642,18 +655,15 @@ export async function cancelOrder(
     await registerCancelRebookChurn(customerId);
     await truckHoldService.clearHoldCacheEntries(closedHoldIds);
 
-    // Live availability: vehicles released back to available AFTER transaction committed
+    // Live availability + fleet cache: vehicles released back to available AFTER transaction committed
     // A4#8: Use actual previous status instead of hardcoded 'in_transit'
+    const { onVehicleTransition } = require('../../shared/services/vehicle-lifecycle.service');
     for (const rv of releasedVehicleData) {
       const vKey = generateVehicleKey(rv.vehicleType, rv.vehicleSubtype);
-      liveAvailabilityService.onVehicleStatusChange(
-        rv.transporterId, vKey, rv.previousStatus, 'available'
-      ).catch((err: any) => logger.warn('[ORDER] Redis availability sync failed', { error: err?.message }));
-    }
-
-    // Manual cache invalidation — $use middleware doesn't fire inside $transaction (M4)
-    for (const rv of releasedVehicleData) {
-      redisService.del(`cache:vehicles:transporter:${rv.transporterId}`).catch(() => {});
+      onVehicleTransition(
+        rv.transporterId, rv.vehicleId, vKey,
+        rv.previousStatus, 'available', 'orderCancel'
+      ).catch((err: any) => logger.warn('[ORDER] Vehicle transition sync failed', { error: err?.message }));
     }
 
     metrics.incrementCounter('holds_released_on_cancel_total', {
@@ -688,4 +698,9 @@ export async function cancelOrder(
   }
 
   return result;
+
+  } finally {
+    // F-H2: Always release the distributed lock
+    await redisService.releaseLock(lockKey, lockHolder).catch(() => {});
+  }
 }

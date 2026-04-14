@@ -21,10 +21,44 @@ import {
 const router = Router();
 
 /**
+ * @route   GET /profile/status
+ * @desc    Get current user's account status and profile completeness
+ * @access  All authenticated users
+ */
+router.get(
+  '/status',
+  authMiddleware,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const user = await profileService.getProfile(req.user!.userId);
+
+      const missingFields: string[] = [];
+      if (!user.name) missingFields.push('name');
+      if (!user.phone) missingFields.push('phone');
+      if (!user.email) missingFields.push('email');
+
+      const accountStatus = user.isActive ? 'active' : 'inactive';
+
+      res.json({
+        success: true,
+        data: {
+          accountStatus,
+          isComplete: missingFields.length === 0,
+          missingFields,
+          role: user.role
+        }
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
  * @route   GET /profile
  * @desc    Get current user's profile
  * @access  All authenticated users
- * 
+ *
  * SCALABILITY: Cache-Control header allows client-side caching
  * - Reduces backend load by 50-90%
  * - Instagram-style: stable URLs cached on device
@@ -43,7 +77,7 @@ router.get(
       
       res.json({
         success: true,
-        data: { user }
+        data: { profile: user, user }
       });
     } catch (error) {
       next(error);
@@ -72,7 +106,7 @@ router.put(
       
       res.json({
         success: true,
-        data: { profile }
+        data: { profile, user: profile }
       });
     } catch (error) {
       next(error);
@@ -101,7 +135,7 @@ router.put(
       
       res.json({
         success: true,
-        data: { user }
+        data: { profile: user, user }
       });
     } catch (error) {
       next(error);
@@ -130,7 +164,7 @@ router.put(
       
       res.json({
         success: true,
-        data: { user }
+        data: { profile: user, user }
       });
     } catch (error) {
       next(error);

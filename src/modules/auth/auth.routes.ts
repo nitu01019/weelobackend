@@ -15,7 +15,7 @@
 
 import { Router } from 'express';
 import { authController } from './auth.controller';
-import { otpRateLimiter, authRateLimiter } from '../../shared/middleware/rate-limiter.middleware';
+import { otpRateLimiter, authRateLimiter, verifyOtpRateLimiter } from '../../shared/middleware/rate-limiter.middleware';
 import { authenticate } from '../../shared/middleware/auth.middleware';
 // Note: authService and config imports removed - debug endpoint was removed for security
 
@@ -26,21 +26,21 @@ const router = Router();
  * @desc    Send OTP to phone number
  * @access  Public (rate limited)
  */
-router.post('/send-otp', otpRateLimiter, authController.sendOtp);
+router.post('/send-otp', authRateLimiter, otpRateLimiter, authController.sendOtp);
 
 /**
  * @route   POST /api/v1/auth/verify-otp
  * @desc    Verify OTP and return tokens
  * @access  Public (rate limited)
  */
-router.post('/verify-otp', authRateLimiter, authController.verifyOtp);
+router.post('/verify-otp', authRateLimiter, verifyOtpRateLimiter, authController.verifyOtp);
 
 /**
  * @route   POST /api/v1/auth/refresh
  * @desc    Refresh access token using refresh token
  * @access  Public
  */
-router.post('/refresh', authController.refreshToken);
+router.post('/refresh', authRateLimiter, authController.refreshToken);
 
 /**
  * @route   POST /api/v1/auth/logout

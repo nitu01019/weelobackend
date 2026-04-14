@@ -45,6 +45,8 @@ interface GetActiveBroadcastsParams {
   actorId: string;
   vehicleType?: string;
   maxDistance?: number;
+  limit?: number;      // F-M6 FIX: Pagination support (0 = all, backward compat)
+  offset?: number;     // F-M6 FIX: Pagination offset
 }
 
 interface AcceptBroadcastParams {
@@ -336,11 +338,20 @@ class BroadcastService {
 
     logger.info(`Found ${activeBroadcasts.length} active broadcasts for transporter ${transporterId}`);
 
-    // ============== FIX 4: Store in Redis cache (5s TTL) ==============
+    // ============== FIX 4: Store in Redis cache (2s TTL) ==============
+    // M-15 FIX: Reduced from 5s to 2s — shorter TTL ensures truck counts
+    // are closer to real-time after accepts, while still protecting DB from polling storms.
     try {
-      await redisService.set(cacheKey, JSON.stringify(activeBroadcasts), 5);
+      await redisService.set(cacheKey, JSON.stringify(activeBroadcasts), 2);
     } catch {
       // Non-critical — next request will just re-query DB
+    }
+
+    // F-M6 FIX: Apply pagination if limit > 0 (0 = return all for backward compat)
+    const paginationLimit = params.limit || 0;
+    const paginationOffset = params.offset || 0;
+    if (paginationLimit > 0) {
+      return activeBroadcasts.slice(paginationOffset, paginationOffset + paginationLimit);
     }
 
     return activeBroadcasts;
@@ -374,6 +385,8 @@ class BroadcastService {
    * - Idempotent - safe to retry
    * - Transaction-safe with database
   */
+  // DEAD CODE — replaced by broadcast-accept.service.ts which has 7 safety mechanisms.
+  // See WEELO-FINAL-INDEX.md F-C1. DO NOT DELETE — kept for reference.
   async acceptBroadcast(broadcastId: string, params: AcceptBroadcastParams): Promise<AcceptBroadcastResult> {
     const { driverId, vehicleId, idempotencyKey, actorUserId, actorRole, metadata } = params;
     const lockKey = `broadcast-accept:${broadcastId}`;
@@ -729,6 +742,8 @@ class BroadcastService {
         // Pattern matches order.service.ts:4162 (proven fix)
         if (driver?.transporterId) {
           redisService.del(`cache:vehicles:transporter:${driver.transporterId}`).catch(() => {});
+          // M-15 FIX: Invalidate broadcast list cache so next poll reflects the new truck count.
+          redisService.del(`cache:broadcasts:${driver.transporterId}`).catch(() => {});
         }
 
         logger.info('[BroadcastAccept] Success', {
@@ -743,7 +758,7 @@ class BroadcastService {
         });
 
         const driverNotification = {
-          type: 'trip_assignment',
+          type: 'trip_assigned',
           assignmentId: result.assignmentId,
           tripId: result.tripId,
           bookingId: broadcastId,
@@ -753,6 +768,8 @@ class BroadcastService {
           farePerTruck: booking.pricePerTruck,
           distanceKm: booking.distanceKm,
           customerName: booking.customerName,
+          // F-L8: INTENTIONAL — B2B trucking requires driver to contact customer directly.
+          // Phone exposure is a business requirement, not a bug. See WEELO-FINAL-INDEX.md F-L8.
           customerPhone: booking.customerPhone,
           assignedAt: now,
           message: `New trip assigned! ${pickup.address || 'Pickup'} → ${drop.address || 'Drop'}`
@@ -760,11 +777,14 @@ class BroadcastService {
 
         emitToUser(driverId, SocketEvent.TRIP_ASSIGNED, driverNotification);
 
+        // F-H7/M8 NOTE: This sendPushNotification call would be replaced with
+        // queueService.queuePushNotification for retry + DLQ, but acceptBroadcast
+        // is dead code (replaced by broadcast-accept.service.ts — see F-C1).
         sendPushNotification(driverId, {
           title: '🚛 New Trip Assigned!',
           body: `${pickup.city || pickup.address || 'Pickup'} → ${drop.city || drop.address || 'Drop'}`,
           data: {
-            type: 'trip_assignment',
+            type: 'trip_assigned',
             tripId: result.tripId,
             assignmentId: result.assignmentId,
             bookingId: broadcastId
@@ -807,6 +827,9 @@ class BroadcastService {
           trucksNeeded: booking.trucksNeeded
         });
 
+        // F-H7/M8 NOTE: This sendPushNotification call would be replaced with
+        // queueService.queuePushNotification for retry + DLQ, but acceptBroadcast
+        // is dead code (replaced by broadcast-accept.service.ts — see F-C1).
         sendPushNotification(booking.customerId, {
           title: `🚛 Truck ${result.trucksConfirmed}/${booking.trucksNeeded} Confirmed!`,
           body: `${vehicle?.vehicleNumber || 'Vehicle'} (${driver?.name || 'Driver'}) assigned to your booking`,
@@ -920,6 +943,27 @@ class BroadcastService {
       const dbMsg = dbErr instanceof Error ? dbErr.message : String(dbErr);
       logger.warn('[Broadcast] Decline durable persist failed', { broadcastId, transporterId: actorId, error: dbMsg });
     }
+
+    // H-37 FIX: Fire-and-forget DB persistence for broadcast declines.
+    // Redis is volatile; DB is the source of truth. The BroadcastDecline table
+    // may not exist yet (requires direct SQL migration). The try/catch ensures
+    // this is completely non-blocking and non-fatal.
+    prismaClient.$queryRawUnsafe(
+      `INSERT INTO "BroadcastDecline" (id, "broadcastId", "transporterId", reason, "declinedAt")
+       VALUES (gen_random_uuid(), $1, $2, $3, NOW())
+       ON CONFLICT ("broadcastId", "transporterId") DO NOTHING`,
+      broadcastId,
+      actorId,
+      reason || null
+    ).catch((persistErr: unknown) => {
+      const persistMsg = persistErr instanceof Error ? persistErr.message : String(persistErr);
+      // Silently handle missing table or other DB errors — Redis has the data
+      logger.warn('[Broadcast] Decline DB persist failed (non-fatal)', {
+        broadcastId,
+        transporterId: actorId,
+        error: persistMsg
+      });
+    });
 
     logger.info(`Broadcast ${broadcastId} declined by ${actorId}. Reason: ${reason}`, {
       notes,

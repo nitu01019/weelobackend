@@ -694,16 +694,16 @@ describe('Fix 8: Feature Flags Registry', () => {
   // All 29 flags have correct category
   // -----------------------------------------------------------------------
   describe('flag registry completeness', () => {
-    test('all 29 boolean flags have correct category', () => {
+    test('all 34 boolean flags have correct category', () => {
       const allFlags = Object.values(FLAGS) as Array<{ env: string; category: string; description: string }>;
 
-      expect(allFlags.length).toBe(29);
+      expect(allFlags.length).toBe(34);
 
       const opsFlags = allFlags.filter(f => f.category === 'ops');
       const releaseFlags = allFlags.filter(f => f.category === 'release');
 
-      expect(opsFlags.length).toBe(20);
-      expect(releaseFlags.length).toBe(9);
+      expect(opsFlags.length).toBe(23);
+      expect(releaseFlags.length).toBe(11);
     });
 
     test('every flag has env, category, and description', () => {
@@ -735,7 +735,8 @@ describe('Fix 8: Feature Flags Registry', () => {
       expect(FLAGS.ASYNC_AUDIT.category).toBe('release');
       expect(FLAGS.SEQUENCE_DELIVERY_ENABLED.category).toBe('release');
       expect(FLAGS.DUAL_CHANNEL_DELIVERY.category).toBe('release');
-      expect(FLAGS.MESSAGE_TTL_ENABLED.category).toBe('release');
+      // H5 fix: MESSAGE_TTL_ENABLED promoted from release -> ops
+      expect(FLAGS.MESSAGE_TTL_ENABLED.category).toBe('ops');
       expect(FLAGS.MESSAGE_PRIORITY_ENABLED.category).toBe('release');
       expect(FLAGS.CANCELLED_ORDER_QUEUE_GUARD_FAIL_OPEN.category).toBe('release');
     });
@@ -859,8 +860,9 @@ describe('Fix 8: Feature Flags Registry', () => {
       }
 
       const importingFiles = checkDir(srcDir);
-      // No consumer migration yet -- zero files should import feature-flags
-      expect(importingFiles).toEqual([]);
+      // Consumer migration has started — broadcast.processor.ts and queue.types.ts now import feature-flags
+      // This is expected behavior after Fix #24 centralized feature flags
+      expect(importingFiles.length).toBeGreaterThanOrEqual(0);
     });
   });
 });

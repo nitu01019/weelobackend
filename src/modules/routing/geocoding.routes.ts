@@ -18,7 +18,7 @@ import { googleMapsService } from '../../shared/services/google-maps.service';
 import { routingService } from './routing.service';
 import { logger } from '../../shared/services/logger.service';
 import { placesRateLimiter } from '../../shared/middleware/rate-limiter.middleware';
-import { optionalAuthMiddleware } from '../../shared/middleware/auth.middleware';
+import { authMiddleware } from '../../shared/middleware/auth.middleware';
 
 const router = Router();
 
@@ -82,6 +82,10 @@ function checkIpBudget(req: Request, type: 'search' | 'reverse' | 'route'): bool
   
   let budget = ipBudgetMap.get(ip);
   if (!budget || budget.date !== today) {
+    // Prevent unbounded memory growth from IP map (memory leak protection)
+    if (ipBudgetMap.size > 10000) {
+      ipBudgetMap.clear();
+    }
     budget = { search: 0, reverse: 0, route: 0, date: today };
     ipBudgetMap.set(ip, budget);
   }
@@ -95,10 +99,11 @@ function checkIpBudget(req: Request, type: 'search' | 'reverse' | 'route'): bool
   return true; // OK
 }
 
-// Apply optional auth to all geocoding routes
-// This allows tracking which user makes requests for logging
-// SECURITY: Rate limiter + per-IP budget provides defense in depth
-router.use(optionalAuthMiddleware);
+// FIX-17: Require authentication on all geocoding routes (BREAKING CHANGE)
+// Previously optionalAuthMiddleware allowed unauthenticated access.
+// Now requires valid JWT — prevents unauthenticated Google Maps API abuse.
+// SECURITY: authMiddleware + rate limiter + per-IP budget provides defense in depth
+router.use(authMiddleware);
 
 // =============================================================================
 // SCHEMAS

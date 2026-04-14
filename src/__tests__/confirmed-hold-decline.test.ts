@@ -104,6 +104,14 @@ jest.mock('../shared/database/prisma.service', () => ({
       findMany: (...args: any[]) => mockTruckHoldLedgerFindMany(...args),
     },
     $executeRaw: (...args: any[]) => mockExecuteRaw(...args),
+    $transaction: (fn: any) => fn({
+      assignment: {
+        updateMany: (...args: any[]) => mockAssignmentUpdateMany(...args),
+        findUnique: (...args: any[]) => mockAssignmentFindUnique(...args),
+        findUniqueOrThrow: (...args: any[]) => mockAssignmentFindUniqueOrThrow(...args),
+      },
+      $executeRaw: (...args: any[]) => mockExecuteRaw(...args),
+    }),
   },
   HoldPhase: {
     FLEX: 'FLEX',
@@ -145,6 +153,19 @@ jest.mock('../modules/hold-expiry/hold-expiry-cleanup.service', () => ({
 const mockReleaseVehicle = jest.fn();
 jest.mock('../shared/services/vehicle-lifecycle.service', () => ({
   releaseVehicle: (...args: any[]) => mockReleaseVehicle(...args),
+}));
+
+// Auto-redispatch service mock (H9 FIX: wired into handleDriverDecline)
+const mockTryAutoRedispatch = jest.fn().mockResolvedValue(undefined);
+jest.mock('../modules/assignment/auto-redispatch.service', () => ({
+  tryAutoRedispatch: (...args: any[]) => mockTryAutoRedispatch(...args),
+}));
+
+// Smart timeout service mock (M10 FIX: wired into handleDriverAcceptance)
+jest.mock('../modules/order-timeout/smart-timeout.service', () => ({
+  smartTimeoutService: {
+    extendTimeout: jest.fn().mockResolvedValue(undefined),
+  },
 }));
 
 // Post-accept effects mock
@@ -197,6 +218,8 @@ function resetAllMocks(): void {
   mockExecuteRaw.mockReset();
   mockEmitToUser.mockReset();
   mockReleaseVehicle.mockReset();
+  mockTryAutoRedispatch.mockReset();
+  mockTryAutoRedispatch.mockResolvedValue(undefined);
 }
 
 /** Build a standard assignment record for decline tests. */
@@ -325,7 +348,7 @@ describe('FIX #41 — Driver decline in Phase 2 sets truckRequest to held', () =
   it('TEST 1: truckRequest status is "held" (NOT "searching") after decline', async () => {
     setupDeclineHappyPath();
 
-    await confirmedHoldService.handleDriverDecline('assign-001');
+    await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
 
     // truckRequest.update was called
     expect(mockTruckRequestUpdate).toHaveBeenCalledTimes(1);
@@ -339,7 +362,7 @@ describe('FIX #41 — Driver decline in Phase 2 sets truckRequest to held', () =
   it('TEST 2: assignedDriverId and assignedVehicleId cleared on decline', async () => {
     setupDeclineHappyPath();
 
-    await confirmedHoldService.handleDriverDecline('assign-001');
+    await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
 
     expect(mockTruckRequestUpdate).toHaveBeenCalledTimes(1);
     const updateData = mockTruckRequestUpdate.mock.calls[0][0].data;
@@ -351,7 +374,7 @@ describe('FIX #41 — Driver decline in Phase 2 sets truckRequest to held', () =
   it('TEST 3: heldById is set to transporter on decline (QA-4 fix: restores exclusivity)', async () => {
     setupDeclineHappyPath();
 
-    await confirmedHoldService.handleDriverDecline('assign-001');
+    await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
 
     expect(mockTruckRequestUpdate).toHaveBeenCalledTimes(1);
     const updateData = mockTruckRequestUpdate.mock.calls[0][0].data;
@@ -362,6 +385,13 @@ describe('FIX #41 — Driver decline in Phase 2 sets truckRequest to held', () =
 
   it('TEST 4: handleDriverTimeout delegates to handleDriverDecline (same behavior)', async () => {
     setupDeclineHappyPath();
+    // handleDriverTimeout calls findUnique for driverId, then handleDriverDecline calls it
+    // inside $transaction for orderId, then again for FK traversal — 3 calls total.
+    mockAssignmentFindUnique
+      .mockReset()
+      .mockResolvedValueOnce({ driverId: 'driver-001' })                           // timeout: lookup driverId
+      .mockResolvedValueOnce({ orderId: 'order-001' })                             // decline TX: lookup orderId
+      .mockResolvedValueOnce({ truckRequestId: 'tr-001', orderId: 'order-001' }); // decline: FK traversal
 
     const result = await confirmedHoldService.handleDriverTimeout('assign-001');
 
@@ -388,10 +418,11 @@ describe('FIX #41 — Driver decline in Phase 2 sets truckRequest to held', () =
       orderId: assignment.orderId,
     });
 
-    await confirmedHoldService.handleDriverDecline('assign-001');
+    await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
 
-    // Step 1: assignment.findUnique called with assignmentId
-    expect(mockAssignmentFindUnique).toHaveBeenCalledTimes(1);
+    // assignment.findUnique called twice: once inside TX for orderId, once for FK traversal
+    expect(mockAssignmentFindUnique).toHaveBeenCalledTimes(2);
+    // The FK traversal call (2nd) uses the select for truckRequestId/orderId
     expect(mockAssignmentFindUnique).toHaveBeenCalledWith({
       where: { id: 'assign-001' },
       select: { truckRequestId: true, orderId: true },
@@ -437,7 +468,7 @@ describe('FIX #41 — Driver decline in Phase 2 sets truckRequest to held', () =
     mockRedisExpire.mockResolvedValue(true);
     mockEmitToUser.mockResolvedValue(undefined);
 
-    const result = await confirmedHoldService.handleDriverDecline('assign-001');
+    const result = await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
 
     expect(result.success).toBe(true);
     expect(result.declined).toBe(true);
@@ -567,7 +598,7 @@ describe('FIX #36 — trucksDeclined increments atomically via hIncrBy', () => {
   it('TEST 11: trucksDeclined incremented via hIncrBy(+1) on decline', async () => {
     setupDeclineHappyPath();
 
-    await confirmedHoldService.handleDriverDecline('assign-001');
+    await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
 
     // Find the hIncrBy call for trucksDeclined
     const declinedCall = mockRedisHIncrBy.mock.calls.find(
@@ -582,7 +613,7 @@ describe('FIX #36 — trucksDeclined increments atomically via hIncrBy', () => {
   it('TEST 12: trucksPending decremented via hIncrBy(-1) on decline', async () => {
     setupDeclineHappyPath();
 
-    await confirmedHoldService.handleDriverDecline('assign-001');
+    await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
 
     // Find the hIncrBy call for trucksPending
     const pendingCall = mockRedisHIncrBy.mock.calls.find(
@@ -618,9 +649,13 @@ describe('FIX #36 — trucksDeclined increments atomically via hIncrBy', () => {
       .mockResolvedValueOnce(assignment2);
 
     // FK traversal for both assignments
+    // NOTE: findUnique is called twice per decline (once inside $transaction for orderId,
+    // once outside for resolveAssignmentTruckRequest), so 4 total for concurrent declines.
     mockAssignmentFindUnique
-      .mockResolvedValueOnce({ truckRequestId: 'tr-001', orderId: 'order-001' })
-      .mockResolvedValueOnce({ truckRequestId: 'tr-002', orderId: 'order-001' });
+      .mockResolvedValueOnce({ orderId: 'order-001' })                               // decline 1: inside TX
+      .mockResolvedValueOnce({ truckRequestId: 'tr-001', orderId: 'order-001' })     // decline 1: FK traversal
+      .mockResolvedValueOnce({ orderId: 'order-001' })                               // decline 2: inside TX
+      .mockResolvedValueOnce({ truckRequestId: 'tr-002', orderId: 'order-001' });    // decline 2: FK traversal
 
     mockTruckRequestFindFirst
       .mockResolvedValueOnce({ id: 'tr-001', orderId: 'order-001' })
@@ -648,8 +683,8 @@ describe('FIX #36 — trucksDeclined increments atomically via hIncrBy', () => {
 
     // Fire both declines concurrently
     const [result1, result2] = await Promise.all([
-      confirmedHoldService.handleDriverDecline('assign-001'),
-      confirmedHoldService.handleDriverDecline('assign-002'),
+      confirmedHoldService.handleDriverDecline('assign-001', 'driver-001'),
+      confirmedHoldService.handleDriverDecline('assign-002', 'driver-001'),
     ]);
 
     expect(result1.success).toBe(true);
@@ -682,7 +717,7 @@ describe('FIX #41 — Decline clears all driver/vehicle assignment fields', () =
   it('assignedDriverName and assignedVehicleNumber also cleared on decline', async () => {
     setupDeclineHappyPath();
 
-    await confirmedHoldService.handleDriverDecline('assign-001');
+    await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
 
     expect(mockTruckRequestUpdate).toHaveBeenCalledTimes(1);
     const updateData = mockTruckRequestUpdate.mock.calls[0][0].data;
@@ -705,7 +740,7 @@ describe('FIX #36 — Socket event emitted with correct decline progress', () =>
   it('emits driver_declined event with decline counts to transporter', async () => {
     setupDeclineHappyPath();
 
-    await confirmedHoldService.handleDriverDecline('assign-001');
+    await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
 
     expect(mockEmitToUser).toHaveBeenCalledTimes(1);
     const [userId, event, payload] = mockEmitToUser.mock.calls[0];
@@ -723,7 +758,7 @@ describe('FIX #36 — Socket event emitted with correct decline progress', () =>
   it('decline with reason passes reason in socket payload', async () => {
     setupDeclineHappyPath();
 
-    await confirmedHoldService.handleDriverDecline('assign-001', 'Driver timed out');
+    await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001', 'Driver timed out');
 
     expect(mockEmitToUser).toHaveBeenCalledTimes(1);
     const [, , payload] = mockEmitToUser.mock.calls[0];
@@ -741,7 +776,7 @@ describe('FIX #41 — Vehicle release and trucksFilled decrement on decline', ()
   it('releases vehicle back to available on decline', async () => {
     setupDeclineHappyPath();
 
-    await confirmedHoldService.handleDriverDecline('assign-001');
+    await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
 
     expect(mockReleaseVehicle).toHaveBeenCalledTimes(1);
     expect(mockReleaseVehicle).toHaveBeenCalledWith('vehicle-001', 'confirmedHoldDecline');
@@ -750,7 +785,7 @@ describe('FIX #41 — Vehicle release and trucksFilled decrement on decline', ()
   it('decrements trucksFilled via raw SQL with GREATEST(0,...) floor', async () => {
     setupDeclineHappyPath();
 
-    await confirmedHoldService.handleDriverDecline('assign-001');
+    await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
 
     expect(mockExecuteRaw).toHaveBeenCalledTimes(1);
   });
@@ -759,19 +794,19 @@ describe('FIX #41 — Vehicle release and trucksFilled decrement on decline', ()
     setupDeclineHappyPath();
     mockReleaseVehicle.mockRejectedValue(new Error('Vehicle release failed'));
 
-    const result = await confirmedHoldService.handleDriverDecline('assign-001');
+    const result = await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
 
     expect(result.success).toBe(true);
     expect(result.declined).toBe(true);
   });
 
-  it('trucksFilled decrement failure is non-fatal (decline still succeeds)', async () => {
+  it('trucksFilled decrement failure inside TX causes decline to fail (atomic)', async () => {
+    // F-M14 FIX: decrement is now inside $transaction, so failure rolls back the whole decline.
     setupDeclineHappyPath();
     mockExecuteRaw.mockRejectedValue(new Error('SQL execution failed'));
 
-    const result = await confirmedHoldService.handleDriverDecline('assign-001');
+    const result = await confirmedHoldService.handleDriverDecline('assign-001', 'driver-001');
 
-    expect(result.success).toBe(true);
-    expect(result.declined).toBe(true);
+    expect(result.success).toBe(false);
   });
 });

@@ -27,10 +27,12 @@ import {
   toCreateOrderServiceRequest
 } from './order.contract';
 import { z } from 'zod';
+import { prismaClient } from '../../shared/database/prisma.service';
 // FIX F-1-2: Use canonical schema from booking.schema.ts (single source of truth)
 import { createOrderSchema } from '../booking/booking.schema';
 // FIX F-1-4: Use shared utils instead of inline duplicates
 import { normalizeOrderLifecycleState, normalizeOrderStatus } from '../../shared/utils/order-lifecycle.utils';
+import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
 
 const router = Router();
 
@@ -46,7 +48,7 @@ const ACTIVE_ORDER_STATUSES = new Set(['created', 'broadcasting', 'active', 'par
 const acceptRequestSchema = z.object({
   truckRequestId: z.string().uuid(),
   vehicleId: z.string().uuid(),
-  driverId: z.string().uuid()
+  driverId: z.string().uuid().optional()
 });
 
 // =============================================================================
@@ -93,13 +95,17 @@ router.get(
 /**
  * POST /api/v1/orders
  * Create a new order with multiple vehicle types
- * 
+ *
+ * CANONICAL order creation endpoint. All other order creation routes
+ * (POST /bookings/orders, POST /bookings) are deprecated and should
+ * migrate to this endpoint.
+ *
  * RULES:
  * 1. ONE ACTIVE ORDER PER CUSTOMER - Customer must cancel current order before creating new one
  * 2. RATE LIMITED - Max 5 orders per minute per customer to prevent abuse
  * 3. DISTRIBUTED LOCK - Prevents race conditions from concurrent requests
  * 4. IDEMPOTENCY - Accepts idempotency key from header for safe retries
- * 
+ *
  * Role: customer
  */
 router.post(
@@ -185,6 +191,8 @@ router.post(
 
       logger.debug(`[Orders] Lock acquired for customer ${user.userId}, processing order...`);
 
+      try {
+
       // M-1 FIX: Idempotency key required (Stripe pattern)
       // Configurable: set REQUIRE_IDEMPOTENCY_KEY=false during client migration
       const requireIdempotencyKey = process.env.REQUIRE_IDEMPOTENCY_KEY !== 'false';
@@ -237,8 +245,6 @@ router.post(
         });
         return;
       }
-
-      try {
 
         const data = validationResult.data;
         const normalizedInput = normalizeCreateOrderInput(data);
@@ -308,13 +314,21 @@ router.get(
     try {
       const user = req.user;
 
+      const page = Math.max(1, parseInt(req.query.page as string) || 1);
+      const limit = Math.min(Math.max(1, parseInt(req.query.limit as string) || 20), 100);
+
       const orders = await orderService.getOrdersByCustomer(user.userId);
+
+      const start = (page - 1) * limit;
+      const paginatedOrders = orders.slice(start, start + limit);
 
       res.json({
         success: true,
         data: {
-          orders,
-          total: orders.length
+          orders: paginatedOrders,
+          total: orders.length,
+          page,
+          limit
         }
       });
 
@@ -370,10 +384,53 @@ router.get(
   }
 );
 
+// =============================================================================
+// GET /pending-settlements — customer-facing pending penalty/settlement dues
+// IMPORTANT: Must be registered BEFORE /:id wildcard to avoid being shadowed
+// =============================================================================
+router.get('/pending-settlements',
+  authMiddleware,
+  roleGuard(['customer']),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const user = req.user;
+      const dues = await prismaClient.customerPenaltyDue.findMany({
+        where: {
+          customerId: user.userId,
+          state: 'due'
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 20
+      });
+
+      const totalPending = dues.reduce((sum: number, d: any) => sum + (Number(d.amount) || 0), 0);
+
+      res.json({
+        success: true,
+        data: {
+          totalPending,
+          count: dues.length,
+          items: dues.map((d: any) => ({
+            id: d.id,
+            orderId: d.orderId,
+            amount: Number(d.amount) || 0,
+            state: d.state,
+            nextOrderHint: d.nextOrderHint || 'Will be adjusted on next booking.',
+            createdAt: d.createdAt
+          }))
+        }
+      });
+    } catch (error: any) {
+      logger.error(`Get pending settlements error: ${error.message}`);
+      next(error);
+    }
+  }
+);
+
 /**
  * GET /api/v1/orders/:id
  * Get order details with all truck requests
- * 
+ *
  * Role: customer, transporter
  */
 router.get(
@@ -402,7 +459,7 @@ router.get(
       const isTransporter = Array.isArray(order.truckRequests)
         && order.truckRequests.some((tr: any) => tr.assignedTransporterId === user.userId);
       const isDriver = Array.isArray(order.truckRequests)
-        && order.truckRequests.some((tr: any) => tr.driverId === user.userId);
+        && order.truckRequests.some((tr: any) => tr.assignedDriverId === user.userId);
       if (!isCustomer && !isTransporter && !isDriver) {
         res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Order not found' } });
         return;
@@ -504,7 +561,7 @@ router.post(
     try {
       const { id: orderId } = req.params;
       const user = req.user;
-      const { reason } = req.body;
+      const reason = typeof req.body.reason === 'string' ? req.body.reason.substring(0, 500) : '';
       const idempotencyKey = req.header('X-Idempotency-Key') || req.header('x-idempotency-key') || undefined;
 
       logger.info(`📛 Order cancellation requested: ${orderId} by ${user.phone}`);
@@ -694,11 +751,17 @@ router.post(
         });
       }
 
-      // Update order
-      await db.updateOrder(orderId, {
-        currentRouteIndex: newIndex,
-        stopWaitTimers
+      // Update order (CAS guard: only advance if index hasn't changed)
+      const updated = await prismaClient.order.updateMany({
+        where: { id: orderId, currentRouteIndex: currentIndex },
+        data: { currentRouteIndex: newIndex, stopWaitTimers: stopWaitTimers as any }
       });
+      if (updated.count === 0) {
+        return res.status(409).json({
+          success: false,
+          error: { code: 'CONFLICT', message: 'Stop already reached by another request' }
+        });
+      }
 
       logger.info(`📍 Driver ${driverId} reached stop ${newIndex} of ${totalPoints - 1}`);
       logger.info(`   [${currentPoint?.type}] ${currentPoint?.address}`);
@@ -725,6 +788,12 @@ router.post(
         // Notify customer
         emitToUser(order.customerId, 'order_completed', {
           orderId,
+          completedAt: now
+        });
+        // Backward compat: Customer app listens for 'booking_completed' for rating trigger
+        emitToUser(order.customerId, 'booking_completed', {
+          orderId,
+          bookingId: orderId,
           completedAt: now
         });
 
@@ -1020,7 +1089,7 @@ router.post(
       const { orderId } = req.params;
       const user = req.user;
       const reasonCode = typeof req.body?.reasonCode === 'string' ? req.body.reasonCode : undefined;
-      const notes = typeof req.body?.notes === 'string' ? req.body.notes : undefined;
+      const notes = typeof req.body?.notes === 'string' ? req.body.notes.substring(0, 1000) : undefined;
       const dispute = await orderService.createCancelDispute(orderId, user.userId, reasonCode, notes);
       if (!dispute.success) {
         return res.status(400).json({
@@ -1191,7 +1260,7 @@ router.get(
             id: order.id,
             customerId: order.customerId,
             customerName: order.customerName,
-            customerPhone: order.customerPhone,
+            customerPhone: maskPhoneForExternal(order.customerPhone),
             pickup: order.pickup,
             drop: order.drop,
             distanceKm: order.distanceKm,
@@ -1221,48 +1290,6 @@ router.get(
       });
     } catch (error: any) {
       logger.error(`Get broadcast snapshot error: ${error.message}`);
-      next(error);
-    }
-  }
-);
-
-// =============================================================================
-// GET /pending-settlements — customer-facing pending penalty/settlement dues
-// =============================================================================
-router.get('/pending-settlements',
-  authMiddleware,
-  roleGuard(['customer']),
-  async (req: Request, res: Response, next: NextFunction) => {
-    try {
-      const user = req.user;
-      const dues = await (orderService as any).prisma.customerPenaltyDue.findMany({
-        where: {
-          customerId: user.userId,
-          state: 'due'
-        },
-        orderBy: { createdAt: 'desc' },
-        take: 20
-      });
-
-      const totalPending = dues.reduce((sum: number, d: any) => sum + (Number(d.amount) || 0), 0);
-
-      res.json({
-        success: true,
-        data: {
-          totalPending,
-          count: dues.length,
-          items: dues.map((d: any) => ({
-            id: d.id,
-            orderId: d.orderId,
-            amount: Number(d.amount) || 0,
-            state: d.state,
-            nextOrderHint: d.nextOrderHint || 'Will be adjusted on next booking.',
-            createdAt: d.createdAt
-          }))
-        }
-      });
-    } catch (error: any) {
-      logger.error(`Get pending settlements error: ${error.message}`);
       next(error);
     }
   }

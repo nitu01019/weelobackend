@@ -126,12 +126,28 @@ jest.mock('../shared/database/prisma.service', () => ({
     $executeRaw: (...args: any[]) => mockExecuteRaw(...args),
     $queryRaw: (...args: any[]) => mockQueryRaw(...args),
     $transaction: jest.fn(async (fn: any) => fn({
+      $queryRaw: (...a: any[]) => mockQueryRaw(...a),
+      $executeRaw: (...a: any[]) => mockExecuteRaw(...a),
+      $executeRawUnsafe: jest.fn().mockResolvedValue(0),
       assignment: {
         update: (...a: any[]) => mockAssignmentUpdate(...a),
         updateMany: (...a: any[]) => mockAssignmentUpdateMany(...a),
+        findFirst: (...a: any[]) => mockAssignmentFindFirst(...a),
       },
       vehicle: {
         updateMany: (...a: any[]) => mockVehicleUpdateMany(...a),
+        findUnique: (...a: any[]) => mockVehicleFindUnique(...a),
+      },
+      truckRequest: {
+        updateMany: (...a: any[]) => mockTruckRequestUpdateMany(...a),
+      },
+      booking: {
+        findFirst: (...a: any[]) => mockBookingFindFirst(...a),
+        findUnique: (...a: any[]) => mockBookingFindUnique(...a),
+        updateMany: (...a: any[]) => mockBookingUpdateMany(...a),
+      },
+      order: {
+        findUnique: (...a: any[]) => mockOrderFindUnique(...a),
       },
     })),
   },
@@ -246,6 +262,7 @@ jest.mock('../shared/services/audit.service', () => ({
 
 // State machines mock
 jest.mock('../core/state-machines', () => ({
+  ...jest.requireActual('../core/state-machines'),
   BOOKING_VALID_TRANSITIONS: {},
   isValidTransition: jest.fn().mockReturnValue(true),
   assertValidTransition: jest.fn(),
@@ -304,6 +321,7 @@ jest.mock('../shared/utils/pii.utils', () => ({
 }));
 
 jest.mock('../shared/services/vehicle-lifecycle.service', () => ({
+  onVehicleTransition: jest.fn().mockResolvedValue(undefined),
   releaseVehicle: jest.fn().mockResolvedValue(undefined),
 }));
 
@@ -338,6 +356,7 @@ function resetAllMocks(): void {
   mockRedisSet.mockResolvedValue(undefined);
   mockRedisGet.mockResolvedValue(null);
   mockAssignmentUpdateMany.mockReset();
+  mockAssignmentUpdateMany.mockResolvedValue({ count: 1 });
   mockAssignmentFindFirst.mockReset();
   mockVehicleFindUnique.mockReset();
   mockVehicleUpdate.mockReset();
@@ -369,12 +388,28 @@ function resetAllMocks(): void {
   // Re-set $transaction mock (resetAllMocks clears implementations)
   const prismaService = require('../shared/database/prisma.service');
   prismaService.prismaClient.$transaction.mockImplementation(async (fn: any) => fn({
+      $queryRaw: (...a: any[]) => mockQueryRaw(...a),
+      $executeRaw: (...a: any[]) => mockExecuteRaw(...a),
+      $executeRawUnsafe: jest.fn().mockResolvedValue(0),
     assignment: {
       update: (...a: any[]) => mockAssignmentUpdate(...a),
       updateMany: (...a: any[]) => mockAssignmentUpdateMany(...a),
+      findFirst: (...a: any[]) => mockAssignmentFindFirst(...a),
     },
     vehicle: {
       updateMany: (...a: any[]) => mockVehicleUpdateMany(...a),
+      findUnique: (...a: any[]) => mockVehicleFindUnique(...a),
+    },
+    truckRequest: {
+      updateMany: (...a: any[]) => mockTruckRequestUpdateMany(...a),
+    },
+    booking: {
+      findFirst: (...a: any[]) => mockBookingFindFirst(...a),
+      findUnique: (...a: any[]) => mockBookingFindUnique(...a),
+      updateMany: (...a: any[]) => mockBookingUpdateMany(...a),
+    },
+    order: {
+      findUnique: (...a: any[]) => mockOrderFindUnique(...a),
     },
   }));
 }

@@ -2,27 +2,57 @@
  * =============================================================================
  * DATABASE SERVICE - PostgreSQL via Prisma
  * =============================================================================
- * 
+ *
  * Production database using PostgreSQL with Prisma ORM.
- * 
- * This file contains:
- * 1. Type definitions (interfaces) used by both Prisma and legacy code
- * 2. Database initialization and export
- * 
+ *
+ * Record types are now defined in prisma.service.ts (single source of truth)
+ * and re-exported here so that all 77+ consumers get the exact same types
+ * that PrismaDatabaseService methods return.
+ *
  * The actual Prisma implementation is in prisma.service.ts
- * 
+ *
  * IMPORTANT: JSON file database has been REMOVED.
  * Only PostgreSQL is supported in production.
  * =============================================================================
  */
 
 import { logger } from '../services/logger.service';
+import type { PrismaDatabaseService } from './prisma.service';
 
 // =============================================================================
-// TYPE DEFINITIONS
+// TYPE RE-EXPORTS — single source of truth lives in prisma.service.ts
+// =============================================================================
+// Previously these were duplicate interface definitions that diverged over time
+// (prisma.service.ts used `| null`, db.ts used `| undefined`). Now unified.
+export type {
+  LocationRecord,
+  RoutePointRecord,
+  StopWaitTimerRecord,
+  UserRecord,
+  VehicleRecord,
+  BookingRecord,
+  OrderRecord,
+  TruckRequestRecord,
+  AssignmentRecord,
+  TrackingRecord,
+} from './prisma.service';
+
+// Import for use in the Database interface below
+import type {
+  UserRecord,
+  VehicleRecord,
+  BookingRecord,
+  OrderRecord,
+  TruckRequestRecord,
+  AssignmentRecord,
+  TrackingRecord,
+} from './prisma.service';
+
+// =============================================================================
+// TYPES UNIQUE TO db.ts
 // =============================================================================
 
-// Database schema
+// Database schema (used by getRawData and similar aggregate endpoints)
 export interface Database {
   users: UserRecord[];
   vehicles: VehicleRecord[];
@@ -37,296 +67,23 @@ export interface Database {
   };
 }
 
-// User Record - Customer, Transporter, or Driver
-export interface UserRecord {
-  id: string;
-  phone: string;
-  role: 'customer' | 'transporter' | 'driver';
-  name: string;
-  email?: string;
-  profilePhoto?: string;
-  
-  // Customer specific
-  company?: string;
-  gstNumber?: string;
-  
-  // Transporter specific
-  businessName?: string;
-  businessAddress?: string;
-  panNumber?: string;
-  
-  // Driver specific
-  transporterId?: string;  // Which transporter this driver belongs to
-  licenseNumber?: string;
-  licenseExpiry?: string;
-  aadharNumber?: string;
-  
-  isVerified: boolean;
-  isActive: boolean;
-  
-  // Availability toggle (for transporters/drivers)
-  isAvailable?: boolean;
-  
-  // Language preference (persisted across login sessions)
-  preferredLanguage?: string;
-  
-  // Profile completion status (driver onboarding)
-  isProfileCompleted?: boolean;
-  
-  createdAt: string;
-  updatedAt: string;
-}
-
-// Vehicle Status - Operational state of the vehicle
+// Vehicle Status — string union alias for convenience (matches VehicleRecord.status)
 export type VehicleStatus = 'available' | 'on_hold' | 'in_transit' | 'maintenance' | 'inactive';
-
-// Vehicle Record - Registered by Transporter
-export interface VehicleRecord {
-  id: string;
-  transporterId: string;
-  assignedDriverId?: string;
-  
-  vehicleNumber: string;
-  vehicleType: string;
-  vehicleSubtype: string;
-  vehicleKey: string;
-  capacity: string;
-  capacityTons?: number;
-  model?: string;
-  year?: number;
-  
-  status: VehicleStatus;
-  currentTripId?: string;
-  maintenanceReason?: string;
-  maintenanceEndDate?: string;
-  lastStatusChange?: string;
-  
-  // Documents
-  rcNumber?: string;
-  rcExpiry?: string;
-  insuranceNumber?: string;
-  insuranceExpiry?: string;
-  permitNumber?: string;
-  permitExpiry?: string;
-  fitnessExpiry?: string;
-  
-  // Photos
-  vehiclePhotos?: string[];
-  rcPhoto?: string;
-  insurancePhoto?: string;
-  
-  isVerified: boolean;
-  isActive: boolean;
-  createdAt: string;
-  updatedAt: string;
-}
-
-// Route Point Record
-export interface RoutePointRecord {
-  type: 'PICKUP' | 'STOP' | 'DROP';
-  latitude: number;
-  longitude: number;
-  address: string;
-  city?: string;
-  state?: string;
-  stopIndex: number;
-}
-
-// Stop Wait Timer Record
-export interface StopWaitTimerRecord {
-  stopIndex: number;
-  arrivedAt: string;
-  departedAt?: string;
-  waitTimeSeconds: number;
-}
-
-// Booking Record - Created by Customer
-export interface BookingRecord {
-  id: string;
-  customerId: string;
-  customerName: string;
-  customerPhone: string;
-  
-  pickup: {
-    latitude: number;
-    longitude: number;
-    address: string;
-    city?: string;
-    state?: string;
-  };
-  drop: {
-    latitude: number;
-    longitude: number;
-    address: string;
-    city?: string;
-    state?: string;
-  };
-  
-  vehicleType: string;
-  vehicleSubtype: string;
-  trucksNeeded: number;
-  trucksFilled: number;
-  distanceKm: number;
-  pricePerTruck: number;
-  totalAmount: number;
-  
-  goodsType?: string;
-  weight?: string;
-  
-  status: 'created' | 'broadcasting' | 'active' | 'partially_filled' | 'fully_filled' | 'in_progress' | 'completed' | 'cancelled' | 'expired';
-  stateChangedAt?: Date | string;
-
-  notifiedTransporters: string[];
-
-  scheduledAt?: string;
-  expiresAt: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-// Order Record
-export interface OrderRecord {
-  id: string;
-  customerId: string;
-  customerName: string;
-  customerPhone: string;
-  
-  routePoints: RoutePointRecord[];
-  currentRouteIndex: number;
-  stopWaitTimers: StopWaitTimerRecord[];
-  
-  pickup: {
-    latitude: number;
-    longitude: number;
-    address: string;
-    city?: string;
-    state?: string;
-  };
-  drop: {
-    latitude: number;
-    longitude: number;
-    address: string;
-    city?: string;
-    state?: string;
-  };
-  
-  distanceKm: number;
-  totalTrucks: number;
-  trucksFilled: number;
-  totalAmount: number;
-  
-  goodsType?: string;
-  weight?: string;
-  cargoWeightKg?: number;
-  
-  status: 'created' | 'broadcasting' | 'active' | 'partially_filled' | 'fully_filled' | 'in_progress' | 'completed' | 'cancelled' | 'expired';
-  stateChangedAt?: Date | string;
-  dispatchState?: 'queued' | 'dispatching' | 'dispatched' | 'dispatch_failed';
-  dispatchAttempts?: number;
-  dispatchReasonCode?: string | null;
-  onlineCandidatesCount?: number;
-  notifiedCount?: number;
-  lastDispatchAt?: Date | string | null;
-  loadingStartedAt?: Date | string | null;
-  unloadingStartedAt?: Date | string | null;
-  lifecycleEventVersion?: number;
-
-  cancelledAt?: string;
-  cancellationReason?: string;
-  
-  scheduledAt?: string;
-  expiresAt: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-// Truck Request Record
-export interface TruckRequestRecord {
-  id: string;
-  orderId: string;
-  requestNumber: number;
-  
-  vehicleType: string;
-  vehicleSubtype: string;
-  pricePerTruck: number;
-  
-  status: 'searching' | 'held' | 'assigned' | 'accepted' | 'in_progress' | 'completed' | 'cancelled' | 'expired';
-  
-  heldBy?: string;
-  heldAt?: string;
-  
-  assignedTo?: string;
-  assignedTransporterId?: string;
-  assignedTransporterName?: string;
-  assignedVehicleId?: string;
-  assignedVehicleNumber?: string;
-  assignedDriverId?: string;
-  assignedDriverName?: string;
-  assignedDriverPhone?: string;
-  
-  tripId?: string;
-  
-  notifiedTransporters: string[];
-  
-  assignedAt?: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-// Assignment Record
-export interface AssignmentRecord {
-  id: string;
-  bookingId: string;
-  truckRequestId?: string;
-  orderId?: string;
-  transporterId: string;
-  transporterName: string;
-  vehicleId: string;
-  vehicleNumber: string;
-  vehicleType: string;
-  vehicleSubtype: string;
-  driverId: string;
-  driverName: string;
-  driverPhone: string;
-  tripId: string;
-  
-  status: 'pending' | 'driver_accepted' | 'driver_declined' | 'en_route_pickup' | 'at_pickup' | 'in_transit' | 'arrived_at_drop' | 'completed' | 'cancelled';
-  
-  assignedAt: string;
-  driverAcceptedAt?: string;
-  startedAt?: string;
-  completedAt?: string;
-}
-
-// Tracking Record
-export interface TrackingRecord {
-  tripId: string;
-  driverId: string;
-  vehicleNumber: string;
-  bookingId: string;
-  latitude: number;
-  longitude: number;
-  speed: number;
-  bearing: number;
-  status: string;
-  lastUpdated: string;
-}
 
 // =============================================================================
 // DATABASE INITIALIZATION - PostgreSQL ONLY (Prisma)
 // =============================================================================
-// 
+//
 // IMPORTANT: This backend uses ONLY PostgreSQL via Prisma.
 // JSON file database has been REMOVED for production use.
-// 
+//
 // DATABASE_URL environment variable MUST be set.
 // =============================================================================
 
 // Prisma Database - the ONLY database for this backend
-// NOTE: Typed as `any` intentionally. Many modules access private/dynamic
-// properties (db.prisma, db.orders, etc.) that are not part of the public
-// PrismaDatabaseService interface. Properly typing this would require
-// refactoring ~15+ consumer files. Tracked for future cleanup.
+// KNOWN-ANY: Typed as PrismaDatabaseService internally, but exported as any
+// because ~30 consumer files access properties not on the public interface.
+// Use prismaClient from prisma.service.ts for type-safe access in new code.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let prismaDbInstance: any = null;
 
@@ -355,10 +112,12 @@ try {
 }
 
 // Export the Prisma database instance - NO FALLBACK to JSON
-export const db = prismaDbInstance;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export const db: any = prismaDbInstance;
 
 // Async database getter - returns Prisma instance
-export async function getDatabase() {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export async function getDatabase(): Promise<any> {
   return prismaDbInstance;
 }
 

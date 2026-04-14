@@ -144,6 +144,19 @@ class AssignmentDispatchService {
           lastStatusChange: new Date().toISOString()
         }
       });
+
+      // H-10 FIX: Increment trucksFilled INSIDE the transaction so the count
+      // rolls back if any subsequent step fails. Uses raw SQL to avoid circular
+      // dependency on bookingService while staying within the TX boundary.
+      if (data.bookingId) {
+        await tx.$queryRaw`
+          UPDATE "Booking"
+          SET "trucksFilled" = "trucksFilled" + 1,
+              "stateChangedAt" = NOW()
+          WHERE id = ${data.bookingId}
+            AND "trucksFilled" < "trucksNeeded"
+        `;
+      }
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable, timeoutMs: 8000 });
 
     // =========================================================================
@@ -175,11 +188,9 @@ class AssignmentDispatchService {
       });
     }
 
-    // Update booking trucks filled (Fix H-A1: lazy require to break circular dep)
-    if (data.bookingId) {
-      const { bookingService }: typeof import('../booking/booking.service') = require('../booking/booking.service');
-      await bookingService.incrementTrucksFilled(data.bookingId);
-    }
+    // H-10: incrementTrucksFilled now happens inside the transaction above (raw SQL).
+    // The external bookingService.incrementTrucksFilled call has been removed to
+    // prevent the count from persisting when the transaction rolls back.
 
     // Notify customer
     emitToBooking(data.bookingId, SocketEvent.TRUCK_ASSIGNED, {

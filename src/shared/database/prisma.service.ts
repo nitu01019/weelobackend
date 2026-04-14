@@ -69,20 +69,22 @@ export interface UserRecord {
   phone: string;
   role: 'customer' | 'transporter' | 'driver';
   name: string;
-  email?: string | null;
-  profilePhoto?: string | null;
-  company?: string | null;
-  gstNumber?: string | null;
-  businessName?: string | null;
-  businessAddress?: string | null;
-  panNumber?: string | null;
-  transporterId?: string | null;
-  licenseNumber?: string | null;
-  licenseExpiry?: string | null;
-  aadharNumber?: string | null;
+  email?: string;
+  profilePhoto?: string;
+  company?: string;
+  gstNumber?: string;
+  businessName?: string;
+  businessAddress?: string;
+  panNumber?: string;
+  transporterId?: string;
+  licenseNumber?: string;
+  licenseExpiry?: string;
+  aadharNumber?: string;
   isVerified: boolean;
   isActive: boolean;
-  isAvailable?: boolean | null;
+  isAvailable?: boolean;
+  preferredLanguage?: string;
+  isProfileCompleted?: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -90,29 +92,29 @@ export interface UserRecord {
 export interface VehicleRecord {
   id: string;
   transporterId: string;
-  assignedDriverId?: string | null;
+  assignedDriverId?: string;
   vehicleNumber: string;
   vehicleType: string;
   vehicleSubtype: string;
-  vehicleKey?: string | null;
+  vehicleKey?: string;
   capacity: string;
-  model?: string | null;
-  year?: number | null;
+  model?: string;
+  year?: number;
   status: 'available' | 'on_hold' | 'in_transit' | 'maintenance' | 'inactive';
-  currentTripId?: string | null;
-  maintenanceReason?: string | null;
-  maintenanceEndDate?: string | null;
-  lastStatusChange?: string | null;
-  rcNumber?: string | null;
-  rcExpiry?: string | null;
-  insuranceNumber?: string | null;
-  insuranceExpiry?: string | null;
-  permitNumber?: string | null;
-  permitExpiry?: string | null;
-  fitnessExpiry?: string | null;
+  currentTripId?: string;
+  maintenanceReason?: string;
+  maintenanceEndDate?: string;
+  lastStatusChange?: string;
+  rcNumber?: string;
+  rcExpiry?: string;
+  insuranceNumber?: string;
+  insuranceExpiry?: string;
+  permitNumber?: string;
+  permitExpiry?: string;
+  fitnessExpiry?: string;
   vehiclePhotos?: string[];
-  rcPhoto?: string | null;
-  insurancePhoto?: string | null;
+  rcPhoto?: string;
+  insurancePhoto?: string;
   isVerified: boolean;
   isActive: boolean;
   createdAt: string;
@@ -133,11 +135,12 @@ export interface BookingRecord {
   distanceKm: number;
   pricePerTruck: number;
   totalAmount: number;
-  goodsType?: string | null;
-  weight?: string | null;
-  status: 'active' | 'partially_filled' | 'fully_filled' | 'in_progress' | 'completed' | 'cancelled' | 'expired';
+  goodsType?: string;
+  weight?: string;
+  status: 'created' | 'broadcasting' | 'active' | 'partially_filled' | 'fully_filled' | 'in_progress' | 'completed' | 'cancelled' | 'expired';
+  stateChangedAt?: Date | string;
   notifiedTransporters: string[];
-  scheduledAt?: string | null;
+  scheduledAt?: string;
   expiresAt: string;
   createdAt: string;
   updatedAt: string;
@@ -157,22 +160,23 @@ export interface OrderRecord {
   totalTrucks: number;
   trucksFilled: number;
   totalAmount: number;
-  goodsType?: string | null;
-  weight?: string | null;
-  cargoWeightKg?: number | null;
-  status: 'active' | 'partially_filled' | 'fully_filled' | 'in_progress' | 'completed' | 'cancelled' | 'expired';
+  goodsType?: string;
+  weight?: string;
+  cargoWeightKg?: number;
+  status: 'created' | 'broadcasting' | 'active' | 'partially_filled' | 'fully_filled' | 'in_progress' | 'completed' | 'cancelled' | 'expired';
+  stateChangedAt?: Date | string;
   dispatchState?: 'queued' | 'dispatching' | 'dispatched' | 'dispatch_failed';
   dispatchAttempts?: number;
   dispatchReasonCode?: string | null;
   onlineCandidatesCount?: number;
   notifiedCount?: number;
-  lastDispatchAt?: string | null;
-  loadingStartedAt?: string | null;
-  unloadingStartedAt?: string | null;
+  lastDispatchAt?: Date | string | null;
+  loadingStartedAt?: Date | string | null;
+  unloadingStartedAt?: Date | string | null;
   lifecycleEventVersion?: number;
-  cancelledAt?: string | null;
-  cancellationReason?: string | null;
-  scheduledAt?: string | null;
+  cancelledAt?: string;
+  cancellationReason?: string;
+  scheduledAt?: string;
   expiresAt: string;
   createdAt: string;
   updatedAt: string;
@@ -186,19 +190,19 @@ export interface TruckRequestRecord {
   vehicleSubtype: string;
   pricePerTruck: number;
   status: 'searching' | 'held' | 'assigned' | 'accepted' | 'in_progress' | 'completed' | 'cancelled' | 'expired';
-  heldBy?: string | null;
-  heldAt?: string | null;
-  assignedTo?: string | null;
-  assignedTransporterId?: string | null;
-  assignedTransporterName?: string | null;
-  assignedVehicleId?: string | null;
-  assignedVehicleNumber?: string | null;
-  assignedDriverId?: string | null;
-  assignedDriverName?: string | null;
-  assignedDriverPhone?: string | null;
-  tripId?: string | null;
+  heldBy?: string;
+  heldAt?: string;
+  assignedTo?: string;
+  assignedTransporterId?: string;
+  assignedTransporterName?: string;
+  assignedVehicleId?: string;
+  assignedVehicleNumber?: string;
+  assignedDriverId?: string;
+  assignedDriverName?: string;
+  assignedDriverPhone?: string;
+  tripId?: string;
   notifiedTransporters: string[];
-  assignedAt?: string | null;
+  assignedAt?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -206,8 +210,8 @@ export interface TruckRequestRecord {
 export interface AssignmentRecord {
   id: string;
   bookingId: string;
-  truckRequestId?: string | null;
-  orderId?: string | null;
+  truckRequestId?: string;
+  orderId?: string;
   transporterId: string;
   transporterName: string;
   vehicleId: string;
@@ -218,11 +222,11 @@ export interface AssignmentRecord {
   driverName: string;
   driverPhone: string;
   tripId: string;
-  status: 'pending' | 'driver_accepted' | 'driver_declined' | 'en_route_pickup' | 'at_pickup' | 'in_transit' | 'arrived_at_drop' | 'completed' | 'cancelled';
+  status: 'pending' | 'driver_accepted' | 'driver_declined' | 'en_route_pickup' | 'at_pickup' | 'in_transit' | 'arrived_at_drop' | 'completed' | 'partial_delivery' | 'cancelled';
   assignedAt: string;
-  driverAcceptedAt?: string | null;
-  startedAt?: string | null;
-  completedAt?: string | null;
+  driverAcceptedAt?: string;
+  startedAt?: string;
+  completedAt?: string;
 }
 
 export interface TrackingRecord {
@@ -282,10 +286,18 @@ let prisma: PrismaClient;
 
 function getPrismaClient(): PrismaClient {
   if (!prisma) {
-    // Build pooled DATABASE_URL with connection limits
+    // Build pooled DATABASE_URL with connection limits and RDS failover timeouts
     const databaseUrl = process.env.DATABASE_URL || '';
     const separator = databaseUrl.includes('?') ? '&' : '?';
-    const pooledUrl = `${databaseUrl}${separator}connection_limit=${DB_POOL_CONFIG.connectionLimit}&pool_timeout=${DB_POOL_CONFIG.poolTimeout}`;
+    // connect_timeout=5: Fail fast if RDS is unreachable after failover (default 0 = wait forever)
+    // socket_timeout=10: Kill queries stuck on a dead socket during failover
+    const hasConnectTimeout = databaseUrl.includes('connect_timeout');
+    const hasSocketTimeout = databaseUrl.includes('socket_timeout');
+    const timeoutParams = [
+      ...(hasConnectTimeout ? [] : ['connect_timeout=5']),
+      ...(hasSocketTimeout ? [] : ['socket_timeout=10']),
+    ].join('&');
+    const pooledUrl = `${databaseUrl}${separator}connection_limit=${DB_POOL_CONFIG.connectionLimit}&pool_timeout=${DB_POOL_CONFIG.poolTimeout}${timeoutParams ? '&' + timeoutParams : ''}`;
 
     prisma = new PrismaClient({
       log: process.env.NODE_ENV === 'development'
@@ -353,23 +365,21 @@ function getPrismaClient(): PrismaClient {
             }
           }
           if (params.model === 'Vehicle') {
-            // For single updates, use result.transporterId directly (no extra query)
-            // For updateMany, result is { count: N } — try to get transporterId from args
-            const transporterId = result?.transporterId;
-            if (transporterId) {
+            // FIX-29: Eliminate N+1 findUnique query for cache invalidation.
+            // Extract transporterId from available sources without an extra DB round-trip:
+            //   1. result.transporterId — available for single create/update/upsert/delete
+            //   2. params.args.data.transporterId — available when transporterId is being set
+            //   3. params.args.where.transporterId — available when filtering by transporter
+            // For updateMany where result is { count: N }, we fall back to args.
+            // If none are available, skip invalidation — the 5-min TTL safety net handles it.
+            const transporterId =
+              result?.transporterId
+              || params.args?.data?.transporterId
+              || params.args?.where?.transporterId;
+            if (transporterId && typeof transporterId === 'string') {
               await redisService.del(`cache:vehicles:transporter:${transporterId}`).catch(() => {});
-            } else {
-              // Fallback: try to get ID from where clause for single-record ops
-              const id = params.args?.where?.id;
-              if (id && typeof id === 'string') {
-                const vehicle = await prisma.vehicle.findUnique({
-                  where: { id }, select: { transporterId: true }
-                }).catch(() => null);
-                if (vehicle?.transporterId) {
-                  await redisService.del(`cache:vehicles:transporter:${vehicle.transporterId}`).catch(() => {});
-                }
-              }
             }
+            // No extra findUnique fallback — TTL (300s) handles the rare miss
           }
         } catch { /* cache invalidation is non-fatal */ }
       }
@@ -475,6 +485,23 @@ export async function withDbTimeout<T>(
         );
       }
 
+      // PostgreSQL statement_timeout (code 57014) — Prisma wraps it as a generic error.
+      // Surface a 503 so callers can distinguish a timed-out query from other failures.
+      const isStatementTimeout =
+        prismaCode === '57014' ||
+        (error instanceof Error && error.message?.includes('statement timeout'));
+      if (isStatementTimeout) {
+        logger.warn('[withDbTimeout] PostgreSQL statement_timeout hit', {
+          error: error instanceof Error ? sanitizeDbError(error.message) : String(error),
+        });
+        const { AppError } = require('../types/error.types');
+        throw new AppError(
+          503,
+          'DB_TIMEOUT',
+          'Database operation timed out. Please retry.'
+        );
+      }
+
       // Non-retryable error — rethrow as-is (e.g., AppError from fn())
       throw error;
     }
@@ -490,7 +517,9 @@ export async function withDbTimeout<T>(
 // =============================================================================
 
 class PrismaDatabaseService {
-  private prisma: PrismaClient;
+  /** Exposed for raw queries ($executeRawUnsafe, $transaction, $queryRawUnsafe).
+   *  Prefer the typed methods on this class for standard CRUD operations. */
+  readonly prisma: PrismaClient;
 
   constructor() {
     this.prisma = getPrismaClient();
@@ -502,7 +531,19 @@ class PrismaDatabaseService {
       await this.prisma.$connect();
       logger.info('✅ PostgreSQL connected via Prisma');
     } catch (error) {
-      logger.error('❌ PostgreSQL connection failed:', sanitizeDbError(error instanceof Error ? error.message : String(error)));
+      const code = error instanceof Error && 'code' in error ? (error as { code?: string }).code : undefined;
+      const msg = sanitizeDbError(error instanceof Error ? error.message : String(error));
+      logger.error('❌ PostgreSQL connection failed:', msg);
+
+      // FIX-12: After RDS failover, stale pool connections are dead.
+      // $disconnect() drains the pool so the next query auto-reconnects
+      // to the new primary. Without this, all queries fail until pool_timeout
+      // naturally evicts the stale sockets.
+      if (code === 'P1001' || code === 'P2024') {
+        logger.warn('[Prisma] Connection issue detected, draining pool for reconnect...', { code });
+        await this.prisma.$disconnect().catch(() => {});
+        // Next query will auto-reconnect via Prisma's lazy connect
+      }
     }
   }
 
@@ -744,14 +785,13 @@ class PrismaDatabaseService {
       if (existing.transporterId && existing.transporterId !== vehicle.transporterId) {
         redisService.del(this.vehiclesCacheKey(existing.transporterId)).catch(() => { });
       }
-      // Live availability: handle status change on re-registration
+      // Live availability + fleet cache: handle status change on re-registration
       if (existing.status !== (vehicle.status || 'available')) {
-        liveAvailabilityService.onVehicleStatusChange(
-          updated.transporterId,
-          updated.vehicleKey || vehicle.vehicleKey || '',
-          existing.status || 'available',
-          (vehicle.status || 'available') as string
-        ).catch(err => logger.warn('[LiveAvail] createVehicle re-reg hook failed:', (err as Error).message));
+        const { onVehicleTransition } = require('../services/vehicle-lifecycle.service');
+        onVehicleTransition(
+          updated.transporterId, updated.id, updated.vehicleKey || vehicle.vehicleKey || '',
+          existing.status || 'available', (vehicle.status || 'available') as string, 'vehicleReReg'
+        ).catch((err: any) => logger.warn('[vehicleReReg] Vehicle transition failed:', err?.message));
       }
       return this.toVehicleRecord(updated);
     }
@@ -812,7 +852,10 @@ class PrismaDatabaseService {
     }
 
     // Cache miss — fetch from DB
-    const vehicles = await this.prisma.vehicle.findMany({ where: { transporterId } });
+    // FIX-15: Bound query to prevent unbounded result sets if a transporter
+    // has an anomalous number of vehicles (e.g., data import bug). 500 is the
+    // MAX_PAGE_SIZE constant used throughout this service.
+    const vehicles = await this.prisma.vehicle.findMany({ where: { transporterId }, take: MAX_PAGE_SIZE });
     const records = vehicles.map(v => this.toVehicleRecord(v));
 
     // Write to cache (fire-and-forget — don't block the caller)
@@ -950,14 +993,13 @@ class PrismaDatabaseService {
       if (oldVehicle?.transporterId && oldVehicle.transporterId !== updated.transporterId) {
         redisService.del(this.vehiclesCacheKey(oldVehicle.transporterId)).catch(() => { });
       }
-      // Live availability: update Redis set + count when status changes
+      // Live availability + fleet cache: update when status changes
       if (oldVehicle && (updates as any).status && oldVehicle.status !== (updates as any).status) {
-        liveAvailabilityService.onVehicleStatusChange(
-          updated.transporterId,
-          updated.vehicleKey || oldVehicle.vehicleKey || '',
-          oldVehicle.status || 'available',
-          (updates as any).status
-        ).catch(err => logger.warn('[LiveAvail] updateVehicle hook failed:', (err as Error).message));
+        const { onVehicleTransition } = require('../services/vehicle-lifecycle.service');
+        onVehicleTransition(
+          updated.transporterId, id, updated.vehicleKey || oldVehicle.vehicleKey || '',
+          oldVehicle.status || 'available', (updates as any).status, 'prismaUpdateVehicle'
+        ).catch((err: any) => logger.warn('[prismaUpdateVehicle] Vehicle transition failed:', err?.message));
       }
       return this.toVehicleRecord(updated);
     } catch (error) {
@@ -1528,6 +1570,11 @@ class PrismaDatabaseService {
     return assignments.map(a => this.toAssignmentRecord(a));
   }
 
+  async getAssignmentsByOrder(orderId: string): Promise<AssignmentRecord[]> {
+    const assignments = await this.prisma.assignment.findMany({ where: { orderId } });
+    return assignments.map(a => this.toAssignmentRecord(a));
+  }
+
   async getAssignmentsByDriver(driverId: string, limit: number = DEFAULT_PAGE_SIZE): Promise<AssignmentRecord[]> {
     const assignments = await this.prisma.assignment.findMany({
       where: { driverId },
@@ -1907,6 +1954,9 @@ function getReadReplicaClient(): PrismaClient {
 
   return prismaRead;
 }
+
+// Export the class type so db.ts can type the singleton without `any`
+export type { PrismaDatabaseService };
 
 // Export singleton instance
 export const prismaDb = new PrismaDatabaseService();

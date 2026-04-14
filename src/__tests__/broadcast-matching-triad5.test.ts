@@ -116,7 +116,7 @@ jest.mock('../shared/services/fcm.service', () => ({
     NEW_BROADCAST: 'new_broadcast',
     ASSIGNMENT_UPDATE: 'assignment_update',
     TRIP_UPDATE: 'trip_update',
-    PAYMENT: 'payment',
+    PAYMENT: 'payment_received',
     GENERAL: 'general',
   },
 }));

@@ -24,6 +24,7 @@ import { prismaClient } from '../../shared/database/prisma.service';
 import { redisService } from '../../shared/services/redis.service';
 import { logger } from '../../shared/services/logger.service';
 import { driverPresenceService } from '../driver/driver-presence.service';
+import { v4 as uuid } from 'uuid';
 
 /** Maximum automatic re-dispatch attempts per booking/order */
 const MAX_REDISPATCH_ATTEMPTS = 2;
@@ -129,11 +130,105 @@ export async function tryAutoRedispatch(params: AutoRedispatchParams): Promise<b
 
   logger.info(`[AUTO-REDISPATCH] Found candidate driver ${candidateDriver.name} (${candidateDriver.id}) for ${streamId}`);
 
+  // F-H9 FIX: Support multi-truck order redispatch (per-slot, BlackBuck pattern)
+  if (!bookingId && orderId) {
+    // For orders, redispatch the specific truck request slot
+    const truckRequest = await prismaClient.truckRequest.findFirst({
+      where: {
+        orderId,
+        assignedDriverId: declinedDriverId,
+        status: { in: ['assigned', 'held'] },
+      },
+    });
+
+    if (!truckRequest) {
+      logger.info(`[AUTO-REDISPATCH] No matching truck request found for order ${orderId}, driver ${declinedDriverId}`);
+      return false;
+    }
+
+    try {
+      // Fetch vehicle and transporter details for the new assignment
+      const vehicle = await prismaClient.vehicle.findUnique({
+        where: { id: vehicleId },
+        select: { vehicleNumber: true, vehicleType: true, vehicleSubtype: true },
+      });
+
+      const transporter = await prismaClient.user.findUnique({
+        where: { id: transporterId },
+        select: { name: true, businessName: true },
+      });
+
+      const newAssignmentId = uuid();
+      const tripId = `TRIP-${uuid()}`;
+      const now = new Date().toISOString();
+      const transporterName = transporter?.businessName || transporter?.name || '';
+
+      // Atomically: reset truck request with new driver + create assignment
+      await prismaClient.$transaction([
+        // Reset truck request and assign new candidate driver
+        prismaClient.truckRequest.update({
+          where: { id: truckRequest.id },
+          data: {
+            status: 'assigned',
+            assignedDriverId: candidateDriver.id,
+            assignedDriverName: candidateDriver.name,
+            assignedDriverPhone: candidateDriver.phone,
+            assignedVehicleId: vehicleId,
+            assignedVehicleNumber: vehicle?.vehicleNumber || '',
+          },
+        }),
+        // Create new assignment for the candidate driver
+        prismaClient.assignment.create({
+          data: {
+            id: newAssignmentId,
+            bookingId: null,
+            truckRequestId: truckRequest.id,
+            orderId,
+            transporterId,
+            transporterName,
+            vehicleId,
+            vehicleNumber: vehicle?.vehicleNumber || '',
+            vehicleType: vehicle?.vehicleType || vehicleType,
+            vehicleSubtype: vehicle?.vehicleSubtype || vehicleSubtype || '',
+            driverId: candidateDriver.id,
+            driverName: candidateDriver.name,
+            driverPhone: candidateDriver.phone || '',
+            tripId,
+            status: 'pending' as any,
+            assignedAt: now,
+          },
+        }),
+      ]);
+
+      // Increment redispatch counter with TTL
+      const newCount = await redisService.incr(redisKey);
+      if (newCount === 1) {
+        await redisService.expire(redisKey, REDISPATCH_COUNTER_TTL_SECONDS);
+      }
+
+      logger.info('[AUTO-REDISPATCH] Order-path redispatch complete', {
+        orderId,
+        truckRequestId: truckRequest.id,
+        newAssignmentId,
+        newDriverId: candidateDriver.id,
+        newDriverName: candidateDriver.name,
+        attempt: `${newCount}/${MAX_REDISPATCH_ATTEMPTS}`,
+      });
+
+      return true;
+    } catch (orderRedispatchError) {
+      logger.error('[AUTO-REDISPATCH] Order-path redispatch failed (non-fatal)', {
+        orderId,
+        truckRequestId: truckRequest.id,
+        candidateDriverId: candidateDriver.id,
+        error: orderRedispatchError instanceof Error ? orderRedispatchError.message : String(orderRedispatchError),
+      });
+      return false;
+    }
+  }
+
   if (!bookingId) {
-    // Auto-redispatch currently only supports the booking path (single-truck).
-    // Multi-truck (orderId) redispatch requires order-accept flow which is
-    // more complex. Transporter will handle manually via existing notification.
-    logger.info(`[AUTO-REDISPATCH] Skipping order-path redispatch for ${streamId} — transporter handles manually`);
+    logger.info(`[AUTO-REDISPATCH] Skipping redispatch for ${streamId} — no bookingId or orderId`);
     return false;
   }
 

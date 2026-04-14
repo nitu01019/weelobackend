@@ -17,9 +17,24 @@ const mockRedisService: any = {
   eval: jest.fn()
 };
 
+// Tagged template mock: jest.fn() returns a promise when called as a tag function
+function makeTagFn(mockFn: jest.Mock) {
+  return Object.assign(
+    (strings: TemplateStringsArray, ...values: any[]) => mockFn(strings, ...values),
+    mockFn
+  );
+}
+
+const mockExecuteRaw = jest.fn();
+const mockQueryRaw = jest.fn();
+const mockExecuteRawUnsafe = jest.fn();
+const mockQueryRawUnsafe = jest.fn();
+
 const mockDbPrisma: any = {
-  $executeRawUnsafe: jest.fn(),
-  $queryRawUnsafe: jest.fn(),
+  $executeRaw: makeTagFn(mockExecuteRaw),
+  $queryRaw: makeTagFn(mockQueryRaw),
+  $executeRawUnsafe: mockExecuteRawUnsafe,
+  $queryRawUnsafe: mockQueryRawUnsafe,
   $transaction: jest.fn()
 };
 
@@ -65,14 +80,20 @@ function resetMocks() {
   });
   mockRedisService.eval.mockResolvedValue(1);
 
-  mockDbPrisma.$executeRawUnsafe.mockResolvedValue(1);
-  mockDbPrisma.$queryRawUnsafe.mockResolvedValue([]);
-  mockDbPrisma.$transaction.mockImplementation(async (fn: any) =>
-    fn({
+  mockExecuteRaw.mockResolvedValue(1);
+  mockQueryRaw.mockResolvedValue([]);
+  mockExecuteRawUnsafe.mockResolvedValue(1);
+  mockQueryRawUnsafe.mockResolvedValue([]);
+  mockDbPrisma.$transaction.mockImplementation(async (fn: any) => {
+    const txQueryRaw = jest.fn().mockResolvedValue([]);
+    const txExecRaw = jest.fn().mockResolvedValue(1);
+    return fn({
+      $queryRaw: makeTagFn(txQueryRaw),
+      $executeRaw: makeTagFn(txExecRaw),
       $queryRawUnsafe: jest.fn(),
       $executeRawUnsafe: jest.fn()
-    })
-  );
+    });
+  });
 }
 
 describe('OtpChallengeService', () => {
@@ -100,7 +121,7 @@ describe('OtpChallengeService', () => {
       }),
       300
     );
-    expect(mockDbPrisma.$executeRawUnsafe).toHaveBeenCalled();
+    expect(mockExecuteRaw).toHaveBeenCalled();
   });
 
   it('returns OTP_VERIFY_IN_PROGRESS when Redis lock is already held', async () => {
@@ -189,18 +210,22 @@ describe('OtpChallengeService', () => {
 
     mockRedisService.eval.mockRejectedValueOnce(new Error('eval disabled'));
 
-    const txQuery = jest.fn().mockResolvedValue([
+    const txQueryBase = jest.fn().mockResolvedValue([
       {
         otp: hash,
         expires_at: new Date(Date.now() + 60_000),
         attempts: 0
       }
     ]);
-    const txExec = jest.fn().mockResolvedValue(1);
+    const txExecBase = jest.fn().mockResolvedValue(1);
+    const txQuery = makeTagFn(txQueryBase);
+    const txExec = makeTagFn(txExecBase);
     mockDbPrisma.$transaction.mockImplementation(async (fn: any) =>
       fn({
-        $queryRawUnsafe: txQuery,
-        $executeRawUnsafe: txExec
+        $queryRaw: txQuery,
+        $executeRaw: txExec,
+        $queryRawUnsafe: txQueryBase,
+        $executeRawUnsafe: txExecBase
       })
     );
 

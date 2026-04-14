@@ -18,6 +18,9 @@ import { Prisma } from '@prisma/client';
 import { db, OrderRecord } from '../../shared/database/db';
 import { prismaClient } from '../../shared/database/prisma.service';
 import { logger } from '../../shared/services/logger.service';
+import { metrics } from '../../shared/monitoring/metrics.service';
+import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
+import { redisService } from '../../shared/services/redis.service';
 import type {
   OrderDispatchOutboxPayload,
   DispatchAttemptContext,
@@ -200,7 +203,7 @@ export async function buildDispatchAttemptContext(orderId: string): Promise<{
   const requestFromOrder: CreateOrderRequest = {
     customerId: order.customerId,
     customerName: order.customerName,
-    customerPhone: order.customerPhone,
+    customerPhone: maskPhoneForExternal(order.customerPhone),
     routePoints: order.routePoints,
     pickup: order.pickup,
     drop: order.drop,
@@ -360,6 +363,15 @@ export async function processDispatchOutboxRow(
           lockedAt: null
         }
       });
+
+      // DLQ visibility: metric + operator log for retry exhaustion
+      metrics.incrementCounter('dispatch_dlq_total', { orderId: resolvedOrderId, reason: 'RETRY_EXHAUSTED' });
+      logger.error('[DispatchOutbox] Message moved to DLQ after max retries', {
+        orderId: resolvedOrderId,
+        attempts: attemptNumber,
+        maxAttempts: row.maxAttempts,
+        lastError: 'DISPATCH_RETRY_EXHAUSTED',
+      });
     } else if (reasonCode === 'NO_ONLINE_TRANSPORTERS') {
       await orderDispatchOutboxDelegate().update({
         where: { id: row.id },
@@ -418,6 +430,17 @@ export async function processDispatchOutboxRow(
       data: updateData
     });
 
+    // DLQ visibility: metric + operator log when exception exhausts retries
+    if (!retryable) {
+      metrics.incrementCounter('dispatch_dlq_total', { orderId: resolvedOrderId, reason: 'EXCEPTION_EXHAUSTED' });
+      logger.error('[DispatchOutbox] Message moved to DLQ after exception exhausted retries', {
+        orderId: resolvedOrderId,
+        attempts: attemptNumber,
+        maxAttempts: row.maxAttempts,
+        lastError: message,
+      });
+    }
+
     const outcome: DispatchAttemptOutcome = {
       dispatchState: 'dispatch_failed',
       reasonCode,
@@ -430,8 +453,28 @@ export async function processDispatchOutboxRow(
   }
 }
 
+// F-M10 FIX: Leader election instance ID — only one ECS instance polls the outbox at a time
+const OUTBOX_LEADER_KEY = 'outbox:leader';
+const OUTBOX_LEADER_TTL_SECONDS = 10;
+const outboxInstanceId = `${process.pid}:${Date.now()}`;
+
 export async function processDispatchOutboxBatch(limit = ORDER_DISPATCH_OUTBOX_BATCH_SIZE): Promise<void> {
   if (!FF_ORDER_DISPATCH_OUTBOX) return;
+
+  // F-M10 FIX: Leader election — only one instance polls the outbox.
+  // Uses Redis SET NX (via acquireLock) with 10s TTL. If another instance
+  // already holds the lock, this instance skips the poll cycle.
+  try {
+    const leaderLock = await redisService.acquireLock(OUTBOX_LEADER_KEY, outboxInstanceId, OUTBOX_LEADER_TTL_SECONDS);
+    if (!leaderLock.acquired) {
+      // Another instance is the leader — skip polling
+      return;
+    }
+  } catch {
+    // Redis down — proceed anyway (single-instance fallback; SKIP LOCKED protects against duplicates)
+    logger.warn('[DispatchOutbox] Leader election Redis call failed — proceeding as fallback');
+  }
+
   const rows = await claimReadyDispatchOutboxRows(limit);
   for (const row of rows) {
     try {
@@ -445,6 +488,13 @@ export async function processDispatchOutboxBatch(limit = ORDER_DISPATCH_OUTBOX_B
       });
     }
   }
+
+  // F-M10 FIX: Renew leadership after successful poll cycle
+  try {
+    await redisService.set(OUTBOX_LEADER_KEY, outboxInstanceId, OUTBOX_LEADER_TTL_SECONDS);
+  } catch {
+    // Non-critical — lock will expire and be re-acquired next cycle
+  }
 }
 
 export async function processDispatchOutboxImmediately(
@@ -455,4 +505,40 @@ export async function processDispatchOutboxImmediately(
   const row = await claimDispatchOutboxByOrderId(orderId);
   if (!row) return null;
   return processDispatchOutboxRow(row, context);
+}
+
+/**
+ * Re-drive a failed dispatch outbox row by resetting it to 'pending'.
+ * Used by admin endpoint to manually retry dispatches that exhausted retries.
+ * Returns the updated row, or null if no failed row exists for the orderId.
+ */
+export async function redriveFailedDispatch(orderId: string): Promise<DispatchOutboxRow | null> {
+  const row = await orderDispatchOutboxDelegate().findUnique({
+    where: { orderId },
+  });
+
+  if (!row || row.status !== 'failed') {
+    return null;
+  }
+
+  const updated = await orderDispatchOutboxDelegate().update({
+    where: { orderId },
+    data: {
+      status: 'pending',
+      attempts: 0,
+      lastError: null,
+      processedAt: null,
+      lockedAt: null,
+      nextRetryAt: new Date(),
+    },
+  });
+
+  metrics.incrementCounter('dispatch_dlq_redrive_total', { orderId });
+  logger.info('[DispatchOutbox] Failed dispatch re-driven by admin', {
+    orderId,
+    previousAttempts: row.attempts,
+    previousError: row.lastError,
+  });
+
+  return updated as DispatchOutboxRow;
 }

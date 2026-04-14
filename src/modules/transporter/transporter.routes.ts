@@ -712,7 +712,7 @@ router.get(
   roleGuard(['transporter', 'admin']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const stats = availabilityService.getStats();
+      const stats = await availabilityService.getStatsAsync();
 
       res.json({
         success: true,

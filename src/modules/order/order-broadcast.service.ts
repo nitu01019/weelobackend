@@ -19,24 +19,36 @@
 
 import { v4 as uuidv4 } from 'uuid';
 import { db, TruckRequestRecord } from '../../shared/database/db';
+import { prismaClient } from '../../shared/database/prisma.service';
 import { logger } from '../../shared/services/logger.service';
-import { emitToUser, emitToUsers } from '../../shared/services/socket.service';
+import { emitToUser, emitToUsers, isUserConnectedAsync } from '../../shared/services/socket.service';
 import { sendPushNotification } from '../../shared/services/fcm.service';
 import { cacheService } from '../../shared/services/cache.service';
 import { queueService } from '../../shared/services/queue.service';
-import { generateVehicleKey } from '../../shared/services/vehicle-key.service';
 import { transporterOnlineService } from '../../shared/services/transporter-online.service';
 import { routingService } from '../routing';
 import { redisService } from '../../shared/services/redis.service';
 import { PROGRESSIVE_RADIUS_STEPS, progressiveRadiusMatcher } from './progressive-radius-matcher';
 import { candidateScorerService } from '../../shared/services/candidate-scorer.service';
+import { adminSuspensionService } from '../admin/admin-suspension.service';
 import { metrics } from '../../shared/monitoring/metrics.service';
+import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
 import type {
   BroadcastRoutePoint,
   BroadcastRouteBreakdown,
   BroadcastData,
 } from './order-types';
 import type { CreateOrderRequest } from './order.service';
+import { BROADCAST_DEDUP_TTL_BUFFER_SECONDS } from '../../core/config/hold-config';
+// M-04 FIX: Import shared helpers from single source of truth
+import {
+  withEventMeta,
+  notifiedTransportersKey,
+  makeVehicleGroupKey,
+  parseVehicleGroupKey,
+  buildRequestsByType,
+  chunkTransporterIds as chunkTransporterIdsBase,
+} from './order-broadcast-helpers';
 
 // ---------------------------------------------------------------------------
 // Constants (moved from order.service.ts)
@@ -73,19 +85,11 @@ const ORDER_STEP_TIMER_PREFIX = 'timer:order-broadcast-step:';
 const FF_ORDER_DISPATCH_STATUS_EVENTS = process.env.FF_ORDER_DISPATCH_STATUS_EVENTS !== 'false';
 
 // ---------------------------------------------------------------------------
-// Shared helpers (used by broadcast + lifecycle-outbox + dispatch-outbox)
+// Shared helpers — re-exported from order-broadcast-helpers.ts (M-04 FIX)
+// Imported above for internal use; re-exported here for external consumers.
 // ---------------------------------------------------------------------------
 
-/**
- * Add standard event metadata for correlation across logs, sockets and load tests.
- */
-export function withEventMeta<T extends Record<string, unknown>>(payload: T, eventId?: string): T & { eventId: string; emittedAt: string } {
-  return {
-    ...payload,
-    eventId: eventId || uuidv4(),
-    emittedAt: new Date().toISOString()
-  };
-}
+export { withEventMeta, notifiedTransportersKey, makeVehicleGroupKey, parseVehicleGroupKey, buildRequestsByType };
 
 /**
  * Clear customer active broadcast key and associated idempotency keys.
@@ -110,44 +114,7 @@ export async function clearCustomerActiveBroadcast(customerId: string): Promise<
   }
 }
 
-// ---------------------------------------------------------------------------
-// Key helpers
-// ---------------------------------------------------------------------------
-
-export function notifiedTransportersKey(orderId: string, vehicleType: string, vehicleSubtype: string): string {
-  return `order:notified:transporters:${orderId}:${generateVehicleKey(vehicleType, vehicleSubtype)}`;
-}
-
-export function makeVehicleGroupKey(vehicleType: string, vehicleSubtype: string): string {
-  return JSON.stringify([vehicleType, vehicleSubtype || '']);
-}
-
-export function parseVehicleGroupKey(groupKey: string): { vehicleType: string; vehicleSubtype: string } {
-  try {
-    const parsed = JSON.parse(groupKey);
-    if (
-      Array.isArray(parsed) &&
-      typeof parsed[0] === 'string' &&
-      typeof parsed[1] === 'string'
-    ) {
-      return {
-        vehicleType: parsed[0],
-        vehicleSubtype: parsed[1]
-      };
-    }
-  } catch {
-    // Legacy fallback below
-  }
-
-  const splitIndex = groupKey.indexOf('_');
-  if (splitIndex === -1) {
-    return { vehicleType: groupKey, vehicleSubtype: '' };
-  }
-  return {
-    vehicleType: groupKey.slice(0, splitIndex),
-    vehicleSubtype: groupKey.slice(splitIndex + 1)
-  };
-}
+// Key helpers — re-exported above from order-broadcast-helpers.ts (M-04 FIX)
 
 // ---------------------------------------------------------------------------
 // Transporter lookup (cached)
@@ -207,21 +174,28 @@ export async function invalidateTransporterCache(vehicleType: string, vehicleSub
 // Broadcast helpers
 // ---------------------------------------------------------------------------
 
-export function buildRequestsByType(requests: TruckRequestRecord[]): Map<string, TruckRequestRecord[]> {
-  const requestsByType = new Map<string, TruckRequestRecord[]>();
-  for (const request of requests) {
-    const key = makeVehicleGroupKey(request.vehicleType, request.vehicleSubtype);
-    if (!requestsByType.has(key)) {
-      requestsByType.set(key, []);
-    }
-    requestsByType.get(key)!.push(request);
-  }
-  return requestsByType;
-}
+// buildRequestsByType — re-exported above from order-broadcast-helpers.ts (M-04 FIX)
 
 export async function getNotifiedTransporters(orderId: string, vehicleType: string, vehicleSubtype: string): Promise<Set<string>> {
   const key = notifiedTransportersKey(orderId, vehicleType, vehicleSubtype);
-  const members = await redisService.sMembers(key).catch(() => []);
+  const members = await redisService.sMembers(key).catch(async (err: unknown) => {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    logger.warn('[Broadcast] Redis SMEMBERS failed, falling back to DB', { orderId, error: errorMessage });
+    try {
+      const truckRequests = await db.getTruckRequestsByOrder(orderId);
+      const dbNotified = new Set<string>();
+      for (const tr of truckRequests) {
+        if (Array.isArray(tr.notifiedTransporters)) {
+          for (const tid of tr.notifiedTransporters) {
+            dbNotified.add(tid);
+          }
+        }
+      }
+      return Array.from(dbNotified);
+    } catch {
+      return [];
+    }
+  });
   return new Set(members);
 }
 
@@ -234,26 +208,23 @@ export async function markTransportersNotified(
   if (transporterIds.length === 0) return;
   const key = notifiedTransportersKey(orderId, vehicleType, vehicleSubtype);
   // Fix C1: Atomic SADD+EXPIRE via Lua script -- prevents orphaned sets without TTL
-  const ttlSeconds = Math.ceil(BROADCAST_TIMEOUT_MS / 1000) + 120;
-  await redisService.sAddWithExpire(key, ttlSeconds, ...transporterIds).catch(() => { });
+  const ttlSeconds = Math.ceil(BROADCAST_TIMEOUT_MS / 1000) + BROADCAST_DEDUP_TTL_BUFFER_SECONDS;
+  await redisService.sAddWithExpire(key, ttlSeconds, ...transporterIds).catch((err: unknown) => {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    logger.warn('[Broadcast] Failed to mark transporters as notified', { orderId, error: errorMessage });
+  });
 }
 
+// M-04 FIX: Delegate to shared helper, binding the module-level chunk size
 export function chunkTransporterIds(transporterIds: string[]): string[][] {
-  if (transporterIds.length <= TRANSPORTER_FANOUT_CHUNK_SIZE) {
-    return [transporterIds];
-  }
-  const chunks: string[][] = [];
-  for (let index = 0; index < transporterIds.length; index += TRANSPORTER_FANOUT_CHUNK_SIZE) {
-    chunks.push(transporterIds.slice(index, index + TRANSPORTER_FANOUT_CHUNK_SIZE));
-  }
-  return chunks;
+  return chunkTransporterIdsBase(transporterIds, TRANSPORTER_FANOUT_CHUNK_SIZE);
 }
 
 // ---------------------------------------------------------------------------
 // Broadcast state changed (customer-facing lifecycle event)
 // ---------------------------------------------------------------------------
 
-export function emitBroadcastStateChanged(
+export async function emitBroadcastStateChanged(
   customerId: string,
   payload: {
     orderId: string;
@@ -265,7 +236,7 @@ export function emitBroadcastStateChanged(
     notifiedTransporters?: number;
     stateChangedAt?: string;
   }
-): void {
+): Promise<void> {
   if (!FF_ORDER_DISPATCH_STATUS_EVENTS) return;
   metrics.incrementCounter('broadcast_state_transition_total', {
     status: (payload.status || 'unknown').toLowerCase(),
@@ -287,20 +258,44 @@ export function emitBroadcastStateChanged(
   // If customer kills the app or loses connectivity, they miss all progress
   // events via socket. This ensures intermediate states (broadcast updates,
   // truck holds, radius expansion) still reach them via push notification.
-  sendPushNotification(customerId, {
-    title: 'Order Update',
-    body: `Your order status changed to ${payload.status}`,
-    data: {
-      type: 'ORDER_STATUS_UPDATE',
-      orderId: payload.orderId,
-      status: payload.status,
-    },
-  }).catch((err: unknown) => {
-    logger.warn('[FCM] Intermediate state push failed', {
-      orderId: payload.orderId,
-      error: err instanceof Error ? err.message : String(err),
-    });
-  });
+  //
+  // F-L6 FIX: Smart push — skip FCM for online users, throttle non-critical states.
+  // Online users already received the update via Socket above.
+  const isCustomerOnline = await isUserConnectedAsync(customerId).catch(() => false);
+  if (isCustomerOnline) {
+    logger.debug('[BROADCAST] Skipping FCM — customer online via Socket', { customerId, orderId: payload.orderId });
+  } else {
+    // Throttle non-critical states (30s window) to reduce FCM noise
+    const NON_CRITICAL_STATES = new Set(['heading_to_pickup', 'loading_complete']);
+    const currentStatus = payload.status;
+    let fcmThrottled = false;
+    if (NON_CRITICAL_STATES.has(currentStatus)) {
+      const throttleKey = `fcm:throttle:${customerId}:${currentStatus}`;
+      const alreadyThrottled = await redisService.get(throttleKey).catch(() => null);
+      if (alreadyThrottled) {
+        logger.debug('[BROADCAST] FCM throttled for non-critical state', { customerId, status: currentStatus });
+        fcmThrottled = true;
+      } else {
+        await redisService.set(throttleKey, '1', 30).catch(() => {});
+      }
+    }
+    if (!fcmThrottled) {
+      sendPushNotification(customerId, {
+        title: 'Order Update',
+        body: `Your order status changed to ${payload.status}`,
+        data: {
+          type: 'order_status_update',
+          orderId: payload.orderId,
+          status: payload.status,
+        },
+      }).catch((err: unknown) => {
+        logger.warn('[FCM] Intermediate state push failed', {
+          orderId: payload.orderId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -401,7 +396,7 @@ export function emitDriverCancellationEvents(
     message: payload.message,
     cancelledAt: payload.cancelledAt || new Date().toISOString(),
     customerName: payload.customerName ?? '',
-    customerPhone: payload.customerPhone ?? '',
+    customerPhone: maskPhoneForExternal(payload.customerPhone ?? ''),
     pickupAddress: payload.pickupAddress ?? '',
     dropAddress: payload.dropAddress ?? '',
     compensationAmount: payload.compensationAmount ?? 0,
@@ -467,11 +462,23 @@ export async function broadcastToTransporters(
     metrics.observeHistogram('broadcast_scoring_ms', Date.now() - scoringStart, {
       source: process.env.FF_DIRECTIONS_API_SCORING_ENABLED === 'true' ? 'directions_api' : 'h3_approx'
     });
-    const targetTransporters = scoredCandidates.map((c) => c.transporterId);
+    // C7 FIX: Filter out suspended transporters before broadcasting
+    // H1 FIX: Batch suspension check — single Redis round-trip instead of N+1 calls
+    const transporterIds = scoredCandidates.map((c) => c.transporterId);
+    const suspendedSet = await adminSuspensionService.getSuspendedUserIds(transporterIds);
+    const eligibleCandidates = scoredCandidates.filter((c) => !suspendedSet.has(c.transporterId));
+    const suspendedCount = scoredCandidates.length - eligibleCandidates.length;
+    if (suspendedCount > 0) {
+      logger.info('[Broadcast] Filtered suspended transporters', {
+        orderId, vehicleType, suspendedCount,
+        remainingCount: eligibleCandidates.length,
+      });
+    }
+    const targetTransporters = eligibleCandidates.map((c) => c.transporterId);
     // Preserve per-transporter pickup distance from scored candidates
     // (already computed by progressive-radius-matcher via Distance Matrix API)
     const candidateDistanceMap = new Map(
-      scoredCandidates.map((c) => [c.transporterId, { distanceKm: c.distanceKm, etaSeconds: c.etaSeconds }])
+      eligibleCandidates.map((c) => [c.transporterId, { distanceKm: c.distanceKm, etaSeconds: c.etaSeconds }])
     );
     onlineCandidates += targetTransporters.length;
 
@@ -563,10 +570,25 @@ export async function processProgressiveBroadcastStep(timerData: {
   metrics.observeHistogram('broadcast_scoring_ms', Date.now() - stepScoringStart, {
     source: process.env.FF_DIRECTIONS_API_SCORING_ENABLED === 'true' ? 'directions_api' : 'h3_approx'
   });
-  const targetTransporters = scoredCandidates.map((c) => c.transporterId);
+  // C7 FIX: Filter out suspended transporters before progressive broadcast step
+  // H1 FIX: Batch suspension check — single Redis round-trip instead of N+1 calls
+  const stepTransporterIds = scoredCandidates.map((c) => c.transporterId);
+  const stepSuspendedSet = await adminSuspensionService.getSuspendedUserIds(stepTransporterIds);
+  const eligibleCandidates = scoredCandidates.filter((c) => !stepSuspendedSet.has(c.transporterId));
+  const stepSuspendedCount = scoredCandidates.length - eligibleCandidates.length;
+  if (stepSuspendedCount > 0) {
+    logger.info('[Broadcast] Filtered suspended transporters in progressive step', {
+      orderId: timerData.orderId,
+      vehicleType: timerData.vehicleType,
+      stepIndex: timerData.stepIndex,
+      suspendedCount: stepSuspendedCount,
+      remainingCount: eligibleCandidates.length,
+    });
+  }
+  const targetTransporters = eligibleCandidates.map((c) => c.transporterId);
   // Preserve per-transporter pickup distance from scored candidates
   const candidateDistanceMap = new Map(
-    scoredCandidates.map((c) => [c.transporterId, { distanceKm: c.distanceKm, etaSeconds: c.etaSeconds }])
+    eligibleCandidates.map((c) => [c.transporterId, { distanceKm: c.distanceKm, etaSeconds: c.etaSeconds }])
   );
 
   if (targetTransporters.length === 0) {
@@ -617,7 +639,7 @@ export async function processProgressiveBroadcastStep(timerData: {
   const requestFromOrder: CreateOrderRequest = {
     customerId: order.customerId,
     customerName: order.customerName,
-    customerPhone: order.customerPhone,
+    customerPhone: maskPhoneForExternal(order.customerPhone),
     routePoints: order.routePoints,
     pickup: order.pickup,
     drop: order.drop,
@@ -805,10 +827,43 @@ export async function broadcastVehicleTypePayload(
     availabilitySnapshot.map((item) => [item.transporterId, item])
   );
 
+  // KYC/Verification gate (defense-in-depth): skip unverified transporters.
+  // Primary gate is at query level (getTransportersWithVehicleType), but this
+  // catches any that slip through via cache, Redis geo index, or fallback paths.
+  let verifiedTransporters = matchingTransporters;
+  try {
+    const verifiedRows = await prismaClient.user.findMany({
+      where: {
+        id: { in: matchingTransporters },
+        isVerified: true,
+      },
+      select: { id: true },
+    });
+    const verifiedSet = new Set(verifiedRows.map((u: { id: string }) => u.id));
+    const beforeKyc = matchingTransporters.length;
+    verifiedTransporters = matchingTransporters.filter(tid => {
+      if (verifiedSet.has(tid)) return true;
+      logger.info(`[Dispatch] Skipping unverified transporter ${tid}`);
+      return false;
+    });
+    if (verifiedTransporters.length < beforeKyc) {
+      logger.info(`[OrderBroadcast] KYC gate: ${beforeKyc} -> ${verifiedTransporters.length} (filtered ${beforeKyc - verifiedTransporters.length} unverified transporters)`);
+    }
+  } catch (kycErr: unknown) {
+    // Fail-open: if KYC check fails, proceed with current list (previous behavior)
+    const msg = kycErr instanceof Error ? kycErr.message : String(kycErr);
+    logger.warn('[OrderBroadcast] KYC verification check failed, proceeding with current list', { orderId, error: msg });
+  }
+
   const sentTransporters: string[] = [];
   const enqueueAcceptedTransporters: string[] = [];
   const enqueueFailedTransporters: string[] = [];
   let skippedNoAvailable = 0;
+
+  // H6 FIX: Cache each transporter's personalized payload so retries send the same
+  // per-transporter data (trucksYouCanProvide, pickupDistanceKm, etc.) instead of
+  // the generic extendedBroadcast which strips personalization fields.
+  const personalizedPayloadCache = new Map<string, Record<string, unknown>>();
 
   // M-23 FIX: Pre-emit order status check interval.
   // Check every N transporters to avoid DB spam, but catch cancellations mid-broadcast.
@@ -819,8 +874,18 @@ export async function broadcastVehicleTypePayload(
   let broadcastEmitCount = 0;
   let broadcastAborted = false;
 
+  // Issue #10: Layer 2 dedup guard — Stripe idempotency pattern.
+  // Layer 1 (progressiveRadiusMatcher.findCandidates) filters alreadyNotified from Redis.
+  // This guard catches duplicates within the same verifiedTransporters array (race/scoring dups).
+  const alreadyNotifiedSet = new Set<string>();
+  let skippedAlreadyNotified = 0;
+
   const socketQueueJobs: Array<Promise<void>> = [];
-  for (const transporterId of matchingTransporters) {
+  for (const transporterId of verifiedTransporters) {
+    if (alreadyNotifiedSet.has(transporterId)) {
+      skippedAlreadyNotified++;
+      continue;
+    }
     // M-23 FIX: Check order status before emitting (reduce stale broadcasts after cancel)
     // Only check every N transporters to avoid DB spam
     if (broadcastEmitCount > 0 && broadcastEmitCount % BROADCAST_STATUS_CHECK_INTERVAL === 0) {
@@ -846,6 +911,8 @@ export async function broadcastVehicleTypePayload(
       continue;
     }
 
+    alreadyNotifiedSet.add(transporterId);
+
     const trucksYouCanProvide = Math.min(availability.available, trucksStillNeeded);
     // Per-transporter pickup distance from Distance Matrix API (already computed)
     const pickupData = candidateDistanceMap?.get(transporterId);
@@ -869,7 +936,10 @@ export async function broadcastVehicleTypePayload(
       isPersonalized: true,
       personalizedFor: transporterId
     };
+    // H6 FIX: Store personalized payload for retry use
+    personalizedPayloadCache.set(transporterId, personalizedBroadcast);
 
+    // TODO(L-10): Track per-transporter non-response rate. Add Redis counter broadcast:nonresponse:{transporterId} and escalation after N ignored broadcasts.
     const enqueueStartedAt = Date.now();
     socketQueueJobs.push(
       queueService
@@ -899,9 +969,15 @@ export async function broadcastVehicleTypePayload(
     broadcastEmitCount++;
   }
 
+  if (skippedAlreadyNotified > 0) {
+    logger.warn('[Broadcast] Layer 2 dedup guard caught duplicates', {
+      orderId, skippedAlreadyNotified, totalCandidates: verifiedTransporters.length
+    });
+  }
+
   if (broadcastAborted) {
     logger.info('[Broadcast] Broadcast aborted early due to inactive order', {
-      orderId, emittedSoFar: broadcastEmitCount, totalCandidates: matchingTransporters.length
+      orderId, emittedSoFar: broadcastEmitCount, totalCandidates: verifiedTransporters.length
     });
   }
 
@@ -937,6 +1013,47 @@ export async function broadcastVehicleTypePayload(
     }
   }
 
+  // H4 FIX: Retry failed transporter notifications once after 2s backoff
+  if (enqueueFailedTransporters.length > 0) {
+    logger.warn('[Broadcast] Retrying failed transporter notifications', {
+      orderId,
+      count: enqueueFailedTransporters.length,
+      transporterIds: enqueueFailedTransporters,
+    });
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    const retryResults = await Promise.allSettled(
+      enqueueFailedTransporters.map((transporterId) => {
+        // H6 FIX: Use cached personalized payload so retry preserves per-transporter
+        // fields (trucksYouCanProvide, pickupDistanceKm, etc.) instead of sending
+        // the generic extendedBroadcast which strips personalization.
+        const cachedPayload = personalizedPayloadCache.get(transporterId) || extendedBroadcast;
+        return queueService.queueBroadcast(transporterId, 'new_broadcast', {
+          ...cachedPayload,
+          _retry: true,
+        }).then(() => {
+          // On successful retry, move to accepted list
+          enqueueAcceptedTransporters.push(transporterId);
+        });
+      })
+    );
+    const retrySuccessCount = retryResults.filter((r) => r.status === 'fulfilled').length;
+    const retryFailCount = retryResults.filter((r) => r.status === 'rejected').length;
+    if (retryFailCount > 0) {
+      logger.warn('[Broadcast] Permanent delivery failures after retry', {
+        orderId,
+        retryFailCount,
+        retrySuccessCount,
+        failedTransporterIds: enqueueFailedTransporters.slice(0, retryFailCount),
+      });
+      metrics.incrementCounter('broadcast_permanent_failure_total', { orderId });
+    } else if (retrySuccessCount > 0) {
+      logger.info('[Broadcast] All retries succeeded', {
+        orderId,
+        retrySuccessCount,
+      });
+    }
+  }
+
   if (FF_BROADCAST_STRICT_SENT_ACCOUNTING) {
     sentTransporters.push(...enqueueAcceptedTransporters);
   }
@@ -957,24 +1074,34 @@ export async function broadcastVehicleTypePayload(
     await Promise.allSettled(notifiedUpdateJobs);
   }
 
+  // H-03 FIX: Only send FCM push to transporters NOT connected via socket.
+  // Matches booking-broadcast.service.ts:311-322 pattern (isUserConnectedAsync).
+  // Online transporters already received the broadcast via WebSocket above.
   if (sentTransporters.length > 0) {
-    await queueService.queuePushNotificationBatch(
-      sentTransporters,
-      {
-        title: `🚛 ${extendedBroadcast.trucksNeededOfThisType}x ${vehicleType.toUpperCase()} Required!`,
-        body: `${extendedBroadcast.pickup.city || extendedBroadcast.pickup.address} → ${extendedBroadcast.drop.city || extendedBroadcast.drop.address}`,
-        data: {
-          type: 'new_broadcast',
-          orderId: extendedBroadcast.orderId,
-          broadcastId: extendedBroadcast.broadcastId,
-          truckRequestId: extendedBroadcast.truckRequestId,
-          legacyType: 'new_truck_request'
+    const presenceResults = await Promise.all(
+      sentTransporters.map(async (tid: string) => ({ tid, connected: await isUserConnectedAsync(tid) }))
+    );
+    const offlineTransporters = presenceResults.filter(r => !r.connected).map(r => r.tid);
+
+    if (offlineTransporters.length > 0) {
+      await queueService.queuePushNotificationBatch(
+        offlineTransporters,
+        {
+          title: `🚛 ${extendedBroadcast.trucksNeededOfThisType}x ${vehicleType.toUpperCase()} Required!`,
+          body: `${extendedBroadcast.pickup.city || extendedBroadcast.pickup.address} → ${extendedBroadcast.drop.city || extendedBroadcast.drop.address}`,
+          data: {
+            type: 'new_broadcast',
+            orderId: extendedBroadcast.orderId,
+            broadcastId: extendedBroadcast.broadcastId,
+            truckRequestId: extendedBroadcast.truckRequestId,
+            legacyType: 'new_truck_request'
+          }
         }
-      }
-    ).catch((error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error);
-      logger.warn(`Failed to queue push notifications for order ${orderId}: ${message}`);
-    });
+      ).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        logger.warn(`Failed to queue push notifications for order ${orderId}: ${message}`);
+      });
+    }
   }
 
   logger.info('broadcast.enqueue.summary', {

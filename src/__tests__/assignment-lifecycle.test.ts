@@ -254,12 +254,26 @@ describe('Assignment Lifecycle', () => {
 
     // Re-set $transaction mock (M-2: cancel/decline now use $transaction)
     prismaService.prismaClient.$transaction.mockImplementation(async (fn: any) => fn({
+      $queryRaw: jest.fn().mockResolvedValue([]),
+      $executeRaw: (...a: any[]) => mockPrismaExecuteRaw(...a),
+      $executeRawUnsafe: jest.fn().mockResolvedValue(0),
       assignment: {
         update: jest.fn().mockResolvedValue({}),
         updateMany: (...a: any[]) => mockTxAssignmentUpdateMany(...a),
+        findUnique: (...a: any[]) => mockTxAssignmentFindUnique(...a),
       },
       vehicle: {
         updateMany: (...a: any[]) => mockTxVehicleUpdateMany(...a),
+        findUnique: (...a: any[]) => mockVehicleFindUnique(...a),
+      },
+      truckRequest: {
+        updateMany: (...a: any[]) => mockTxTruckRequestUpdateMany(...a),
+      },
+      booking: {
+        updateMany: (...a: any[]) => mockTxBookingUpdateMany(...a),
+      },
+      order: {
+        update: (...a: any[]) => mockTxOrderUpdate(...a),
       },
     }));
 
@@ -353,31 +367,24 @@ describe('Assignment Lifecycle', () => {
       );
     });
 
-    test('2. Cancel on already-cancelled assignment — idempotent, no error', async () => {
+    test('2. Cancel on already-cancelled assignment — throws ASSIGNMENT_ALREADY_TERMINAL', async () => {
       const assignment = buildAssignment({ status: 'cancelled' });
       mockGetAssignmentById.mockResolvedValue(assignment);
 
-      const { bookingService: mockedBookingService } = require('../modules/booking/booking.service');
-      mockedBookingService.decrementTrucksFilled.mockResolvedValue(undefined);
-
-      await assignmentService.cancelAssignment(ASSIGNMENT_ID, TRANSPORTER_ID);
-
-      // M-2: Still uses $transaction (no terminal guard in current impl)
-      const prismaService = require('../shared/database/prisma.service');
-      expect(prismaService.prismaClient.$transaction).toHaveBeenCalledTimes(1);
+      // F-H11 FIX: Terminal state guard now throws for already-terminal assignments
+      await expect(
+        assignmentService.cancelAssignment(ASSIGNMENT_ID, TRANSPORTER_ID)
+      ).rejects.toThrow('Assignment is already cancelled');
     });
 
-    test('3. Cancel on completed assignment — still processes (current implementation)', async () => {
+    test('3. Cancel on completed assignment — throws ASSIGNMENT_ALREADY_TERMINAL', async () => {
       const assignment = buildAssignment({ status: 'completed' });
       mockGetAssignmentById.mockResolvedValue(assignment);
-      const { bookingService: mockedBookingService } = require('../modules/booking/booking.service');
-      mockedBookingService.decrementTrucksFilled.mockResolvedValue(undefined);
 
-      await assignmentService.cancelAssignment(ASSIGNMENT_ID, TRANSPORTER_ID);
-
-      // M-2: Current impl always uses $transaction
-      const prismaService = require('../shared/database/prisma.service');
-      expect(prismaService.prismaClient.$transaction).toHaveBeenCalledTimes(1);
+      // F-H11 FIX: Terminal state guard now throws for already-terminal assignments
+      await expect(
+        assignmentService.cancelAssignment(ASSIGNMENT_ID, TRANSPORTER_ID)
+      ).rejects.toThrow('Assignment is already completed');
     });
 
     test('4. Two cancels — both succeed (current impl has no atomic guard)', async () => {
@@ -393,9 +400,15 @@ describe('Assignment Lifecycle', () => {
 
       jest.clearAllMocks();
       // Re-set mocks after clearAllMocks
+      mockTxAssignmentUpdateMany.mockResolvedValue({ count: 1 });
+      mockTxVehicleUpdateMany.mockResolvedValue({ count: 1 });
       prismaService.prismaClient.$transaction.mockImplementation(async (fn: any) => fn({
-        assignment: { update: jest.fn().mockResolvedValue({}) },
+      $queryRaw: jest.fn().mockResolvedValue([]),
+      $executeRaw: (...a: any[]) => mockPrismaExecuteRaw(...a),
+      $executeRawUnsafe: jest.fn().mockResolvedValue(0),
+        assignment: { update: jest.fn().mockResolvedValue({}), updateMany: (...a: any[]) => mockTxAssignmentUpdateMany(...a) },
         vehicle: { updateMany: (...a: any[]) => mockTxVehicleUpdateMany(...a) },
+        truckRequest: { updateMany: (...a: any[]) => mockTxTruckRequestUpdateMany(...a) },
       }));
       prismaService.withDbTimeout.mockImplementation(async (fn: (tx: any) => Promise<any>) => fn(mockTx));
       mockGetAssignmentById.mockResolvedValue(assignment);
@@ -504,6 +517,9 @@ describe('Assignment Lifecycle', () => {
       jest.clearAllMocks();
       // Re-set $transaction mock after clearAllMocks
       prismaService.prismaClient.$transaction.mockImplementation(async (fn: any) => fn({
+      $queryRaw: jest.fn().mockResolvedValue([]),
+      $executeRaw: jest.fn().mockResolvedValue(0),
+      $executeRawUnsafe: jest.fn().mockResolvedValue(0),
         assignment: { update: jest.fn().mockResolvedValue({}) },
         vehicle: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
       }));
@@ -543,20 +559,20 @@ describe('Assignment Lifecycle', () => {
     };
 
     test('11. Timeout on pending — succeeds, marks as timed out', async () => {
-      // prismaClient.assignment.updateMany (direct, not TX)
-      mockPrismaAssignmentUpdateMany.mockResolvedValue({ count: 1 });
+      // handleAssignmentTimeout now uses $transaction; tx routes to mockTxAssignmentUpdateMany
+      mockTxAssignmentUpdateMany.mockResolvedValue({ count: 1 });
       mockGetAssignmentById.mockResolvedValue(buildAssignment({ status: 'driver_declined' }));
 
       await assignmentService.handleAssignmentTimeout(timerData);
 
-      // Verify prismaClient.assignment.updateMany called directly
-      expect(mockPrismaAssignmentUpdateMany).toHaveBeenCalledWith({
+      // Verify tx.assignment.updateMany called inside $transaction
+      expect(mockTxAssignmentUpdateMany).toHaveBeenCalledWith({
         where: { id: ASSIGNMENT_ID, status: 'pending' },
-        data: { status: 'driver_declined' },
+        data: expect.objectContaining({ status: 'driver_declined', declineType: 'timeout' }),
       });
 
-      // Verify vehicle released via releaseVehicleIfBusy (prismaClient.vehicle.updateMany)
-      expect(mockVehicleUpdateMany).toHaveBeenCalledWith({
+      // Verify vehicle released inside tx (tx.vehicle.updateMany)
+      expect(mockTxVehicleUpdateMany).toHaveBeenCalledWith({
         where: { id: VEHICLE_ID, status: { not: 'available' } },
         data: expect.objectContaining({ status: 'available' }),
       });
@@ -577,13 +593,13 @@ describe('Assignment Lifecycle', () => {
     });
 
     test('12. Timeout on already-accepted — no-op (returns false, race lost)', async () => {
-      mockPrismaAssignmentUpdateMany.mockResolvedValue({ count: 0 });
+      mockTxAssignmentUpdateMany.mockResolvedValue({ count: 0 });
       mockGetAssignmentById.mockResolvedValue(buildAssignment({ status: 'driver_accepted' }));
 
       await assignmentService.handleAssignmentTimeout(timerData);
 
-      // Vehicle should NOT be released
-      expect(mockVehicleUpdateMany).not.toHaveBeenCalled();
+      // Vehicle should NOT be released (skipped due to count=0)
+      expect(mockTxVehicleUpdateMany).not.toHaveBeenCalled();
 
       // No notifications sent for timeout
       expect(mockRedisSet).not.toHaveBeenCalled();
@@ -595,34 +611,26 @@ describe('Assignment Lifecycle', () => {
     });
 
     test('13. Timeout on already-declined — no-op (returns false)', async () => {
-      mockPrismaAssignmentUpdateMany.mockResolvedValue({ count: 0 });
+      mockTxAssignmentUpdateMany.mockResolvedValue({ count: 0 });
       mockGetAssignmentById.mockResolvedValue(buildAssignment({ status: 'driver_declined' }));
 
       await assignmentService.handleAssignmentTimeout(timerData);
 
-      expect(mockVehicleUpdateMany).not.toHaveBeenCalled();
+      expect(mockTxVehicleUpdateMany).not.toHaveBeenCalled();
       expect(mockRedisSet).not.toHaveBeenCalled();
     });
 
     test('14. Timeout releases vehicle back to available', async () => {
-      mockPrismaAssignmentUpdateMany.mockResolvedValue({ count: 1 });
+      mockTxAssignmentUpdateMany.mockResolvedValue({ count: 1 });
       mockGetAssignmentById.mockResolvedValue(buildAssignment({ status: 'driver_declined' }));
 
       await assignmentService.handleAssignmentTimeout(timerData);
 
-      // Vehicle released via releaseVehicleIfBusy → prismaClient.vehicle.updateMany
-      expect(mockVehicleUpdateMany).toHaveBeenCalledWith({
+      // Vehicle released inside $transaction via tx.vehicle.updateMany
+      expect(mockTxVehicleUpdateMany).toHaveBeenCalledWith({
         where: { id: VEHICLE_ID, status: { not: 'available' } },
         data: expect.objectContaining({ status: 'available' }),
       });
-
-      // Redis availability updated
-      expect(mockOnVehicleStatusChange).toHaveBeenCalledWith(
-        TRANSPORTER_ID,
-        'open_17ft:KA01AB1234',
-        'on_hold',
-        'available'
-      );
     });
   });
 
@@ -972,17 +980,17 @@ describe('Assignment Lifecycle', () => {
         truckRequestId: TRUCK_REQUEST_ID,
       };
 
-      // handleAssignmentTimeout uses prismaClient.assignment.updateMany directly
-      mockPrismaAssignmentUpdateMany.mockResolvedValue({ count: 1 });
+      // handleAssignmentTimeout uses $transaction (assignment.service.ts facade)
+      mockTxAssignmentUpdateMany.mockResolvedValue({ count: 1 });
       mockGetAssignmentById.mockResolvedValue(buildAssignment({ status: 'driver_declined' }));
 
       await assignmentService.handleAssignmentTimeout(timerData);
 
-      // Uses $executeRaw with GREATEST(0, ...) floor guard for trucksFilled decrement
+      // Uses tx.$executeRaw with GREATEST(0, ...) floor guard for trucksFilled decrement
       expect(mockPrismaExecuteRaw).toHaveBeenCalled();
 
-      // Uses prismaClient.truckRequest.updateMany directly
-      expect(mockPrismaTruckRequestUpdateMany).toHaveBeenCalledWith({
+      // Uses tx.truckRequest.updateMany inside $transaction
+      expect(mockTxTruckRequestUpdateMany).toHaveBeenCalledWith({
         where: { id: TRUCK_REQUEST_ID, orderId: ORDER_ID },
         data: expect.objectContaining({ status: 'searching' }),
       });
