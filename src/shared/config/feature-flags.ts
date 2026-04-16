@@ -34,6 +34,14 @@ interface FlagDefinition {
   readonly env: string;
   readonly category: FlagCategory;
   readonly description: string;
+  /**
+   * F-B-53: Optional explicit default. When set, overrides the category
+   * implicit default. LaunchDarkly best practice: declare the safe default
+   * explicitly rather than rely on category/env-unset semantics. Only used
+   * today by DUAL_CHANNEL_DELIVERY (safe default = true) so the "more
+   * delivery paths" property is preserved if the env var is ever unset.
+   */
+  readonly defaultValue?: boolean;
 }
 
 interface NumericFlagDefinition {
@@ -228,13 +236,16 @@ export const FLAGS = {
   },
 
   // --- Dual channel delivery (queue.service.ts:81) ---
-  // PRODUCTION: Set FF_DUAL_CHANNEL_DELIVERY=true in .env to enable
-  // dual delivery (Socket.IO + FCM) for critical broadcast events.
+  // F-B-53: Safe default flipped ON. LaunchDarkly guidance: for a dual-write
+  // safety net, over-delivery is safe and under-delivery is not. Explicit
+  // `defaultValue: true` overrides the 'release' category default (which
+  // would otherwise return OFF when the env var is unset).
   // Implementation: broadcast.processor.ts lines 237-284.
   DUAL_CHANNEL_DELIVERY: {
     env: 'FF_DUAL_CHANNEL_DELIVERY',
     category: 'release' as const,
     description: 'Dual channel (socket + FCM) delivery for critical events',
+    defaultValue: true,
   },
 
   // --- Message TTL (queue.service.ts:84) ---
@@ -335,19 +346,28 @@ export type NumericFlagKey = keyof typeof NUMERIC_FLAGS;
 /**
  * Check if a boolean feature flag is enabled.
  *
- * Ops toggles:     ON  unless env === 'false'  (safe-by-default, opt-out)
- * Release toggles: OFF unless env === 'true'   (explicit opt-in)
+ * Precedence:
+ *   1. If env var is set, explicit 'true'/'false' wins.
+ *   2. Otherwise, `flag.defaultValue` (if declared) wins (F-B-53).
+ *   3. Otherwise, category implicit default:
+ *        ops:     ON  (safe-by-default, opt-out)
+ *        release: OFF (explicit opt-in)
  *
- * This produces IDENTICAL booleans to the current raw process.env checks:
- *   ops:     process.env.FF_xxx !== 'false'   <==> isEnabled(FLAGS.xxx)
- *   release: process.env.FF_xxx === 'true'    <==> isEnabled(FLAGS.xxx)
+ * Rationale: LaunchDarkly safe-default pattern lets a specific flag declare
+ * "default ON" even inside the 'release' category (e.g. dual-channel delivery
+ * where over-delivery is safe but under-delivery is not).
  */
 export function isEnabled(flag: FlagDefinition): boolean {
   const value = process.env[flag.env];
-  if (flag.category === 'ops') {
-    return value !== 'false';
+  // Explicit env override wins.
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  // No env setting — honor explicit defaultValue if declared.
+  if (typeof flag.defaultValue === 'boolean') {
+    return flag.defaultValue;
   }
-  return value === 'true';
+  // Fall back to category implicit default.
+  return flag.category === 'ops';
 }
 
 /**

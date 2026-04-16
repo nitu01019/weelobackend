@@ -213,6 +213,23 @@ if (config.isProduction && hasSSLCertificates()) {
 registerHoldExpiryProcessor();
 logger.info('✅ Hold expiry cleanup processor registered (Layer 1)');
 
+// BEGIN FCM startup guard (F-B-53)
+// In production, FCM is the ONLY delivery path for users with no live socket
+// (background app, stale connection). Missing credentials must fail the boot
+// loudly rather than silently degrade dual-channel delivery.
+if (process.env.NODE_ENV === 'production') {
+  const hasServiceAccount =
+    !!process.env.FIREBASE_SERVICE_ACCOUNT ||
+    !!process.env.FIREBASE_SERVICE_ACCOUNT_PATH ||
+    (!!process.env.FIREBASE_PROJECT_ID && !!process.env.FIREBASE_PRIVATE_KEY && !!process.env.FIREBASE_CLIENT_EMAIL);
+  if (!hasServiceAccount) {
+    throw new Error(
+      'FCM startup guard (F-B-53): FIREBASE_SERVICE_ACCOUNT (or FIREBASE_SERVICE_ACCOUNT_PATH, or the FIREBASE_PROJECT_ID/PRIVATE_KEY/CLIENT_EMAIL triplet) is required in production. Dual-channel delivery depends on it.'
+    );
+  }
+}
+// END FCM startup guard (F-B-53)
+
 // Initialize FCM Service for Push Notifications
 fcmService.initialize().then(() => {
   logger.info('📱 FCM Service initialized');

@@ -1578,7 +1578,14 @@ const FCM_FALLBACK_EVENTS = new Set([
   'booking_expired', 'booking_cancelled', 'order_status_update',
   'driver_timeout', 'assignment_timeout', 'hold_expired',
   'payment_pending', 'payment_confirmed',
-  'flex_hold_started'
+  'flex_hold_started',
+  // F-B-53: expanded lifecycle coverage — over-delivery is safe, under-delivery
+  // is not. Every critical state transition should reach the user even if they
+  // have no live socket at emit time (background app, stale connection).
+  'order_cancelled', 'order_expired',
+  'payment_succeeded', 'payment_failed',
+  'sos_alert',
+  'hold_released'
 ]);
 
 /**

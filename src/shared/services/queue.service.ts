@@ -28,6 +28,7 @@ import { createTrackingStreamSink } from './tracking-stream-sink';
 import { metrics } from '../monitoring/metrics.service';
 import { prismaClient } from '../database/prisma.service';
 import * as admin from 'firebase-admin';
+import { FLAGS, isEnabled } from '../config/feature-flags';
 
 // =============================================================================
 // TYPES
@@ -82,8 +83,15 @@ export const CANCELLED_ORDER_QUEUE_GUARD_CACHE_TTL_MS = Math.max(
 /** Sequence-numbered delivery + unacked queue + replay on reconnect */
 export const FF_SEQUENCE_DELIVERY_ENABLED = process.env.FF_SEQUENCE_DELIVERY_ENABLED === 'true';
 
-/** Parallel Socket.IO + FCM delivery for every broadcast */
-export const FF_DUAL_CHANNEL_DELIVERY = process.env.FF_DUAL_CHANNEL_DELIVERY === 'true';
+/**
+ * Parallel Socket.IO + FCM delivery for every broadcast.
+ *
+ * F-B-53: delegated to the centralized feature-flags registry so the
+ * `defaultValue: true` declared there applies uniformly. Previously this
+ * module did a raw `=== 'true'` check (defaulting OFF when unset), which
+ * caused split-brain with other readers that consulted `isEnabled()`.
+ */
+export const FF_DUAL_CHANNEL_DELIVERY = isEnabled(FLAGS.DUAL_CHANNEL_DELIVERY);
 
 /** Message TTL enforcement — drop stale messages before emitting (H5: default ON) */
 export const FF_MESSAGE_TTL_ENABLED = process.env.FF_MESSAGE_TTL_ENABLED !== 'false';
