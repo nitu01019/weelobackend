@@ -1256,12 +1256,21 @@ export function initializeSocket(server: HttpServer): Server {
     // ================================================================
     // M15 FIX: Handle mid-session FCM token refresh via socket
     // ================================================================
-    socket.on('fcm_token_refresh', async (data: { token?: string }) => {
+    socket.on('fcm_token_refresh', async (data: { fcmToken?: string; token?: string }) => {
       try {
-        if (!data?.token || data.token.length < 10) return;
+        // F-C-54: Accept both `fcmToken` (canonical, emitted by captain) and
+        // `token` (legacy alias). Prefer `fcmToken`. Silent-return on bad payload.
+        const receivedToken = data?.fcmToken ?? data?.token;
+        if (!receivedToken || receivedToken.length < 10) {
+          try {
+            const { metrics } = require('../monitoring/metrics.service');
+            metrics.incrementCounter('fcm_token_refresh_bad_payload_total');
+          } catch { /* metrics unavailable — non-critical */ }
+          return;
+        }
         if (!userId) return;
         const { fcmService } = await import('./fcm.service');
-        await fcmService.registerToken(userId, data.token);
+        await fcmService.registerToken(userId, receivedToken);
         logger.info('[FCM] Mid-session token refresh via socket', { userId });
         socket.emit('fcm_token_refresh_ack', { success: true });
       } catch (error) {
