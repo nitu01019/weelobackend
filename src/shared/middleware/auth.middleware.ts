@@ -20,6 +20,7 @@ import { logger } from '../services/logger.service';
 import { redisService } from '../services/redis.service';
 import { prismaClient } from '../database/prisma.service';
 import { metrics } from '../monitoring/metrics.service';
+import { adminSuspensionService } from '../../modules/admin/admin-suspension.service';
 
 /**
  * User roles enum
@@ -121,9 +122,14 @@ export async function authMiddleware(
       }
     }
 
-    // Customer suspension check (Redis user-ID blacklist)
+    // F-A-10 FIX: Role-agnostic suspension check via canonical service helper.
+    // Previously inlined `customer:suspended:{id}` key name that mismatched the
+    // write path (`suspension:{id}` in adminSuspensionService), silently allowing
+    // every suspended driver/transporter/admin to keep using the API.
+    // Service-level helper fails open internally on Redis errors — we keep the
+    // explicit catch so AUTH_REDIS_FAIL_POLICY=closed still takes effect.
     try {
-      const isSuspended = await redisService.exists(`customer:suspended:${decoded.userId}`);
+      const isSuspended = await adminSuspensionService.isUserSuspended(decoded.userId);
       if (isSuspended) {
         return next(new AppError(403, 'ACCOUNT_SUSPENDED', 'Your account has been suspended'));
       }
@@ -290,9 +296,12 @@ export async function optionalAuthMiddleware(
       }
     }
 
-    // Customer suspension check — treat suspended as unauthenticated
+    // F-A-10 FIX: Role-agnostic suspension check — treat suspended as unauthenticated.
+    // Same canonical helper as authMiddleware so read/write share a single
+    // Redis key prefix (`suspension:{id}`); prevents silent-allow on drivers,
+    // transporters, and admins whose suspensions were stored under the new key.
     try {
-      const isSuspended = await redisService.exists(`customer:suspended:${decoded.userId}`);
+      const isSuspended = await adminSuspensionService.isUserSuspended(decoded.userId);
       if (isSuspended) {
         next(); // suspended user = unauthenticated for optional auth
         return;

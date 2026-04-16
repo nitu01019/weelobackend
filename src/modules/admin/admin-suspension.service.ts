@@ -58,6 +58,19 @@ const MAX_SUSPENSION_HOURS = 8760; // 1 year
 const MIN_SUSPENSION_HOURS = 0.0167; // ~1 minute
 
 // =============================================================================
+// KEY HELPERS (canonical — single source of truth for Redis key shape)
+// =============================================================================
+
+/**
+ * F-A-10 FIX: Canonical Redis suspension key helper.
+ * Every read (middleware, monitoring, SCAN) and every write (suspendUser,
+ * unsuspendUser) MUST go through this helper — never hardcode the prefix.
+ * Prevents the silent key-drift bug where auth.middleware used a
+ * `customer:suspended:{id}` literal while the service wrote `suspension:{id}`.
+ */
+export const suspensionKey = (userId: string): string => `${SUSPENSION_KEY_PREFIX}${userId}`;
+
+// =============================================================================
 // SERVICE
 // =============================================================================
 
