@@ -112,6 +112,11 @@ const ENV_VARS: EnvVar[] = [
   // REDIS CACHE
   // ==========================================================================
   {
+    name: 'REDIS_URL',
+    required: false, // M-9: validated separately — required in production, localhost fallback in dev
+    description: 'Redis connection URL (required in production)'
+  },
+  {
     name: 'REDIS_ENABLED',
     required: false,
     default: 'false',
@@ -383,6 +388,29 @@ const ENV_VARS: EnvVar[] = [
     validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 10 && parseInt(v) <= 300,
     description: 'Flex hold base duration in seconds'
   },
+  // F-C-75: keys referenced by hold-config.ts but previously undeclared here,
+  // so validation passed silently without any contract check.
+  {
+    name: 'FLEX_HOLD_EXTENSION_SECONDS',
+    required: false,
+    default: '30',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 5 && parseInt(v) <= 120,
+    description: 'Flex hold per-extension bump in seconds (PRD 7777: +30s per driver assignment)'
+  },
+  {
+    name: 'FLEX_HOLD_MAX_DURATION_SECONDS',
+    required: false,
+    default: '130',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 30 && parseInt(v) <= 600,
+    description: 'Flex hold absolute max duration in seconds (base + all extensions)'
+  },
+  {
+    name: 'ORDER_BASE_TIMEOUT_SECONDS',
+    required: false,
+    default: '120',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 30 && parseInt(v) <= 600,
+    description: 'Base order broadcast/expiry timeout in seconds (PRD 7777: 120s)'
+  },
 
   // ==========================================================================
   // ORDER CREATION GUARDS
@@ -577,6 +605,12 @@ export function validateEnvironment(): ValidationResult {
         result.errors.push('GOOGLE_MAPS_API_KEY is required in production for Places/Geocoding');
       }
       
+      // M-9 FIX: REDIS_URL is required in production — fail-fast
+      if (envVar.name === 'REDIS_URL' && !value) {
+        result.valid = false;
+        result.errors.push('REDIS_URL is required in production (no localhost fallback)');
+      }
+
       // Redis should be enabled in production
       if (envVar.name === 'REDIS_ENABLED' && value !== 'true') {
         result.warnings.push('REDIS_ENABLED should be true in production for caching and rate limiting');
