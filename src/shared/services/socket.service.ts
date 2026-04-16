@@ -200,6 +200,7 @@ export const SocketEvent = {
   TRANSPORTER_STATUS_CHANGED: 'transporter_status_changed',
   DRIVER_ACCEPTED: 'driver_accepted',
   DRIVER_DECLINED: 'driver_declined',
+  FLEX_HOLD_STARTED: 'flex_hold_started',
   FLEX_HOLD_EXTENDED: 'flex_hold_extended',
   CASCADE_REASSIGNED: 'cascade_reassigned',
   DRIVER_RATING_UPDATED: 'driver_rating_updated',
@@ -1576,7 +1577,8 @@ const FCM_FALLBACK_EVENTS = new Set([
   'booking_updated', 'driver_accepted', 'driver_declined',
   'booking_expired', 'booking_cancelled', 'order_status_update',
   'driver_timeout', 'assignment_timeout', 'hold_expired',
-  'payment_pending', 'payment_confirmed'
+  'payment_pending', 'payment_confirmed',
+  'flex_hold_started'
 ]);
 
 /**

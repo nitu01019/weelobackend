@@ -202,9 +202,10 @@ class FlexHoldService {
 
     // AB-2 fix: Reject hold creation if the parent broadcast/order has expired.
     // Prevents stale broadcasts from locking trucks after expiry.
+    // F-C-50: Also select customerId so we can mirror `flex_hold_started` to the customer room.
     const parentOrder = await prismaClient.order.findUnique({
       where: { id: request.orderId },
-      select: { expiresAt: true, status: true },
+      select: { expiresAt: true, status: true, customerId: true },
     });
     if (!parentOrder) {
       return {
@@ -293,6 +294,24 @@ class FlexHoldService {
         holdId,
         expiresAt: baseExpiresAt,
       });
+
+      // F-C-50: Emit `flex_hold_started` to transporter so captain UI has a
+      // reliable kick-off signal (REST-only today means a lost HTTP response
+      // leaves the UI stuck). Mirror to customer room for lifecycle parity
+      // with the existing `flex_hold_extended` emit pattern.
+      const flexHoldStartedPayload = {
+        holdId,
+        orderId: request.orderId,
+        phase: 'FLEX' as const,
+        expiresAt: baseExpiresAt.toISOString(),
+        baseDurationSeconds: this.config.baseDurationSeconds,
+        canExtend: true,
+        maxExtensions: this.config.maxExtensions,
+      };
+      await socketService.emitToUser(request.transporterId, 'flex_hold_started', flexHoldStartedPayload);
+      if (parentOrder.customerId) {
+        await socketService.emitToUser(parentOrder.customerId, 'flex_hold_started', flexHoldStartedPayload);
+      }
 
       return {
         success: true,
