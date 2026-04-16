@@ -329,23 +329,23 @@ describe('A. Fleet Cache Invalidation (#5)', () => {
     it('deletes vehicle list and available keys for transporter', async () => {
       await fleetCacheService.invalidateVehicleCache(TRANSPORTER_ID);
       expect(mockCacheDelete).toHaveBeenCalledWith(
-        expect.stringContaining(`fleet:vehicles:${TRANSPORTER_ID}`)
+        expect.stringContaining(`fleetcache:vehicles:${TRANSPORTER_ID}`)
       );
       expect(mockCacheDelete).toHaveBeenCalledWith(
-        expect.stringContaining(`fleet:vehicles:available:${TRANSPORTER_ID}`)
+        expect.stringContaining(`fleetcache:vehicles:available:${TRANSPORTER_ID}`)
       );
     });
 
     it('deletes individual vehicle key when vehicleId provided', async () => {
       await fleetCacheService.invalidateVehicleCache(TRANSPORTER_ID, VEHICLE_ID);
-      expect(mockCacheDelete).toHaveBeenCalledWith(`fleet:vehicle:${VEHICLE_ID}`);
+      expect(mockCacheDelete).toHaveBeenCalledWith(`fleetcache:vehicle:${VEHICLE_ID}`);
     });
 
     it('scans and removes type-specific cache keys', async () => {
       mockCacheScanIterator.mockReturnValue(
         makeAsyncIterator([
-          `fleet:vehicles:${TRANSPORTER_ID}:type:open`,
-          `fleet:vehicles:${TRANSPORTER_ID}:type:container`,
+          `fleetcache:vehicles:${TRANSPORTER_ID}:type:open`,
+          `fleetcache:vehicles:${TRANSPORTER_ID}:type:container`,
         ])
       );
       await fleetCacheService.invalidateVehicleCache(TRANSPORTER_ID);
@@ -359,13 +359,13 @@ describe('A. Fleet Cache Invalidation (#5)', () => {
       mockCacheScanIterator.mockImplementation(() => {
         callCount++;
         if (callCount === 2) {
-          return makeAsyncIterator([`fleet:snapshot:${TRANSPORTER_ID}:open`]);
+          return makeAsyncIterator([`fleetcache:snapshot:${TRANSPORTER_ID}:open`]);
         }
         return makeAsyncIterator([]);
       });
       await fleetCacheService.invalidateVehicleCache(TRANSPORTER_ID);
       expect(mockCacheDelete).toHaveBeenCalledWith(
-        `fleet:snapshot:${TRANSPORTER_ID}:open`
+        `fleetcache:snapshot:${TRANSPORTER_ID}:open`
       );
     });
 
@@ -396,16 +396,16 @@ describe('A. Fleet Cache Invalidation (#5)', () => {
     it('deletes driver list and available keys for transporter', async () => {
       await fleetCacheService.invalidateDriverCache(TRANSPORTER_ID);
       expect(mockCacheDelete).toHaveBeenCalledWith(
-        expect.stringContaining(`fleet:drivers:${TRANSPORTER_ID}`)
+        expect.stringContaining(`fleetcache:drivers:${TRANSPORTER_ID}`)
       );
       expect(mockCacheDelete).toHaveBeenCalledWith(
-        expect.stringContaining(`fleet:drivers:available:${TRANSPORTER_ID}`)
+        expect.stringContaining(`fleetcache:drivers:available:${TRANSPORTER_ID}`)
       );
     });
 
     it('deletes individual driver key when driverId provided', async () => {
       await fleetCacheService.invalidateDriverCache(TRANSPORTER_ID, DRIVER_ID);
-      expect(mockCacheDelete).toHaveBeenCalledWith(`fleet:driver:${DRIVER_ID}`);
+      expect(mockCacheDelete).toHaveBeenCalledWith(`fleetcache:driver:${DRIVER_ID}`);
     });
 
     it('does not throw if cache delete fails', async () => {
@@ -476,7 +476,7 @@ describe('A. Fleet Cache Invalidation (#5)', () => {
       await fleetCacheService.updateVehicleStatus(VEHICLE_ID, 'in_transit', TRIP_ID);
 
       expect(mockCacheSet).toHaveBeenCalledWith(
-        `fleet:vehicle:${VEHICLE_ID}`,
+        `fleetcache:vehicle:${VEHICLE_ID}`,
         expect.objectContaining({ status: 'in_transit', currentTripId: TRIP_ID }),
         expect.any(Number)
       );

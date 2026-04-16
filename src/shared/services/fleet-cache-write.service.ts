@@ -15,9 +15,14 @@ import { logger } from './logger.service';
 import {
   CACHE_KEYS,
   CACHE_TTL,
+  FLEET_CACHE_PREFIX,
   CachedVehicle,
   CachedDriver,
 } from './fleet-cache-types';
+
+// F-B-03: Tracking-shape regex — matches `fleet:index:transporters` and
+// `fleet:{uuid}` active-driver sets. Used as defensive deny-list in clearAll.
+const TRACKING_KEY_DENYLIST = /^fleet:(index:transporters|[0-9a-f]{8}-[0-9a-f]{4}-)/i;
 
 // ===========================================================================
 // CACHE INVALIDATION
@@ -32,14 +37,14 @@ export async function invalidateVehicleCache(transporterId: string, vehicleId?: 
   ];
 
   try {
-    const iterator = cacheService.scanIterator(`fleet:vehicles:${transporterId}:type:*`);
+    const iterator = cacheService.scanIterator(`fleetcache:vehicles:${transporterId}:type:*`);
     for await (const key of iterator) { keysToDelete.push(key); }
   } catch (error) {
     logger.warn(`[FleetCache] Error getting pattern keys: ${error}`);
   }
 
   try {
-    const iterator = cacheService.scanIterator(`fleet:snapshot:${transporterId}:*`);
+    const iterator = cacheService.scanIterator(`fleetcache:snapshot:${transporterId}:*`);
     for await (const key of iterator) { keysToDelete.push(key); }
   } catch (error) {
     logger.warn(`[FleetCache] Error getting snapshot keys: ${error}`);
@@ -140,10 +145,20 @@ export async function updateDriverAvailability(
 export async function clearAll(): Promise<void> {
   logger.warn('[FleetCache] Clearing ALL fleet caches');
   try {
-    const iterator = cacheService.scanIterator('fleet:*');
+    // F-B-03: Scan only the FleetCache-owned prefix + defensive deny-list.
+    const iterator = cacheService.scanIterator(`${FLEET_CACHE_PREFIX}*`);
     let count = 0;
-    for await (const key of iterator) { await cacheService.delete(key); count++; }
-    logger.info(`[FleetCache] Cleared ${count} cache entries`);
+    let skipped = 0;
+    for await (const key of iterator) {
+      if (TRACKING_KEY_DENYLIST.test(key)) {
+        logger.error(`[FleetCache] fleetcache_refuse_tracking_key: refused to delete tracking-shaped key under fleetcache scan: ${key}`);
+        skipped++;
+        continue;
+      }
+      await cacheService.delete(key);
+      count++;
+    }
+    logger.info(`[FleetCache] Cleared ${count} cache entries (skipped=${skipped})`);
   } catch (error) {
     logger.error(`[FleetCache] Error clearing caches: ${error}`);
   }

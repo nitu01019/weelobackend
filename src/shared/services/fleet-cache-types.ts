@@ -8,17 +8,22 @@
  * =============================================================================
  */
 
+// F-B-03: FleetCache owns the `fleetcache:*` namespace. Tracking owns `fleet:*`
+// (fleet:{transporterId}, fleet:index:transporters). Do NOT collapse these two
+// prefixes — clearAll() scans only `fleetcache:*` and refuses to touch tracking.
+export const FLEET_CACHE_PREFIX = 'fleetcache:';
+
 export const CACHE_KEYS = {
-  VEHICLES: (transporterId: string) => `fleet:vehicles:${transporterId}`,
+  VEHICLES: (transporterId: string) => `fleetcache:vehicles:${transporterId}`,
   VEHICLES_BY_TYPE: (transporterId: string, type: string, subtype?: string) =>
-    `fleet:vehicles:${transporterId}:type:${type.toLowerCase()}${subtype ? `:${subtype.toLowerCase()}` : ''}`,
-  VEHICLES_AVAILABLE: (transporterId: string) => `fleet:vehicles:available:${transporterId}`,
-  VEHICLE: (vehicleId: string) => `fleet:vehicle:${vehicleId}`,
-  DRIVERS: (transporterId: string) => `fleet:drivers:${transporterId}`,
-  DRIVERS_AVAILABLE: (transporterId: string) => `fleet:drivers:available:${transporterId}`,
-  DRIVER: (driverId: string) => `fleet:driver:${driverId}`,
+    `fleetcache:vehicles:${transporterId}:type:${type.toLowerCase()}${subtype ? `:${subtype.toLowerCase()}` : ''}`,
+  VEHICLES_AVAILABLE: (transporterId: string) => `fleetcache:vehicles:available:${transporterId}`,
+  VEHICLE: (vehicleId: string) => `fleetcache:vehicle:${vehicleId}`,
+  DRIVERS: (transporterId: string) => `fleetcache:drivers:${transporterId}`,
+  DRIVERS_AVAILABLE: (transporterId: string) => `fleetcache:drivers:available:${transporterId}`,
+  DRIVER: (driverId: string) => `fleetcache:driver:${driverId}`,
   AVAILABILITY_SNAPSHOT: (transporterId: string, vehicleType: string) =>
-    `fleet:snapshot:${transporterId}:${vehicleType.toLowerCase()}`
+    `fleetcache:snapshot:${transporterId}:${vehicleType.toLowerCase()}`
 };
 
 export const CACHE_TTL = {

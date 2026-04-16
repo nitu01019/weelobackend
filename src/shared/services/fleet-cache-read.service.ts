@@ -401,11 +401,11 @@ export async function getStats(): Promise<{
 }> {
   try {
     let vehicleCount = 0;
-    for await (const _ of cacheService.scanIterator('fleet:vehicle*')) { vehicleCount++; }
+    for await (const _ of cacheService.scanIterator('fleetcache:vehicle*')) { vehicleCount++; }
     let driverCount = 0;
-    for await (const _ of cacheService.scanIterator('fleet:driver*')) { driverCount++; }
+    for await (const _ of cacheService.scanIterator('fleetcache:driver*')) { driverCount++; }
     let snapshotCount = 0;
-    for await (const _ of cacheService.scanIterator('fleet:snapshot*')) { snapshotCount++; }
+    for await (const _ of cacheService.scanIterator('fleetcache:snapshot*')) { snapshotCount++; }
     return { vehicleKeys: vehicleCount, driverKeys: driverCount, snapshotKeys: snapshotCount };
   } catch (error) {
     logger.warn(`[FleetCache] Error getting stats: ${error}`);

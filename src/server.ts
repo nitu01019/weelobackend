@@ -50,6 +50,7 @@ import { validateAndLogEnvironment } from './core/config/env.validation';
 // Config & Services
 import { config } from './config/environment';
 import { logger } from './shared/services/logger.service';
+import { logFlagStates, validateFeatureFlags, flagHealthRouter } from './shared/config/feature-flags';
 import { initializeSocket, getConnectedUserCount, getConnectionStats, getRedisAdapterStatus } from './shared/services/socket.service';
 
 // Middleware
@@ -306,6 +307,8 @@ app.use(metricsMiddleware);
 // HEALTH & MONITORING ROUTES - BEFORE rate limiter so ALB health checks never get throttled
 // =============================================================================
 app.use('/', healthRoutes);
+// M-8 FIX: Feature flag debugging endpoint
+app.use('/', flagHealthRouter);
 
 app.get('/health/runtime', async (_req, res) => {
   try {
@@ -584,6 +587,28 @@ async function bootstrap(): Promise<void> {
     logger.warn(`[Startup] Rating reminder poller failed to start (non-fatal): ${msg}`);
   }
 
+  // I-1 FIX: Start smart-timeout expiry checker (was defined but never called — orders
+  // with OrderTimeout records now auto-expire via 15s polling).
+  try {
+    const { smartTimeoutService } = await import('./modules/order-timeout/smart-timeout.service');
+    smartTimeoutService.startExpiryChecker();
+    logger.info('[Startup] Smart-timeout expiry checker started (every 15s)');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn(`[Startup] Smart-timeout expiry checker failed to start (non-fatal): ${msg}`);
+  }
+
+  // I-1 FIX: Start broadcast expiry checker (was defined but never called — stale
+  // broadcasts now auto-expire via 5s polling).
+  try {
+    const { broadcastService: bcastSvc } = await import('./modules/broadcast/broadcast.service');
+    bcastSvc.startExpiryChecker();
+    logger.info('[Startup] Broadcast expiry checker started (every 5s)');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn(`[Startup] Broadcast expiry checker failed to start (non-fatal): ${msg}`);
+  }
+
   // C-8 FIX: Recover orphaned progressive step timers after server restart.
   // Timer keys may exist in Redis but be missing from the timers:pending sorted
   // set if a previous instance crashed between reading and processing a timer.
@@ -599,6 +624,62 @@ async function bootstrap(): Promise<void> {
     logger.warn(`[Startup] C-8 timer recovery failed (non-fatal): ${msg}`);
   }
 
+  // Issue #14 FIX: Periodic cleanup of OrderIdempotency and OrderCancelIdempotency
+  // tables. Batched deletes with distributed lock. See cleanup-order-idempotency.job.ts.
+  try {
+    const { startIdempotencyCleanupJob } = await import('./shared/jobs/cleanup-order-idempotency.job');
+    startIdempotencyCleanupJob();
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn(`[Startup] Idempotency cleanup job failed to start (non-fatal): ${msg}`);
+  }
+
+  // -------------------------------------------------------------------------
+  // BEGIN prefix-overlap assertion (F-B-03)
+  // Fail-fast at boot if two Redis namespace owners share an overlapping prefix.
+  // FleetCache owns `fleetcache:*`; tracking owns `fleet:*`. Prevents a future
+  // regression from re-introducing the fleetCacheService.clearAll() -> tracking
+  // wipe collision. Reference: WEELO-CRITICAL-SOLUTION.md#F-B-03.
+  // -------------------------------------------------------------------------
+  {
+    const prefixOwners: Array<{ owner: string; prefix: string }> = [];
+    try {
+      const { fleetCacheService } = await import('./shared/services/fleet-cache.service');
+      const fleetCachePrefixes = Array.isArray(fleetCacheService?.registeredPrefixes)
+        ? fleetCacheService.registeredPrefixes
+        : ['fleetcache:'];
+      for (const prefix of fleetCachePrefixes) {
+        prefixOwners.push({ owner: 'fleetCacheService', prefix });
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn(`[Startup] F-B-03 prefix-assertion: failed to load fleetCacheService: ${msg}`);
+      prefixOwners.push({ owner: 'fleetCacheService', prefix: 'fleetcache:' });
+    }
+    // Tracking owns `fleet:*` (fleet:{transporterId}, fleet:index:transporters).
+    // Hardcoded because tracking keys live on a constant map (REDIS_KEYS) that
+    // does not yet expose a registeredPrefixes contract.
+    prefixOwners.push({ owner: 'trackingService', prefix: 'fleet:' });
+
+    for (let i = 0; i < prefixOwners.length; i++) {
+      for (let j = i + 1; j < prefixOwners.length; j++) {
+        const a = prefixOwners[i];
+        const b = prefixOwners[j];
+        // Overlap = either prefix is a strict prefix of the other (glob-unsafe).
+        const overlaps = a.prefix === b.prefix
+          || a.prefix.startsWith(b.prefix)
+          || b.prefix.startsWith(a.prefix);
+        if (overlaps) {
+          const message = `[Startup] F-B-03 fatal: Redis prefix overlap detected — ${a.owner}="${a.prefix}" collides with ${b.owner}="${b.prefix}". Two services sharing a SCAN prefix WILL mutually delete keys on clearAll(). Fix: rename one owner's prefix before rollout.`;
+          logger.error(message);
+          throw new Error(message);
+        }
+      }
+    }
+    logger.info(`[Startup] F-B-03 prefix-assertion ok (${prefixOwners.length} owners, no overlaps)`);
+  }
+  // END prefix-overlap assertion (F-B-03)
+
   // -------------------------------------------------------------------------
   // 4. Start listening for HTTP traffic
   // -------------------------------------------------------------------------
@@ -608,10 +689,10 @@ async function bootstrap(): Promise<void> {
     });
   });
 
-  // Server timeouts — set after listen
-  server.timeout = 30000;           // 30s max request time
-  server.keepAliveTimeout = 65000;  // 65s > ALB idle timeout (60s)
-  server.headersTimeout = 66000;    // 66s > keepAliveTimeout
+  // Server timeouts — set after listen (must satisfy: headersTimeout > keepAliveTimeout > ALB idle 60s)
+  server.timeout = 30000;           // 30 000 ms — max time for a single request
+  server.keepAliveTimeout = 65000;  // 65 000 ms — keep-alive > ALB idle timeout (60 000 ms)
+  server.headersTimeout = 66000;    // 66 000 ms — headers timeout > keepAliveTimeout (65 000 ms)
 
   // Start cleanup job for expired orders (runs every 2 minutes)
   import('./shared/jobs/cleanup-expired-orders.job').then(({ startCleanupJob }) => {
@@ -656,6 +737,13 @@ async function bootstrap(): Promise<void> {
   logger.info(banner);
 
   logger.info(`Server started on port ${PORT}`);
+
+  // M-8 FIX: Validate all feature flags at startup (fail-fast on invalid values in production)
+  validateFeatureFlags();
+
+  // M-3 FIX: Dump all feature flag states once at startup for deploy-time verification.
+  // Called after app.listen so logger is fully initialized.
+  logFlagStates();
 }
 
 bootstrap().catch((err) => {

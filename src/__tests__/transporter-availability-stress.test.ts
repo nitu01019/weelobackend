@@ -768,7 +768,7 @@ describe('Fleet Cache', () => {
     const cachedVehicles = [
       { id: 'v-cached', vehicleType: 'Open', status: 'available', isActive: true, lastUpdated: new Date().toISOString() },
     ];
-    const cacheKey = `fleet:vehicles:${T1}`;
+    const cacheKey = `fleetcache:vehicles:${T1}`;
     await cacheService.set(cacheKey, cachedVehicles, 300);
 
     const { fleetCacheService } = require('../shared/services/fleet-cache.service');
@@ -781,7 +781,7 @@ describe('Fleet Cache', () => {
   });
 
   it('should invalidate vehicle cache on vehicle status change', async () => {
-    const cacheKey = `fleet:vehicles:${T1}`;
+    const cacheKey = `fleetcache:vehicles:${T1}`;
     await cacheService.set(cacheKey, [makeVehicle()], 300);
 
     const { fleetCacheService } = require('../shared/services/fleet-cache.service');
@@ -819,7 +819,7 @@ describe('Fleet Cache', () => {
   });
 
   it('should auto-refresh after cache TTL expiry', async () => {
-    const cacheKey = `fleet:vehicles:${T1}`;
+    const cacheKey = `fleetcache:vehicles:${T1}`;
     // Set with very short TTL (already expired)
     cacheService._store.set(cacheKey, {
       value: JSON.stringify([makeVehicle()]),
@@ -872,7 +872,7 @@ describe('Fleet Cache', () => {
 
   it('should update individual vehicle status in cache', async () => {
     const vehicleId = 'v-status-update';
-    const cacheKey = `fleet:vehicle:${vehicleId}`;
+    const cacheKey = `fleetcache:vehicle:${vehicleId}`;
     await cacheService.set(cacheKey, {
       id: vehicleId,
       transporterId: T1,
