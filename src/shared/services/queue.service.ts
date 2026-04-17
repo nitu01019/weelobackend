@@ -1906,7 +1906,15 @@ export class QueueService {
   }
 
   /**
-   * Queue a push notification
+   * Queue a push notification.
+   *
+   * W0-1: The `priority` field is forwarded verbatim to
+   * `sendPushNotification` in the processor, which passes it to
+   * `buildMessage` where `android.priority` is set from it. Callers
+   * that issue time-sensitive driver-dispatch pushes MUST pass
+   * `priority: 'high'` at the TOP LEVEL (not nested inside `data`) — see
+   * `phase3to100-fcm-priority-regression.test.ts` for the 5 positive
+   * callsites this contract protects.
    */
   async queuePushNotification(
     userId: string,
@@ -1914,6 +1922,7 @@ export class QueueService {
       title: string;
       body: string;
       data?: Record<string, string>;
+      priority?: 'high' | 'normal';
     }
   ): Promise<string> {
     return this.queue.add(
@@ -1925,7 +1934,11 @@ export class QueueService {
   }
 
   /**
-   * Queue push notifications to multiple users (batch)
+   * Queue push notifications to multiple users (batch).
+   *
+   * W0-1: `priority` is forwarded to each per-user job so the downstream
+   * `sendPushNotification → buildMessage` path emits `android.priority`
+   * correctly. See `queuePushNotification` above for the contract.
    */
   async queuePushNotificationBatch(
     userIds: string[],
@@ -1933,6 +1946,7 @@ export class QueueService {
       title: string;
       body: string;
       data?: Record<string, string>;
+      priority?: 'high' | 'normal';
     }
   ): Promise<string[]> {
     const jobs = userIds.map(userId => ({
