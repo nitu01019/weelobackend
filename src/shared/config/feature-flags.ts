@@ -235,6 +235,19 @@ export const FLAGS = {
     description: 'RAMEN-style sequenced message delivery via Socket.IO',
   },
 
+  // --- Durable emit (socket.service.ts, F-B-26) ---
+  // Gate for the at-least-once durable-emit path: every lifecycle emit writes
+  // an envelope to `socket:unacked:{userId}` ZSET with a per-user monotonic seq
+  // before firing io.to(...).emit(). On reconnect, the replay handler drains
+  // unacked in seq order; BROADCAST_ACK prunes by score. Default OFF for
+  // soak-safe rollout (10% -> 50% -> 100%). When OFF, identical existing
+  // behavior (global seq stamp only, no ZADD outside queue processor path).
+  DURABLE_EMIT_ENABLED: {
+    env: 'FF_DURABLE_EMIT_ENABLED',
+    category: 'release' as const,
+    description: 'At-least-once durable Socket.IO emit via per-user ZSET + seq',
+  },
+
   // --- Dual channel delivery (queue.service.ts:81) ---
   // F-B-53: Safe default flipped ON. LaunchDarkly guidance: for a dual-write
   // safety net, over-delivery is safe and under-delivery is not. Explicit

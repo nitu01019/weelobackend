@@ -38,6 +38,7 @@ import { HOLD_CONFIG } from '../../core/config/hold-config';
 import { logger } from './logger.service';
 import { redisService } from './redis.service';
 import { socketCircuit } from './circuit-breaker.service';
+import { isEnabled, FLAGS } from '../config/feature-flags';
 import {
   TRANSPORTER_PRESENCE_KEY,
   PRESENCE_TTL_SECONDS as TRANSPORTER_PRESENCE_TTL,
@@ -1554,7 +1555,7 @@ function getNextSequenceSync(): number {
   return ++currentSeq;
 }
 
-function withSocketMeta(data: any): any {
+function withSocketMeta(data: any, seqOverride?: number): any {
   if (!data || typeof data !== 'object' || Array.isArray(data)) {
     return data;
   }
@@ -1566,8 +1567,172 @@ function withSocketMeta(data: any): any {
     ...data,
     eventVersion: SOCKET_EVENT_VERSION,
     serverTimeMs: Date.now(),
-    _seq: getNextSequenceSync()
+    _seq: typeof seqOverride === 'number' ? seqOverride : getNextSequenceSync()
   };
+}
+
+// =============================================================================
+// F-B-26: DURABLE EMIT — at-least-once delivery via per-user ZSET + monotonic seq
+// =============================================================================
+// Pattern: Transactional Outbox (microservices.io) + Socket.IO ZSET unacked
+// queue (Sigma Computing) + per-user monotonic seq (Kafka idempotent producer).
+//
+// Problem (per Phase-1 F-B-26): the only two production ZADD sites for
+// `socket:unacked:{userId}` live in the broadcast-queue processor. Every
+// direct `emitToUser` / room emit stamps a global `_seq` on the payload but
+// never writes the envelope, so the ACK/replay path has nothing to replay.
+//
+// Fix: `durableEmit(userId, event, data)` writes envelope -> ZADD -> TTL refresh
+// -> io.to('user:'+userId).emit with the per-user seq stamped back on the
+// payload. Emit helpers below route LIFECYCLE_EMIT_EVENTS through this path
+// when FF_DURABLE_EMIT_ENABLED is on; telemetry remains fire-and-forget.
+// =============================================================================
+
+/**
+ * Lifecycle events that require at-least-once durable delivery. When
+ * FF_DURABLE_EMIT_ENABLED is on, emit helpers route these through durableEmit
+ * (ZADD envelope before io.emit). Telemetry events (location_updated,
+ * broadcast_countdown, heartbeat) remain fire-and-forget to avoid ZSET spam.
+ */
+const LIFECYCLE_EMIT_EVENTS: ReadonlySet<string> = new Set([
+  'trip_assigned',
+  'truck_confirmed',
+  'driver_accepted',
+  'driver_declined',
+  'booking_updated',
+  'booking_expired',
+  'booking_cancelled',
+  'booking_completed',
+  'assignment_status_changed',
+  'assignment_stale',
+  'assignment_timeout',
+  'driver_timeout',
+  'hold_expired',
+  'hold_confirmed',
+  'hold_released',
+  'flex_hold_started',
+  'flex_hold_extended',
+  'new_broadcast',
+  'broadcast_state_changed',
+  'order_cancelled',
+  'order_expired',
+  'order_completed',
+  'order_status_update',
+  'order_state_sync',
+  'payment_pending',
+  'payment_confirmed',
+  'payment_succeeded',
+  'payment_failed',
+  'sos_alert',
+  'cascade_reassigned'
+]);
+
+// TTL for the unacked-envelope ZSET. Mirrors queue.service.ts
+// UNACKED_QUEUE_TTL_SECONDS (600s) — duplicated here to avoid importing
+// queue.service.ts from socket.service.ts (would pull a large cycle).
+const DURABLE_EMIT_TTL_SECONDS = 600;
+
+/**
+ * F-B-26: Write an envelope to `socket:unacked:{userId}` under a per-user
+ * monotonic sequence, refresh TTL, then emit. On reconnect the replay handler
+ * (lines ~1295-1324) drains unacked in seq order; BROADCAST_ACK (lines ~1328-
+ * 1341) prunes by score.
+ *
+ * Best-effort: any Redis failure degrades to a plain emit with a global seq
+ * (matches pre-F-B-26 behavior). Never throws.
+ *
+ * @param userId Target user ID (room = `user:${userId}`)
+ * @param event Socket.IO event name
+ * @param data Event payload (object)
+ * @returns true if emit fired (regardless of whether ZADD succeeded)
+ */
+async function durableEmit(userId: string, event: string, data: any): Promise<boolean> {
+  if (!io) return false;
+  let seq: number | undefined;
+  try {
+    seq = await redisService.incr(`socket:seq:${userId}`);
+    const envelope = JSON.stringify({
+      seq,
+      event,
+      payload: data,
+      createdAt: Date.now()
+    });
+    // ZADD + TTL refresh in parallel (independent ops)
+    await Promise.all([
+      redisService.zAdd(`socket:unacked:${userId}`, seq, envelope),
+      redisService.expire(`socket:unacked:${userId}`, DURABLE_EMIT_TTL_SECONDS)
+    ]);
+  } catch (persistErr: unknown) {
+    // ZSET write failed — fall back to non-durable emit. Over-delivery is
+    // safe; under-delivery is not. Log and carry on.
+    const msg = persistErr instanceof Error ? persistErr.message : String(persistErr);
+    logger.warn('[durableEmit] ZSET write failed, emitting without durable persistence', {
+      userId, event, error: msg
+    });
+    seq = undefined;
+  }
+  try {
+    io.to(`user:${userId}`).emit(event, withSocketMeta(data, seq));
+  } catch (emitErr: unknown) {
+    socketCircuit.reportFailure();
+    const msg = emitErr instanceof Error ? emitErr.message : String(emitErr);
+    logger.warn('[durableEmit] Emit failed, circuit breaker recording', {
+      userId, event, error: msg
+    });
+    return false;
+  }
+  return true;
+}
+
+/**
+ * F-B-26: Enumerate LOCAL members of a room → distinct userIds. Used by room
+ * helpers (emitToBooking/emitToTrip/...) when the event is in
+ * LIFECYCLE_EMIT_EVENTS and FF_DURABLE_EMIT_ENABLED is on. Only local
+ * members are visible (enumerating across peers would require async
+ * fetchSockets which adds latency to every lifecycle emit). Peer instances
+ * handle ZADD persistence for their own locally-connected users when the
+ * business event executes on their side; for multi-instance deployments the
+ * emitting instance covers its local users and the adapter-backed room emit
+ * still reaches disconnected-here-but-connected-there users for live delivery.
+ */
+function enumerateRoomUserIds(room: string): string[] {
+  if (!io) return [];
+  const socketIds = io.of('/').adapter.rooms?.get(room);
+  if (!socketIds || socketIds.size === 0) return [];
+  const userIds = new Set<string>();
+  for (const socketId of socketIds) {
+    const uid = socketUsers.get(socketId);
+    if (typeof uid === 'string' && uid.length > 0) userIds.add(uid);
+  }
+  return Array.from(userIds);
+}
+
+/**
+ * F-B-26: Persist an envelope under each userId's unacked ZSET without
+ * emitting (the caller owns the subsequent room emit). Returns silently on
+ * any Redis error — best-effort. This is the room-emit companion to the
+ * full `durableEmit(userId, event, data)` which does both ZADD and emit.
+ */
+async function persistRoomEnvelopes(userIds: string[], event: string, data: any): Promise<void> {
+  if (userIds.length === 0) return;
+  await Promise.all(userIds.map(async (uid) => {
+    try {
+      const seq = await redisService.incr(`socket:seq:${uid}`);
+      const envelope = JSON.stringify({
+        seq,
+        event,
+        payload: data,
+        createdAt: Date.now()
+      });
+      await Promise.all([
+        redisService.zAdd(`socket:unacked:${uid}`, seq, envelope),
+        redisService.expire(`socket:unacked:${uid}`, DURABLE_EMIT_TTL_SECONDS)
+      ]);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn('[persistRoomEnvelopes] ZSET write failed for user', { userId: uid, event, error: msg });
+    }
+  }));
 }
 
 // H-1 FIX: Critical lifecycle events that warrant FCM push when user has no local sockets.
@@ -1666,14 +1831,25 @@ export function emitToUser(userId: string, event: string, data: any): boolean {
     return false;
   }
 
-  // ALWAYS emit — Redis adapter handles cross-instance delivery
-  try {
-    io.to(`user:${userId}`).emit(event, withSocketMeta(data));
-  } catch (emitErr: unknown) {
-    socketCircuit.reportFailure();
-    const msg = emitErr instanceof Error ? emitErr.message : String(emitErr);
-    logger.warn('[Socket] Emit failed, circuit breaker recording', { userId, event, error: msg });
-    return false;
+  // F-B-26: Durable emit path — ZADD envelope to socket:unacked:{userId} under
+  // a per-user seq BEFORE firing io.emit. Gated behind FF_DURABLE_EMIT_ENABLED
+  // so rollout is controlled; default OFF = identical pre-fix behavior.
+  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
+    // Fire-and-forget: durableEmit handles its own errors & circuit recording.
+    durableEmit(userId, event, data).catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn('[Socket] durableEmit rejected unexpectedly', { userId, event, error: msg });
+    });
+  } else {
+    // ALWAYS emit — Redis adapter handles cross-instance delivery
+    try {
+      io.to(`user:${userId}`).emit(event, withSocketMeta(data));
+    } catch (emitErr: unknown) {
+      socketCircuit.reportFailure();
+      const msg = emitErr instanceof Error ? emitErr.message : String(emitErr);
+      logger.warn('[Socket] Emit failed, circuit breaker recording', { userId, event, error: msg });
+      return false;
+    }
   }
 
   // H-1 FIX: FCM fallback for offline users on critical lifecycle events.
@@ -1703,6 +1879,15 @@ export function emitToUser(userId: string, event: string, data: any): boolean {
  */
 export function emitToBooking(bookingId: string, event: string, data: any): void {
   if (!io) return;
+  // F-B-26: When durable emit is on and the event is lifecycle, ZADD an
+  // envelope for each local user in the room BEFORE the room broadcast, so
+  // the unacked store is populated for reconnect replay. The io.to(room).emit
+  // still fires once (cross-instance via Redis adapter) so connected users
+  // receive exactly one payload. Telemetry and flag-off paths are unchanged.
+  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
+    const userIds = enumerateRoomUserIds(`booking:${bookingId}`);
+    persistRoomEnvelopes(userIds, event, data).catch(() => { /* already logged per-user */ });
+  }
   io.to(`booking:${bookingId}`).emit(event, withSocketMeta(data));
   logger.debug(`Emitted ${event} to booking ${bookingId}`);
 }
@@ -1720,6 +1905,14 @@ export function emitToTrip(tripId: string, event: string, data: any): void {
   if (event === SocketEvent.LOCATION_UPDATED) {
     const room = io.of('/').adapter.rooms?.get(roomName);
     if (!room || room.size === 0) return;
+  }
+
+  // F-B-26: Durable persistence for lifecycle trip events (trip_assigned,
+  // order_completed, cascade_reassigned, etc.). LOCATION_UPDATED is
+  // telemetry — never ZADDed regardless of flag state.
+  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
+    const userIds = enumerateRoomUserIds(roomName);
+    persistRoomEnvelopes(userIds, event, data).catch(() => { /* already logged per-user */ });
   }
 
   io.to(roomName).emit(event, withSocketMeta(data));
@@ -1789,6 +1982,14 @@ export function getIO(): Server | null {
  */
 export function emitToOrder(orderId: string, event: string, data: any): void {
   if (!io) return;
+  // F-B-26: Persist lifecycle envelopes for each local user in the order
+  // room before the room broadcast. Order events (order_cancelled,
+  // order_expired, order_completed, truck_confirmed, new_broadcast) are
+  // exactly the events dropped on reconnect per the audit reproduction.
+  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
+    const userIds = enumerateRoomUserIds(`order:${orderId}`);
+    persistRoomEnvelopes(userIds, event, data).catch(() => { /* already logged per-user */ });
+  }
   io.to(`order:${orderId}`).emit(event, withSocketMeta(data));
   logger.debug(`Emitted ${event} to order ${orderId}`);
 }
@@ -1823,6 +2024,14 @@ export function emitToUsers(userIds: string[], event: string, data: any): void {
   if (!io || userIds.length === 0) return;
 
   const uniqueUserIds = Array.from(new Set(userIds));
+
+  // F-B-26: For lifecycle events, ZADD each recipient's envelope BEFORE the
+  // batched emit so reconnect replay covers the fan-out. The envelope write
+  // is per-user (independent seq counters), run in parallel.
+  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
+    persistRoomEnvelopes(uniqueUserIds, event, data).catch(() => { /* already logged per-user */ });
+  }
+
   const payload = withSocketMeta(data);
   const userRooms = uniqueUserIds.map((userId) => `user:${userId}`);
   const chunkSize = SOCKET_MULTI_ROOM_EMIT_CHUNK_SIZE;
@@ -1845,6 +2054,14 @@ export function emitToUsers(userIds: string[], event: string, data: any): void {
 export function emitToRoom(room: string, event: string, data: any): void {
   if (!io) return;
 
+  // F-B-26: For lifecycle events, enumerate local room members and ZADD each
+  // userId's envelope before the broadcast. Covers ad-hoc rooms outside of
+  // the booking/trip/order families (e.g., transporter scoped rooms).
+  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
+    const userIds = enumerateRoomUserIds(room);
+    persistRoomEnvelopes(userIds, event, data).catch(() => { /* already logged per-user */ });
+  }
+
   io.to(room).emit(event, withSocketMeta(data));
 
   logger.debug(`Emitted ${event} to room ${room}`);
@@ -1857,6 +2074,14 @@ export function emitToRoom(room: string, event: string, data: any): void {
  */
 export function emitToAllTransporters(event: string, data: any): void {
   if (!io) return;
+
+  // F-B-26: Lifecycle events to all transporters (e.g. new_broadcast
+  // fan-out) must be durable per-recipient. Enumerate the local
+  // role:transporter room and ZADD each user's envelope before the broadcast.
+  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
+    const userIds = enumerateRoomUserIds('role:transporter');
+    persistRoomEnvelopes(userIds, event, data).catch(() => { /* already logged per-user */ });
+  }
 
   io.to('role:transporter').emit(event, withSocketMeta(data));
   logger.debug(`Broadcast ${event} to transporters`);
@@ -1874,6 +2099,14 @@ export function emitToAllTransporters(event: string, data: any): void {
  */
 export function emitToTransporterDrivers(transporterId: string, event: string, data: any): void {
   if (!io) return;
+
+  // F-B-26: Driver-room lifecycle fan-out (e.g., truck_confirmed reaching
+  // drivers under a transporter). ZADD each local driver's envelope before
+  // the room broadcast so reconnect replay recovers missed messages.
+  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
+    const userIds = enumerateRoomUserIds(`transporter:${transporterId}`);
+    persistRoomEnvelopes(userIds, event, data).catch(() => { /* already logged per-user */ });
+  }
 
   // Emit to all drivers in transporter room
   io.to(`transporter:${transporterId}`).emit(event, withSocketMeta(data));
@@ -1952,5 +2185,22 @@ export function cleanupAdapterReconnect(): void {
   if (adapterReconnectTimer) {
     clearInterval(adapterReconnectTimer);
     adapterReconnectTimer = null;
+  }
+}
+
+/**
+ * F-B-26: Test-only hook. Lets durable-emit contract tests inject a fake
+ * Socket.IO Server (plus populate the local `socketUsers` map) without going
+ * through the full `initializeSocket` handshake path. Production code must
+ * NEVER call this — if NODE_ENV is not 'test', the helper is a no-op.
+ */
+export function __setIoForTesting(fakeIo: unknown, localUsers?: Map<string, string>): void {
+  if (process.env.NODE_ENV !== 'test') return;
+  io = fakeIo as Server | null;
+  if (localUsers) {
+    socketUsers.clear();
+    for (const [socketId, userId] of localUsers) {
+      socketUsers.set(socketId, userId);
+    }
   }
 }
