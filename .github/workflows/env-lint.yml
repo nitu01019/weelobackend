@@ -2,6 +2,7 @@ name: Env Lint
 
 # -----------------------------------------------------------------------------
 # F-C-75 — CI gate for `.env.example` vs `src/shared/config/env.config.ts` drift.
+# Author: Wave 1 Agent W1-4 (phase3-to-100 plan).
 #
 # Script (package.json `lint:env`): `ts-node scripts/verify-env-example.ts`.
 # Fails the job (non-zero exit) if any env key declared in the runtime config
@@ -10,6 +11,7 @@ name: Env Lint
 #
 # Triggers: every pull_request + every push to main.
 # Style mirrors `.github/workflows/security.yml` (Node 20, npm cache).
+# Shape is locked by src/__tests__/phase3to100-env-lint-workflow.test.ts.
 # -----------------------------------------------------------------------------
 
 on:
