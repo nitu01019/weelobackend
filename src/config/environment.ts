@@ -98,6 +98,15 @@ function parseCorsOrigins(value: string): string | string[] {
   return value.split(',').map(origin => origin.trim()).filter(Boolean);
 }
 
+/**
+ * F-A-08: Parse trusted-proxy CIDR list from comma-separated string.
+ * Default covers AWS VPC CIDRs so ALB → task traffic is recognised as
+ * trusted without any ops override.
+ */
+function parseTrustedProxyCidrs(value: string): string[] {
+  return value.split(',').map(s => s.trim()).filter(Boolean);
+}
+
 // =============================================================================
 // CONFIGURATION OBJECT
 // =============================================================================
@@ -193,6 +202,14 @@ export const config = {
   cors: {
     origin: parseCorsOrigins(getOptional('CORS_ORIGIN', '*')),
   },
+
+  // F-A-08: Trusted-proxy CIDRs for Express `trust proxy`.
+  // Numeric hop-count (e.g., `1`) lets attackers spoof X-Forwarded-For; a
+  // CIDR allowlist restricts XFF trust to ALB/VPC subnets only. Override via
+  // TRUSTED_PROXY_CIDRS=10.x/16,10.y/16 in production when subnets differ.
+  trustedProxyCidrs: parseTrustedProxyCidrs(
+    getOptional('TRUSTED_PROXY_CIDRS', '10.0.0.0/16,172.16.0.0/12')
+  ),
 
   // Booking backpressure
   bookingConcurrencyLimit: getNumber('BOOKING_CONCURRENCY_LIMIT', 200),

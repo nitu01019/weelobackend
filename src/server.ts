@@ -93,7 +93,8 @@ import { holdReconciliationService } from './modules/hold-expiry/hold-reconcilia
 import { customBookingRouter } from './modules/custom-booking';
 import geocodingRouter from './modules/routing/geocoding.routes';
 import { healthRoutes } from './shared/routes/health.routes';
-import { metricsMiddleware } from './shared/monitoring/metrics.service';
+import { metricsMiddleware, metrics } from './shared/monitoring/metrics.service';
+import { getClientIpChain } from './shared/utils/net.utils';
 import { assertRedisEvictionPolicy, RedisEvictionPolicyError } from './shared/monitoring/redis-eviction-assertion';
 import { fcmService } from './shared/services/fcm.service';
 import { redisService } from './shared/services/redis.service';
@@ -243,8 +244,31 @@ fcmService.initialize().then(() => {
 // =============================================================================
 
 // Trust proxy - MUST be first before any middleware that uses req.ip (rate limiter, etc.)
-// Without this, req.ip returns ALB's internal IP — all users share one rate limit bucket.
-app.set('trust proxy', 1);
+// F-A-08: CIDR-based trusted-proxy list replaces the spoofable numeric hop-count.
+// Numeric `1` pops exactly one XFF entry — an attacker prepends their own XFF value
+// and Express surfaces it as req.ip, trivially beating per-IP rate limits
+// (adam-p.ca "Perils of the real client IP"). CIDR list only trusts XFF from our ALB/VPC.
+app.set('trust proxy', config.trustedProxyCidrs);
+logger.info(`[Edge] Trust proxy CIDRs: ${config.trustedProxyCidrs.join(', ') || '(none — XFF fully ignored)'}`);
+
+// F-A-08: emit `edge_client_ip_source_total` so ops can watch spoof-probe rate.
+// source="xff" — req.ip came from a trusted XFF hop.
+// source="socket" — req.ip came from the socket (XFF was ignored or absent).
+// source="unknown" — neither resolvable (alert: rate{source="unknown"} > 10/5m).
+app.use((req, _res, next) => {
+  try {
+    const { sources, final } = getClientIpChain(req);
+    const source = !final || final === 'unknown'
+      ? 'unknown'
+      : sources.length > 0 && sources.includes(final)
+        ? 'xff'
+        : 'socket';
+    metrics.incrementCounter('edge_client_ip_source_total', { source });
+  } catch {
+    // Never let observability block the request path.
+  }
+  next();
+});
 
 // Request ID for tracking (must be first)
 app.use(requestIdMiddleware);

@@ -21,6 +21,11 @@ import { logger } from '../../shared/services/logger.service';
 import { metrics } from '../../shared/monitoring/metrics.service';
 import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
 import { redisService } from '../../shared/services/redis.service';
+import {
+  acquireLeader,
+  renewLeader,
+  startHeartbeat,
+} from '../../shared/services/leader-election.service';
 import type {
   OrderDispatchOutboxPayload,
   DispatchAttemptContext,
@@ -453,27 +458,75 @@ export async function processDispatchOutboxRow(
   }
 }
 
-// F-M10 FIX: Leader election instance ID — only one ECS instance polls the outbox at a time
+// F-M10 + F-A-56: Leader election instance ID — only one ECS instance polls the outbox at a time.
+// F-A-56 raises TTL 10s → 60s (3× batch p99 budget — matches Redlock safety rule) and
+// replaces the blind post-batch `redisService.set` renewal with an atomic CAS
+// heartbeat (leader-election.service.ts). The blind renewal could stomp a new
+// leader that had legitimately taken over during a GC pause, inviting duplicate
+// row processing.
 const OUTBOX_LEADER_KEY = 'outbox:leader';
-const OUTBOX_LEADER_TTL_SECONDS = 10;
+const OUTBOX_LEADER_TTL_SECONDS = Math.max(10, parseInt(process.env.OUTBOX_LEADER_TTL_SECONDS || '60', 10) || 60);
+const OUTBOX_LEADER_HEARTBEAT_MS = Math.max(5_000, parseInt(process.env.OUTBOX_LEADER_HEARTBEAT_MS || '20000', 10) || 20_000);
+const FF_OUTBOX_LEADER_FENCING = process.env.FF_OUTBOX_LEADER_FENCING === 'true';
 const outboxInstanceId = `${process.pid}:${Date.now()}`;
+
+let outboxHeartbeatTimer: NodeJS.Timeout | null = null;
+
+/** Stop the heartbeat (called on SIGTERM/shutdown). Exposed for tests + graceful shutdown. */
+export function stopOutboxLeaderHeartbeat(): void {
+  if (outboxHeartbeatTimer) {
+    clearInterval(outboxHeartbeatTimer);
+    outboxHeartbeatTimer = null;
+  }
+}
 
 export async function processDispatchOutboxBatch(limit = ORDER_DISPATCH_OUTBOX_BATCH_SIZE): Promise<void> {
   if (!FF_ORDER_DISPATCH_OUTBOX) return;
 
-  // F-M10 FIX: Leader election — only one instance polls the outbox.
-  // Uses Redis SET NX (via acquireLock) with 10s TTL. If another instance
-  // already holds the lock, this instance skips the poll cycle.
-  try {
-    const leaderLock = await redisService.acquireLock(OUTBOX_LEADER_KEY, outboxInstanceId, OUTBOX_LEADER_TTL_SECONDS);
-    if (!leaderLock.acquired) {
-      // Another instance is the leader — skip polling
-      return;
+  let isLeader = false;
+
+  if (FF_OUTBOX_LEADER_FENCING) {
+    // New path: atomic SET NX EX acquisition + CAS heartbeat. The heartbeat
+    // keeps extending the lease as long as we're still the owner, so we don't
+    // need to re-acquire on every poll cycle.
+    try {
+      const stillOwner = await renewLeader(OUTBOX_LEADER_KEY, outboxInstanceId, OUTBOX_LEADER_TTL_SECONDS);
+      if (stillOwner) {
+        isLeader = true;
+      } else {
+        const acquired = await acquireLeader(OUTBOX_LEADER_KEY, outboxInstanceId, OUTBOX_LEADER_TTL_SECONDS);
+        if (!acquired) return;
+        isLeader = true;
+        if (!outboxHeartbeatTimer) {
+          outboxHeartbeatTimer = startHeartbeat(
+            OUTBOX_LEADER_KEY,
+            outboxInstanceId,
+            OUTBOX_LEADER_TTL_SECONDS,
+            OUTBOX_LEADER_HEARTBEAT_MS
+          );
+          metrics.incrementCounter('outbox_leader_heartbeat_started_total');
+        }
+      }
+    } catch {
+      logger.warn('[DispatchOutbox] Leader election (fenced) Redis call failed — proceeding as fallback');
+      isLeader = true;
     }
-  } catch {
-    // Redis down — proceed anyway (single-instance fallback; SKIP LOCKED protects against duplicates)
-    logger.warn('[DispatchOutbox] Leader election Redis call failed — proceeding as fallback');
+  } else {
+    // Legacy path: acquireLock-style election + blind renewal. Preserved behind
+    // the default-OFF flag so rollout can be canaried.
+    try {
+      const leaderLock = await redisService.acquireLock(OUTBOX_LEADER_KEY, outboxInstanceId, OUTBOX_LEADER_TTL_SECONDS);
+      if (!leaderLock.acquired) {
+        return;
+      }
+      isLeader = true;
+    } catch {
+      logger.warn('[DispatchOutbox] Leader election Redis call failed — proceeding as fallback');
+      isLeader = true;
+    }
   }
+
+  if (!isLeader) return;
 
   const rows = await claimReadyDispatchOutboxRows(limit);
   for (const row of rows) {
@@ -489,11 +542,16 @@ export async function processDispatchOutboxBatch(limit = ORDER_DISPATCH_OUTBOX_B
     }
   }
 
-  // F-M10 FIX: Renew leadership after successful poll cycle
-  try {
-    await redisService.set(OUTBOX_LEADER_KEY, outboxInstanceId, OUTBOX_LEADER_TTL_SECONDS);
-  } catch {
-    // Non-critical — lock will expire and be re-acquired next cycle
+  // Legacy path: blind SET to "renew". F-A-56 notes this is unsafe if we
+  // GC-paused past the TTL during the batch — a new leader would be stomped.
+  // Under the fenced path, the independent heartbeat handles renewal with
+  // atomic CAS and this block is skipped entirely.
+  if (!FF_OUTBOX_LEADER_FENCING) {
+    try {
+      await redisService.set(OUTBOX_LEADER_KEY, outboxInstanceId, OUTBOX_LEADER_TTL_SECONDS);
+    } catch {
+      // Non-critical — lock will expire and be re-acquired next cycle
+    }
   }
 }
 
