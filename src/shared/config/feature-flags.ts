@@ -144,6 +144,18 @@ export const FLAGS = {
     description: 'Safety guard preventing release of holds in unexpected states',
   },
 
+  // --- F-A-79: Hold phase CAS guard (hold-state-machine.ts) ---
+  // Gates the centralised guardedConfirmFlexToConfirmed helper. Default OFF —
+  // the helper is exported but callers keep their current (now phase-aligned)
+  // writes; flip ON in P5/P6 saga extraction after 1-release soak. When ON,
+  // the monolith confirm paths funnel through the helper and any CAS-miss is
+  // surfaced as HoldTransitionError with metrics label reason=\"cas_miss\".
+  HOLD_GUARDED_TRANSITIONS: {
+    env: 'FF_HOLD_GUARDED_TRANSITIONS',
+    category: 'release' as const,
+    description: 'Centralized FLEX->CONFIRMED CAS guard helper (F-A-79)',
+  },
+
   // --- Booking routes (booking.routes.ts:33) ---
   LEGACY_BOOKING_PROXY_TO_ORDER: {
     env: 'FF_LEGACY_BOOKING_PROXY_TO_ORDER',

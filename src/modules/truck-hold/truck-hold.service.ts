@@ -1037,6 +1037,8 @@ class TruckHoldService {
         await tx.truckHoldLedger.update({
           where: { holdId },
           data: {
+            phase: HoldPhase.CONFIRMED,
+            phaseChangedAt: new Date(),
             status: 'confirmed',
             confirmedAt: new Date(),
             terminalReason: null
@@ -1712,6 +1714,8 @@ class TruckHoldService {
       await prismaClient.truckHoldLedger.update({
         where: { holdId },
         data: {
+          phase: HoldPhase.CONFIRMED,
+          phaseChangedAt: new Date(),
           status: 'confirmed',
           confirmedAt: new Date(),
           terminalReason: null
