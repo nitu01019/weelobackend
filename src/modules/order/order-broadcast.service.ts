@@ -835,31 +835,104 @@ export async function broadcastVehicleTypePayload(
   // legacy isVerified boolean. Both predicates are applied so a mismatched
   // legacy row (isVerified=true but kycStatus!=VERIFIED, or vice versa) is
   // excluded — fail-secure. Pattern: Fernando Hermida / Ola KYC FSM.
+  //
+  // F-B-76: fail CLOSED on KYC check failure. Previous behavior was
+  // fail-open (broadcast to everyone on DB error), which silently defeated
+  // the KYC gate the moment the DB was flaky. We now:
+  //   1. Retry up to 3 attempts with exponential backoff (100ms, 200ms, 400ms)
+  //      to absorb transient errors (connection pool contention, rolling DB
+  //      restart, brief network blip).
+  //   2. On terminal failure, broadcast to an EMPTY list (fail-closed). A
+  //      skipped broadcast is strictly safer than sending an assignment
+  //      opportunity to an un-KYC'd driver.
+  //   3. Increment the `broadcast_kyc_failclosed_total` counter for ops alerting.
+  //   4. Emit a loud error log via the phrase `DISPATCH DEGRADED` so the
+  //      existing CloudWatch page-filter fires on-call.
+  //
+  // Pattern: Stripe / AWS "fail-closed on identity verification outage" —
+  //   https://stripe.com/docs/connect/identity-verification
+  //   https://aws.amazon.com/blogs/security/how-to-fail-closed-when-an-identity-check-is-unavailable/
   let verifiedTransporters = matchingTransporters;
-  try {
-    const verifiedRows = await prismaClient.user.findMany({
-      where: {
-        id: { in: matchingTransporters },
-        isActive: true,
-        isVerified: true,
-        kycStatus: 'VERIFIED',
-      },
-      select: { id: true },
-    });
-    const verifiedSet = new Set(verifiedRows.map((u: { id: string }) => u.id));
-    const beforeKyc = matchingTransporters.length;
-    verifiedTransporters = matchingTransporters.filter(tid => {
-      if (verifiedSet.has(tid)) return true;
-      logger.info(`[Dispatch] Skipping KYC-ineligible transporter ${tid}`);
-      return false;
-    });
-    if (verifiedTransporters.length < beforeKyc) {
-      logger.info(`[OrderBroadcast] KYC gate: ${beforeKyc} -> ${verifiedTransporters.length} (filtered ${beforeKyc - verifiedTransporters.length} KYC-ineligible transporters)`);
+  const F_B_76_MAX_ATTEMPTS = 3;
+  const F_B_76_BASE_BACKOFF_MS = 100;
+  let kycAttempt = 0;
+  let kycSucceeded = false;
+  let lastKycError: unknown = null;
+  while (kycAttempt < F_B_76_MAX_ATTEMPTS && !kycSucceeded) {
+    kycAttempt += 1;
+    try {
+      const verifiedRows = await prismaClient.user.findMany({
+        where: {
+          id: { in: matchingTransporters },
+          isActive: true,
+          isVerified: true,
+          kycStatus: 'VERIFIED',
+        },
+        select: { id: true },
+      });
+      const verifiedSet = new Set(verifiedRows.map((u: { id: string }) => u.id));
+      const beforeKyc = matchingTransporters.length;
+      verifiedTransporters = matchingTransporters.filter(tid => {
+        if (verifiedSet.has(tid)) return true;
+        logger.info(`[Dispatch] Skipping KYC-ineligible transporter ${tid}`);
+        return false;
+      });
+      if (verifiedTransporters.length < beforeKyc) {
+        logger.info(`[OrderBroadcast] KYC gate: ${beforeKyc} -> ${verifiedTransporters.length} (filtered ${beforeKyc - verifiedTransporters.length} KYC-ineligible transporters)`);
+      }
+      kycSucceeded = true;
+    } catch (kycErr: unknown) {
+      lastKycError = kycErr;
+      const msg = kycErr instanceof Error ? kycErr.message : String(kycErr);
+      if (kycAttempt < F_B_76_MAX_ATTEMPTS) {
+        // Exponential backoff before retry: 100ms, 200ms, 400ms.
+        const backoff = F_B_76_BASE_BACKOFF_MS * Math.pow(2, kycAttempt - 1);
+        logger.warn(
+          `[OrderBroadcast] KYC check attempt ${kycAttempt}/${F_B_76_MAX_ATTEMPTS} failed, retrying in ${backoff}ms`,
+          { orderId, error: msg }
+        );
+        await new Promise(resolve => setTimeout(resolve, backoff));
+      } else {
+        logger.error(
+          `[OrderBroadcast] KYC check failed after ${F_B_76_MAX_ATTEMPTS} attempts — FAIL CLOSED (broadcast to empty list)`,
+          { orderId, error: msg }
+        );
+      }
     }
-  } catch (kycErr: unknown) {
-    // Fail-open: if KYC check fails, proceed with current list (previous behavior)
-    const msg = kycErr instanceof Error ? kycErr.message : String(kycErr);
-    logger.warn('[OrderBroadcast] KYC verification check failed, proceeding with current list', { orderId, error: msg });
+  }
+  if (!kycSucceeded) {
+    // F-B-76 fail-closed: do NOT broadcast to an unverified pool. An empty
+    // list means the order will re-broadcast later (or escalate via the
+    // timeout path) rather than leak work to un-KYC'd drivers.
+    verifiedTransporters = [];
+
+    // Observability: increment the fail-closed counter so ops can alert
+    // on sustained KYC outages. The metric labels carry orderId and the
+    // candidate pool size so on-call can reconstruct blast radius.
+    // `metrics` is imported at module top — no dynamic import needed.
+    try {
+      metrics.incrementCounter(
+        'broadcast_kyc_failclosed_total',
+        {
+          orderId,
+          candidateCount: String(matchingTransporters.length),
+        },
+        1
+      );
+    } catch (metricsErr: unknown) {
+      logger.debug('[OrderBroadcast] metrics increment failed (non-fatal)', {
+        error: metricsErr instanceof Error ? metricsErr.message : String(metricsErr),
+      });
+    }
+
+    // Loud error log — hits the same ingest path ops uses for page-worthy
+    // alerts (see CLOUD-WATCH filter on 'FAIL CLOSED').
+    logger.error('[OrderBroadcast] DISPATCH DEGRADED: KYC gate FAIL CLOSED for order', {
+      orderId,
+      matchingTransporterCount: matchingTransporters.length,
+      attempts: F_B_76_MAX_ATTEMPTS,
+      lastError: lastKycError instanceof Error ? lastKycError.message : String(lastKycError),
+    });
   }
 
   const sentTransporters: string[] = [];
