@@ -354,6 +354,7 @@ export async function emitCancellationLifecycle(payload: OrderCancelledOutboxPay
     await queueService.queuePushNotificationBatch(payload.transporters, {
       title: '❌ Order Cancelled',
       body: `Order #${payload.orderId.slice(-8).toUpperCase()} was cancelled by customer`,
+      priority: 'high', // W0-1: top-level priority drives FCM android.priority so transporters on doze see cancellation promptly.
       data: {
         type: 'order_cancelled',
         orderId: payload.orderId,
