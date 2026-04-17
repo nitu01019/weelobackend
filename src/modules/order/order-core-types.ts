@@ -36,6 +36,13 @@ export interface VehicleRequirement {
   vehicleSubtype: string;   // e.g., "20-24 Ton", "17ft"
   quantity: number;         // How many trucks of this type
   pricePerTruck: number;    // Price for this specific type
+  // F-A-26: signed quote fields returned by pricingService.calculateEstimate.
+  // When present AND valid, order-creation skips the silent recompute that
+  // previously produced non-deterministic prices across request boundaries.
+  quoteToken?: string;
+  surgeRuleId?: string;
+  surgeBucketStart?: string;
+  surgeBucketEnd?: string;
 }
 
 /**

@@ -1,10 +1,16 @@
 /**
  * =============================================================================
- * ORDER CREATION SERVICE - createOrder pipeline and all sub-methods
+ * ORDER CREATION SERVICE - Extracted sub-functions (NOT the active path)
  * =============================================================================
  *
- * Extracted from order.service.ts during file-size decomposition.
- * Contains the createOrder() method and all its private helper methods.
+ * These functions are imported by order-delegates.service.ts, which defines
+ * a SECOND OrderService class. However, NO route imports that class —
+ * all routes use the OrderService in order.service.ts directly.
+ *
+ * This file is NOT dead code (its functions are imported), but the
+ * orchestration via order-delegates.service.ts IS a dead code path.
+ *
+ * Status: DEPRECATED — scheduled for cleanup.
  * =============================================================================
  */
 
@@ -16,8 +22,9 @@ import { prismaClient, withDbTimeout, OrderStatus, BookingStatus, TruckRequestSt
 import { logger } from '../../shared/services/logger.service';
 import { truncate } from '../../shared/utils/truncate';
 import { redisService } from '../../shared/services/redis.service';
-import { pricingService } from '../pricing/pricing.service';
+import { pricingService, verifyQuoteToken } from '../pricing/pricing.service';
 import { AppError } from '../../shared/types/error.types';
+import { metrics } from '../../shared/monitoring/metrics.service';
 import { googleMapsService } from '../../shared/services/google-maps.service';
 import { roundCoord } from '../../shared/utils/geo.utils';
 import { TERMINAL_STATUSES } from '../booking/booking.types';
@@ -165,6 +172,7 @@ export async function enforceOrderDebounce(ctx: OrderCreateContext): Promise<voi
     // If error is our debounce AppError, rethrow it
     if (error instanceof AppError) throw error;
     // If Redis fails, skip debounce (don't block orders)
+    metrics.incrementCounter('order_debounce_redis_bypass_total');
     logger.warn(`⚠️ Debounce check failed: ${message}. Proceeding without debounce.`);
   }
 }
@@ -226,18 +234,35 @@ export async function checkExistingActiveOrders(ctx: OrderCreateContext): Promis
   // ========================================
   // Layer 1: Redis fast-path (catches 95%+ duplicates before DB).
   // Intentionally OUTSIDE the transaction for performance.
+  // I-4 FIX: Wrap Redis ops in try/catch — if Redis is down, fall through to DB
+  // SERIALIZABLE transaction (the authoritative guard). Better to allow a rare
+  // duplicate attempt (caught by TX) than to block ALL order creation.
   const activeKey = `customer:active-broadcast:${ctx.request.customerId}`;
-  const existingBroadcastId = await redisService.get(activeKey);
-  if (existingBroadcastId) {
-    throw new AppError(409, 'ACTIVE_ORDER_EXISTS', 'You already have an active order');
+  try {
+    const existingBroadcastId = await redisService.get(activeKey);
+    if (existingBroadcastId) {
+      throw new AppError(409, 'ACTIVE_ORDER_EXISTS', 'You already have an active order');
+    }
+  } catch (error: unknown) {
+    if (error instanceof AppError) throw error;
+    const msg = error instanceof Error ? error.message : String(error);
+    logger.warn(`[ORDER] Redis active-broadcast check failed: ${msg}. Falling through to DB guard.`);
   }
 
   // Layer 2: Distributed lock to serialize concurrent creates from same customer.
-  const lock = await redisService.acquireLock(ctx.lockKey, ctx.request.customerId, 10);
-  if (!lock.acquired) {
-    throw new AppError(409, 'LOCK_CONTENTION', 'Order creation in progress, please wait');
+  // I-4 FIX: If lock acquisition fails, proceed without lock — the SERIALIZABLE TX
+  // is the real concurrency guard; the lock is an optimization, not a requirement.
+  try {
+    const lock = await redisService.acquireLock(ctx.lockKey, ctx.request.customerId, 10);
+    if (!lock.acquired) {
+      throw new AppError(409, 'LOCK_CONTENTION', 'Order creation in progress, please wait');
+    }
+    ctx.lockAcquired = true;
+  } catch (error: unknown) {
+    if (error instanceof AppError) throw error;
+    const msg = error instanceof Error ? error.message : String(error);
+    logger.warn(`[ORDER] Redis lock acquisition failed: ${msg}. Proceeding without lock (DB TX is authoritative).`);
   }
-  ctx.lockAcquired = true;
 
   // FIX #11: DB authoritative check REMOVED from here.
   // It was running OUTSIDE the SERIALIZABLE transaction, creating a TOCTOU race:
@@ -269,28 +294,35 @@ export async function checkOrderServerIdempotency(ctx: OrderCreateContext): Prom
   // FIX #77: Use order-specific prefix to avoid collision with booking deduplication keys
   ctx.dedupeKey = `idem:order:create:${ctx.request.customerId}:${ctx.idempotencyHash}`;
 
-  const existingDedupeId = await redisService.get(ctx.dedupeKey);
-  if (existingDedupeId) {
-    const existingDedupeOrder = await db.getOrderById(existingDedupeId);
-    if (existingDedupeOrder && !['cancelled', 'expired'].includes(existingDedupeOrder.status)) {
-      logger.info('Idempotent replay: returning existing order', { orderId: existingDedupeId, idempotencyHash: ctx.idempotencyHash });
-      const totalTrucks = ctx.request.vehicleRequirements.reduce((sum, req) => sum + req.quantity, 0);
-      const totalAmount = ctx.request.vehicleRequirements.reduce((sum, req) => sum + (req.quantity * req.pricePerTruck), 0);
-      return {
-        orderId: existingDedupeId,
-        totalTrucks,
-        totalAmount,
-        dispatchState: 'dispatched',
-        dispatchAttempts: 1,
-        onlineCandidates: existingDedupeOrder.onlineCandidatesCount || 0,
-        notifiedTransporters: existingDedupeOrder.notifiedCount || 0,
-        reasonCode: existingDedupeOrder.dispatchReasonCode || undefined,
-        serverTimeMs: Date.now(),
-        truckRequests: [],
-        expiresAt: existingDedupeOrder.expiresAt,
-        expiresIn: 0
-      };
+  // I-4 FIX: Wrap Redis dedup check in try/catch — if Redis fails, skip dedup
+  // and let the DB SERIALIZABLE transaction handle uniqueness.
+  try {
+    const existingDedupeId = await redisService.get(ctx.dedupeKey);
+    if (existingDedupeId) {
+      const existingDedupeOrder = await db.getOrderById(existingDedupeId);
+      if (existingDedupeOrder && !['cancelled', 'expired'].includes(existingDedupeOrder.status)) {
+        logger.info('Idempotent replay: returning existing order', { orderId: existingDedupeId, idempotencyHash: ctx.idempotencyHash });
+        const totalTrucks = ctx.request.vehicleRequirements.reduce((sum, req) => sum + req.quantity, 0);
+        const totalAmount = ctx.request.vehicleRequirements.reduce((sum, req) => sum + (req.quantity * req.pricePerTruck), 0);
+        return {
+          orderId: existingDedupeId,
+          totalTrucks,
+          totalAmount,
+          dispatchState: 'dispatched',
+          dispatchAttempts: 1,
+          onlineCandidates: existingDedupeOrder.onlineCandidatesCount || 0,
+          notifiedTransporters: existingDedupeOrder.notifiedCount || 0,
+          reasonCode: existingDedupeOrder.dispatchReasonCode || undefined,
+          serverTimeMs: Date.now(),
+          truckRequests: [],
+          expiresAt: existingDedupeOrder.expiresAt,
+          expiresIn: 0
+        };
+      }
     }
+  } catch (error: unknown) {
+    const msg = error instanceof Error ? error.message : String(error);
+    logger.warn(`[ORDER] Redis server-idempotency check failed: ${msg}. Proceeding without dedup (DB TX is authoritative).`);
   }
   return null;
 }
@@ -369,10 +401,46 @@ export async function resolveServerRouteDistance(ctx: OrderCreateContext): Promi
 export function validateAndCorrectPrices(ctx: OrderCreateContext): void {
   // ==========================================================================
   // SECURITY: Server-side price validation
+  //
+  // F-A-26: when the client replays a signed quote token from
+  // `pricingService.calculateEstimate`, we HMAC-verify it here instead of
+  // silently re-pricing. This prevents two back-to-back requests in the same
+  // 5-min surge bucket from returning different amounts, while still
+  // catching tampered/forged tokens (Stripe PaymentIntent semantics).
   // ==========================================================================
   const PRICE_TOLERANCE = 0.05; // 5% tolerance for rounding/surge timing
 
   for (const req of ctx.request.vehicleRequirements) {
+    // F-A-26: short-circuit to "accept client price" when the quote token is
+    // present, HMAC-valid, and its 5-min bucket has not yet expired.
+    if (
+      req.quoteToken &&
+      req.surgeRuleId &&
+      req.surgeBucketStart &&
+      req.surgeBucketEnd
+    ) {
+      const tokenValid = verifyQuoteToken(
+        req.quoteToken,
+        {
+          pricePerTruck: req.pricePerTruck,
+          surgeRuleId: req.surgeRuleId,
+          surgeBucketStart: req.surgeBucketStart,
+          surgeBucketEnd: req.surgeBucketEnd,
+        }
+      );
+      if (tokenValid) {
+        logger.info(
+          `[ORDER] Quote token valid for ${req.vehicleType}/${req.vehicleSubtype}; ` +
+          `honoring client price ₹${req.pricePerTruck} (surgeRule=${req.surgeRuleId})`
+        );
+        continue;
+      }
+      logger.warn(
+        `⚠️ QUOTE TOKEN REJECTED for ${req.vehicleType}/${req.vehicleSubtype} ` +
+        `(surgeRule=${req.surgeRuleId}); falling through to server re-price.`
+      );
+    }
+
     try {
       const serverEstimate = pricingService.calculateEstimate({
         vehicleType: req.vehicleType,
@@ -587,10 +655,10 @@ export async function persistOrderTransaction(
     await tx.order.create({
       data: {
         ...order,
-        routePoints: order.routePoints as any,
-        stopWaitTimers: order.stopWaitTimers as any,
-        pickup: order.pickup as any,
-        drop: order.drop as any,
+        routePoints: order.routePoints as unknown as Prisma.InputJsonValue,
+        stopWaitTimers: order.stopWaitTimers as unknown as Prisma.InputJsonValue,
+        pickup: order.pickup as unknown as Prisma.InputJsonValue,
+        drop: order.drop as unknown as Prisma.InputJsonValue,
         status: order.status as OrderStatus
       }
     });
@@ -813,14 +881,26 @@ export async function cacheOrderIdempotencyResponse(
   }
 
   // Store server-generated idempotency key
+  // I-4 FIX (defense-in-depth): These are post-commit cache writes — order is already
+  // in DB. If Redis fails here, dedup cache is stale but DB TX guard still catches dupes.
   const orderTimeoutSeconds = Math.ceil(BROADCAST_TIMEOUT_MS / 1000);
-  await redisService.set(ctx.dedupeKey, ctx.orderId, orderTimeoutSeconds + 30);
-  await redisService.set(`idem:broadcast:latest:${ctx.request.customerId}`, ctx.dedupeKey, orderTimeoutSeconds + 30);
+  try {
+    await redisService.set(ctx.dedupeKey, ctx.orderId, orderTimeoutSeconds + 30);
+    await redisService.set(`idem:broadcast:latest:${ctx.request.customerId}`, ctx.dedupeKey, orderTimeoutSeconds + 30);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn(`[ORDER] Post-commit dedup cache write failed: ${msg}. Order already persisted — DB guard is authoritative.`);
+  }
 
   // FIX CRITICAL#3: TTL=86400 (24h) as SAFETY CEILING, not primary cleanup.
   // Primary cleanup is explicit DEL on terminal status (clearCustomerActiveBroadcast).
   // Industry standard (Stripe): idempotency keys have 24h TTL, cleared on completion.
   const activeKey = `customer:active-broadcast:${ctx.request.customerId}`;
   const ACTIVE_BROADCAST_TTL_SECONDS = 86400;
-  await redisService.set(activeKey, ctx.orderId, ACTIVE_BROADCAST_TTL_SECONDS);
+  try {
+    await redisService.set(activeKey, ctx.orderId, ACTIVE_BROADCAST_TTL_SECONDS);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn(`[ORDER] Post-commit active-broadcast cache write failed: ${msg}. Order already persisted — DB guard is authoritative.`);
+  }
 }

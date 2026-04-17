@@ -99,7 +99,13 @@ export const suggestionsSchema = z.object({
 // =============================================================================
 
 /**
- * Enhanced price estimate response structure
+ * Enhanced price estimate response structure.
+ *
+ * F-A-26: adds the surge determinism anchor (`surgeRuleId`, `surgeBucketStart`,
+ * `surgeBucketEnd`) plus an HMAC-signed `quoteToken`. Fields are optional to
+ * preserve backward compatibility with existing clients, but the pricing
+ * service now emits them on every estimate so the order-creation path can
+ * verify the quote without silently re-pricing.
  */
 export interface PriceEstimateResponse {
   basePrice: number;
@@ -126,6 +132,13 @@ export interface PriceEstimateResponse {
   currency: 'INR';
   validForMinutes: number;
   estimatedAt: string;
+  // F-A-26: signed price quote (Adyen/Stripe pattern) + deterministic surge
+  // anchor (Uber H3 × 5-min bucket). Optional so schemas from older code paths
+  // still compile; the canonical pricing.service.ts always populates them.
+  quoteToken?: string;
+  surgeRuleId?: string;
+  surgeBucketStart?: string;
+  surgeBucketEnd?: string;
 }
 
 /**
