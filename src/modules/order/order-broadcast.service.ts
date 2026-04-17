@@ -827,15 +827,22 @@ export async function broadcastVehicleTypePayload(
     availabilitySnapshot.map((item) => [item.transporterId, item])
   );
 
-  // KYC/Verification gate (defense-in-depth): skip unverified transporters.
+  // KYC/Verification gate (defense-in-depth): skip KYC-ineligible transporters.
   // Primary gate is at query level (getTransportersWithVehicleType), but this
   // catches any that slip through via cache, Redis geo index, or fallback paths.
+  //
+  // F-B-75: filter on the explicit kycStatus FSM column (enum), not just the
+  // legacy isVerified boolean. Both predicates are applied so a mismatched
+  // legacy row (isVerified=true but kycStatus!=VERIFIED, or vice versa) is
+  // excluded — fail-secure. Pattern: Fernando Hermida / Ola KYC FSM.
   let verifiedTransporters = matchingTransporters;
   try {
     const verifiedRows = await prismaClient.user.findMany({
       where: {
         id: { in: matchingTransporters },
+        isActive: true,
         isVerified: true,
+        kycStatus: 'VERIFIED',
       },
       select: { id: true },
     });
@@ -843,11 +850,11 @@ export async function broadcastVehicleTypePayload(
     const beforeKyc = matchingTransporters.length;
     verifiedTransporters = matchingTransporters.filter(tid => {
       if (verifiedSet.has(tid)) return true;
-      logger.info(`[Dispatch] Skipping unverified transporter ${tid}`);
+      logger.info(`[Dispatch] Skipping KYC-ineligible transporter ${tid}`);
       return false;
     });
     if (verifiedTransporters.length < beforeKyc) {
-      logger.info(`[OrderBroadcast] KYC gate: ${beforeKyc} -> ${verifiedTransporters.length} (filtered ${beforeKyc - verifiedTransporters.length} unverified transporters)`);
+      logger.info(`[OrderBroadcast] KYC gate: ${beforeKyc} -> ${verifiedTransporters.length} (filtered ${beforeKyc - verifiedTransporters.length} KYC-ineligible transporters)`);
     }
   } catch (kycErr: unknown) {
     // Fail-open: if KYC check fails, proceed with current list (previous behavior)

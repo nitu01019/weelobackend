@@ -130,6 +130,16 @@ enum TimeoutExtensionType {
   NO_PROGRESS   // Reset on no progress (for recovery)
 }
 
+// F-B-75: KYC FSM. Kept in sync with the legacy `isVerified` boolean by admin
+// flows; broadcast filter at order-broadcast.service.ts requires VERIFIED.
+enum KycStatus {
+  NOT_STARTED   // No KYC submitted yet (default)
+  UNDER_REVIEW  // Documents uploaded, pending admin review
+  VERIFIED      // KYC passed — eligible for broadcast
+  REJECTED      // KYC failed — not eligible, must re-submit
+  EXPIRED       // Previously verified, documents expired — must re-verify
+}
+
 // =============================================================================
 // USER MODEL
 // =============================================================================
@@ -184,9 +194,10 @@ model User {
   // =========================================
   // STATUS FLAGS
   // =========================================
-  isVerified  Boolean  @default(false) // KYC verified
-  isActive    Boolean  @default(true)  // Account active
-  isAvailable Boolean? @default(true)  // Available for new orders (transporter/driver)
+  isVerified  Boolean   @default(false) // KYC verified (legacy boolean; kept in sync with kycStatus='VERIFIED' by admin flows)
+  kycStatus   KycStatus @default(NOT_STARTED) // F-B-75: explicit KYC FSM — broadcasts only VERIFIED
+  isActive    Boolean   @default(true)  // Account active
+  isAvailable Boolean?  @default(true)  // Available for new orders (transporter/driver)
 
   // =========================================
   // TIMESTAMPS
