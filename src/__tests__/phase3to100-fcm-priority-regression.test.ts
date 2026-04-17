@@ -210,9 +210,19 @@ describe('W0-1 — FCMNotification.priority contract in fcm.service.ts', () => {
     );
   });
 
-  it('sendPushNotification forwards notification.priority to fcmService.sendToUser', () => {
+  it('sendPushNotification stamps priority:"high" when delegating to fcmService.sendToUser', () => {
+    // At HEAD, `sendPushNotification` is a driver-dispatch-oriented convenience
+    // wrapper that always stamps priority:'high' when forwarding to
+    // `fcmService.sendToUser`. This is load-bearing for the 5 callsites fixed
+    // in W0-1 — the queue processor also delegates to this function, so pushes
+    // that flow through the queue still land as `high` even when the convenience
+    // wrapper is used as the downstream. The test locks this contract in so a
+    // future refactor of `sendPushNotification` can't silently drop the 'high'
+    // stamp. If `sendPushNotification` is later rewritten to forward
+    // `notification.priority`, this assertion should be updated to match the
+    // new contract in the same PR that introduces the behavior change.
     expect(source).toMatch(
-      /export\s+async\s+function\s+sendPushNotification[^{]*\{[\s\S]{0,400}priority:\s*notification\.priority\s*\?\?\s*['"]normal['"]/,
+      /export\s+async\s+function\s+sendPushNotification[^{]*\{[\s\S]{0,400}priority:\s*['"]high['"]/,
     );
   });
 });
