@@ -14,6 +14,7 @@
     "lint:env": "ts-node scripts/verify-env-example.ts",
     "test": "jest",
     "test:coverage": "jest --coverage",
+    "test:differentiator": "jest --testPathPattern=differentiator",
     "db:migrate:dev": "prisma migrate dev",
     "db:generate": "prisma generate",
     "db:push:prod": "prisma migrate deploy",
