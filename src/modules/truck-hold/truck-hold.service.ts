@@ -1105,6 +1105,13 @@ class TruckHoldService {
    * @param assignments - Array of { vehicleId, driverId } for each truck
    * @returns Success/failure with assignment details
    */
+  /**
+   * ⚠ PRE-SHIP CHECKLIST (F-A-76 strangler-fig meta-parent)
+   * This monolith (confirmHoldWithAssignments, ~673 LOC) will be extracted in P5.
+   * All hold-saga fixes (F-A-78/79/80/82/84) must preserve single-entry semantics.
+   * Routes `truck-hold-crud.routes.ts:171` + `truck-hold.routes.ts:226` pin here.
+   * DO NOT add new call-sites. See .planning/phase4/INDEX.md § F-A-76.
+   */
   async confirmHoldWithAssignments(
     holdId: string,
     transporterId: string,
