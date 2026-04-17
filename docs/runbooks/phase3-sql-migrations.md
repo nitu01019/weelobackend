@@ -6,6 +6,16 @@
 1. `migrations/phase3-f-a-02-order-unique.sql` — adds `Order.idempotencyKey` + partial-unique index.
 2. `migrations/phase3-f-b-75-kyc.sql` — adds `KycStatus` enum, `User.kycStatus` column, composite index, seeds trusted transporters.
 
+> ### 🚨 CRITICAL / FIRST PRIORITY — F-B-75 dispatch-break risk
+>
+> **If Phase 3 backend is already deployed and `migrations/phase3-f-b-75-kyc.sql` has NOT yet run, dispatch is SILENTLY BROKEN.**
+>
+> Mechanism: `src/modules/order/order-broadcast.service.ts:864-869` filters drivers by `kycStatus='VERIFIED'`. Prisma will throw "unknown column" → F-B-76 fail-closed catch (lines 884-907) → `verifiedTransporters = []` → zero-broadcast → no driver receives the order. Users see their ride request hang.
+>
+> **Therefore: run `phase3-f-b-75-kyc.sql` BEFORE (or atomically with) any backend deploy that contains the F-B-75 filter code.** Monitor `broadcast_kyc_failclosed_total` after execution — it should drop to near zero for VERIFIED transporters.
+>
+> If backend is already deployed and dispatch is dead: run this migration IMMEDIATELY as the first action of your maintenance window.
+
 **Maintenance window:** Recommend off-peak. Both migrations are wrapped in `BEGIN/COMMIT`; each uses `ADD COLUMN IF NOT EXISTS` / `CREATE ... IF NOT EXISTS` / `DO $$ ... EXCEPTION WHEN duplicate_object THEN null` and is safe to re-run. Expected duration: under 1 minute each, including index build (current row counts are small — see `CLAUDE.md` "Production DB Quick Stats").
 
 ---
