@@ -129,112 +129,19 @@ const SOCKET_EVENT_VERSION = 1;
 const SOCKET_MULTI_ROOM_EMIT_CHUNK_SIZE = Math.min(500, Math.max(25, parseInt(process.env.SOCKET_MULTI_ROOM_EMIT_CHUNK_SIZE || '300', 10) || 300));
 
 /**
- * Socket Events
- * 
- * ENHANCED: Added booking lifecycle events for timeout handling
- * ENHANCED: Added real-time truck count updates for multi-truck requests
+ * Socket Events — F-C-52 canonical registry
+ *
+ * The hand-rolled map that used to live here (67+ LOC, prone to 3-repo drift
+ * against captain + customer apps — see TM-8.md:47-56) has moved to
+ * `packages/contracts/events.generated.ts`, codegen'd from
+ * `packages/contracts/events.asyncapi.yaml`. See `packages/contracts/README.md`
+ * for the contract and rollout plan.
+ *
+ * All existing call sites keep their `SocketEvent.FOO` shape — this module
+ * re-exports the generated registry so no downstream changes are required.
  */
-export const SocketEvent = {
-  // Server -> Client
-  CONNECTED: 'connected',
-  BOOKING_UPDATED: 'booking_updated',
-  TRUCK_ASSIGNED: 'truck_assigned',
-  TRIP_ASSIGNED: 'trip_assigned',
-  LOCATION_UPDATED: 'location_updated',
-  ASSIGNMENT_STATUS_CHANGED: 'assignment_status_changed',
-  NEW_BROADCAST: 'new_broadcast',
-  TRUCK_CONFIRMED: 'truck_confirmed',
-
-  // Booking lifecycle events
-  BOOKING_EXPIRED: 'booking_expired',           // No transporters accepted in time
-  BOOKING_FULLY_FILLED: 'booking_fully_filled', // All trucks assigned
-  BOOKING_PARTIALLY_FILLED: 'booking_partially_filled', // Some trucks assigned
-  NO_VEHICLES_AVAILABLE: 'no_vehicles_available', // No matching transporters found
-  BROADCAST_COUNTDOWN: 'broadcast_countdown',   // Timer tick for UI
-
-  // NEW: Real-time truck request updates (for multi-truck system)
-  TRUCK_REQUEST_ACCEPTED: 'truck_request_accepted',     // A transporter accepted 1 truck
-  TRUCKS_REMAINING_UPDATE: 'trucks_remaining_update',   // Update remaining truck count
-  REQUEST_NO_LONGER_AVAILABLE: 'request_no_longer_available', // Request taken by someone else
-  ORDER_STATUS_UPDATE: 'order_status_update',           // Overall order status changed
-
-  // Fleet/Vehicle events (for real-time fleet updates)
-  VEHICLE_REGISTERED: 'vehicle_registered',
-  VEHICLE_UPDATED: 'vehicle_updated',
-  VEHICLE_DELETED: 'vehicle_deleted',
-  VEHICLE_STATUS_CHANGED: 'vehicle_status_changed',
-  FLEET_UPDATED: 'fleet_updated',
-
-  // Driver events (for real-time driver updates)
-  DRIVER_ADDED: 'driver_added',
-  DRIVER_UPDATED: 'driver_updated',
-  DRIVER_DELETED: 'driver_deleted',
-  DRIVER_STATUS_CHANGED: 'driver_status_changed',
-  DRIVERS_UPDATED: 'drivers_updated',
-
-  // Lightning-fast notification events
-  NEW_ORDER_ALERT: 'new_order_alert',           // Urgent notification with sound
-  ACCEPT_CONFIRMATION: 'accept_confirmation',   // Confirm acceptance to transporter
-
-  ERROR: 'error',
-
-  // Driver presence events
-  HEARTBEAT: 'heartbeat',                       // Driver sends every 12s
-  DRIVER_ONLINE: 'driver_online',               // Driver came online
-  DRIVER_OFFLINE: 'driver_offline',             // Driver went offline
-  DRIVER_TIMEOUT: 'driver_timeout',             // Driver didn't accept in time
-  ASSIGNMENT_TIMEOUT: 'assignment_timeout',     // Assignment timed out (no driver response)
-  DRIVER_PRESENCE_TIMEOUT: 'driver_presence_timeout', // Driver presence TTL expired
-  TRIP_CANCELLED: 'trip_cancelled',             // Trip cancelled by customer
-
-  // Broadcast lifecycle events (Fix E1: consolidated from BroadcastEvents)
-  BROADCAST_EXPIRED: 'broadcast_expired',
-  BROADCAST_CANCELLED: 'order_cancelled',
-  BROADCAST_STATE_CHANGED: 'broadcast_state_changed',
-
-  // Booking lifecycle additions (FIX-4: #88)
-  BOOKING_CANCELLED: 'booking_cancelled',
-  DRIVER_APPROACHING: 'driver_approaching',
-  DRIVER_MAY_BE_OFFLINE: 'driver_may_be_offline',
-  DRIVER_CONNECTIVITY_ISSUE: 'driver_connectivity_issue',
-  HOLD_EXPIRED: 'hold_expired',
-  TRANSPORTER_STATUS_CHANGED: 'transporter_status_changed',
-  DRIVER_ACCEPTED: 'driver_accepted',
-  DRIVER_DECLINED: 'driver_declined',
-  FLEX_HOLD_STARTED: 'flex_hold_started',
-  FLEX_HOLD_EXTENDED: 'flex_hold_extended',
-  CASCADE_REASSIGNED: 'cascade_reassigned',
-  DRIVER_RATING_UPDATED: 'driver_rating_updated',
-  PROFILE_COMPLETED: 'profile_completed',
-  PROFILE_PHOTO_UPDATED: 'profile_photo_updated',
-  LICENSE_PHOTOS_UPDATED: 'license_photos_updated',
-  ASSIGNMENT_STALE: 'assignment_stale',
-  ORDER_NO_SUPPLY: 'order_no_supply',                   // No vehicles available (order.service.ts)
-  ROUTE_PROGRESS_UPDATED: 'route_progress_updated',
-  ORDER_COMPLETED: 'order_completed',
-  BOOKING_COMPLETED: 'booking_completed',   // Backward compat: Customer app rating trigger
-  ORDER_PROGRESS_UPDATE: 'order_progress_update',
-  ORDER_TIMEOUT_EXTENDED: 'order_timeout_extended',
-  ORDER_EXPIRED: 'order_expired',
-  ORDER_CANCELLED: 'order_cancelled',
-  ORDER_STATE_SYNC: 'order_state_sync',
-
-  // Client -> Server
-  JOIN_BOOKING: 'join_booking',
-  LEAVE_BOOKING: 'leave_booking',
-  JOIN_ORDER: 'join_order',                     // Join order room for updates
-  LEAVE_ORDER: 'leave_order',
-  UPDATE_LOCATION: 'update_location',
-  JOIN_TRANSPORTER: 'join_transporter', // Driver joins transporter room for broadcasts
-  BROADCAST_ACK: 'broadcast_ack',           // Phase 4: client ACKs sequence-numbered message
-  DRIVER_SOS: 'driver_sos',                 // C13: Driver emergency SOS
-
-  // C-16: Trip room join (customer joins trip room for per-truck tracking)
-  JOIN_TRIP: 'join_trip',
-
-  // C-17: ETA push to customer
-  ETA_UPDATED: 'eta_updated'
-};
+export { SocketEvent } from '../../../packages/contracts/events.generated';
+import { SocketEvent } from '../../../packages/contracts/events.generated';
 
 /**
  * =============================================================================

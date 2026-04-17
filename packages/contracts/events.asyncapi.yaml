@@ -1,0 +1,269 @@
+asyncapi: 3.0.0
+info:
+  title: Weelo Socket Event Contracts
+  version: 1.0.0
+  description: |
+    Canonical event-name registry for Weelo socket traffic. Source of truth for
+    backend, captain, and customer repos. Codegen emits:
+      - TypeScript: `events.generated.ts` (consumed by src/shared/services/socket.service.ts)
+      - Kotlin: `SocketEvent.kt` (stamped into captain + customer constants)
+    Owned by F-C-52. Rename/extend here → codegen → consumers. Do NOT add event
+    names anywhere else. CI `contracts:verify` greps for literal `socket.emit(...)`.
+
+# Channels are grouped by direction (server->client vs client->server) to mirror
+# the legacy SocketEvent map in src/shared/services/socket.service.ts:137-237.
+channels:
+  # ==========================================================================
+  # SERVER → CLIENT (lifecycle + notifications)
+  # ==========================================================================
+  connected:
+    address: connected
+    messages: {}
+  booking_updated:
+    address: booking_updated
+    messages: {}
+  truck_assigned:
+    address: truck_assigned
+    messages: {}
+  trip_assigned:
+    address: trip_assigned
+    messages: {}
+  location_updated:
+    address: location_updated
+    messages: {}
+  assignment_status_changed:
+    address: assignment_status_changed
+    messages: {}
+  new_broadcast:
+    address: new_broadcast
+    messages: {}
+  truck_confirmed:
+    address: truck_confirmed
+    messages: {}
+
+  # ----- Booking lifecycle -----
+  booking_expired:
+    address: booking_expired
+    messages: {}
+  booking_fully_filled:
+    address: booking_fully_filled
+    messages: {}
+  booking_partially_filled:
+    address: booking_partially_filled
+    messages: {}
+  no_vehicles_available:
+    address: no_vehicles_available
+    messages: {}
+  broadcast_countdown:
+    address: broadcast_countdown
+    messages: {}
+
+  # ----- Multi-truck request updates -----
+  truck_request_accepted:
+    address: truck_request_accepted
+    messages: {}
+  trucks_remaining_update:
+    address: trucks_remaining_update
+    messages: {}
+  request_no_longer_available:
+    address: request_no_longer_available
+    messages: {}
+  order_status_update:
+    address: order_status_update
+    messages: {}
+
+  # ----- Fleet / Vehicle -----
+  vehicle_registered:
+    address: vehicle_registered
+    messages: {}
+  vehicle_updated:
+    address: vehicle_updated
+    messages: {}
+  vehicle_deleted:
+    address: vehicle_deleted
+    messages: {}
+  vehicle_status_changed:
+    address: vehicle_status_changed
+    messages: {}
+  fleet_updated:
+    address: fleet_updated
+    messages: {}
+
+  # ----- Driver lifecycle -----
+  driver_added:
+    address: driver_added
+    messages: {}
+  driver_updated:
+    address: driver_updated
+    messages: {}
+  driver_deleted:
+    address: driver_deleted
+    messages: {}
+  driver_status_changed:
+    address: driver_status_changed
+    messages: {}
+  drivers_updated:
+    address: drivers_updated
+    messages: {}
+
+  # ----- Lightning alerts -----
+  new_order_alert:
+    address: new_order_alert
+    messages: {}
+  accept_confirmation:
+    address: accept_confirmation
+    messages: {}
+  error:
+    address: error
+    messages: {}
+
+  # ----- Driver presence -----
+  heartbeat:
+    address: heartbeat
+    messages: {}
+  driver_online:
+    address: driver_online
+    messages: {}
+  driver_offline:
+    address: driver_offline
+    messages: {}
+  driver_timeout:
+    address: driver_timeout
+    messages: {}
+  assignment_timeout:
+    address: assignment_timeout
+    messages: {}
+  driver_presence_timeout:
+    address: driver_presence_timeout
+    messages: {}
+  trip_cancelled:
+    address: trip_cancelled
+    messages: {}
+
+  # ----- Broadcast lifecycle -----
+  broadcast_expired:
+    address: broadcast_expired
+    messages: {}
+  order_cancelled:
+    address: order_cancelled
+    messages: {}
+  broadcast_state_changed:
+    address: broadcast_state_changed
+    messages: {}
+
+  # ----- Booking lifecycle additions -----
+  booking_cancelled:
+    address: booking_cancelled
+    messages: {}
+  driver_approaching:
+    address: driver_approaching
+    messages: {}
+  driver_may_be_offline:
+    address: driver_may_be_offline
+    messages: {}
+  driver_connectivity_issue:
+    address: driver_connectivity_issue
+    messages: {}
+  hold_expired:
+    address: hold_expired
+    messages: {}
+  transporter_status_changed:
+    address: transporter_status_changed
+    messages: {}
+  driver_accepted:
+    address: driver_accepted
+    messages: {}
+  driver_declined:
+    address: driver_declined
+    messages: {}
+  flex_hold_started:
+    address: flex_hold_started
+    messages: {}
+  flex_hold_extended:
+    address: flex_hold_extended
+    messages: {}
+  cascade_reassigned:
+    address: cascade_reassigned
+    messages: {}
+  driver_rating_updated:
+    address: driver_rating_updated
+    messages: {}
+  profile_completed:
+    address: profile_completed
+    messages: {}
+  profile_photo_updated:
+    address: profile_photo_updated
+    messages: {}
+  license_photos_updated:
+    address: license_photos_updated
+    messages: {}
+  assignment_stale:
+    address: assignment_stale
+    messages: {}
+  order_no_supply:
+    address: order_no_supply
+    messages: {}
+  route_progress_updated:
+    address: route_progress_updated
+    messages: {}
+  order_completed:
+    address: order_completed
+    messages: {}
+  booking_completed:
+    address: booking_completed
+    messages: {}
+  order_progress_update:
+    address: order_progress_update
+    messages: {}
+  order_timeout_extended:
+    address: order_timeout_extended
+    messages: {}
+  order_expired:
+    address: order_expired
+    messages: {}
+  order_state_sync:
+    address: order_state_sync
+    messages: {}
+
+  # ==========================================================================
+  # CLIENT → SERVER
+  # ==========================================================================
+  join_booking:
+    address: join_booking
+    messages: {}
+  leave_booking:
+    address: leave_booking
+    messages: {}
+  join_order:
+    address: join_order
+    messages: {}
+  leave_order:
+    address: leave_order
+    messages: {}
+  update_location:
+    address: update_location
+    messages: {}
+  join_transporter:
+    address: join_transporter
+    messages: {}
+  broadcast_ack:
+    address: broadcast_ack
+    messages: {}
+  driver_sos:
+    address: driver_sos
+    messages: {}
+  join_trip:
+    address: join_trip
+    messages: {}
+  eta_updated:
+    address: eta_updated
+    messages: {}
+
+# ---------------------------------------------------------------------------
+# Legacy aliases — additional TS member names mapping to an existing wire value.
+# Kept for backwards compat with call sites like `SocketEvent.BROADCAST_CANCELLED`.
+# NOT new events; codegen emits `<memberName>: '<existing wire value>'`.
+# Format: `<MEMBER_NAME>: <existing_address>`
+# ---------------------------------------------------------------------------
+x-event-aliases:
+  BROADCAST_CANCELLED: order_cancelled
