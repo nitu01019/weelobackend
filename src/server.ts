@@ -94,6 +94,7 @@ import { customBookingRouter } from './modules/custom-booking';
 import geocodingRouter from './modules/routing/geocoding.routes';
 import { healthRoutes } from './shared/routes/health.routes';
 import { metricsMiddleware } from './shared/monitoring/metrics.service';
+import { assertRedisEvictionPolicy, RedisEvictionPolicyError } from './shared/monitoring/redis-eviction-assertion';
 import { fcmService } from './shared/services/fcm.service';
 import { redisService } from './shared/services/redis.service';
 import { startBookingExpiryChecker } from './modules/booking/booking.service';
@@ -489,6 +490,43 @@ async function bootstrap(): Promise<void> {
   } catch (err) {
     logger.error('RedisService initialization failed:', err);
     // Continue — redisService falls back to in-memory mode
+  }
+
+  // -------------------------------------------------------------------------
+  // 1a. Redis eviction policy assertion (W0-3 / F-A-77)
+  // -------------------------------------------------------------------------
+  // Halt boot if Redis is configured with any policy other than 'noeviction'.
+  // Eviction would silently drop BullMQ delayed jobs, distributed locks, and
+  // idempotency keys — corrupting the durable hold-expiry lifecycle.
+  //
+  // ElastiCache escape hatch: if CONFIG GET returns NOPERM, the assertion
+  // logs a WARN + increments `redis_eviction_check_skipped_total` but does
+  // NOT halt — managed providers own the policy out-of-band.
+  //
+  // Runs BEFORE Socket.IO and hold reconciliation workers start so a bad
+  // policy fails fast, before any durable state touches Redis.
+  // -------------------------------------------------------------------------
+  if (redisService.isRedisEnabled()) {
+    const evictionClient = redisService.getClient();
+    if (evictionClient && typeof evictionClient.call === 'function') {
+      try {
+        await assertRedisEvictionPolicy(evictionClient);
+      } catch (err) {
+        if (err instanceof RedisEvictionPolicyError) {
+          logger.error(
+            `REDIS_EVICTION_POLICY_INVALID — observed '${err.policy}', required 'noeviction'. Halting boot. ${err.message}`
+          );
+          process.exit(1);
+        }
+        // Any other error: log + skip, do not halt (assertion already
+        // fails-open on non-policy errors, but be defensive).
+        logger.warn('[Redis] Eviction policy check threw unexpected error — continuing boot', { error: (err as Error)?.message });
+      }
+    } else {
+      logger.warn('[Redis] Eviction policy check skipped — raw client unavailable or lacks .call()');
+    }
+  } else {
+    logger.info('[Redis] Eviction policy check skipped — using in-memory fallback');
   }
 
   // -------------------------------------------------------------------------
