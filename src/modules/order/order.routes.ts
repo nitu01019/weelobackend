@@ -193,33 +193,45 @@ router.post(
 
       try {
 
-      // M-1 FIX: Idempotency key required (Stripe pattern)
-      // Configurable: set REQUIRE_IDEMPOTENCY_KEY=false during client migration
-      const requireIdempotencyKey = process.env.REQUIRE_IDEMPOTENCY_KEY !== 'false';
+      // F-A-02 FIX: Idempotency-Key header hard-required (Stripe + IETF
+      // draft-ietf-httpapi-idempotency-key-header-07). The previous
+      // REQUIRE_IDEMPOTENCY_KEY=false branch silently fabricated a UUID
+      // server-side, which gave zero dedup protection on retry. We now reject
+      // missing/invalid keys outright, with a short 2-week dual-mode grace
+      // window gated by ALLOW_MISSING_IDEMPOTENCY_KEY_UNTIL so already-deployed
+      // clients that pre-date the header roll-out keep working until the
+      // deadline passes.
       const clientKey = (req.headers['x-idempotency-key'] as string | undefined)?.trim();
       const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-      if (requireIdempotencyKey && !clientKey) {
-        res.status(400).json({
-          success: false,
-          error: {
-            code: 'MISSING_IDEMPOTENCY_KEY',
-            message: 'x-idempotency-key header is required for order creation',
-          },
-        });
-        return;
-      }
+      const graceUntilRaw = process.env.ALLOW_MISSING_IDEMPOTENCY_KEY_UNTIL;
+      const graceUntilMs = graceUntilRaw ? Date.parse(graceUntilRaw) : NaN;
+      const inGraceWindow = Number.isFinite(graceUntilMs) && Date.now() < graceUntilMs;
 
       let idempotencyKey: string;
       if (clientKey && UUID_REGEX.test(clientKey)) {
         idempotencyKey = clientKey;
         logger.debug(`[Orders] Idempotency key from client: ${idempotencyKey.substring(0, 8)}...`);
-      } else {
-        // Fallback: generate server-side key when REQUIRE_IDEMPOTENCY_KEY=false
-        // The active-order check below is the actual dedup safety net.
+      } else if (inGraceWindow) {
+        // Grace-window fallback: server-generates a UUID so legacy clients
+        // keep working, but logs a warn so SRE can track the remaining
+        // population of header-missing callers before the deadline flips.
         const { v4: uuidv4 } = require('uuid');
         idempotencyKey = uuidv4();
-        logger.warn(`[Orders] POST / - No client idempotency key provided. Server-generated key has no dedup value.`, { userId: user.userId });
+        logger.warn(
+          '[Orders] POST / - Missing/invalid x-idempotency-key within grace window. Server-generated key has no dedup value.',
+          { userId: user.userId, graceUntil: graceUntilRaw }
+        );
+      } else {
+        res.status(400).json({
+          success: false,
+          error: {
+            code: 'MISSING_IDEMPOTENCY_KEY',
+            message:
+              'x-idempotency-key header is required for order creation and must be a UUID v4',
+          },
+        });
+        return;
       }
 
       // =================================================================
