@@ -19,6 +19,7 @@ import { queueService } from '../../shared/services/queue.service';
 import { HOLD_CONFIG } from '../../core/config/hold-config';
 import { RADIUS_KEYS } from '../booking/booking.types';
 import { metrics } from '../../shared/monitoring/metrics.service';
+import { assertValidTransition, BOOKING_VALID_TRANSITIONS } from '../../core/state-machines';
 
 export interface AcceptBroadcastParams {
   driverId: string;
@@ -182,8 +183,15 @@ export async function acceptBroadcast(broadcastId: string, params: AcceptBroadca
         throw new Error('Secondary lock not acquired');
       }
     } catch (secondaryErr: unknown) {
-      // Secondary Redis lock also failed — last resort: in-process fallback
-      logger.warn('[BroadcastAccept] Secondary Redis lock failed, using in-process fallback', {
+      // C19 FIX: Lock architecture documentation
+      // Layer 1: Redis primary lock (distributed, preferred)
+      // Layer 2: Redis secondary lock (distributed, fallback)
+      // Layer 3: In-process Map lock (single-instance only — NOT effective on multi-ECS)
+      // Layer 4: PostgreSQL advisory lock (pg_advisory_xact_lock) — unconditional inside TX
+      // The advisory lock at Layer 4 is the REAL distributed safety net.
+      // If both Redis layers fail, Layer 3 provides no cross-instance protection,
+      // but Layer 4 always fires regardless.
+      logger.warn('[BroadcastAccept] Both Redis lock layers failed — falling back to in-process lock (no cross-instance protection). Advisory lock (Layer 4) inside TX is the safety net.', {
         broadcastId, vehicleId, driverId,
         error: secondaryErr instanceof Error ? secondaryErr.message : String(secondaryErr),
       });
@@ -319,6 +327,19 @@ export async function acceptBroadcast(broadcastId: string, params: AcceptBroadca
 
           const newTrucksFilled = booking.trucksFilled + 1;
           const newStatus: BookingRecord['status'] = newTrucksFilled >= booking.trucksNeeded ? 'fully_filled' : 'partially_filled';
+
+          // STATE-MACHINE GUARD: Validate booking transition inside $transaction
+          // (Prisma $use middleware cannot fire inside interactive transactions)
+          // LOG-ONLY for now — matches middleware rollout strategy
+          try {
+            assertValidTransition('Booking', BOOKING_VALID_TRANSITIONS, booking.status, newStatus);
+          } catch (smErr) {
+            logger.warn('[BroadcastAccept] State machine violation (log-only)', {
+              broadcastId, from: booking.status, to: newStatus,
+              error: smErr instanceof Error ? smErr.message : String(smErr),
+            });
+          }
+
           await tx.booking.update({ where: { id: broadcastId }, data: { status: newStatus as BookingStatus } });
 
           const now = new Date().toISOString();
@@ -444,6 +465,7 @@ export async function acceptBroadcast(broadcastId: string, params: AcceptBroadca
           await sendPushNotification(driverId, {
             title: 'New Trip Assigned!',
             body: `${pickup.city || pickup.address || 'Pickup'} → ${drop.city || drop.address || 'Drop'}`,
+            priority: 'high',
             data: { type: 'trip_assigned', tripId: result.tripId, assignmentId: result.assignmentId, bookingId: broadcastId, driverName: driver?.name || '', vehicleNumber: vehicle?.vehicleNumber || '', vehicleType: vehicle?.vehicleType || '', status: 'trip_assigned' }
           });
         }, 3, 500);
@@ -458,7 +480,7 @@ export async function acceptBroadcast(broadcastId: string, params: AcceptBroadca
           queueService.queuePushNotification(driverId, {
             title: 'New Trip Assigned!',
             body: `${pickup.city || pickup.address || 'Pickup'} → ${drop.city || drop.address || 'Drop'}`,
-            data: { type: 'trip_assigned', tripId: result.tripId, assignmentId: result.assignmentId, bookingId: broadcastId, driverName: driver?.name || '', vehicleNumber: vehicle?.vehicleNumber || '', vehicleType: vehicle?.vehicleType || '', status: 'trip_assigned' }
+            data: { type: 'trip_assigned', priority: 'high', tripId: result.tripId, assignmentId: result.assignmentId, bookingId: broadcastId, driverName: driver?.name || '', vehicleNumber: vehicle?.vehicleNumber || '', vehicleType: vehicle?.vehicleType || '', status: 'trip_assigned' }
           }).catch((err) => { logger.warn('[BroadcastAccept] Driver push notification queue failed', { driverId, assignmentId: result.assignmentId, error: err instanceof Error ? err.message : String(err) }); });
         } catch (_queueErr) {
           // Best effort — timeout handler will surface the assignment to the driver
@@ -491,6 +513,7 @@ export async function acceptBroadcast(broadcastId: string, params: AcceptBroadca
           await sendPushNotification(booking.customerId, {
             title: `Truck ${result.trucksConfirmed}/${booking.trucksNeeded} Confirmed!`,
             body: `${vehicle?.vehicleNumber || 'Vehicle'} (${driver?.name || 'Driver'}) assigned to your booking`,
+            priority: 'high',
             data: { type: 'truck_confirmed', bookingId: broadcastId, trucksConfirmed: result.trucksConfirmed, totalTrucks: booking.trucksNeeded }
           });
         }, 3, 500);
