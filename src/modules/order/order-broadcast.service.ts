@@ -1240,3 +1240,19 @@ export function orderBroadcastStepTimerKey(
 ): string {
   return `${ORDER_STEP_TIMER_PREFIX}${orderId}:${vehicleType}:${vehicleSubtype}:${stepIndex}`;
 }
+
+/**
+ * Cancel the in-memory backup setTimeout registered for a progressive step timer.
+ *
+ * Contract-preserving stub: the original in-memory backup mechanism (a Map of
+ * setTimeout handles keyed by step-timer key) was scaffolded in order-timer.service.ts
+ * but its registration path was never merged. Authority now lives entirely with the
+ * Redis-based step timers + `processExpiredBroadcastStepTimers` poller; the poller
+ * calls this cleanup on Redis-fire and on bulk clear (`clearProgressiveStepTimers`)
+ * to guarantee caller-side idempotence for the day the in-process backup is wired.
+ *
+ * No-op today. Safe to call multiple times with any key.
+ */
+export function clearProgressiveStepBackup(_timerKey: string): void {
+  // Intentionally empty — Redis is the single source of truth for step timers.
+}
