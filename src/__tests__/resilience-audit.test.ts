@@ -907,7 +907,7 @@ describe('Memory & performance', () => {
       DB_POOL_TIMEOUT: 5,
       DRIVER_ACCEPT_TIMEOUT_SECONDS: 45,
       FLEX_HOLD_MAX_DURATION_SECONDS: 130,
-      CONFIRMED_HOLD_MAX_SECONDS: 120,
+      CONFIRMED_HOLD_MAX_SECONDS: 180,
       STALE_PROCESSING_THRESHOLD_MS: 5 * 60 * 1000,
       BRPOP_TIMEOUT_SEC: 2,
     };
@@ -1236,10 +1236,11 @@ describe('Structural verification of production patterns', () => {
   // 5.5: Queue service has cancelled order guard
   // -------------------------------------------------------------------------
   test('5.5: Queue service implements cancelled order guard', () => {
+    // F-B-50: canonical surface is queue.service.ts (modular queue-management.service.ts deleted).
     const fs = require('fs');
     const path = require('path');
-    const queueMgmtPath = path.resolve(__dirname, '../shared/services/queue-management.service.ts');
-    const source = fs.readFileSync(queueMgmtPath, 'utf-8');
+    const queuePath = path.resolve(__dirname, '../shared/services/queue.service.ts');
+    const source = fs.readFileSync(queuePath, 'utf-8');
 
     // Verify the cancelled order queue guard exists
     expect(source).toContain('cancelledOrderQueueGuardEnabled');

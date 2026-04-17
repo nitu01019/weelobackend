@@ -1028,10 +1028,11 @@ describe('#100 — withDbTimeout retry parameter', () => {
 
 describe('#103 — Immutable job object during processing', () => {
   it('processJob creates new object (spread) instead of mutating original job', () => {
+    // F-B-50: canonical surface is queue.service.ts (modular queue-redis.service.ts deleted).
     const fs = require('fs');
     const path = require('path');
     const src = fs.readFileSync(
-      path.resolve(__dirname, '../shared/services/queue-redis.service.ts'),
+      path.resolve(__dirname, '../shared/services/queue.service.ts'),
       'utf8'
     );
 
@@ -1048,11 +1049,12 @@ describe('#103 — Immutable job object during processing', () => {
     expect(updatedJob.attempts).toBe(1);  // copy has incremented value
   });
 
-  it('queue-memory.service also uses immutable job spread pattern', () => {
+  it('queue.service InMemoryQueue path also uses immutable job spread pattern', () => {
+    // F-B-50: InMemoryQueue now lives in queue.service.ts (modular queue-memory.service.ts deleted).
     const fs = require('fs');
     const path = require('path');
     const src = fs.readFileSync(
-      path.resolve(__dirname, '../shared/services/queue-memory.service.ts'),
+      path.resolve(__dirname, '../shared/services/queue.service.ts'),
       'utf8'
     );
 
@@ -1062,72 +1064,27 @@ describe('#103 — Immutable job object during processing', () => {
 });
 
 // ============================================================================
-// #104 — setTimeout backup: Redis zAdd called BEFORE setTimeout fallback
+// #104 — setTimeout backup: REMOVED
+// F-B-50: the zAdd('timers:fallback') + setTimeout fallback only existed in the
+// modular queue-management.service.ts facade (dead-on-arrival, zero production
+// callers). The canonical queue.service.ts::scheduleAssignmentTimeout uses a
+// Redis sorted-set with reconciliation poller and deliberately does NOT fall
+// back to in-memory setTimeout (comment at queue.service.ts:2012-2014: "Do NOT
+// fall back to in-memory setTimeout for critical timeouts"). This describe
+// block was asserting dead code and is removed with the facade.
 // ============================================================================
-
-describe('#104 — Redis zAdd called before setTimeout fallback', () => {
-  beforeEach(resetAllMocks);
-
-  it('queue-management source calls zAdd before setTimeout in fallback path', () => {
-    const fs = require('fs');
-    const path = require('path');
-    const src = fs.readFileSync(
-      path.resolve(__dirname, '../shared/services/queue-management.service.ts'),
-      'utf8'
-    );
-
-    expect(src).toContain('#104');
-    expect(src).toContain("redisService.zAdd('timers:fallback'");
-    // zAdd line must appear before setTimeout line in the fallback block
-    const zAddIdx = src.indexOf("redisService.zAdd('timers:fallback'");
-    const setTimeoutIdx = src.indexOf('setTimeout(async', zAddIdx);
-    expect(zAddIdx).toBeGreaterThan(-1);
-    expect(setTimeoutIdx).toBeGreaterThan(zAddIdx);
-  });
-
-  it('zAdd is called with the timer data before setTimeout fires', async () => {
-    // Simulate the scheduleAssignmentTimeout fallback path
-    const expiresAtMs = Date.now() + 30_000;
-    const data = { assignmentId: 'a-1', driverId: 'd-1' };
-
-    mockRedisZAdd.mockResolvedValue(1);
-
-    const { redisService } = require('../shared/services/redis.service');
-    // zAdd called first
-    await redisService.zAdd('timers:fallback', expiresAtMs, JSON.stringify(data)).catch(() => {});
-    // setTimeout would be called after (not awaited here)
-
-    expect(mockRedisZAdd).toHaveBeenCalledWith(
-      'timers:fallback',
-      expiresAtMs,
-      JSON.stringify(data)
-    );
-  });
-
-  it('zAdd failure does not prevent setTimeout from being set', async () => {
-    mockRedisZAdd.mockRejectedValue(new Error('Redis down'));
-
-    const { redisService } = require('../shared/services/redis.service');
-    let setTimeoutCalled = false;
-
-    await redisService.zAdd('timers:fallback', Date.now() + 1000, '{}').catch(() => {});
-    // setTimeout still runs regardless of zAdd failure
-    setTimeoutCalled = true;
-
-    expect(setTimeoutCalled).toBe(true);
-  });
-});
 
 // ============================================================================
 // #105 — processingStartedAt used for stale job detection
 // ============================================================================
 
 describe('#105 — Stale processing job detection uses processingStartedAt', () => {
-  it('queue-redis source uses processingStartedAt for stale threshold check', () => {
+  it('queue.service RedisQueue uses processingStartedAt for stale threshold check', () => {
+    // F-B-50: canonical surface is queue.service.ts (modular queue-redis.service.ts deleted).
     const fs = require('fs');
     const path = require('path');
     const src = fs.readFileSync(
-      path.resolve(__dirname, '../shared/services/queue-redis.service.ts'),
+      path.resolve(__dirname, '../shared/services/queue.service.ts'),
       'utf8'
     );
 
@@ -1363,11 +1320,13 @@ describe('#138 — Order status cache batch eviction (100 entries, not 1)', () =
     expect(orderStatusCache.size).toBe(sizeBefore); // no eviction
   });
 
-  it('queue-management source evicts 100 entries, not just 1', () => {
+  it('queue.service evicts 100 entries, not just 1', () => {
+    // F-B-50: #138 batch-evict fix ported from deleted queue-management.service.ts
+    // to canonical queue.service.ts.
     const fs = require('fs');
     const path = require('path');
     const src = fs.readFileSync(
-      path.resolve(__dirname, '../shared/services/queue-management.service.ts'),
+      path.resolve(__dirname, '../shared/services/queue.service.ts'),
       'utf8'
     );
 

@@ -9,6 +9,10 @@
 
 import { redisService } from './redis.service';
 import { logger } from './logger.service';
+// F-B-50: Direct import from the canonical queue.service.ts singleton.
+// Replaces a broken runtime `require` against a non-exported facade singleton
+// whose failure was being silently swallowed by `.catch(() => {})`.
+import { queueService } from './queue.service';
 
 const OUTBOX_PREFIX = 'notification:outbox:';
 const OUTBOX_TTL_SECONDS = 3600;       // 1 hour
@@ -45,18 +49,18 @@ export async function bufferNotification(
 export async function drainOutbox(userId: string): Promise<void> {
   const key = `${OUTBOX_PREFIX}${userId}`;
   try {
-    const { queueManagementService } = require('./queue-management.service');
     let item: string | null;
     while ((item = await redisService.rPop(key))) {
       const parsed: OutboxEntry = JSON.parse(item);
       if (Date.now() - parsed.timestamp > FRESHNESS_MS) continue;
-      await queueManagementService
+      await queueService
         .queuePushNotification(parsed.userId, parsed.payload)
         .catch(() => {});
     }
     logger.info(`[NotificationOutbox] Drained outbox for user ${userId}`);
-  } catch (err: any) {
-    logger.warn(`[NotificationOutbox] Drain failed for ${userId}: ${err?.message}`);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.warn(`[NotificationOutbox] Drain failed for ${userId}: ${message}`);
   }
 }
 

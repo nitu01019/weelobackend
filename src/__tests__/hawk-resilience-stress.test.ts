@@ -340,29 +340,8 @@ jest.mock('../shared/services/tracking-stream-sink', () => ({
   createTrackingStreamSink: jest.fn().mockReturnValue({ flush: jest.fn().mockResolvedValue(undefined) }),
 }));
 
-jest.mock('../shared/services/queue-memory.service', () => ({
-  InMemoryQueue: jest.fn().mockImplementation(() => ({
-    add: jest.fn().mockResolvedValue('job-1'),
-    addBatch: jest.fn().mockResolvedValue([]),
-    process: jest.fn(),
-    start: jest.fn(),
-    stop: jest.fn(),
-    getStats: jest.fn().mockReturnValue({}),
-    getQueueDepth: jest.fn().mockResolvedValue(0),
-  })),
-}));
-
-jest.mock('../shared/services/queue-redis.service', () => ({
-  RedisQueue: jest.fn().mockImplementation(() => ({
-    add: jest.fn().mockResolvedValue('job-1'),
-    addBatch: jest.fn().mockResolvedValue([]),
-    process: jest.fn(),
-    start: jest.fn(),
-    stop: jest.fn(),
-    getStats: jest.fn().mockReturnValue({}),
-    getQueueDepth: jest.fn().mockResolvedValue(0),
-  })),
-}));
+// F-B-50: queue-memory.service / queue-redis.service mocks removed — their modular
+// files were deleted (dead-on-arrival duplicates). Canonical surface is queue.service.ts.
 
 // =============================================================================
 // IMPORTS
@@ -2090,11 +2069,11 @@ describe('Section 5: Configuration Tests', () => {
   });
 
   // --------------------------------------------------------------------------
-  // 5.4: CONFIRMED_HOLD_MAX_SECONDS defaults to 120
+  // 5.4: CONFIRMED_HOLD_MAX_SECONDS defaults to 180
   // --------------------------------------------------------------------------
-  test('5.4 CONFIRMED_HOLD_MAX_SECONDS defaults to 120', () => {
-    const duration = parseInt(process.env.CONFIRMED_HOLD_MAX_SECONDS || '120', 10);
-    expect(duration).toBe(120);
+  test('5.4 CONFIRMED_HOLD_MAX_SECONDS defaults to 180', () => {
+    const duration = parseInt(process.env.CONFIRMED_HOLD_MAX_SECONDS || '180', 10);
+    expect(duration).toBe(180);
   });
 
   // --------------------------------------------------------------------------
@@ -2246,85 +2225,15 @@ describe('Section 5: Configuration Tests', () => {
 });
 
 // =============================================================================
-// SECTION 6: BONUS — DLQ & Queue Management Tests (6 tests)
+// SECTION 6: BONUS — DLQ & Queue Management Tests
+// F-B-50: tests 6.1-6.4 removed — they validated processDLQ/processAllDLQs which
+// only existed in the modular queue-management.service.ts facade (never wired
+// into production) and was deleted as dead code. sanitizeDbError tests retained.
 // =============================================================================
 
 describe('Section 6: DLQ & Queue Management Tests', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-  });
-
-  // --------------------------------------------------------------------------
-  // 6.1: processDLQ reads and logs failed jobs
-  // --------------------------------------------------------------------------
-  test('6.1 processDLQ logs permanently failed jobs', async () => {
-    const { QueueService } = require('../shared/services/queue-management.service');
-    const service = new QueueService();
-
-    mockRedisService.lRange.mockResolvedValue([
-      JSON.stringify({ id: 'job-fail-1', error: 'timeout', attempts: 3 }),
-      JSON.stringify({ id: 'job-fail-2', error: 'bad payload' }),
-    ]);
-
-    const count = await service.processDLQ('test-queue');
-
-    expect(count).toBe(2);
-    expect(mockLogger.error).toHaveBeenCalledWith(
-      '[DLQ] Permanently failed job',
-      expect.objectContaining({ queue: 'test-queue' })
-    );
-  });
-
-  // --------------------------------------------------------------------------
-  // 6.2: processDLQ returns 0 when Redis is down
-  // --------------------------------------------------------------------------
-  test('6.2 processDLQ returns 0 on Redis failure', async () => {
-    const { QueueService } = require('../shared/services/queue-management.service');
-    const service = new QueueService();
-
-    mockRedisService.lRange.mockRejectedValue(new Error('Redis gone'));
-
-    const count = await service.processDLQ('test-queue');
-
-    expect(count).toBe(0);
-  });
-
-  // --------------------------------------------------------------------------
-  // 6.3: processDLQ handles malformed JSON entries
-  // --------------------------------------------------------------------------
-  test('6.3 processDLQ handles malformed JSON entries', async () => {
-    const { QueueService } = require('../shared/services/queue-management.service');
-    const service = new QueueService();
-
-    mockRedisService.lRange.mockResolvedValue(['not-json', '{invalid']);
-
-    const count = await service.processDLQ('broken-queue');
-
-    expect(count).toBe(2);
-    expect(mockLogger.error).toHaveBeenCalledWith(
-      '[DLQ] Malformed DLQ entry',
-      expect.objectContaining({ queue: 'broken-queue' })
-    );
-  });
-
-  // --------------------------------------------------------------------------
-  // 6.4: processDLQ alerts when depth exceeds 10
-  // --------------------------------------------------------------------------
-  test('6.4 processDLQ alerts when depth > 10', async () => {
-    const { QueueService } = require('../shared/services/queue-management.service');
-    const service = new QueueService();
-
-    const entries = Array.from({ length: 15 }, (_, i) =>
-      JSON.stringify({ id: `job-${i}`, error: 'fail' })
-    );
-    mockRedisService.lRange.mockResolvedValue(entries);
-
-    await service.processDLQ('busy-queue');
-
-    expect(mockLogger.error).toHaveBeenCalledWith(
-      '[DLQ] ALERT: Queue depth exceeds threshold',
-      expect.objectContaining({ depth: 15 })
-    );
   });
 
   // --------------------------------------------------------------------------

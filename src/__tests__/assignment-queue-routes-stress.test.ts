@@ -508,7 +508,8 @@ jest.mock('../modules/auth/sms.service', () => ({
 // IMPORTS — after mocks
 // =============================================================================
 
-import { InMemoryQueue } from '../shared/services/queue-memory.service';
+// F-B-50: InMemoryQueue canonical export lives in queue.service.ts (modular files removed).
+import { InMemoryQueue } from '../shared/services/queue.service';
 import { assignmentDispatchService } from '../modules/assignment/assignment-dispatch.service';
 import { assignmentResponseService } from '../modules/assignment/assignment-response.service';
 import { assignmentLifecycleService } from '../modules/assignment/assignment-lifecycle.service';
@@ -1708,7 +1709,8 @@ describe('QueueService Management Layer', () => {
 
   beforeEach(() => {
     jest.isolateModules(() => {
-      QueueService = require('../shared/services/queue-management.service').QueueService;
+      // F-B-50: QueueService canonical surface is queue.service.ts after modular facade removal.
+      QueueService = require('../shared/services/queue.service').QueueService;
     });
   });
 

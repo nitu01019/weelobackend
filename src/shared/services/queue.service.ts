@@ -297,7 +297,7 @@ export class InMemoryQueue extends EventEmitter {
     processor: JobProcessor,
     _jobIndex: number
   ): Promise<void> {
-    // FIX-41: Create immutable copy instead of mutating the input job object
+    // FIX-41 / #103: Create immutable copy instead of mutating the input job object.
     const updatedJob = { ...job, attempts: job.attempts + 1 };
     try {
       await processor(updatedJob);
@@ -809,8 +809,8 @@ export class RedisQueue extends EventEmitter {
     processor: JobProcessor
   ): Promise<void> {
     const processingKey = this.getProcessingKey(queueName);
-    // FIX-41: Create immutable copy instead of mutating the input job object
-    // FIX-16: Stamp processingStartedAt when job begins processing for accurate staleness checks
+    // FIX-41 / #103: Create immutable copy instead of mutating the input job object.
+    // FIX-16 / #105: Stamp processingStartedAt when job begins processing for accurate staleness checks.
     const updatedJob = { ...job, attempts: job.attempts + 1, processingStartedAt: Date.now() };
     try {
       await processor(updatedJob);
@@ -1825,9 +1825,11 @@ export class QueueService {
       expiresAt: now + this.orderStatusCacheTtlMs
     });
 
+    // #138: Evict in batches of 100 (amortized O(1) per insert) rather than
+    // 1-at-a-time which caused pathological eviction under burst load.
     if (this.orderStatusCache.size > 8000) {
-      const oldestKey = this.orderStatusCache.keys().next().value;
-      if (oldestKey) this.orderStatusCache.delete(oldestKey);
+      const keysToDelete = [...this.orderStatusCache.keys()].slice(0, 100);
+      keysToDelete.forEach(k => this.orderStatusCache.delete(k));
     }
 
     return normalizedStatus;

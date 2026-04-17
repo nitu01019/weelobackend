@@ -482,55 +482,15 @@ describe('Issue #24: isUserConnected checks Redis presence across instances', ()
 // Issue #25 Tests — No DLQ consumer for failed queue jobs
 // =============================================================================
 
-describe('Issue #25: DLQ consumer processes permanently failed jobs', () => {
-
-  beforeEach(() => {
-    jest.clearAllMocks();
-  });
-
-  test('#25.1: processDLQ reads DLQ entries and logs them', async () => {
-    // We need to test the QueueService class directly
-    // Since it requires real queue infrastructure, we verify the method exists
-    // and the logic by reading the source
-    const fs = require('fs');
-    const source = fs.readFileSync(
-      require('path').resolve(__dirname, '../shared/services/queue-management.service.ts'),
-      'utf-8'
-    );
-
-    // processDLQ method should exist
-    expect(source).toContain('async processDLQ(queueName: string)');
-    // Should read from dlq:{queueName}
-    expect(source).toContain('`dlq:${queueName}`');
-    // Should log permanently failed jobs
-    expect(source).toContain('[DLQ] Permanently failed job');
-  });
-
-  test('#25.2: processDLQ alerts when depth exceeds threshold', async () => {
-    const fs = require('fs');
-    const source = fs.readFileSync(
-      require('path').resolve(__dirname, '../shared/services/queue-management.service.ts'),
-      'utf-8'
-    );
-
-    // Should alert when depth > 10
-    expect(source).toContain('depth > 10');
-    expect(source).toContain('[DLQ] ALERT: Queue depth exceeds threshold');
-  });
-
-  test('#25.3: processAllDLQs processes all known queues', async () => {
-    const fs = require('fs');
-    const source = fs.readFileSync(
-      require('path').resolve(__dirname, '../shared/services/queue-management.service.ts'),
-      'utf-8'
-    );
-
-    // processAllDLQs method should exist
-    expect(source).toContain('async processAllDLQs()');
-    // Should iterate over all queue names
-    expect(source).toContain('Object.values(QueueService.QUEUES)');
-    // Should also check broadcasts DLQ
-    expect(source).toContain("results['broadcasts']");
+// F-B-50: Issue #25 tests (processDLQ / processAllDLQs) removed — these methods
+// only existed in the modular queue-management.service.ts facade which was
+// dead-on-arrival (no production callers per Phase 1 audit) and is now deleted.
+// The canonical queue.service.ts does not ship processDLQ; DLQ entries are
+// processed by separate operational tooling and are not part of the queue
+// service surface.
+describe.skip('Issue #25: DLQ consumer processes permanently failed jobs', () => {
+  it('removed with modular queue facade (F-B-50)', () => {
+    // intentionally empty; describe.skip retains the ID for audit traceability
   });
 });
 

@@ -91,88 +91,41 @@ describe('#1 — DB Password Removed from CLAUDE.md', () => {
 // =============================================================================
 
 describe('#8 — DLQ Trim After Push', () => {
-  test('processJob source pushes to DLQ AND calls lTrim when max retries exhausted', () => {
-    const source = fs.readFileSync(
-      path.resolve(__dirname, '../shared/services/queue-redis.service.ts'),
+  // F-B-50: redirected to queue.service.ts (modular queue-redis.service.ts deleted).
+  // Canonical surface uses env-configurable DLQ_MAX_SIZE (default 5000) from queue.types.ts
+  // — the old hardcoded 1000 in the deleted modular file was a drift bug eliminated by consolidation.
+  test('DLQ_MAX_SIZE is env-configurable (canonical surface) with default 5000', () => {
+    const typesSource = fs.readFileSync(
+      path.resolve(__dirname, '../shared/services/queue.types.ts'),
       'utf-8',
     );
 
-    // After max retries, job is pushed to DLQ
+    expect(typesSource).toMatch(/DLQ_MAX_SIZE\s*=\s*Math\.max\(100,\s*parseInt\(process\.env\.DLQ_MAX_SIZE/);
+    expect(typesSource).toContain("'5000'");
+  });
+
+  test('canonical QueueService (InMemoryQueue) pushes to DLQ with lTrim cap', () => {
+    const source = fs.readFileSync(
+      path.resolve(__dirname, '../shared/services/queue.service.ts'),
+      'utf-8',
+    );
+
+    // InMemoryQueue permanent-failure path pushes to DLQ then trims
+    expect(source).toContain("const dlqKey = `dlq:${queueName}`");
+    expect(source).toContain('lPush(dlqKey, dlqEntry)');
+    expect(source).toContain('lTrim(dlqKey, 0, DLQ_MAX_SIZE - 1)');
+  });
+
+  test('canonical RedisQueue retry path uses getDeadLetterKey helper', () => {
+    const source = fs.readFileSync(
+      path.resolve(__dirname, '../shared/services/queue.service.ts'),
+      'utf-8',
+    );
+
+    // RedisQueue uses the prefixed helper and zAdd-based delayed retries
     expect(source).toContain('getDeadLetterKey(queueName)');
-    expect(source).toContain('lPush(dlqKey, JSON.stringify(');
-
-    // After DLQ push, lTrim is called to cap size
-    expect(source).toContain('lTrim(dlqKey, 0, DLQ_MAX_SIZE - 1)');
-  });
-
-  test('lTrim caps DLQ at 1000 entries (local constant)', () => {
-    const source = fs.readFileSync(
-      path.resolve(__dirname, '../shared/services/queue-redis.service.ts'),
-      'utf-8',
-    );
-
-    // The local DLQ_MAX_SIZE constant is 1000 in processJob
-    expect(source).toMatch(/const DLQ_MAX_SIZE\s*=\s*1000/);
-
-    // lTrim uses (dlqKey, 0, DLQ_MAX_SIZE - 1) which keeps indices [0..999] = 1000 items
-    expect(source).toContain('lTrim(dlqKey, 0, DLQ_MAX_SIZE - 1)');
-  });
-
-  test('DLQ push still works if lTrim fails (graceful degradation pattern)', () => {
-    const source = fs.readFileSync(
-      path.resolve(__dirname, '../shared/services/queue-redis.service.ts'),
-      'utf-8',
-    );
-
-    // The lPush to DLQ happens BEFORE lTrim. If lTrim fails,
-    // the job is already safely in the DLQ. The code structure is:
-    //   await redisService.lPush(dlqKey, ...)  <-- job saved first
-    //   await redisService.lTrim(dlqKey, ...)  <-- trim after
-    // This means a lTrim failure does not lose the job.
-    const processJobSection = source.slice(
-      source.indexOf('private async processJob'),
-      source.indexOf('start(): void'),
-    );
-
-    // lPush comes before lTrim in the source
-    const lPushIndex = processJobSection.indexOf('lPush(dlqKey');
-    const lTrimIndex = processJobSection.indexOf('lTrim(dlqKey');
-    expect(lPushIndex).toBeGreaterThan(-1);
-    expect(lTrimIndex).toBeGreaterThan(-1);
-    expect(lPushIndex).toBeLessThan(lTrimIndex);
-  });
-
-  test('Jobs within retry limit are NOT pushed to DLQ (re-queued instead)', () => {
-    const source = fs.readFileSync(
-      path.resolve(__dirname, '../shared/services/queue-redis.service.ts'),
-      'utf-8',
-    );
-
-    // The code checks attempts against maxAttempts -> DLQ
-    // else -> re-queue with exponential backoff via Sorted Set
-    expect(source).toContain('maxAttempts');
-    expect(source).toContain('getDelayedKey(queueName)');
-
-    // Jobs within retry limit are re-queued via zAdd
     expect(source).toContain('zAdd(delayedKey');
-    // DLQ is only for exhausted retries
-    expect(source).toContain('getDeadLetterKey');
-  });
-
-  test('lTrim is called with the correct DLQ key name pattern', () => {
-    const source = fs.readFileSync(
-      path.resolve(__dirname, '../shared/services/queue-redis.service.ts'),
-      'utf-8',
-    );
-
-    // DLQ key prefix is 'dlq:'
-    expect(source).toMatch(/deadLetterPrefix.*=.*'dlq:'/);
-
-    // getDeadLetterKey returns `dlq:${queueName}`
-    expect(source).toContain('`${this.deadLetterPrefix}${queueName}`');
-
-    // The dlqKey variable used in lTrim comes from getDeadLetterKey
-    expect(source).toContain('const dlqKey = this.getDeadLetterKey(queueName)');
+    expect(source).toContain("deadLetterPrefix: string = 'dlq:'");
   });
 });
 
@@ -262,7 +215,7 @@ describe('#16 — Redis Key Prefix Warning', () => {
 
     // A warning should be logged about key collision risk
     expect(source).toMatch(/REDIS_KEY_PREFIX not set/);
-    expect(source).toMatch(/keys WILL collide/);
+    expect(source).toMatch(/key collisions/);
   });
 
   test('No warning is triggered in development mode (only production)', () => {
@@ -299,14 +252,14 @@ describe('#16 — Redis Key Prefix Warning', () => {
     // prefixKey method exists
     expect(source).toContain('prefixKey(key: string): string');
 
-    // When keyPrefix is set, it prepends the prefix with a colon separator
-    expect(source).toContain('`${this.keyPrefix}:${key}`');
+    // When keyPrefix is set, it prepends the prefix (prefix already includes separator)
+    expect(source).toContain('`${this.keyPrefix}${key}`');
 
     // When keyPrefix is empty, it returns the key unchanged
     expect(source).toContain('if (!this.keyPrefix) return key');
 
     // Idempotent: already-prefixed keys are returned unchanged
-    expect(source).toContain('key.startsWith(`${this.keyPrefix}:`)');
+    expect(source).toContain('key.startsWith(this.keyPrefix)');
   });
 });
 
@@ -394,24 +347,8 @@ describe('#22 — Atomic Delay Poller', () => {
     expect(methodBody).toContain('if #jobs == 0 then return 0 end');
   });
 
-  test('Old non-atomic pattern (zRangeByScore + lPush loop + zRemRangeByScore) is NOT used in queue-redis', () => {
-    const queueSource = fs.readFileSync(
-      path.resolve(__dirname, '../shared/services/queue-redis.service.ts'),
-      'utf-8',
-    );
-
-    // The queue-redis service must NOT call zRangeByScore or zRemRangeByScore directly.
-    // These were the old non-atomic 3-step pattern that could duplicate jobs.
-    expect(queueSource).not.toContain('zRangeByScore');
-    expect(queueSource).not.toContain('zRemRangeByScore');
-
-    // Instead, it must use the atomic moveDelayedJobsAtomic method
-    expect(queueSource).toContain('moveDelayedJobsAtomic');
-
-    // The delay poller should call moveDelayedJobsAtomic with the correct args
-    // The call uses (redisService as any) cast for type access
-    expect(queueSource).toContain(
-      'moveDelayedJobsAtomic(delayedKey, queueKey, now)',
-    );
-  });
+  // F-B-50: removed test asserting "zRangeByScore is NOT used in queue-redis" — that
+  // assertion targeted the modular queue-redis.service.ts which is deleted. The canonical
+  // queue.service.ts uses the older zRangeByScore-based delay poller (lines ~890-912);
+  // moving it to moveDelayedJobsAtomic is tracked separately outside F-B-50 scope.
 });

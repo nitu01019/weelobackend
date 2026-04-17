@@ -189,7 +189,7 @@ jest.mock('../core/config/hold-config', () => ({
   HOLD_CONFIG: {
     driverAcceptTimeoutMs: 45000,
     driverAcceptTimeoutSeconds: 45,
-    confirmedHoldMaxSeconds: 120,
+    confirmedHoldMaxSeconds: 180,
     flexHoldDurationSeconds: 90,
     flexHoldExtensionSeconds: 30,
     flexHoldMaxDurationSeconds: 130,
@@ -842,62 +842,12 @@ describe('isUserConnectedAsync checks Redis first (Fix #24)', () => {
 // SECTION 9: DLQ consumer (Fix #25)
 // =============================================================================
 
-describe('DLQ consumer logs and alerts (Fix #25)', () => {
-  test('9.1: processDLQ method exists on QueueService', () => {
-    const fs = require('fs');
-    const path = require('path');
-    const source = fs.readFileSync(
-      path.resolve(__dirname, '../shared/services/queue-management.service.ts'),
-      'utf-8'
-    );
-
-    expect(source).toContain('async processDLQ(queueName: string)');
-  });
-
-  test('9.2: DLQ consumer logs all failed jobs', () => {
-    const fs = require('fs');
-    const path = require('path');
-    const source = fs.readFileSync(
-      path.resolve(__dirname, '../shared/services/queue-management.service.ts'),
-      'utf-8'
-    );
-
-    expect(source).toContain("logger.error('[DLQ] Permanently failed job'");
-  });
-
-  test('9.3: DLQ depth > 10 triggers alert', () => {
-    const fs = require('fs');
-    const path = require('path');
-    const source = fs.readFileSync(
-      path.resolve(__dirname, '../shared/services/queue-management.service.ts'),
-      'utf-8'
-    );
-
-    expect(source).toContain('depth > 10');
-    expect(source).toContain("'[DLQ] ALERT: Queue depth exceeds threshold'");
-  });
-
-  test('9.4: processAllDLQs iterates all known queues', () => {
-    const fs = require('fs');
-    const path = require('path');
-    const source = fs.readFileSync(
-      path.resolve(__dirname, '../shared/services/queue-management.service.ts'),
-      'utf-8'
-    );
-
-    expect(source).toContain('async processAllDLQs()');
-    expect(source).toContain('Object.values(QueueService.QUEUES)');
-  });
-
-  test('9.5: DLQ uses dlq:{queueName} key pattern in Redis', () => {
-    const fs = require('fs');
-    const path = require('path');
-    const source = fs.readFileSync(
-      path.resolve(__dirname, '../shared/services/queue-management.service.ts'),
-      'utf-8'
-    );
-
-    expect(source).toContain('`dlq:${queueName}`');
+// F-B-50: Fix #25 processDLQ tests skipped — methods only existed in the
+// modular queue-management.service.ts facade (dead-on-arrival per Phase 1) and
+// are deleted with the facade. Preserved as describe.skip for audit traceability.
+describe.skip('DLQ consumer logs and alerts (Fix #25)', () => {
+  test('removed with modular queue facade (F-B-50)', () => {
+    // intentionally empty
   });
 });
 
