@@ -105,6 +105,17 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
     counter('tracking.init_retry_total', 'Total tracking initialization retry attempts'),
     counter('tracking.init_failure_total', 'Total tracking initialization failures after all retries'),
     counter('tracking.init_success_total', 'Total successful tracking initializations'),
+
+    // W0-4 — FCM push priority canary (labels: priority, type).
+    // Observability for W0-1's fix (commit 4d071a1 regression). Lets us see
+    // the live high/normal breakdown per notification type so a silent flip
+    // back to `normal` can be caught within minutes instead of days.
+    //
+    // Alert: fcm_priority_normal_ratio
+    // Expression: sum(rate(fcm_push_priority_total{priority="normal"}[5m])) / sum(rate(fcm_push_priority_total[5m]))
+    // Threshold: > 0.2 for 15m → investigate dispatch lag
+    // Severity: WARN
+    counter('fcm_push_priority_total', 'Total FCM pushes labelled by android priority (high|normal) and notification type'),
   ];
 
   for (const def of defs) {

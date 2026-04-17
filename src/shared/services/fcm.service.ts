@@ -696,6 +696,22 @@ class FCMService {
     // can launch a full-screen intent (wake screen + heads-up overlay).
     const isFullScreen = FCMService.FULLSCREEN_TYPES.has(notification.type);
 
+    // W0-4: Canary metric for the priority that actually ships on the wire.
+    // The same conditional used below for `android.priority` is mirrored here
+    // so the counter and the outgoing payload can never drift. The counter
+    // lets us verify in prod that W0-1's high-priority fix is actually
+    // reaching Android drivers.
+    const effectivePriority: 'high' | 'normal' =
+      notification.priority === 'high' ? 'high' : 'normal';
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { metrics } = require('../monitoring/metrics.service');
+      metrics.incrementCounter('fcm_push_priority_total', {
+        priority: effectivePriority,
+        type: notification.type,
+      });
+    } catch { /* metrics not available — never break a send over a counter */ }
+
     return {
       notification: {
         title: truncate(notification.title, 100) || '',
