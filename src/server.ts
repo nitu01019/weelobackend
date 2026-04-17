@@ -836,6 +836,20 @@ const gracefulShutdown = async (signal: string) => {
     trackingService?.stopDriverOfflineChecker?.();
     // H-15 FIX: Stop hold reconciliation worker (was never called during shutdown)
     holdReconciliationService.stop();
+
+    // F-A-77: Stop the legacy hold cleanup reconciler (60s interval) and explicitly
+    // release the 'hold:cleanup:unified' Redis lock so a peer ECS task can take over
+    // immediately instead of waiting for the 60s lock TTL. BullMQ graceful-shutdown
+    // pattern + redis-lock convention (owner releases what owner acquired).
+    try {
+      const { truckHoldService }: typeof import('./modules/truck-hold/truck-hold.service') = require('./modules/truck-hold/truck-hold.service');
+      truckHoldService.stopCleanupJob();
+      await redisService.releaseLock('hold:cleanup:unified', `cleanup-${process.pid}`).catch(() => {});
+      logger.info('[Shutdown] Hold cleanup reconciler stopped + unified cleanup lock released');
+    } catch (err) {
+      logger.warn('[Shutdown] Hold cleanup shutdown failed', err);
+    }
+
     logger.info('All background intervals stopped');
   } catch (err) {
     logger.error('Error stopping background intervals', err);

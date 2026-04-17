@@ -106,6 +106,7 @@ import { fcmService } from '../../shared/services/fcm.service';
 import { driverService } from '../driver/driver.service';
 import { HOLD_CONFIG } from '../../core/config/hold-config';
 import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
+import { holdExpiryCleanupService } from '../hold-expiry/hold-expiry-cleanup.service';
 
 // =============================================================================
 // TYPES & INTERFACES
@@ -206,7 +207,11 @@ export interface OrderAvailability {
 const CONFIG = {
   // Keep enough time for transporter to map vehicles + drivers before confirm.
   HOLD_DURATION_SECONDS: 180,      // 3 minutes hold window
-  CLEANUP_INTERVAL_MS: 5000,       // How often to clean expired holds
+  // F-A-77: Downgraded from 5s to 60s — per-hold durable HOLD_EXPIRY jobs are
+  // the primary expiry mechanism; this setInterval is now a belt-and-braces
+  // reconciler for (a) jobs whose enqueue failed, (b) Redis clock skew.
+  // Pattern: BullMQ delayed jobs + Uber Cadence durable timers.
+  CLEANUP_INTERVAL_MS: 60000,      // Safety-net reconciler cadence (60s)
   MAX_HOLD_QUANTITY: 50,           // Max trucks one transporter can hold at once
   MIN_HOLD_QUANTITY: 1,            // Minimum trucks to hold
 };
@@ -870,6 +875,22 @@ class TruckHoldService {
 
       this.broadcastAvailabilityUpdate(orderId);
       logger.info(`[TruckHold] ✅ Held ${heldCount} trucks. Hold ID: ${holdId}, Expires: ${expiresAt.toISOString()}`);
+
+      // F-A-77: Enqueue a per-hold durable expiry job. Legacy holds default to FLEX phase
+      // (schema default) so scheduleFlexHoldCleanup is the correct routing. This moves the
+      // primary expiry responsibility from the in-process setInterval to a Redis-backed
+      // delayed job that survives container restarts. The setInterval reconciler (60s)
+      // remains as belt-and-braces for failed enqueues and Redis clock skew.
+      try {
+        await holdExpiryCleanupService.scheduleFlexHoldCleanup(holdId, expiresAt);
+      } catch (scheduleErr: unknown) {
+        const errMsg = scheduleErr instanceof Error ? scheduleErr.message : String(scheduleErr);
+        logger.warn(`[TruckHold] Failed to schedule durable HOLD_EXPIRY job — reconciler will catch within 60s`, {
+          holdId,
+          orderId,
+          error: errMsg,
+        });
+      }
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : 'HOLD_FAILED';
       if (message.startsWith('NOT_ENOUGH_AVAILABLE')) {
@@ -2253,7 +2274,7 @@ class TruckHoldService {
       await this.processExpiredHoldsOnce();
     }, CONFIG.CLEANUP_INTERVAL_MS);
 
-    logger.info(`[TruckHold] Cleanup job started (every ${CONFIG.CLEANUP_INTERVAL_MS / 1000}s)`);
+    logger.info(`[TruckHold] Cleanup reconciler started (every ${CONFIG.CLEANUP_INTERVAL_MS / 1000}s — safety net; primary path is durable HOLD_EXPIRY queue)`);
   }
 
   /**
