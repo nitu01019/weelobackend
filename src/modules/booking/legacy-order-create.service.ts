@@ -212,145 +212,79 @@ function groupRequestsByVehicleType(requests: TruckRequestRecord[]): GroupedRequ
 }
 
 /**
- * Broadcast to transporters - the core matching algorithm
+ * Broadcast to transporters — THIN-WRAP per F-B-77 (Strangler Fig).
  *
- * OPTIMIZED:
- * - Finds transporters for each vehicle type group in parallel
- * - Sends grouped notifications (less WebSocket calls)
- * - Updates notifiedTransporters in batch
+ * Delegates to the canonical `order-broadcast.service.ts::broadcastToTransporters`
+ * via `order-delegates-bridge.service.ts`. Adapts fork-shaped input
+ * `(OrderRecord, GroupedRequests[], distanceKm)` into the canonical
+ * `(orderId, CreateOrderRequest, TruckRequestRecord[], expiresAt, resolvedPickup)` shape
+ * and back-fills `CreateOrderResult['broadcastSummary']` from the canonical result.
  */
 async function broadcastToTransporters(
   order: OrderRecord,
   groupedRequests: GroupedRequests[],
   distanceKm: number
 ): Promise<CreateOrderResult['broadcastSummary']> {
+  const { broadcastToTransporters: canonicalBroadcast } = require('../order/order-delegates-bridge.service') as typeof import('../order/order-delegates-bridge.service');
 
-  const allTransporterIds = new Set<string>();
-  const groupSummaries: CreateOrderResult['broadcastSummary']['groupedBy'] = [];
+  const truckRequests = groupedRequests.flatMap(g => g.requests);
 
-  // Process each vehicle type group
-  for (const group of groupedRequests) {
-    // Find transporters with this vehicle type
-    const allTransporterIdsForType = await db.getTransportersWithVehicleType(
-      group.vehicleType,
-      group.vehicleSubtype
-    );
+  const canonicalRequest = {
+    customerId: order.customerId,
+    customerName: order.customerName,
+    customerPhone: order.customerPhone,
+    pickup: {
+      latitude: order.pickup.latitude,
+      longitude: order.pickup.longitude,
+      address: order.pickup.address || '',
+      city: order.pickup.city,
+      state: order.pickup.state,
+    },
+    drop: {
+      latitude: order.drop.latitude,
+      longitude: order.drop.longitude,
+      address: order.drop.address || '',
+      city: order.drop.city,
+      state: order.drop.state,
+    },
+    distanceKm,
+    vehicleRequirements: groupedRequests.map(g => ({
+      vehicleType: g.vehicleType,
+      vehicleSubtype: g.vehicleSubtype,
+      quantity: g.requests.length,
+      pricePerTruck: g.requests[0]?.pricePerTruck ?? 0,
+    })),
+    goodsType: order.goodsType ?? undefined,
+    cargoWeightKg: order.cargoWeightKg ?? undefined,
+  };
 
-    // Phase 3 optimization: Filter to only ONLINE transporters using Redis set
-    // O(1) per transporter instead of N+1 DB queries
-    const transporterIds = await transporterOnlineService.filterOnline(allTransporterIdsForType);
+  const resolvedPickup = {
+    latitude: order.pickup.latitude,
+    longitude: order.pickup.longitude,
+    address: order.pickup.address || '',
+    city: order.pickup.city,
+    state: order.pickup.state,
+  };
 
-    group.transporterIds = transporterIds;
+  const result = await canonicalBroadcast(
+    order.id,
+    canonicalRequest,
+    truckRequests,
+    order.expiresAt,
+    resolvedPickup
+  );
 
-    // Update notifiedTransporters for each request in this group
-    const requestIds = group.requests.map(r => r.id);
-    await db.updateTruckRequestsBatch(requestIds, { notifiedTransporters: transporterIds });
-
-    // Track unique transporters
-    transporterIds.forEach(id => allTransporterIds.add(id));
-
-    // Add to summary
-    groupSummaries.push({
-      vehicleType: group.vehicleType,
-      vehicleSubtype: group.vehicleSubtype,
-      count: group.requests.length,
-      transportersNotified: transporterIds.length
-    });
-
-    // Broadcast to each transporter in this group
-    if (transporterIds.length > 0) {
-      const broadcastPayload = {
-        orderId: order.id,
-        customerName: order.customerName,
-
-        // Vehicle info for this group
-        vehicleType: group.vehicleType,
-        vehicleSubtype: group.vehicleSubtype,
-        trucksNeeded: group.requests.length,
-
-        // Individual request IDs (transporters can accept specific ones)
-        requestIds: group.requests.map(r => r.id),
-
-        // Pricing
-        pricePerTruck: group.requests[0].pricePerTruck,
-        totalFare: group.requests.reduce((sum, r) => sum + r.pricePerTruck, 0),
-
-        // Location info
-        pickupAddress: order.pickup.address,
-        pickupCity: order.pickup.city,
-        dropAddress: order.drop.address,
-        dropCity: order.drop.city,
-        distanceKm,
-        // H-8 FIX: Unified location format -- nested objects for new Captain app, flat for legacy
-        pickupLocation: {
-          lat: order.pickup.latitude,
-          lng: order.pickup.longitude,
-          address: order.pickup.address || '',
-        },
-        dropLocation: {
-          lat: order.drop.latitude,
-          lng: order.drop.longitude,
-          address: order.drop.address || '',
-        },
-
-        // H-8 FIX: Unified ETA -- both fields present for backward compatibility
-        // pickupEtaMinutes: DEPRECATED but kept for old Captain app versions
-        // pickupEtaSeconds: NEW standard field
-        pickupEtaSeconds: 0,
-        pickupEtaMinutes: 0,
-
-        // Goods info
-        goodsType: order.goodsType,
-        weight: order.weight,
-
-        // Timing
-        createdAt: order.createdAt,
-        expiresAt: order.expiresAt,
-        timeoutSeconds: ORDER_CONFIG.TIMEOUT_MS / 1000,
-
-        isUrgent: false,
-
-        // H-8 FIX: Payload version -- lets Captain app detect new format
-        payloadVersion: 2,
-      };
-
-      // H-19 FIX: Cap notified transporters to prevent FCM throttling and latency spikes
-      const MAX_BROADCAST_TRANSPORTERS_ORDER = parseInt(process.env.MAX_BROADCAST_TRANSPORTERS || '100', 10);
-      const cappedOrderTransporters = transporterIds.length > MAX_BROADCAST_TRANSPORTERS_ORDER
-        ? (() => {
-            logger.info(`[Broadcast][Order] Capping ${transporterIds.length} -> ${MAX_BROADCAST_TRANSPORTERS_ORDER} transporters`);
-            return transporterIds.slice(0, MAX_BROADCAST_TRANSPORTERS_ORDER);
-          })()
-        : transporterIds;
-
-      // Emit to all transporters in this group
-      // Phase 3: Removed per-transporter db.getUserById() -- already filtered by Redis online set.
-      // Name lookup is non-critical for broadcast; transporter ID is logged instead.
-      for (const transporterId of cappedOrderTransporters) {
-        emitToUser(transporterId, SocketEvent.NEW_BROADCAST, broadcastPayload);
-        logger.info(`Notified: ${transporterId.substring(0, 8)}... for ${group.vehicleType} ${group.vehicleSubtype} (${group.requests.length} trucks)`);
-
-        // H-7 FIX: Broadcast delivery tracking for observability (fire-and-forget)
-        try {
-          if (typeof redisService.hSet === 'function') {
-            redisService.hSet(
-              `broadcast:delivery:${order.id}`,
-              transporterId,
-              JSON.stringify({ emittedAt: Date.now(), channel: 'socket' })
-            ).then(() => redisService.expire(`broadcast:delivery:${order.id}`, 3600))
-             .catch((_err: unknown) => { /* silent -- observability only */ });
-          }
-        } catch (_h7Err: unknown) { /* H-7 is observability only -- never crash broadcast */ }
-      }
-    } else {
-      logger.warn(`No transporters found for ${group.vehicleType} ${group.vehicleSubtype}`);
-    }
-  }
+  const groupedBy: CreateOrderResult['broadcastSummary']['groupedBy'] = groupedRequests.map(g => ({
+    vehicleType: g.vehicleType,
+    vehicleSubtype: g.vehicleSubtype,
+    count: g.requests.length,
+    transportersNotified: 0,
+  }));
 
   return {
     totalRequests: groupedRequests.reduce((sum, g) => sum + g.requests.length, 0),
-    groupedBy: groupSummaries,
-    totalTransportersNotified: allTransporterIds.size
+    groupedBy,
+    totalTransportersNotified: result.notifiedTransporters,
   };
 }
 
