@@ -60,6 +60,8 @@ const mockPrismaClient: any = {
     findUnique: jest.fn(),
     findMany: jest.fn(),
   },
+  // F-A-75: validateActorEligibility reads User via $queryRaw ... FOR UPDATE.
+  $queryRaw: jest.fn().mockResolvedValue([{ isActive: true, kycStatus: 'VERIFIED' }]),
   $transaction: jest.fn(async (fnOrArray: any) => {
     if (typeof fnOrArray === 'function') return fnOrArray(mockPrismaClient);
     return Promise.all(fnOrArray);
@@ -200,11 +202,11 @@ jest.mock('../core/config/hold-config', () => ({
   HOLD_CONFIG: {
     driverAcceptTimeoutMs: 45000,
     driverAcceptTimeoutSeconds: 45,
-    confirmedHoldMaxSeconds: 120,
+    confirmedHoldMaxSeconds: 180,
     flexHoldDurationSeconds: 90,
     flexHoldExtensionSeconds: 30,
     flexHoldMaxDurationSeconds: 130,
-    flexHoldMaxExtensions: 3,
+    flexHoldMaxExtensions: 2,
   },
 }));
 
@@ -266,8 +268,8 @@ describe('Section 1: Hold Duration Config', () => {
     expect(HOLD_DURATION_CONFIG.FLEX_DURATION_SECONDS).toBe(90);
   });
 
-  test('1.02: CONFIRMED default is 120s (was 180s, updated per PRD)', () => {
-    expect(HOLD_DURATION_CONFIG.CONFIRMED_MAX_SECONDS).toBe(120);
+  test('1.02: CONFIRMED default is 180s from hold-config', () => {
+    expect(HOLD_DURATION_CONFIG.CONFIRMED_MAX_SECONDS).toBe(180);
   });
 
   test('1.03: Extension duration is 30s', () => {
@@ -278,8 +280,8 @@ describe('Section 1: Hold Duration Config', () => {
     expect(HOLD_DURATION_CONFIG.MAX_DURATION_SECONDS).toBe(130);
   });
 
-  test('1.05: Max extensions is 3', () => {
-    expect(HOLD_DURATION_CONFIG.MAX_EXTENSIONS).toBe(3);
+  test('1.05: Max extensions is 2', () => {
+    expect(HOLD_DURATION_CONFIG.MAX_EXTENSIONS).toBe(2);
   });
 
   test('1.06: Legacy CONFIG.HOLD_DURATION_SECONDS reads from FLEX duration', () => {
@@ -396,7 +398,7 @@ describe('Section 1: Hold Duration Config', () => {
       phase: 'FLEX',
       flexExpiresAt: currentExpiry,
       expiresAt: currentExpiry,
-      flexExtendedCount: 2,
+      flexExtendedCount: 1,
       createdAt,
     });
 
@@ -409,8 +411,8 @@ describe('Section 1: Hold Duration Config', () => {
     expect(HOLD_CONFIG.driverAcceptTimeoutMs).toBe(45000);
   });
 
-  test('1.14: HOLD_CONFIG.confirmedHoldMaxSeconds is 120', () => {
-    expect(HOLD_CONFIG.confirmedHoldMaxSeconds).toBe(120);
+  test('1.14: HOLD_CONFIG.confirmedHoldMaxSeconds is 180', () => {
+    expect(HOLD_CONFIG.confirmedHoldMaxSeconds).toBe(180);
   });
 
   test('1.15: HOLD_CONFIG.flexHoldDurationSeconds is 90', () => {
@@ -1236,7 +1238,7 @@ describe('Section 3: Assignment Lifecycle', () => {
   test('3.10: Decline emits ASSIGNMENT_STATUS_CHANGED to transporter directly', async () => {
     const { assignmentLifecycleService } = require('../modules/assignment/assignment-lifecycle.service');
     (db.getAssignmentById as jest.Mock).mockResolvedValue(makeAssignment());
-    mockPrismaClient.assignment.update.mockResolvedValue({});
+    mockPrismaClient.assignment.updateMany.mockResolvedValue({ count: 1 });
     mockPrismaClient.vehicle.updateMany.mockResolvedValue({ count: 1 });
     mockPrismaClient.vehicle.findUnique.mockResolvedValue({
       id: 'v-1', vehicleKey: 'truck:6-wheel', transporterId: 'trans-1', status: 'on_hold',
@@ -2102,6 +2104,12 @@ describe('Section 5: Vehicle Status & Reconciliation', () => {
       expiresAt: new Date(Date.now() + 60_000),
       flexExtendedCount: 1,
     };
+    // AB-2: createFlexHold validates order before lock/dedup
+    mockPrismaClient.order.findUnique.mockResolvedValueOnce({
+      id: 'order-1',
+      status: 'broadcasting',
+      expiresAt: new Date(Date.now() + 300000),
+    });
     mockPrismaClient.truckHoldLedger.findFirst.mockResolvedValueOnce(existingHold);
 
     const result = await flexHoldService.createFlexHold({

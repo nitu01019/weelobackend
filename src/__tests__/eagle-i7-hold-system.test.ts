@@ -97,11 +97,11 @@ jest.mock('../core/config/hold-config', () => ({
   HOLD_CONFIG: {
     driverAcceptTimeoutMs: 45000,
     driverAcceptTimeoutSeconds: 45,
-    confirmedHoldMaxSeconds: 120,
+    confirmedHoldMaxSeconds: 180,
     flexHoldDurationSeconds: 90,
     flexHoldExtensionSeconds: 30,
     flexHoldMaxDurationSeconds: 130,
-    flexHoldMaxExtensions: 3,
+    flexHoldMaxExtensions: 2,
   },
 }));
 
@@ -337,16 +337,19 @@ describe('EAGLE I7 — Hold System Fixes', () => {
       const confirmedExpiresAt = new Date(Date.now() + 60_000);
 
       // H-8: initializeConfirmedHold now uses $transaction with $queryRaw FOR UPDATE
+      // F-A-75: helper queries User row first, then hold row.
       const prismaServiceMod = require('../shared/database/prisma.service');
       prismaServiceMod.prismaClient.$transaction.mockImplementation(async (cb: any) => {
         const txClient = {
           ...prismaServiceMod.prismaClient,
-          $queryRaw: jest.fn().mockResolvedValue([{
-            holdId: 'hold-dr08',
-            phase: 'CONFIRMED',
-            confirmedExpiresAt,
-            transporterId: 'trans-1',
-          }]),
+          $queryRaw: jest.fn()
+            .mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }])
+            .mockResolvedValueOnce([{
+              holdId: 'hold-dr08',
+              phase: 'CONFIRMED',
+              confirmedExpiresAt,
+              transporterId: 'trans-1',
+            }]),
         };
         return cb(txClient);
       });

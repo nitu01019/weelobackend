@@ -449,12 +449,15 @@ describe('QA Hold System Scenarios', () => {
     describe('confirmedHoldService.initializeConfirmedHold', () => {
       it('5. Ownership check on initializeConfirmedHold — same behavior as transitionToConfirmed', async () => {
         // H-8: initializeConfirmedHold now uses $queryRaw with FOR UPDATE inside $transaction
-        mock$QueryRaw.mockResolvedValue([{
-          holdId: 'hold-001',
-          phase: 'FLEX',
-          confirmedExpiresAt: null,
-          transporterId: 'transporter-A',
-        }]);
+        // F-A-75: first $queryRaw is User eligibility, second is the hold lookup.
+        mock$QueryRaw
+          .mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }])
+          .mockResolvedValueOnce([{
+            holdId: 'hold-001',
+            phase: 'FLEX',
+            confirmedExpiresAt: null,
+            transporterId: 'transporter-A',
+          }]);
 
         const { confirmedHoldService } = require('../modules/truck-hold/confirmed-hold.service');
 

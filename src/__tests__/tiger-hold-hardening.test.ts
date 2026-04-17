@@ -54,7 +54,13 @@ const mockPrismaClient = {
   user: {
     findMany: jest.fn(),
   },
-  $transaction: jest.fn(),
+  // F-A-75: validateActorEligibility reads User via $queryRaw ... FOR UPDATE.
+  $queryRaw: jest.fn().mockResolvedValue([{ isActive: true, kycStatus: 'VERIFIED' }]),
+  // F-A-75: createFlexHold now wraps truckHoldLedger.create in $transaction; default
+  // pass-through delegates to mockPrismaClient so existing mocks still apply.
+  $transaction: jest.fn().mockImplementation(async (fn: any) =>
+    typeof fn === 'function' ? fn(mockPrismaClient) : Promise.all(fn)
+  ),
 };
 
 jest.mock('../shared/database/prisma.service', () => ({
@@ -960,6 +966,12 @@ describe('FlexHold dedup (M-22)', () => {
     };
 
     mockPrismaClient.truckHoldLedger.findFirst.mockResolvedValue(existingHold);
+    // AB-2: createFlexHold checks order existence before acquiring lock
+    mockPrismaClient.order.findUnique.mockResolvedValue({
+      id: 'order-1',
+      status: 'broadcasting',
+      expiresAt: new Date(Date.now() + 300_000),
+    });
 
     const result = await flexHoldService.createFlexHold({
       orderId: 'order-1',

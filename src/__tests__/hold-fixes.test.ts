@@ -101,6 +101,10 @@ const mockPrismaClient: any = {
     findUnique: (...args: any[]) => mockTruckHoldLedgerFindUnique(...args),
   },
   $executeRaw: (...args: any[]) => mockExecuteRaw(...args),
+  // F-A-75: validateActorEligibility reads the User row via $queryRaw ... FOR UPDATE.
+  // Default to a VERIFIED + active actor so unrelated hold tests pass; individual
+  // tests can override via `mockPrismaClient.$queryRaw.mockResolvedValueOnce(...)`.
+  $queryRaw: jest.fn().mockResolvedValue([{ isActive: true, kycStatus: 'VERIFIED' }]),
   $transaction: async (fn: any) => fn(mockPrismaClient),
 };
 

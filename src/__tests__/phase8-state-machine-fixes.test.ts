@@ -181,7 +181,10 @@ describe('H-8: Confirmed hold uses SELECT FOR UPDATE', () => {
   it('initializeConfirmedHold wraps read-check-write in $transaction', async () => {
     mockTransaction.mockImplementation(async (cb: Function) => {
       const tx = { $queryRaw: mockQueryRaw, truckHoldLedger: { update: mockUpdate } };
-      mockQueryRaw.mockResolvedValue([{ holdId: 'h-1', phase: 'FLEX', transporterId: 't-1', confirmedExpiresAt: null }]);
+      // F-A-75: helper queries User row first (FOR UPDATE), then the hold row.
+      mockQueryRaw
+        .mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }])
+        .mockResolvedValueOnce([{ holdId: 'h-1', phase: 'FLEX', transporterId: 't-1', confirmedExpiresAt: null }]);
       mockUpdate.mockResolvedValue({ orderId: 'o-1', transporterId: 't-1', quantity: 2 });
       return cb(tx);
     });
@@ -195,7 +198,11 @@ describe('H-8: Confirmed hold uses SELECT FOR UPDATE', () => {
 
   it('rejects when hold is not in FLEX phase', async () => {
     mockTransaction.mockImplementation(async (cb: Function) => {
-      return cb({ $queryRaw: jest.fn().mockResolvedValue([{ holdId: 'h-2', phase: 'EXPIRED', transporterId: 't-1', confirmedExpiresAt: null }]), truckHoldLedger: { update: mockUpdate } });
+      const qr = jest.fn()
+        // F-A-75: User row comes first.
+        .mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }])
+        .mockResolvedValueOnce([{ holdId: 'h-2', phase: 'EXPIRED', transporterId: 't-1', confirmedExpiresAt: null }]);
+      return cb({ $queryRaw: qr, truckHoldLedger: { update: mockUpdate } });
     });
     const { confirmedHoldService } = require('../modules/truck-hold/confirmed-hold.service');
     const result = await confirmedHoldService.initializeConfirmedHold('h-2', 't-1', []);
@@ -205,7 +212,11 @@ describe('H-8: Confirmed hold uses SELECT FOR UPDATE', () => {
 
   it('rejects when transporterId does not match (ownership)', async () => {
     mockTransaction.mockImplementation(async (cb: Function) => {
-      return cb({ $queryRaw: jest.fn().mockResolvedValue([{ holdId: 'h-3', phase: 'FLEX', transporterId: 't-owner', confirmedExpiresAt: null }]), truckHoldLedger: { update: mockUpdate } });
+      const qr = jest.fn()
+        // F-A-75: User row comes first.
+        .mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }])
+        .mockResolvedValueOnce([{ holdId: 'h-3', phase: 'FLEX', transporterId: 't-owner', confirmedExpiresAt: null }]);
+      return cb({ $queryRaw: qr, truckHoldLedger: { update: mockUpdate } });
     });
     const { confirmedHoldService } = require('../modules/truck-hold/confirmed-hold.service');
     const result = await confirmedHoldService.initializeConfirmedHold('h-3', 't-fake', []);

@@ -46,6 +46,7 @@ import { logger } from '../../shared/services/logger.service';
 import { redisService } from '../../shared/services/redis.service';
 import { socketService } from '../../shared/services/socket.service';
 import { holdExpiryCleanupService } from '../hold-expiry/hold-expiry-cleanup.service';
+import { validateActorEligibility, HoldEligibilityError } from './hold-eligibility';
 
 // =============================================================================
 // TYPES & INTERFACES
@@ -253,24 +254,31 @@ class FlexHoldService {
     }
 
     try {
-      // Create hold in database
-      const holdLedger = await prismaClient.truckHoldLedger.create({
-        data: {
-          holdId,
-          orderId: request.orderId,
-          transporterId: request.transporterId,
-          vehicleType: request.vehicleType,
-          vehicleSubtype: request.vehicleSubtype,
-          quantity: request.quantity,
-          truckRequestIds: request.truckRequestIds,
-          status: 'active',
-          phase: HoldPhase.FLEX,
-          phaseChangedAt: now,
-          flexExpiresAt: baseExpiresAt,
-          flexExtendedCount: 0,
-          expiresAt: baseExpiresAt,
-          createdAt: now,
-        },
+      // F-A-75: Create hold inside a transaction so the KYC+isActive re-check can use
+      // SELECT ... FOR UPDATE on the User row and roll back atomically if the actor is
+      // no longer eligible at hold-creation time. The outer Redis lock still serializes
+      // concurrent flex-hold attempts on the same holdId; this TX adds per-User row
+      // serialization against the admin revoke/suspend path.
+      const holdLedger = await prismaClient.$transaction(async (tx) => {
+        await validateActorEligibility(tx, request.transporterId, 'flex_hold');
+        return tx.truckHoldLedger.create({
+          data: {
+            holdId,
+            orderId: request.orderId,
+            transporterId: request.transporterId,
+            vehicleType: request.vehicleType,
+            vehicleSubtype: request.vehicleSubtype,
+            quantity: request.quantity,
+            truckRequestIds: request.truckRequestIds,
+            status: 'active',
+            phase: HoldPhase.FLEX,
+            phaseChangedAt: now,
+            flexExpiresAt: baseExpiresAt,
+            flexExtendedCount: 0,
+            expiresAt: baseExpiresAt,
+            createdAt: now,
+          },
+        });
       });
 
       // Cache state in Redis for fast access
@@ -323,6 +331,19 @@ class FlexHoldService {
         message: `Flex hold created. Expires in ${this.config.baseDurationSeconds} seconds.`,
       };
     } catch (error: any) {
+      // F-A-75: bubble KYC / isActive eligibility failures with a distinct error code.
+      if (error instanceof HoldEligibilityError) {
+        logger.warn('[FLEX HOLD] Eligibility denied', {
+          code: error.code,
+          transporterId: request.transporterId,
+          orderId: request.orderId,
+        });
+        return {
+          success: false,
+          message: error.message,
+          error: error.code,
+        };
+      }
       logger.error('[FLEX HOLD] Failed to create flex hold', {
         error: error.message,
         orderId: request.orderId,

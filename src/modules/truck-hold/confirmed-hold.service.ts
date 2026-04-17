@@ -39,6 +39,7 @@ import { releaseVehicle } from '../../shared/services/vehicle-lifecycle.service'
 import { HOLD_CONFIG } from '../../core/config/hold-config';
 import { smartTimeoutService } from '../order-timeout/smart-timeout.service';
 import { tryAutoRedispatch } from '../assignment/auto-redispatch.service';
+import { validateActorEligibility, HoldEligibilityError } from './hold-eligibility';
 
 // =============================================================================
 // TYPES & INTERFACES
@@ -123,7 +124,14 @@ class ConfirmedHoldService {
       driverId: string;
       truckRequestId: string;
     }>
-  ): Promise<{ success: boolean; message: string; confirmedExpiresAt?: Date; missingAssignmentIds?: string[] }> {
+  ): Promise<{
+    success: boolean;
+    message: string;
+    confirmedExpiresAt?: Date;
+    missingAssignmentIds?: string[];
+    errorCode?: string;
+    httpStatus?: number;
+  }> {
     logger.info('[CONFIRMED HOLD] Initializing confirmed hold', {
       holdId,
       transporterId,
@@ -135,6 +143,9 @@ class ConfirmedHoldService {
       // to prevent TOCTOU race where two concurrent requests both read phase=FLEX
       // and both update to CONFIRMED.
       const txResult = await prismaClient.$transaction(async (tx) => {
+        // F-A-75: row-locked KYC+isActive re-check (same TX as the phase transition).
+        await validateActorEligibility(tx, transporterId, 'confirmed_hold');
+
         // Lock the row with FOR UPDATE to prevent concurrent phase transitions
         const rows = await tx.$queryRaw<Array<{
           holdId: string;
@@ -150,7 +161,7 @@ class ConfirmedHoldService {
         const existing = rows[0];
 
         if (!existing) {
-          return { success: false as const, message: 'Hold not found' };
+          return { success: false as const, message: 'Hold not found', errorCode: 'HOLD_NOT_FOUND', httpStatus: 404 };
         }
 
         // FIX-6: Ownership verification — only the transporter who created the hold can confirm it
@@ -160,7 +171,7 @@ class ConfirmedHoldService {
             requestedBy: transporterId,
             ownedBy: existing.transporterId,
           });
-          return { success: false as const, message: 'Not your hold' };
+          return { success: false as const, message: 'Not your hold', errorCode: 'FORBIDDEN', httpStatus: 403 };
         }
 
         if (existing.phase === HoldPhase.CONFIRMED) {
@@ -172,10 +183,21 @@ class ConfirmedHoldService {
           };
         }
 
+        if (existing.phase === HoldPhase.EXPIRED || existing.phase === HoldPhase.RELEASED) {
+          return {
+            success: false as const,
+            message: `Hold has expired or been released (current phase: ${existing.phase})`,
+            errorCode: 'HOLD_EXPIRED',
+            httpStatus: 410,
+          };
+        }
+
         if (existing.phase !== HoldPhase.FLEX) {
           return {
             success: false as const,
-            message: `Cannot move to CONFIRMED from ${existing.phase} -- must be FLEX`
+            message: `Cannot move to CONFIRMED from ${existing.phase} -- must be FLEX`,
+            errorCode: 'HOLD_ALREADY_CONFIRMED',
+            httpStatus: 409,
           };
         }
 
@@ -203,7 +225,12 @@ class ConfirmedHoldService {
 
       // Handle early-return cases from the transaction
       if (!txResult.success) {
-        return { success: false, message: txResult.message };
+        return {
+          success: false,
+          message: txResult.message,
+          errorCode: (txResult as any).errorCode,
+          httpStatus: (txResult as any).httpStatus,
+        };
       }
       if (txResult.message) {
         // Idempotent return — already CONFIRMED
@@ -303,6 +330,11 @@ class ConfirmedHoldService {
         missingAssignmentIds: missingIds.length > 0 ? missingIds : undefined,
       };
     } catch (error: any) {
+      // F-A-75: map KYC/isActive ineligibility to 403 (not generic 500).
+      if (error instanceof HoldEligibilityError) {
+        logger.warn('[CONFIRMED HOLD] Eligibility denied', { code: error.code, transporterId, holdId });
+        return { success: false, message: error.message, errorCode: error.code, httpStatus: 403 };
+      }
       logger.error('[CONFIRMED HOLD] Failed to initialize confirmed hold', {
         error: error.message,
         holdId,
@@ -311,6 +343,8 @@ class ConfirmedHoldService {
       return {
         success: false,
         message: 'Failed to initialize confirmed hold',
+        errorCode: 'INITIALIZE_FAILED',
+        httpStatus: 500,
       };
     }
   }
@@ -345,17 +379,13 @@ class ConfirmedHoldService {
         const now = new Date();
         const nowIso = now.toISOString();
 
-        // CAS guard: only accept if assignment is still pending
-        const updated = await prismaClient.assignment.updateMany({
-          where: {
-            id: assignmentId,
-            driverId,
-            status: AssignmentStatus.pending,  // CAS precondition
-          },
-          data: {
-            status: AssignmentStatus.driver_accepted,
-            driverAcceptedAt: nowIso,
-          },
+        // F-A-75: CAS + driver-row KYC check run in the same TX (FOR UPDATE).
+        const updated = await prismaClient.$transaction(async (tx) => {
+          await validateActorEligibility(tx, driverId, 'driver_accept');
+          return tx.assignment.updateMany({
+            where: { id: assignmentId, driverId, status: AssignmentStatus.pending },
+            data: { status: AssignmentStatus.driver_accepted, driverAcceptedAt: nowIso },
+          });
         });
 
         if (updated.count === 0) {
@@ -477,6 +507,11 @@ class ConfirmedHoldService {
         await redisService.releaseLock(lockKey, lockHolder).catch(() => {});
       }
     } catch (error: any) {
+      // F-A-75: surface driver KYC/isActive ineligibility so client can prompt re-verify.
+      if (error instanceof HoldEligibilityError) {
+        logger.warn('[CONFIRMED HOLD] Driver eligibility denied on accept', { code: error.code, driverId, assignmentId });
+        return { success: false, assignmentId, accepted: false, declined: false, timeout: false, message: error.message, errorCode: error.code };
+      }
       logger.error('[CONFIRMED HOLD] Failed to handle driver acceptance', {
         error: error.message,
         assignmentId,

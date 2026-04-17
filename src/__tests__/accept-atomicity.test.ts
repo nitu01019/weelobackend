@@ -218,6 +218,15 @@ function resetAllMocks(): void {
   mockTruckHoldLedgerFindFirst.mockReset();
   mockExecuteRaw.mockReset();
   mockTransaction.mockReset();
+  // F-A-75: default $transaction pass-through with a VERIFIED + active User row for
+  // $queryRaw. Individual tests can override by calling mockTransaction.mockImplementation.
+  mockTransaction.mockImplementation(async (fn: any) => {
+    const tx = {
+      ...buildTxProxy(),
+      $queryRaw: jest.fn().mockResolvedValue([{ isActive: true, kycStatus: 'VERIFIED' }]),
+    };
+    return fn(tx);
+  });
   mockEmitToUser.mockReset();
   mockReleaseVehicle.mockReset();
   mockApplyPostAcceptSideEffects.mockReset();
@@ -291,7 +300,10 @@ function setupAcceptanceHappyPath(assignmentOverrides: Record<string, any> = {})
   mockRedisAcquireLock.mockResolvedValue({ acquired: true });
   mockRedisReleaseLock.mockResolvedValue(undefined);
 
-  // The actual implementation does NOT use $transaction — it calls assignment.updateMany directly
+  // F-A-75: mockTransaction default pass-through is set in resetAllMocks. The TX
+  // proxy's $queryRaw returns a VERIFIED + active User row so validateActorEligibility
+  // permits the CAS update to run against the outer assignment.updateMany mock.
+
   // CAS succeeds
   mockAssignmentUpdateMany.mockResolvedValue({ count: 1 });
 

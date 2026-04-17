@@ -107,6 +107,13 @@ import { driverService } from '../driver/driver.service';
 import { HOLD_CONFIG } from '../../core/config/hold-config';
 import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
 import { holdExpiryCleanupService } from '../hold-expiry/hold-expiry-cleanup.service';
+// F-A-75: KYC SECOND-GATE — row-locked eligibility re-check inside hold TX.
+// Helper + error class live in a dedicated module so test files that
+// jest.mock('./truck-hold.service') cannot accidentally erase them from
+// cross-module imports in flex-hold.service / confirmed-hold.service.
+// See `./hold-eligibility.ts` for the rationale (KYC FSM, Ola, Uber Rider Identity).
+import { validateActorEligibility, HoldEligibilityError } from './hold-eligibility';
+export { validateActorEligibility, HoldEligibilityError } from './hold-eligibility';
 
 // =============================================================================
 // TYPES & INTERFACES
@@ -788,6 +795,11 @@ class TruckHoldService {
       let heldCount = 0;
 
       await withDbTimeout(async (tx) => {
+        // F-A-75: Second-gate KYC + isActive re-check inside the same transaction as
+        // the hold mutation, with SELECT ... FOR UPDATE row-lock to serialize against
+        // concurrent admin revocations. Errors propagate and roll back the TX.
+        await validateActorEligibility(tx, transporterId, 'legacy_hold');
+
         const order = await tx.order.findUnique({
           where: { id: orderId },
           select: { id: true, status: true, expiresAt: true }
@@ -892,6 +904,19 @@ class TruckHoldService {
         });
       }
     } catch (error: unknown) {
+      // F-A-75: surface KYC / isActive eligibility failures with a distinct code so
+      // the API layer can return 403 FORBIDDEN_INELIGIBLE instead of a generic 500.
+      if (error instanceof HoldEligibilityError) {
+        statusCode = 403;
+        response = {
+          success: false,
+          message: error.message,
+          error: error.code,
+        };
+        await this.saveIdempotentOperationResponse(transporterId, 'hold', idempotencyKey, payloadHash, statusCode, response);
+        this.recordHoldOutcomeMetrics(response, holdStartedAtMs);
+        return response;
+      }
       const message = error instanceof Error ? error.message : 'HOLD_FAILED';
       if (message.startsWith('NOT_ENOUGH_AVAILABLE')) {
         const available = parseInt(message.split(':')[1] || '0', 10);
@@ -1327,6 +1352,11 @@ class TruckHoldService {
       const transporter = await db.getUserById(transporterId);
       const now = new Date().toISOString();
       const confirmedAssignments = await withDbTimeout(async (tx) => {
+        // F-A-75: Second-gate KYC + isActive re-check inside the same transaction as
+        // the assignment writes. Row-locked so a concurrent admin revocation cannot
+        // race between our read and the truckRequest/assignment mutations below.
+        await validateActorEligibility(tx, transporterId, 'legacy_accept');
+
         const txAssignments: Array<{
           assignmentId: string;
           tripId: string;
@@ -1705,6 +1735,11 @@ class TruckHoldService {
       };
 
     } catch (error: unknown) {
+      // F-A-75: surface KYC / isActive ineligibility as a distinct rejection so the API
+      // caller can render the correct 403 error instead of a generic transaction failure.
+      if (error instanceof HoldEligibilityError) {
+        return { success: false, message: error.message };
+      }
       const msg = error instanceof Error ? error.message : String(error);
       const prismaError = error as { code?: string; meta?: { target?: string[] } };
       logger.error(`[TruckHold] Error confirming with assignments: ${msg}`, error);

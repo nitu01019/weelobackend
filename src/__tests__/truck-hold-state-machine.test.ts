@@ -100,6 +100,8 @@ jest.mock('../shared/database/prisma.service', () => ({
       const prismaServiceMod = require('../shared/database/prisma.service');
       return cb(prismaServiceMod.prismaClient);
     }),
+    // F-A-75: validateActorEligibility reads User via $queryRaw ... FOR UPDATE.
+    $queryRaw: jest.fn().mockResolvedValue([{ isActive: true, kycStatus: 'VERIFIED' }]),
     $executeRaw: jest.fn().mockResolvedValue(0),
   },
   withDbTimeout: jest.fn(),
@@ -717,12 +719,15 @@ describe('Confirmed Hold Lifecycle', () => {
     prismaServiceMod.prismaClient.$transaction.mockImplementation(async (cb: any) => {
       const txClient = {
         ...prismaServiceMod.prismaClient,
-        $queryRaw: jest.fn().mockResolvedValue([{
-          holdId: TEST_HOLD_ID,
-          phase: 'FLEX',
-          transporterId: TEST_TRANSPORTER_ID,
-          confirmedExpiresAt: null,
-        }]),
+        // F-A-75: first $queryRaw is User eligibility, second is the hold lookup.
+        $queryRaw: jest.fn()
+          .mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }])
+          .mockResolvedValueOnce([{
+            holdId: TEST_HOLD_ID,
+            phase: 'FLEX',
+            transporterId: TEST_TRANSPORTER_ID,
+            confirmedExpiresAt: null,
+          }]),
         truckHoldLedger: {
           ...prismaServiceMod.prismaClient.truckHoldLedger,
           update: mockTruckHoldLedgerUpdate,
@@ -858,7 +863,8 @@ describe('Confirmed Hold Lifecycle', () => {
 
     mockHMSet.mockResolvedValue(undefined);
 
-    const result = await confirmedHoldService.handleDriverAcceptance(TEST_ASSIGNMENT_ID);
+    // F-A-75: helper queries driver's User row to validate KYC+isActive; pass driverId.
+    const result = await confirmedHoldService.handleDriverAcceptance(TEST_ASSIGNMENT_ID, TEST_DRIVER_ID);
 
     expect(result.success).toBe(true);
     expect(result.accepted).toBe(true);
@@ -1266,10 +1272,10 @@ describe('Core Hold (truck-hold.service.ts)', () => {
             orderId: TEST_ORDER_ID,
           }),
         },
-        $queryRaw: jest.fn().mockResolvedValue([
-          { id: 'tr-1' },
-          { id: 'tr-2' },
-        ]),
+        // F-A-75: first $queryRaw is User eligibility, second is the truck-request claim.
+        $queryRaw: jest.fn()
+          .mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }])
+          .mockResolvedValueOnce([{ id: 'tr-1' }, { id: 'tr-2' }]),
       };
       await callback(mockTx);
     });

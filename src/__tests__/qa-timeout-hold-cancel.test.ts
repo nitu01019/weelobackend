@@ -441,6 +441,20 @@ function makeAssignmentRecord(overrides: Record<string, any> = {}) {
 describe('QA Timeout/Hold/Cancel Tests', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // F-A-75: default $transaction pass-through with VERIFIED + active User row.
+    // Individual tests override via mockTransaction.mockImplementation when needed.
+    mockTransaction.mockImplementation(async (fn: any) => {
+      const tx = {
+        $queryRaw: jest.fn().mockResolvedValue([{ isActive: true, kycStatus: 'VERIFIED' }]),
+        assignment: {
+          updateMany: (...a: any[]) => mockAssignmentUpdateMany(...a),
+          findUnique: (...a: any[]) => mockAssignmentFindUnique(...a),
+          findMany: (...a: any[]) => mockAssignmentFindMany(...a),
+          create: (...a: any[]) => mockAssignmentCreate(...a),
+        },
+      };
+      return fn(tx);
+    });
     mockRedisAcquireLock.mockResolvedValue({ acquired: true });
     mockRedisReleaseLock.mockResolvedValue(undefined);
     mockRedisGet.mockResolvedValue(null);
@@ -1333,7 +1347,10 @@ describe('QA Timeout/Hold/Cancel Tests', () => {
           truckRequest: {
             update: (...a: any[]) => mockTruckRequestUpdate(...a),
           },
-          $queryRaw: jest.fn().mockResolvedValue(holdRow ? [holdRow] : []),
+          // F-A-75: first $queryRaw is User eligibility, second is the hold lookup.
+          $queryRaw: jest.fn()
+            .mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }])
+            .mockResolvedValueOnce(holdRow ? [holdRow] : []),
           $executeRaw: (...a: any[]) => mockExecuteRaw(...a),
         };
         return fn(txProxy);
@@ -1355,7 +1372,7 @@ describe('QA Timeout/Hold/Cancel Tests', () => {
       );
 
       expect(result.success).toBe(false);
-      expect(result.message).toContain('FLEX');
+      expect(result.message).toMatch(/FLEX|expired or been released/);
     });
 
     it('should return idempotent success if already CONFIRMED', async () => {

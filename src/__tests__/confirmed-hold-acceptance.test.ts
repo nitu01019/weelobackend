@@ -81,29 +81,35 @@ const mockTruckHoldLedgerFindFirst = jest.fn();
 const mockTruckHoldLedgerFindUnique = jest.fn();
 const mockExecuteRaw = jest.fn();
 
-jest.mock('../shared/database/prisma.service', () => ({
-  prismaClient: {
-    assignment: {
-      update: (...args: any[]) => mockAssignmentUpdate(...args),
-      updateMany: (...args: any[]) => mockAssignmentUpdateMany(...args),
-      findUnique: (...args: any[]) => mockAssignmentFindUnique(...args),
-      findUniqueOrThrow: (...args: any[]) => mockAssignmentFindUniqueOrThrow(...args),
-      findMany: (...args: any[]) => mockAssignmentFindMany(...args),
-      count: (...args: any[]) => mockAssignmentCount(...args),
-    },
-    truckRequest: {
-      findFirst: (...args: any[]) => mockTruckRequestFindFirst(...args),
-      findUnique: (...args: any[]) => mockTruckRequestFindUnique(...args),
-      findMany: (...args: any[]) => mockTruckRequestFindMany(...args),
-      update: (...args: any[]) => mockTruckRequestUpdate(...args),
-    },
-    truckHoldLedger: {
-      update: (...args: any[]) => mockTruckHoldLedgerUpdate(...args),
-      findFirst: (...args: any[]) => mockTruckHoldLedgerFindFirst(...args),
-      findUnique: (...args: any[]) => mockTruckHoldLedgerFindUnique(...args),
-    },
-    $executeRaw: (...args: any[]) => mockExecuteRaw(...args),
+// F-A-75: mock $queryRaw so validateActorEligibility can read User row in TX.
+const mockQueryRaw = jest.fn().mockResolvedValue([{ isActive: true, kycStatus: 'VERIFIED' }]);
+const mockPrismaClient: any = {
+  assignment: {
+    update: (...args: any[]) => mockAssignmentUpdate(...args),
+    updateMany: (...args: any[]) => mockAssignmentUpdateMany(...args),
+    findUnique: (...args: any[]) => mockAssignmentFindUnique(...args),
+    findUniqueOrThrow: (...args: any[]) => mockAssignmentFindUniqueOrThrow(...args),
+    findMany: (...args: any[]) => mockAssignmentFindMany(...args),
+    count: (...args: any[]) => mockAssignmentCount(...args),
   },
+  truckRequest: {
+    findFirst: (...args: any[]) => mockTruckRequestFindFirst(...args),
+    findUnique: (...args: any[]) => mockTruckRequestFindUnique(...args),
+    findMany: (...args: any[]) => mockTruckRequestFindMany(...args),
+    update: (...args: any[]) => mockTruckRequestUpdate(...args),
+  },
+  truckHoldLedger: {
+    update: (...args: any[]) => mockTruckHoldLedgerUpdate(...args),
+    findFirst: (...args: any[]) => mockTruckHoldLedgerFindFirst(...args),
+    findUnique: (...args: any[]) => mockTruckHoldLedgerFindUnique(...args),
+  },
+  $executeRaw: (...args: any[]) => mockExecuteRaw(...args),
+  $queryRaw: (...args: any[]) => mockQueryRaw(...args),
+  // Pass-through so TX body runs against the same mock surface.
+  $transaction: (fn: any) => fn(mockPrismaClient),
+};
+jest.mock('../shared/database/prisma.service', () => ({
+  prismaClient: mockPrismaClient,
   HoldPhase: {
     FLEX: 'FLEX',
     CONFIRMED: 'CONFIRMED',

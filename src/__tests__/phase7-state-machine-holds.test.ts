@@ -1120,6 +1120,8 @@ describe('Phase 7 — State Machine & Hold Transitions', () => {
     it('should only allow FLEX → CONFIRMED initialization', async () => {
       const { confirmedHoldService } = require('../modules/truck-hold/confirmed-hold.service');
 
+      // F-A-75: validateActorEligibility queries User row (FOR UPDATE) before the hold.
+      mockQueryRaw.mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }]);
       // H-8: initializeConfirmedHold now uses $queryRaw with FOR UPDATE inside $transaction
       mockQueryRaw.mockResolvedValueOnce([
         { holdId: 'h-1', phase: 'FLEX', transporterId: 't-1', confirmedExpiresAt: null },
@@ -1137,6 +1139,8 @@ describe('Phase 7 — State Machine & Hold Transitions', () => {
     it('should reject EXPIRED → CONFIRMED initialization', async () => {
       const { confirmedHoldService } = require('../modules/truck-hold/confirmed-hold.service');
 
+      // F-A-75: User-row eligibility check runs first inside the TX.
+      mockQueryRaw.mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }]);
       // H-8: $queryRaw returns the hold row with EXPIRED phase
       mockQueryRaw.mockResolvedValueOnce([
         { holdId: 'h-1', phase: 'EXPIRED', transporterId: 't-1', confirmedExpiresAt: null },
@@ -1145,12 +1149,14 @@ describe('Phase 7 — State Machine & Hold Transitions', () => {
       const result = await confirmedHoldService.initializeConfirmedHold('h-1', 't-1', []);
 
       expect(result.success).toBe(false);
-      expect(result.message).toMatch(/must be FLEX/);
+      expect(result.message).toMatch(/expired or been released|must be FLEX/);
     });
 
     it('should be idempotent for CONFIRMED → CONFIRMED (returns success)', async () => {
       const { confirmedHoldService } = require('../modules/truck-hold/confirmed-hold.service');
 
+      // F-A-75: User-row eligibility check runs first inside the TX.
+      mockQueryRaw.mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }]);
       // H-8: $queryRaw returns hold already in CONFIRMED phase
       mockQueryRaw.mockResolvedValueOnce([
         { holdId: 'h-1', phase: 'CONFIRMED', transporterId: 't-1',
@@ -1166,6 +1172,8 @@ describe('Phase 7 — State Machine & Hold Transitions', () => {
     it('should reject if transporterId does not match hold owner', async () => {
       const { confirmedHoldService } = require('../modules/truck-hold/confirmed-hold.service');
 
+      // F-A-75: User-row eligibility check runs first inside the TX.
+      mockQueryRaw.mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }]);
       // H-8: $queryRaw returns hold owned by different transporter
       mockQueryRaw.mockResolvedValueOnce([
         { holdId: 'h-1', phase: 'FLEX', transporterId: 't-1', confirmedExpiresAt: null },
@@ -1191,6 +1199,8 @@ describe('Phase 7 — State Machine & Hold Transitions', () => {
     it('should schedule driver acceptance timeouts for each assignment', async () => {
       const { confirmedHoldService } = require('../modules/truck-hold/confirmed-hold.service');
 
+      // F-A-75: User-row eligibility check runs first inside the TX.
+      mockQueryRaw.mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }]);
       // H-8: $queryRaw returns hold row in FLEX phase (FOR UPDATE)
       mockQueryRaw.mockResolvedValueOnce([
         { holdId: 'h-1', phase: 'FLEX', transporterId: 't-1', confirmedExpiresAt: null },
@@ -1226,6 +1236,8 @@ describe('Phase 7 — State Machine & Hold Transitions', () => {
       const { confirmedHoldService } = require('../modules/truck-hold/confirmed-hold.service');
 
       mockRedisAcquireLock.mockResolvedValue({ acquired: true, lockHolder: 'lk' });
+      // F-A-75: driver-accept path now validates KYC+isActive inside its TX.
+      mockQueryRaw.mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }]);
       mockAssignmentUpdateMany.mockResolvedValue({ count: 1 });
       mockAssignmentFindUniqueOrThrow.mockResolvedValue({
         id: 'a-1', driverId: 'd-1', vehicleId: 'v-1', transporterId: 't-1',

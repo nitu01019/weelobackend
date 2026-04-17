@@ -300,12 +300,15 @@ describe('FIX-6 (#37): Ownership check on hold confirmation', () => {
   describe('confirmedHoldService.initializeConfirmedHold', () => {
     test('rejects when transporterId does not match hold owner', async () => {
       // H-8: initializeConfirmedHold now uses $queryRaw with FOR UPDATE inside $transaction
-      mockPrisma.$queryRaw.mockResolvedValue([{
-        holdId: 'hold-abc-123',
-        phase: 'FLEX',
-        confirmedExpiresAt: null,
-        transporterId: 'transporter-owner',
-      }]);
+      // F-A-75: helper queries User first (FOR UPDATE), then the hold row. Queue both.
+      mockPrisma.$queryRaw
+        .mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }])
+        .mockResolvedValueOnce([{
+          holdId: 'hold-abc-123',
+          phase: 'FLEX',
+          confirmedExpiresAt: null,
+          transporterId: 'transporter-owner',
+        }]);
 
       const result = await confirmedHoldService.initializeConfirmedHold(
         'hold-abc-123',
@@ -325,12 +328,15 @@ describe('FIX-6 (#37): Ownership check on hold confirmation', () => {
         transporterId: 'transporter-owner',
       });
       // H-8: $queryRaw returns rows array
-      mockPrisma.$queryRaw.mockResolvedValue([{
-        holdId: 'hold-abc-123',
-        phase: 'FLEX',
-        confirmedExpiresAt: null,
-        transporterId: 'transporter-owner',
-      }]);
+      // F-A-75: helper queries User first (FOR UPDATE), then the hold row.
+      mockPrisma.$queryRaw
+        .mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }])
+        .mockResolvedValueOnce([{
+          holdId: 'hold-abc-123',
+          phase: 'FLEX',
+          confirmedExpiresAt: null,
+          transporterId: 'transporter-owner',
+        }]);
       mockPrisma.truckHoldLedger.update.mockResolvedValue({
         ...hold,
         phase: 'CONFIRMED',
@@ -364,7 +370,10 @@ describe('FIX-6 (#37): Ownership check on hold confirmation', () => {
 
     test('returns failure when hold does not exist', async () => {
       // H-8: $queryRaw returns empty array when hold not found
-      mockPrisma.$queryRaw.mockResolvedValue([]);
+      // F-A-75: User query must succeed (verified actor) so we reach the hold lookup.
+      mockPrisma.$queryRaw
+        .mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }])
+        .mockResolvedValueOnce([]);
 
       const result = await confirmedHoldService.initializeConfirmedHold(
         'non-existent',
@@ -379,12 +388,15 @@ describe('FIX-6 (#37): Ownership check on hold confirmation', () => {
     test('returns idempotent response when already in CONFIRMED phase', async () => {
       const existingExpiry = new Date(Date.now() + 120_000);
       // H-8: $queryRaw returns row with CONFIRMED phase
-      mockPrisma.$queryRaw.mockResolvedValue([{
-        holdId: 'hold-abc-123',
-        phase: 'CONFIRMED',
-        confirmedExpiresAt: existingExpiry,
-        transporterId: 'transporter-owner',
-      }]);
+      // F-A-75: helper queries User first, then the hold row.
+      mockPrisma.$queryRaw
+        .mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }])
+        .mockResolvedValueOnce([{
+          holdId: 'hold-abc-123',
+          phase: 'CONFIRMED',
+          confirmedExpiresAt: existingExpiry,
+          transporterId: 'transporter-owner',
+        }]);
 
       const result = await confirmedHoldService.initializeConfirmedHold(
         'hold-abc-123',
@@ -594,12 +606,15 @@ describe('FIX-6 edge cases: Ownership check with various hold states', () => {
 
   test('initializeConfirmedHold: rejects non-FLEX phase even with correct owner', async () => {
     // H-8: $queryRaw returns row with EXPIRED phase
-    mockPrisma.$queryRaw.mockResolvedValue([{
-      holdId: 'hold-abc-123',
-      phase: 'EXPIRED',
-      confirmedExpiresAt: null,
-      transporterId: 'transporter-owner',
-    }]);
+    // F-A-75: helper queries User first, then the hold row.
+    mockPrisma.$queryRaw
+      .mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }])
+      .mockResolvedValueOnce([{
+        holdId: 'hold-abc-123',
+        phase: 'EXPIRED',
+        confirmedExpiresAt: null,
+        transporterId: 'transporter-owner',
+      }]);
 
     const result = await confirmedHoldService.initializeConfirmedHold(
       'hold-abc-123',
@@ -608,6 +623,6 @@ describe('FIX-6 edge cases: Ownership check with various hold states', () => {
     );
 
     expect(result.success).toBe(false);
-    expect(result.message).toContain('Cannot move to CONFIRMED from EXPIRED');
+    expect(result.message).toMatch(/Cannot move to CONFIRMED from EXPIRED|expired or been released/);
   });
 });

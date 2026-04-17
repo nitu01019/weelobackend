@@ -34,6 +34,8 @@ const mockPrismaClientFc50: any = {
   order: {
     findUnique: jest.fn(),
   },
+  // F-A-75: validateActorEligibility reads User via $queryRaw ... FOR UPDATE.
+  $queryRaw: jest.fn().mockResolvedValue([{ isActive: true, kycStatus: 'VERIFIED' }]),
   $transaction: jest.fn(async (fnOrArray: any) => {
     if (typeof fnOrArray === 'function') return fnOrArray(mockPrismaClientFc50);
     return Promise.all(fnOrArray);
