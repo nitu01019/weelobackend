@@ -69,48 +69,251 @@ const SRC_ROOT = path.join(REPO_ROOT, 'src');
 const ALLOWED_OWNER_REL = 'modules/admin/admin-suspension.service.ts';
 
 // =============================================================================
-// Scanner (intentionally stubbed in Commit 1 — real impl in Commit 2)
+// Scanner
 // =============================================================================
 
-/**
- * Strip `//` line comments and `/* *\/` block comments from a TypeScript
- * source string. Leaves the rest of the source intact (including strings
- * that happen to CONTAIN `//` — see notes below).
- *
- * NOTE: This is a heuristic stripper, not a full TS lexer. It walks the
- * source char-by-char tracking four states (code, single-quote string,
- * double-quote string, template-literal, line comment, block comment).
- * Good enough for the narrow job: detect raw string/template literals
- * starting with `suspension:`.
- *
- * NOTE: in Commit 1 (RED), this function and findSuspensionLiteralMatches
- * are stubs — they return empty. Commit 2 ships the real impl.
- */
-function stripCommentsTS(source: string): string {
-  // Commit 1 stub — real impl lands in Commit 2.
-  return source;
-}
-
 interface LiteralMatch {
-  /** 1-based line number in the stripped source. */
+  /** 1-based line number where the literal begins in the original source. */
   line: number;
-  /** The matched text (single-line excerpt). */
+  /** Single-line excerpt starting at the opening quote (for error reports). */
   snippet: string;
   /** Literal kind: single-quote, double-quote, or template-literal. */
   kind: 'single' | 'double' | 'template';
 }
 
 /**
- * Scan a TypeScript source string for any literal (string or template) that
- * starts with `suspension:`. Returns all matches. Comments are stripped
- * first so in-code-docstring mentions do NOT trigger.
+ * The needle we are guarding against. Any string/template literal whose
+ * opening content begins with this prefix is a F-A-10 regression.
+ * Case-sensitive; the F-A-10 Redis key is lowercase by contract.
+ */
+const SUSPENSION_LITERAL_PREFIX = 'suspension:';
+
+/**
+ * Scan a TypeScript source string for any string or template literal whose
+ * value begins with `suspension:`. Returns all matches.
+ *
+ * The scanner walks the source character-by-character with a small state
+ * machine that tracks:
+ *   - plain code                (default)
+ *   - `//` line comments        (skipped)
+ *   - `/* *\/` block comments   (skipped)
+ *   - single-quote strings      (opening checked for `suspension:`)
+ *   - double-quote strings      (opening checked for `suspension:`)
+ *   - template literals         (opening checked for `suspension:`)
+ *
+ * Only the OPENING of each literal is inspected — i.e. the substring
+ * immediately following the opening quote. This keeps the scanner linear
+ * and precise: `'suspension:foo'` is flagged, but `'foo-suspension:bar'`
+ * is NOT (the prefix must be the first thing in the literal).
+ *
+ * Escape handling: backslash-escaped quotes inside string literals are
+ * respected so `'a\'b'` is a single literal. Template interpolation
+ * `${...}` is handled by re-entering code-state while inside.
  */
 function scanForSuspensionLiteral(source: string): LiteralMatch[] {
-  // Commit 1 stub — always returns empty so the synthetic test below fails.
-  // Commit 2 replaces with the real implementation.
-  void source;
-  void stripCommentsTS;
-  return [];
+  type State =
+    | 'code'
+    | 'lineComment'
+    | 'blockComment'
+    | 'singleString'
+    | 'doubleString'
+    | 'templateString'
+    | 'templateExpr';
+
+  const matches: LiteralMatch[] = [];
+  let state: State = 'code';
+  let line = 1;
+  // Depth of nested `${ ... }` inside template literals. When we exit the
+  // outermost `${`, we return to templateString state.
+  let exprBraceDepth = 0;
+
+  const n = source.length;
+  let i = 0;
+  while (i < n) {
+    const ch = source[i];
+    const next = i + 1 < n ? source[i + 1] : '';
+
+    // Track line numbers uniformly, regardless of state.
+    if (ch === '\n') line++;
+
+    switch (state) {
+      case 'code': {
+        if (ch === '/' && next === '/') {
+          state = 'lineComment';
+          i += 2;
+          continue;
+        }
+        if (ch === '/' && next === '*') {
+          state = 'blockComment';
+          i += 2;
+          continue;
+        }
+        if (ch === "'") {
+          if (source.startsWith(SUSPENSION_LITERAL_PREFIX, i + 1)) {
+            matches.push({ line, snippet: extractOneLine(source, i), kind: 'single' });
+          }
+          state = 'singleString';
+          i += 1;
+          continue;
+        }
+        if (ch === '"') {
+          if (source.startsWith(SUSPENSION_LITERAL_PREFIX, i + 1)) {
+            matches.push({ line, snippet: extractOneLine(source, i), kind: 'double' });
+          }
+          state = 'doubleString';
+          i += 1;
+          continue;
+        }
+        if (ch === '`') {
+          if (source.startsWith(SUSPENSION_LITERAL_PREFIX, i + 1)) {
+            matches.push({ line, snippet: extractOneLine(source, i), kind: 'template' });
+          }
+          state = 'templateString';
+          i += 1;
+          continue;
+        }
+        i += 1;
+        continue;
+      }
+      case 'lineComment': {
+        if (ch === '\n') state = 'code';
+        i += 1;
+        continue;
+      }
+      case 'blockComment': {
+        if (ch === '*' && next === '/') {
+          state = 'code';
+          i += 2;
+          continue;
+        }
+        i += 1;
+        continue;
+      }
+      case 'singleString': {
+        if (ch === '\\') {
+          i += 2; // skip escape + next char
+          continue;
+        }
+        if (ch === "'") {
+          state = 'code';
+          i += 1;
+          continue;
+        }
+        i += 1;
+        continue;
+      }
+      case 'doubleString': {
+        if (ch === '\\') {
+          i += 2;
+          continue;
+        }
+        if (ch === '"') {
+          state = 'code';
+          i += 1;
+          continue;
+        }
+        i += 1;
+        continue;
+      }
+      case 'templateString': {
+        if (ch === '\\') {
+          i += 2;
+          continue;
+        }
+        if (ch === '`') {
+          state = 'code';
+          i += 1;
+          continue;
+        }
+        if (ch === '$' && next === '{') {
+          state = 'templateExpr';
+          exprBraceDepth = 1;
+          i += 2;
+          continue;
+        }
+        i += 1;
+        continue;
+      }
+      case 'templateExpr': {
+        // Inside `${ ... }` — treat sub-strings as independent literals so
+        // any nested `'suspension:xxx'` still gets flagged.
+        if (ch === '{') {
+          exprBraceDepth++;
+          i += 1;
+          continue;
+        }
+        if (ch === '}') {
+          exprBraceDepth--;
+          if (exprBraceDepth === 0) {
+            state = 'templateString';
+          }
+          i += 1;
+          continue;
+        }
+        // Nested strings inside the expression — delegate to a tiny
+        // sub-walk that only flags matches and returns the next index
+        // after the closing quote.
+        if (ch === "'" || ch === '"' || ch === '`') {
+          const quote = ch;
+          if (source.startsWith(SUSPENSION_LITERAL_PREFIX, i + 1)) {
+            matches.push({
+              line,
+              snippet: extractOneLine(source, i),
+              kind: quote === "'" ? 'single' : quote === '"' ? 'double' : 'template',
+            });
+          }
+          i = skipNestedString(source, i, quote as "'" | '"' | '`');
+          continue;
+        }
+        if (ch === '/' && next === '/') {
+          state = 'lineComment';
+          i += 2;
+          continue;
+        }
+        if (ch === '/' && next === '*') {
+          state = 'blockComment';
+          i += 2;
+          continue;
+        }
+        i += 1;
+        continue;
+      }
+    }
+  }
+
+  return matches;
+}
+
+/**
+ * Walk a string literal starting at its opening quote (inclusive) and
+ * return the index AFTER the closing quote. Respects `\` escapes.
+ */
+function skipNestedString(source: string, startIdx: number, quote: "'" | '"' | '`'): number {
+  let i = startIdx + 1;
+  while (i < source.length) {
+    const c = source[i];
+    if (c === '\\') {
+      i += 2;
+      continue;
+    }
+    if (c === quote) {
+      return i + 1;
+    }
+    i += 1;
+  }
+  return i;
+}
+
+/**
+ * Return up to `maxLen` characters starting at `startIdx`, trimmed at the
+ * first newline. Used for error-report snippets.
+ */
+function extractOneLine(source: string, startIdx: number, maxLen = 120): string {
+  let end = startIdx;
+  while (end < source.length && source[end] !== '\n' && end - startIdx < maxLen) {
+    end++;
+  }
+  return source.slice(startIdx, end);
 }
 
 // =============================================================================
