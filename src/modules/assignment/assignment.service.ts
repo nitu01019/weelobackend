@@ -400,7 +400,6 @@ class AssignmentService {
     queueService.queuePushNotification(data.driverId, {
       title: '🚛 New Trip Assigned!',
       body: `Trip for ${vehicle.vehicleNumber}. Accept within ${ASSIGNMENT_CONFIG.TIMEOUT_MS / 1000} seconds.`,
-      priority: 'high', // W0-1: top-level priority drives android.priority in buildMessage (4KB FCM); data.priority retained below for Android-side client compat.
       data: {
         type: 'trip_assigned',
         priority: 'high', // Issue #20: Time-sensitive — driver must accept within timeout (Android-side priority via data map per FCM SDK contract)

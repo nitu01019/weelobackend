@@ -403,7 +403,6 @@ export async function reassignDriver(input: ReassignDriverInput): Promise<Reassi
   queueService.queuePushNotification(newDriverId, {
     title: 'New Trip Assigned!',
     body: `Trip for ${oldAssignment.vehicleNumber}. Accept within ${DRIVER_ACCEPT_TIMEOUT_MS / 1000} seconds.`,
-    priority: 'high', // W0-1: top-level priority drives FCM android.priority; data.priority retained for Android-side client compat.
     data: {
       type: 'trip_assigned',
       priority: 'high', // Android-side priority via data map per FCM SDK contract
