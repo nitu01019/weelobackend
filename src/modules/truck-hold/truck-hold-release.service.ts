@@ -3,6 +3,21 @@
  * TRUCK HOLD RELEASE — Release, Close, and Cache Cleanup
  * =============================================================================
  *
+ * FIX F-A-76 (thin-wrap marker, Strangler Fig intermediate — 2026-04-17):
+ *   This file is DEPRECATED and scheduled for deletion in Phase 4 (post-soak).
+ *   Zero non-test production importers (verified by d1-rajat Phase 1 grep).
+ *   The canonical runtime surface is `truckHoldService.releaseHold`,
+ *   `truckHoldService.closeActiveHoldsForOrder`, and
+ *   `truckHoldService.clearHoldCacheEntries` in truck-hold.service.ts (the
+ *   monolith). The top-level functions exported here are preserved only
+ *   because 14 test files use `fs.readFileSync` on this file's source text
+ *   AND jest.mock/require on its exported symbols. Phase 4 will migrate
+ *   those assertions to the monolith source and then outright-delete this
+ *   file. Until then, DO NOT import from this path in new production code
+ *   — use `truckHoldService` instead. ESLint enforces this via
+ *   `no-restricted-imports` (warn-level during soak, with test-override).
+ *   See docs audits/phase3/e3-yash.md for the soak/delete plan.
+ *
  * Handles:
  * - releaseHold(): Release a single hold (manual, cleanup, or system)
  * - closeActiveHoldsForOrder(): Close all active holds when order terminates

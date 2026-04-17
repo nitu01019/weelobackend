@@ -3,6 +3,20 @@
  * TRUCK HOLD CONFIRM — Confirm Hold With Vehicle & Driver Assignments
  * =============================================================================
  *
+ * FIX F-A-76 (thin-wrap marker, Strangler Fig intermediate — 2026-04-17):
+ *   This file is DEPRECATED and scheduled for deletion in Phase 4 (post-soak).
+ *   Zero non-test production importers (verified by d1-rajat Phase 1 grep).
+ *   The canonical runtime surface is `truckHoldService.confirmHoldWithAssignments`
+ *   in truck-hold.service.ts (the monolith). The top-level function exported
+ *   here is preserved only because existing test files use `fs.readFileSync`
+ *   on this file's source text AND jest.mock/require on its exported symbols
+ *   (see audit d1-rajat.md — 14 test files, ~200 assertions). Phase 4 will
+ *   migrate those assertions to the monolith source and then outright-delete
+ *   this file. Until then, DO NOT import from this path in new production
+ *   code — use `truckHoldService` instead. ESLint enforces this via
+ *   `no-restricted-imports` (warn-level during soak, with test-override).
+ *   See docs audits/phase3/e3-yash.md for the soak/delete plan.
+ *
  * Saga orchestrator for confirming a hold with specific vehicle + driver
  * assignments. Steps:
  *   1. validateHoldForConfirmation

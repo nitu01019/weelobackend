@@ -3,6 +3,19 @@
  * TRUCK HOLD CRUD ROUTES - Hold, confirm, release, availability, my-active
  * =============================================================================
  *
+ * FIX F-A-76 (thin-wrap marker, Strangler Fig intermediate — 2026-04-17):
+ *   This file is DEPRECATED and scheduled for deletion in Phase 4 (post-soak).
+ *   Zero non-test production importers; the canonical router composition lives
+ *   in truck-hold.routes.ts which mounts truckHoldService methods directly.
+ *   This file is preserved solely because qa-endpoint-contracts.test.ts
+ *   imports `truckHoldCrudRouter` via `require()` for contract assertions.
+ *   Phase 4 will migrate that test to the canonical router and then outright-
+ *   delete this file. Until then, DO NOT import from this path in new
+ *   production code — use `truckHoldService` mounted from truck-hold.routes.ts
+ *   instead. ESLint enforces this via `no-restricted-imports` (warn-level
+ *   during soak, with test-override). See docs audits/phase3/e3-yash.md for
+ *   the soak/delete plan.
+ *
  * Extracted from truck-hold.routes.ts (file-split).
  * =============================================================================
  */

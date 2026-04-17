@@ -3,6 +3,19 @@
  * TRUCK HOLD CREATE — Hold Creation, Simple Confirm, Idempotency
  * =============================================================================
  *
+ * FIX F-A-76 (thin-wrap marker, Strangler Fig intermediate — 2026-04-17):
+ *   This file is DEPRECATED and scheduled for deletion in Phase 4 (post-soak).
+ *   Zero non-test production importers (verified by d1-rajat Phase 1 grep).
+ *   The canonical runtime surface is `truckHoldService` in truck-hold.service.ts
+ *   (the monolith). The top-level functions exported here are preserved only
+ *   because 14 existing test files use `fs.readFileSync` on this file's source
+ *   text to verify fix-marker comments and code patterns (see audit d1-rajat.md).
+ *   Phase 4 will migrate those assertions to the monolith source and then
+ *   outright-delete this file. Until then, DO NOT import from this path in new
+ *   production code — use `truckHoldService` instead. ESLint enforces this via
+ *   `no-restricted-imports` (warn-level during soak, with test-override).
+ *   See docs audits/phase3/e3-yash.md for the soak/delete plan.
+ *
  * Handles:
  * - holdTrucks(): Atomic DB claim for truck holds
  * - confirmHold(): Simple hold confirmation (without vehicle/driver)
