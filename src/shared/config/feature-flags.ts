@@ -304,6 +304,25 @@ export const FLAGS = {
     category: 'release' as const,
     description: 'Fail-open mode for cancelled order queue guard (allow on error)',
   },
+
+  // --- F-A-50: Consolidated createOrder dispatch + smart-timeout path ---
+  // When ON, order.service.ts::createOrder replaces two legacy behaviors with
+  // the delegate-tested variants:
+  //   1. Fire-and-forget `processDispatchOutboxImmediately(...).catch(...)` is
+  //      replaced with `await processDispatchOutboxImmediately(...)` and the
+  //      returned DispatchAttemptOutcome is written back into dispatchState /
+  //      onlineCandidates / notifiedTransporters (F-A-70 prep).
+  //   2. Legacy `setOrderExpiryTimer(orderId, timeoutMs)` is supplemented by
+  //      `smartTimeoutService.initializeOrderTimeout(orderId, totalTrucks)`
+  //      so smart-timeout tracking starts at order creation (F-A-52 prep,
+  //      FIX #77 from the delegate path).
+  // Default OFF for soak-safe rollout — parity test in
+  // `src/__tests__/fix-order-service-consolidation.test.ts` must pass before flip.
+  CREATE_ORDER_CONSOLIDATED: {
+    env: 'FF_CREATE_ORDER_CONSOLIDATED',
+    category: 'release' as const,
+    description: 'Consolidated createOrder: awaited dispatch + smart-timeout init (F-A-50)',
+  },
 } as const;
 
 // ---------------------------------------------------------------------------

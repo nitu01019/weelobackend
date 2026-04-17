@@ -135,6 +135,9 @@ import {
 import {
   acceptTruckRequest as acceptTruckRequestFn,
 } from './order-accept.service';
+// F-A-50: Centralized feature flag + smart-timeout service for consolidated path
+import { FLAGS, isEnabled } from '../../shared/config/feature-flags';
+import { smartTimeoutService } from '../order-timeout';
 
 // =============================================================================
 // CACHE KEYS & TTL (Optimized for fast lookups)
@@ -1252,12 +1255,42 @@ class OrderService {
       };
 
       if (FF_ORDER_DISPATCH_OUTBOX) {
-        this.processDispatchOutboxImmediately(orderId, dispatchContext).catch(err =>
-          logger.warn('Immediate dispatch failed, outbox poller will retry', { orderId, error: err.message })
-        );
-        dispatchState = 'dispatching';
-        dispatchReasonCode = 'DISPATCH_RETRYING';
-        dispatchAttempts = 1;
+        // F-A-50 / F-A-70 prep: when CREATE_ORDER_CONSOLIDATED is ON, await the
+        // dispatch and use the DispatchAttemptOutcome to set real dispatchState /
+        // notifiedTransporters instead of unconditionally stamping 'dispatching'.
+        // Default (OFF): legacy fire-and-forget behavior — outbox poller retries.
+        if (isEnabled(FLAGS.CREATE_ORDER_CONSOLIDATED)) {
+          metrics.incrementCounter('order_create_path_total', { path: 'consolidated' });
+          try {
+            const outcome = await this.processDispatchOutboxImmediately(orderId, dispatchContext);
+            if (outcome) {
+              dispatchState = outcome.dispatchState;
+              dispatchReasonCode = outcome.reasonCode;
+              dispatchAttempts = outcome.dispatchAttempts;
+              onlineCandidates = outcome.onlineCandidates;
+              notifiedTransporters = outcome.notifiedTransporters;
+            } else {
+              // Null outcome = flag disabled inside helper / lock contention —
+              // leave state as 'dispatching' and let outbox poller retry.
+              dispatchState = 'dispatching';
+              dispatchReasonCode = 'DISPATCH_RETRYING';
+              dispatchAttempts = 1;
+            }
+          } catch (err: unknown) {
+            const message = err instanceof Error ? err.message : String(err);
+            logger.error('[ORDER] Consolidated immediate dispatch threw', { orderId, error: message });
+            dispatchState = 'dispatch_failed';
+            dispatchReasonCode = 'DISPATCH_ERROR';
+          }
+        } else {
+          metrics.incrementCounter('order_create_path_total', { path: 'legacy' });
+          this.processDispatchOutboxImmediately(orderId, dispatchContext).catch(err =>
+            logger.warn('Immediate dispatch failed, outbox poller will retry', { orderId, error: err.message })
+          );
+          dispatchState = 'dispatching';
+          dispatchReasonCode = 'DISPATCH_RETRYING';
+          dispatchAttempts = 1;
+        }
       } else {
         // IMPORTANT: Wrapped in try-catch - dispatch errors should NEVER fail order creation
         try {
@@ -1290,6 +1323,10 @@ class OrderService {
       // the customer's time. Expire now and let them retry or widen the search.
       if (notifiedTransporters === 0 && dispatchState === 'dispatch_failed') {
         logger.warn('[Order] 0 transporters notified — expiring immediately', { orderId, onlineCandidates, dispatchReasonCode });
+        // F-A-50 / FIX #74 port: assert the 'broadcasting'->'expired' edge is
+        // valid in ORDER_VALID_TRANSITIONS before writing. Mirrors the delegate
+        // path in order-creation.service.ts::setupOrderExpiry (line 801).
+        assertValidTransition('Order', ORDER_VALID_TRANSITIONS, 'broadcasting', 'expired');
         await prismaClient.order.update({
           where: { id: orderId },
           data: {
@@ -1326,7 +1363,21 @@ class OrderService {
       }
 
       // 4. Set expiry timer
-      this.setOrderExpiryTimer(orderId, this.BROADCAST_TIMEOUT_MS);
+      // F-A-50 / FIX #77: when CREATE_ORDER_CONSOLIDATED is ON, kick off the
+      // smart-timeout tracker so +60s/+30s extensions are recorded on driver
+      // confirm. Legacy `setOrderExpiryTimer` is retained behind the flag for
+      // safe rollback — it's the deprecated (F-A-52) expiry checker.
+      if (isEnabled(FLAGS.CREATE_ORDER_CONSOLIDATED)) {
+        try {
+          await smartTimeoutService.initializeOrderTimeout(orderId, totalTrucks);
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          logger.warn('[ORDER] smartTimeoutService.initializeOrderTimeout failed, falling back to legacy timer', { orderId, error: message });
+          this.setOrderExpiryTimer(orderId, this.BROADCAST_TIMEOUT_MS);
+        }
+      } else {
+        this.setOrderExpiryTimer(orderId, this.BROADCAST_TIMEOUT_MS);
+      }
 
       // Fix B4: Assert valid transition before writing
       // Note: order was created as 'broadcasting', and we're transitioning to 'active'.
@@ -1544,6 +1595,13 @@ class OrderService {
   // Timer Delegates (extracted to order-timer.service.ts)
   // ---------------------------------------------------------------------------
 
+  /**
+   * @deprecated F-A-52: Legacy in-memory expiry timer. Replaced by
+   * `smartTimeoutService.initializeOrderTimeout` which persists the timeout in
+   * Postgres and supports +60s/+30s extensions on driver confirm. Retained
+   * behind `FF_CREATE_ORDER_CONSOLIDATED=false` for safe rollback during the
+   * F-A-50 soak window. Will be removed once the flag flips to default ON.
+   */
   private async setOrderExpiryTimer(orderId: string, timeoutMs: number): Promise<void> {
     return setOrderExpiryTimerFn(orderId, timeoutMs);
   }
