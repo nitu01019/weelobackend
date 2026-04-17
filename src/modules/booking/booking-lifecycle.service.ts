@@ -255,6 +255,7 @@ export class BookingLifecycleService {
         {
           title: '⏰ Booking Expired',
           body: `${booking.vehicleType} booking request has expired`,
+          priority: 'high', // W0-1: top-level priority drives FCM android.priority; data.priority retained for Android-side client compat.
           data: {
             type: 'booking_expired',
             bookingId,

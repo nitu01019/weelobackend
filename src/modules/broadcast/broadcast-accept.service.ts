@@ -480,6 +480,7 @@ export async function acceptBroadcast(broadcastId: string, params: AcceptBroadca
           queueService.queuePushNotification(driverId, {
             title: 'New Trip Assigned!',
             body: `${pickup.city || pickup.address || 'Pickup'} → ${drop.city || drop.address || 'Drop'}`,
+            priority: 'high', // W0-1: top-level priority drives FCM android.priority; data.priority retained for Android-side client compat.
             data: { type: 'trip_assigned', priority: 'high', tripId: result.tripId, assignmentId: result.assignmentId, bookingId: broadcastId, driverName: driver?.name || '', vehicleNumber: vehicle?.vehicleNumber || '', vehicleType: vehicle?.vehicleType || '', status: 'trip_assigned' }
           }).catch((err) => { logger.warn('[BroadcastAccept] Driver push notification queue failed', { driverId, assignmentId: result.assignmentId, error: err instanceof Error ? err.message : String(err) }); });
         } catch (_queueErr) {
