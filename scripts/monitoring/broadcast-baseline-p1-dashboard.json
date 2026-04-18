@@ -13,17 +13,14 @@
       "width": 12,
       "height": 6,
       "properties": {
-        "title": "L3 — eta_ranking_fallback_total (rate / 1m, by reason)",
+        "title": "L3 — eta_ranking_fallback_total (rate / 1m, grouped by reason)",
         "view": "timeSeries",
         "stacked": false,
         "region": "ap-south-1",
         "period": 60,
         "stat": "Sum",
         "metrics": [
-          ["Weelo/Backend", "eta_ranking_fallback_total", "reason", "google_timeout", {"label": "reason=google_timeout"}],
-          ["...", "reason", "google_quota", {"label": "reason=google_quota"}],
-          ["...", "reason", "haversine_no_key", {"label": "reason=haversine_no_key"}],
-          ["...", "reason", "other", {"label": "reason=other"}]
+          [{"expression": "SEARCH(' {Weelo/Backend,reason,stepIndex,errorClass} MetricName=\"eta_ranking_fallback_total\" ', 'Sum', 60)", "label": "", "id": "e1"}]
         ],
         "annotations": {
           "alarms": ["arn:aws:cloudwatch:ap-south-1:ACCOUNT_ID:alarm:weelo-p1-eta-fallback-spike"]
@@ -36,14 +33,14 @@
       "width": 12,
       "height": 6,
       "properties": {
-        "title": "L7 — fleet_cache_corruption_total (rate / 1m)",
+        "title": "L7 — fleet_cache_corruption_total (rate / 1m, grouped by keyPrefix)",
         "view": "timeSeries",
         "stacked": false,
         "region": "ap-south-1",
         "period": 60,
         "stat": "Sum",
         "metrics": [
-          ["Weelo/Backend", "fleet_cache_corruption_total", {"label": "corrupt reads"}]
+          [{"expression": "SEARCH(' {Weelo/Backend,keyPrefix} MetricName=\"fleet_cache_corruption_total\" ', 'Sum', 60)", "label": "", "id": "e2"}]
         ],
         "annotations": {
           "alarms": ["arn:aws:cloudwatch:ap-south-1:ACCOUNT_ID:alarm:weelo-p1-fleet-cache-corruption"]
@@ -77,17 +74,14 @@
       "width": 12,
       "height": 6,
       "properties": {
-        "title": "M18 — socket_emit_while_adapter_down_total (by event)",
+        "title": "M18 — socket_emit_while_adapter_down_total (rate / 1m, grouped by event)",
         "view": "timeSeries",
         "stacked": true,
         "region": "ap-south-1",
         "period": 60,
         "stat": "Sum",
         "metrics": [
-          ["Weelo/Backend", "socket_emit_while_adapter_down_total", "event", "order_broadcast", {"label": "event=order_broadcast"}],
-          ["...", "event", "driver_accepted", {"label": "event=driver_accepted"}],
-          ["...", "event", "flex_hold_started", {"label": "event=flex_hold_started"}],
-          ["...", "event", "other", {"label": "event=other"}]
+          [{"expression": "SEARCH(' {Weelo/Backend,event} MetricName=\"socket_emit_while_adapter_down_total\" ', 'Sum', 60)", "label": "", "id": "e3"}]
         ],
         "annotations": {
           "alarms": ["arn:aws:cloudwatch:ap-south-1:ACCOUNT_ID:alarm:weelo-p1-socket-adapter-down"]
