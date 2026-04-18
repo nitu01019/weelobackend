@@ -138,6 +138,11 @@ import {
 // F-A-50: Centralized feature flag + smart-timeout service for consolidated path
 import { FLAGS, isEnabled } from '../../shared/config/feature-flags';
 import { smartTimeoutService } from '../order-timeout';
+// F-A-24: unified TTL constants for idempotency + active-broadcast key
+import {
+  ACTIVE_BROADCAST_TTL_SECONDS,
+  IDEMPOTENCY_TTL_SECONDS,
+} from '../../shared/constants/idempotency';
 
 // =============================================================================
 // CACHE KEYS & TTL (Optimized for fast lookups)
@@ -230,6 +235,15 @@ export interface CreateOrderRequest {
   goodsType?: string;
   cargoWeightKg?: number;
   scheduledAt?: string;  // For scheduled bookings
+
+  // F-A-04: contact / payment / notes participate in payloadHash so retries
+  // that share an idempotency-key but differ in any of these fields surface
+  // as IDEMPOTENCY_CONFLICT instead of silently collapsing onto the cached
+  // response. Mirrors the canonical type in order-core-types.ts.
+  contactName?: string;
+  contactPhone?: string;
+  paymentMode?: string;
+  notes?: string;
 
   // SCALABILITY: Idempotency key prevents duplicate orders on network retry
   idempotencyKey?: string;  // UUID from client (optional)
@@ -469,6 +483,14 @@ class OrderService {
       .sort()
       .join('|');
 
+    // F-A-04: contact/payment/notes participate in the hash so that retries
+    // with the same idempotency-key but different downstream-meaningful values
+    // surface as IDEMPOTENCY_CONFLICT instead of silently collapsing.
+    const contactName = (request.contactName || '').trim().toLowerCase();
+    const contactPhone = (request.contactPhone || '').replace(/\D/g, '');
+    const paymentMode = (request.paymentMode || '').trim().toLowerCase();
+    const notes = (request.notes || '').trim().toLowerCase();
+
     const payload = [
       request.customerId,
       routeFingerprint,
@@ -476,7 +498,11 @@ class OrderService {
       Number(request.distanceKm || 0).toFixed(2),
       (request.goodsType || '').trim().toLowerCase(),
       request.cargoWeightKg ?? '',
-      request.scheduledAt ?? ''
+      request.scheduledAt ?? '',
+      contactName,
+      contactPhone,
+      paymentMode,
+      notes
     ].join('::');
 
     return crypto.createHash('sha256').update(payload).digest('hex');
@@ -710,6 +736,12 @@ class OrderService {
         if (cached) {
           const cachedResponse = JSON.parse(cached) as CreateOrderResponse;
           logger.info(`✅ Idempotency HIT: Returning cached order ${cachedResponse.orderId.substring(0, 8)}... for key ${request.idempotencyKey.substring(0, 8)}...`);
+          // F-A-03: tag the envelope so the route layer can emit the
+          // Idempotent-Replayed header. Strip-on-write keeps wire bytes
+          // identical to the original 201 when FF is OFF (route also no-ops).
+          if (isEnabled(FLAGS.IDEMPOTENT_REPLAY_HEADER)) {
+            (cachedResponse as CreateOrderResponse & { __replayed?: boolean }).__replayed = true;
+          }
           return cachedResponse;
         }
         logger.debug(`🔍 Idempotency MISS: Processing new order for key ${request.idempotencyKey.substring(0, 8)}...`);
@@ -730,6 +762,10 @@ class OrderService {
           idempotencyKey: `${request.idempotencyKey.substring(0, 8)}...`,
           orderId: dbReplay.orderId
         });
+        // F-A-03: same replay tagging on the DB-backed branch.
+        if (isEnabled(FLAGS.IDEMPOTENT_REPLAY_HEADER)) {
+          (dbReplay as CreateOrderResponse & { __replayed?: boolean }).__replayed = true;
+        }
         return dbReplay;
       }
     }
@@ -1469,8 +1505,19 @@ class OrderService {
       await redisService.set(dedupeKey, orderId, orderTimeoutSeconds + 30);
       await redisService.set(`idem:broadcast:latest:${request.customerId}`, dedupeKey, orderTimeoutSeconds + 30);
 
-      // Set customer active broadcast key (one-per-customer enforcement)
-      await redisService.set(activeKey, orderId, orderTimeoutSeconds + 60);
+      // F-A-24: when FF_UNIFIED_IDEMPOTENCY_TTL is ON, the active-broadcast
+      // key shares the 24h ceiling with the idempotency cache. Terminal-state
+      // handlers DELETE both keys explicitly (clearCustomerActiveBroadcast),
+      // so the long TTL is a safety floor only. When OFF, keep the legacy
+      // orderTimeoutSeconds + 60 value (~180s with default config).
+      const activeBroadcastTtl = isEnabled(FLAGS.UNIFIED_IDEMPOTENCY_TTL)
+        ? ACTIVE_BROADCAST_TTL_SECONDS
+        : orderTimeoutSeconds + 60;
+      await redisService.set(activeKey, orderId, activeBroadcastTtl);
+
+      // Reference IDEMPOTENCY_TTL_SECONDS so the unified TTL constant has
+      // exactly one canonical import site in this monolith path.
+      void IDEMPOTENCY_TTL_SECONDS;
 
       // Return response
       return orderResponse;

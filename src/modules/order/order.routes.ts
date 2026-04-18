@@ -33,8 +33,91 @@ import { createOrderSchema } from '../booking/booking.schema';
 // FIX F-1-4: Use shared utils instead of inline duplicates
 import { normalizeOrderLifecycleState, normalizeOrderStatus } from '../../shared/utils/order-lifecycle.utils';
 import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
+// F-A-07: gate POST /orders middleware order on FF_ORDER_QUEUE_POST_VALIDATION.
+import { FLAGS, isEnabled } from '../../shared/config/feature-flags';
 
 const router = Router();
+
+// =============================================================================
+// F-A-07 — Named edge middlewares (validation + rate-limit)
+// =============================================================================
+// Extracted from the inline POST / handler so they can run BEFORE the
+// bookingQueue admission middleware when FF_ORDER_QUEUE_POST_VALIDATION is ON.
+// Cheap deterministic checks gate access to the (limited) queue slots, so
+// flooding malformed or over-quota requests never starves real bookings.
+// =============================================================================
+
+/**
+ * Validate the create-order request body using the canonical Zod schema.
+ * On failure, responds 400 with VALIDATION_ERROR; on success stashes the
+ * parsed payload on `req` so the handler can reuse it without re-parsing.
+ */
+export function validateCreateOrderBody(req: Request, res: Response, next: NextFunction): void {
+  const validationResult = createOrderSchema.safeParse(req.body);
+  if (!validationResult.success) {
+    res.status(400).json({
+      success: false,
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: 'Invalid request data',
+        details: validationResult.error.errors
+      }
+    });
+    return;
+  }
+  (req as Request & { validatedOrderBody?: unknown }).validatedOrderBody = validationResult.data;
+  next();
+}
+
+/**
+ * Per-customer rate-limit on order creation. Defaults to 5 / minute, matching
+ * the legacy inline check at order.routes.ts:142-163. Sets the standard
+ * Retry-After header on 429 per RFC 6585.
+ */
+export async function orderRateLimitMiddleware(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  const user = req.user;
+  if (!user || !user.userId) {
+    next();
+    return;
+  }
+  try {
+    const rateLimitKey = `order_create:${user.userId}`;
+    const rateLimit = await orderService.checkRateLimit(rateLimitKey, 5, 60);
+    if (!rateLimit.allowed) {
+      logger.warn(`[Orders] Rate limit exceeded for customer ${user.userId}`);
+      const retryAfterMs = Math.max(1000, (rateLimit.retryAfter || 1) * 1000);
+      res.setHeader('Retry-After', Math.ceil(retryAfterMs / 1000).toString());
+      res.status(429).json({
+        success: false,
+        error: {
+          code: 'RATE_LIMIT_EXCEEDED',
+          message: `Too many requests. Please wait ${rateLimit.retryAfter} seconds before trying again.`,
+          retryAfterMs,
+          data: {
+            retryAfter: rateLimit.retryAfter,
+            retryAfterMs,
+            limit: 5,
+            window: '1 minute'
+          }
+        }
+      });
+      return;
+    }
+    next();
+  } catch (err) {
+    next(err);
+  }
+}
+
+// F-A-07: gate POST / middleware order on FF_ORDER_QUEUE_POST_VALIDATION.
+// When ON: validateCreateOrderBody + orderRateLimitMiddleware run BEFORE
+// bookingQueue.middleware. When OFF: legacy in-handler validation preserved.
+const FF_ORDER_QUEUE_POST_VALIDATION_ENABLED = (): boolean =>
+  isEnabled(FLAGS.ORDER_QUEUE_POST_VALIDATION);
 
 const ACTIVE_ORDER_STATUSES = new Set(['created', 'broadcasting', 'active', 'partially_filled']);
 
@@ -112,6 +195,19 @@ router.post(
   '/',
   authMiddleware,
   roleGuard(['customer']),
+  // F-A-07: validateCreateOrderBody and orderRateLimitMiddleware are bound
+  // here in the new admission order. They are gated on
+  // FF_ORDER_QUEUE_POST_VALIDATION at runtime — when the flag is OFF they
+  // pass-through, preserving legacy in-handler validation. When ON they reject
+  // bad/over-quota requests BEFORE bookingQueue.middleware consumes a slot.
+  (req: Request, res: Response, next: NextFunction) =>
+    isEnabled(FLAGS.ORDER_QUEUE_POST_VALIDATION)
+      ? validateCreateOrderBody(req, res, next)
+      : next(),
+  (req: Request, res: Response, next: NextFunction) =>
+    isEnabled(FLAGS.ORDER_QUEUE_POST_VALIDATION)
+      ? void orderRateLimitMiddleware(req, res, next)
+      : next(),
   bookingQueue.middleware({ priority: Priority.HIGH, timeout: 15000 }),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
@@ -120,46 +216,59 @@ router.post(
       // =================================================================
       // Fix A3: Validate + rate-limit BEFORE acquiring lock
       // Fail fast on bad input without holding a distributed lock.
+      // F-A-07: when FF_ORDER_QUEUE_POST_VALIDATION is ON, the named
+      // validateCreateOrderBody / orderRateLimitMiddleware above have
+      // already run; the inline checks below are skipped via the same FF.
       // =================================================================
       logger.info(`[Orders] POST / - Customer: ${user.userId}`);
       logger.debug(`[Orders] POST / - Body keys: ${Object.keys(req.body).join(', ')}`);
 
-      // Validate request body FIRST (no lock needed)
-      const validationResult = createOrderSchema.safeParse(req.body);
-      if (!validationResult.success) {
-        res.status(400).json({
-          success: false,
-          error: {
-            code: 'VALIDATION_ERROR',
-            message: 'Invalid request data',
-            details: validationResult.error.errors
-          }
-        });
-        return;
+      let validationResult: ReturnType<typeof createOrderSchema.safeParse>;
+      const stashedBody = (req as Request & { validatedOrderBody?: unknown }).validatedOrderBody;
+      if (FF_ORDER_QUEUE_POST_VALIDATION_ENABLED() && stashedBody !== undefined) {
+        // Already parsed by validateCreateOrderBody; rebuild a success-shaped
+        // object so downstream code remains identical.
+        validationResult = { success: true, data: stashedBody as any } as any;
+      } else {
+        // Validate request body FIRST (no lock needed)
+        validationResult = createOrderSchema.safeParse(req.body);
+        if (!validationResult.success) {
+          res.status(400).json({
+            success: false,
+            error: {
+              code: 'VALIDATION_ERROR',
+              message: 'Invalid request data',
+              details: validationResult.error.errors
+            }
+          });
+          return;
+        }
       }
 
-      // Rate limit SECOND (no lock needed)
-      const rateLimitKey = `order_create:${user.userId}`;
-      const rateLimit = await orderService.checkRateLimit(rateLimitKey, 5, 60);
-      if (!rateLimit.allowed) {
-        logger.warn(`[Orders] Rate limit exceeded for customer ${user.userId}`);
-        const retryAfterMs = Math.max(1000, (rateLimit.retryAfter || 1) * 1000);
-        res.setHeader('Retry-After', Math.ceil(retryAfterMs / 1000).toString());
-        res.status(429).json({
-          success: false,
-          error: {
-            code: 'RATE_LIMIT_EXCEEDED',
-            message: `Too many requests. Please wait ${rateLimit.retryAfter} seconds before trying again.`,
-            retryAfterMs,
-            data: {
-              retryAfter: rateLimit.retryAfter,
+      if (!FF_ORDER_QUEUE_POST_VALIDATION_ENABLED()) {
+        // Rate limit SECOND (no lock needed)
+        const rateLimitKey = `order_create:${user.userId}`;
+        const rateLimit = await orderService.checkRateLimit(rateLimitKey, 5, 60);
+        if (!rateLimit.allowed) {
+          logger.warn(`[Orders] Rate limit exceeded for customer ${user.userId}`);
+          const retryAfterMs = Math.max(1000, (rateLimit.retryAfter || 1) * 1000);
+          res.setHeader('Retry-After', Math.ceil(retryAfterMs / 1000).toString());
+          res.status(429).json({
+            success: false,
+            error: {
+              code: 'RATE_LIMIT_EXCEEDED',
+              message: `Too many requests. Please wait ${rateLimit.retryAfter} seconds before trying again.`,
               retryAfterMs,
-              limit: 5,
-              window: '1 minute'
+              data: {
+                retryAfter: rateLimit.retryAfter,
+                retryAfterMs,
+                limit: 5,
+                window: '1 minute'
+              }
             }
-          }
-        });
-        return;
+          });
+          return;
+        }
       }
 
       // =================================================================
@@ -275,6 +384,15 @@ router.post(
         const result = await orderService.createOrder(orderRequest);
 
         logger.info(`Order created by ${user.phone}: ${result.orderId}`);
+
+        // F-A-03: when the service signals a replay (cache or DB hit), surface
+        // the IETF-recommended Idempotent-Replayed header. Strip the marker
+        // off the body so wire-bytes match the original 201 response.
+        const replayMarker = (result as { __replayed?: boolean }).__replayed === true;
+        if (replayMarker) {
+          res.setHeader('Idempotent-Replayed', 'true');
+          delete (result as { __replayed?: boolean }).__replayed;
+        }
 
         const responseData = buildCreateOrderResponseData(
           result,
