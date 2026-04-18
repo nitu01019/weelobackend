@@ -429,14 +429,19 @@ describe('AB3: Hold lifetime capped to broadcast remaining time', () => {
 });
 
 // =============================================================================
-// M19: Outbox leader TTL reduced to 10s
+// M19: Outbox leader TTL raised to 60s (F-A-56) with 10s floor
+// Rationale: raised from 10s → 60s per F-A-56 (INDEX.md Part 3) because
+// batch × fan-out × Google Directions p99 exceeded 10s leading to leader
+// stomp. Math.max(10, ...) floor prevents env misconfig below safe minimum.
 // =============================================================================
 
-describe('M19: Outbox leader TTL reduced from 30s to 10s', () => {
+describe('M19: Outbox leader TTL — env-driven 60s default with 10s floor (F-A-56)', () => {
   const source = readSource('modules/order/order-dispatch-outbox.service.ts');
 
-  test('M19-01: OUTBOX_LEADER_TTL_SECONDS is 10', () => {
-    expect(source).toContain('OUTBOX_LEADER_TTL_SECONDS = 10');
+  test('M19-01: OUTBOX_LEADER_TTL_SECONDS constant declared with 10s floor', () => {
+    // F-A-56 changed from hardcoded 10 to env-driven with Math.max(10, ...) safety floor
+    expect(source).toContain('OUTBOX_LEADER_TTL_SECONDS');
+    expect(source).toMatch(/Math\.max\s*\(\s*10\s*,/);
   });
 
   test('M19-02: leader TTL is used in acquireLock call', () => {
