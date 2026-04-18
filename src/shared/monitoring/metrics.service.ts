@@ -28,29 +28,24 @@
 
 import { Request, Response, NextFunction } from 'express';
 import { logger } from '../services/logger.service';
-import {
-  registerDefaultCounters,
-  registerDefaultGauges,
-  registerDefaultHistograms,
-} from './metrics-definitions';
 
 // =============================================================================
 // METRIC TYPES
 // =============================================================================
 
-export interface CounterMetric {
+interface CounterMetric {
   name: string;
   help: string;
   labels: Record<string, number>;
 }
 
-export interface GaugeMetric {
+interface GaugeMetric {
   name: string;
   help: string;
   value: number;
 }
 
-export interface HistogramMetric {
+interface HistogramMetric {
   name: string;
   help: string;
   buckets: number[];
@@ -88,13 +83,339 @@ class MetricsService {
   }
 
   /**
-   * Initialize default metrics by delegating to the centralized
-   * definitions in metrics-definitions.ts (single source of truth).
+   * Initialize default metrics
    */
   private initializeDefaultMetrics(): void {
-    registerDefaultCounters(this.counters);
-    registerDefaultGauges(this.gauges);
-    registerDefaultHistograms(this.histograms);
+    // HTTP request counter
+    this.counters.set('http_requests_total', {
+      name: 'http_requests_total',
+      help: 'Total number of HTTP requests',
+      labels: {}
+    });
+
+    // HTTP request duration histogram
+    this.histograms.set('http_request_duration_ms', {
+      name: 'http_request_duration_ms',
+      help: 'HTTP request duration in milliseconds',
+      buckets: this.latencyBuckets,
+      values: new Map(),
+      bucketCounts: new Map(),
+      sum: new Map(),
+      count: new Map()
+    });
+
+    // Database query counter
+    this.counters.set('db_queries_total', {
+      name: 'db_queries_total',
+      help: 'Total number of database queries',
+      labels: {}
+    });
+
+    // Database query duration
+    this.histograms.set('db_query_duration_ms', {
+      name: 'db_query_duration_ms',
+      help: 'Database query duration in milliseconds',
+      buckets: this.latencyBuckets,
+      values: new Map(),
+      bucketCounts: new Map(),
+      sum: new Map(),
+      count: new Map()
+    });
+
+    // Cache metrics
+    this.counters.set('cache_hits_total', {
+      name: 'cache_hits_total',
+      help: 'Total number of cache hits',
+      labels: {}
+    });
+
+    this.counters.set('cache_misses_total', {
+      name: 'cache_misses_total',
+      help: 'Total number of cache misses',
+      labels: {}
+    });
+
+    // Load test metrics (correlated by run id)
+    this.counters.set('load_test_requests_total', {
+      name: 'load_test_requests_total',
+      help: 'Total number of requests tagged with X-Load-Test-Run-Id',
+      labels: {}
+    });
+
+    this.histograms.set('load_test_request_duration_ms', {
+      name: 'load_test_request_duration_ms',
+      help: 'Load test tagged request duration in milliseconds',
+      buckets: this.latencyBuckets,
+      values: new Map(),
+      bucketCounts: new Map(),
+      sum: new Map(),
+      count: new Map()
+    });
+
+    // Tracking stream metrics
+    this.counters.set('tracking_stream_publish_success_total', {
+      name: 'tracking_stream_publish_success_total',
+      help: 'Total tracking telemetry records published successfully',
+      labels: {}
+    });
+
+    this.counters.set('tracking_stream_publish_fail_total', {
+      name: 'tracking_stream_publish_fail_total',
+      help: 'Total tracking telemetry records failed to publish',
+      labels: {}
+    });
+
+    this.counters.set('tracking_stream_dropped_total', {
+      name: 'tracking_stream_dropped_total',
+      help: 'Total tracking telemetry records dropped due to backpressure or retry exhaustion',
+      labels: {}
+    });
+
+    this.counters.set('tracking_stream_retry_total', {
+      name: 'tracking_stream_retry_total',
+      help: 'Total tracking telemetry records retried for stream publishing',
+      labels: {}
+    });
+
+    this.counters.set('tracking_queue_dropped_total', {
+      name: 'tracking_queue_dropped_total',
+      help: 'Total tracking queue events dropped by queue hard limit policy',
+      labels: {}
+    });
+
+    this.counters.set('broadcast_queue_guard_dropped_total', {
+      name: 'broadcast_queue_guard_dropped_total',
+      help: 'Total broadcast queue jobs dropped by inactive-order guard',
+      labels: {}
+    });
+
+    this.counters.set('broadcast_queue_guard_fail_open_total', {
+      name: 'broadcast_queue_guard_fail_open_total',
+      help: 'Total broadcast queue jobs emitted via guard fail-open fallback',
+      labels: {}
+    });
+
+    this.histograms.set('tracking_stream_batch_size', {
+      name: 'tracking_stream_batch_size',
+      help: 'Tracking stream publish batch size',
+      buckets: [1, 5, 10, 25, 50, 100, 250, 500],
+      values: new Map(),
+      bucketCounts: new Map(),
+      sum: new Map(),
+      count: new Map()
+    });
+
+    this.histograms.set('broadcast_queue_guard_lookup_latency_ms', {
+      name: 'broadcast_queue_guard_lookup_latency_ms',
+      help: 'Broadcast queue guard order-status lookup latency in milliseconds',
+      buckets: this.latencyBuckets,
+      values: new Map(),
+      bucketCounts: new Map(),
+      sum: new Map(),
+      count: new Map()
+    });
+
+    this.counters.set('cancel_requests_total', {
+      name: 'cancel_requests_total',
+      help: 'Total cancellation requests by policy stage and decision',
+      labels: {}
+    });
+
+    this.counters.set('cancel_emit_retry_total', {
+      name: 'cancel_emit_retry_total',
+      help: 'Total cancellation fanout retries by channel',
+      labels: {}
+    });
+
+    this.counters.set('cancel_rebook_throttled_total', {
+      name: 'cancel_rebook_throttled_total',
+      help: 'Total order create attempts blocked by cancel/rebook churn guard',
+      labels: {}
+    });
+
+    this.counters.set('holds_released_on_cancel_total', {
+      name: 'holds_released_on_cancel_total',
+      help: 'Total held rows released due to customer cancellation',
+      labels: {}
+    });
+
+    this.counters.set('cancel_dispute_created_total', {
+      name: 'cancel_dispute_created_total',
+      help: 'Total blocked-stage cancel disputes created',
+      labels: {}
+    });
+
+    // =========================================================================
+    // Phase 6: Dispatch Pipeline Metrics
+    // =========================================================================
+
+    this.histograms.set('broadcast_candidate_lookup_ms', {
+      name: 'broadcast_candidate_lookup_ms',
+      help: 'Candidate lookup latency (H3 or GEORADIUS) per progressive step',
+      buckets: [1, 2, 5, 10, 20, 50, 100, 250, 500],
+      values: new Map(),
+      bucketCounts: new Map(),
+      sum: new Map(),
+      count: new Map()
+    });
+
+    this.histograms.set('broadcast_scoring_ms', {
+      name: 'broadcast_scoring_ms',
+      help: 'ETA scoring latency per source (directions_api, haversine_fallback, cache)',
+      buckets: [5, 10, 25, 50, 100, 250, 500, 1000, 2500],
+      values: new Map(),
+      bucketCounts: new Map(),
+      sum: new Map(),
+      count: new Map()
+    });
+
+    this.counters.set('broadcast_candidates_found', {
+      name: 'broadcast_candidates_found',
+      help: 'Number of candidate transporters found per vehicle type and step',
+      labels: {}
+    });
+
+    this.counters.set('broadcast_fanout_total', {
+      name: 'broadcast_fanout_total',
+      help: 'Total transporters fanned out per broadcast by vehicle type',
+      labels: {}
+    });
+
+    this.counters.set('broadcast_skipped_no_available', {
+      name: 'broadcast_skipped_no_available',
+      help: 'Broadcasts skipped because no transporters were available',
+      labels: {}
+    });
+
+    this.histograms.set('broadcast_end_to_end_ms', {
+      name: 'broadcast_end_to_end_ms',
+      help: 'End-to-end broadcast pipeline latency (order creation to last fanout enqueue)',
+      buckets: [50, 100, 250, 500, 1000, 2500, 5000, 10000],
+      values: new Map(),
+      bucketCounts: new Map(),
+      sum: new Map(),
+      count: new Map()
+    });
+
+    // =========================================================================
+    // Phase 6: Delivery Channel Metrics
+    // =========================================================================
+
+    this.counters.set('broadcast_delivery_enqueued', {
+      name: 'broadcast_delivery_enqueued',
+      help: 'Broadcast delivery jobs enqueued by channel (socket, fcm) and priority',
+      labels: {}
+    });
+
+    this.counters.set('broadcast_delivery_delivered', {
+      name: 'broadcast_delivery_delivered',
+      help: 'Broadcast messages successfully delivered by channel',
+      labels: {}
+    });
+
+    this.counters.set('broadcast_delivery_failed', {
+      name: 'broadcast_delivery_failed',
+      help: 'Broadcast delivery failures by channel and reason',
+      labels: {}
+    });
+
+    this.histograms.set('broadcast_delivery_latency_ms', {
+      name: 'broadcast_delivery_latency_ms',
+      help: 'Broadcast delivery latency from enqueue to emit/push completion',
+      buckets: [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000],
+      values: new Map(),
+      bucketCounts: new Map(),
+      sum: new Map(),
+      count: new Map()
+    });
+
+    // =========================================================================
+    // === P1-T1.2 (t1-2-obs-postcommit) ===
+    // L2 — Post-commit best-effort cache write failures (fail-soft path).
+    // Order creation is NOT blocked on these cache writes; this counter makes
+    // the invisible failure rate visible to ops dashboards.
+    //   Labels: cache = 'google_directions' | 'idempotency'
+    //   Call sites (src/modules/order/order.service.ts):
+    //     * Google Directions catch branch
+    //     * Idempotency cache catch branch
+    this.counters.set('post_commit_cache_failure_total', {
+      name: 'post_commit_cache_failure_total',
+      help: 'Post-commit best-effort cache write failures by cache type (fail-soft path)',
+      labels: {}
+    });
+
+    // M18 — Socket.IO Redis adapter degraded window: per-emit counter that
+    // fires every time emitToUser runs while `redisPubSubInitialized === false`.
+    // The existing `socket_adapter_failure_total` fires once on state
+    // transition; this one quantifies the blast radius of local-only emits.
+    //   Labels: event = <socket event name>, mode = redisAdapterMode
+    //   Call site: src/shared/services/socket.service.ts (emitToUser)
+    //   Alarm descriptor (owned by T1.7):
+    //     scripts/monitoring/alarm-m18-adapter-down.json
+    this.counters.set('socket_emit_while_adapter_down_total', {
+      name: 'socket_emit_while_adapter_down_total',
+      help: 'Socket emits processed while Redis adapter is down (local-instance only broadcast)',
+      labels: {}
+    });
+    // =========================================================================
+
+    this.gauges.set('broadcast_queue_depth', {
+      name: 'broadcast_queue_depth',
+      help: 'Current broadcast queue depth',
+      value: 0
+    });
+
+    // WebSocket connections
+    this.gauges.set('websocket_connections', {
+      name: 'websocket_connections',
+      help: 'Current number of WebSocket connections',
+      value: 0
+    });
+
+    // Memory usage
+    this.gauges.set('nodejs_memory_heap_used_bytes', {
+      name: 'nodejs_memory_heap_used_bytes',
+      help: 'Node.js heap memory used',
+      value: 0
+    });
+
+    this.gauges.set('nodejs_memory_heap_total_bytes', {
+      name: 'nodejs_memory_heap_total_bytes',
+      help: 'Node.js total heap memory',
+      value: 0
+    });
+
+    // Event loop lag
+    this.gauges.set('nodejs_eventloop_lag_ms', {
+      name: 'nodejs_eventloop_lag_ms',
+      help: 'Node.js event loop lag in milliseconds',
+      value: 0
+    });
+
+    // Active requests
+    this.gauges.set('http_active_requests', {
+      name: 'http_active_requests',
+      help: 'Number of currently active HTTP requests',
+      value: 0
+    });
+
+    this.gauges.set('tracking_stream_buffer_depth', {
+      name: 'tracking_stream_buffer_depth',
+      help: 'Current in-memory buffer depth before tracking stream flush',
+      value: 0
+    });
+
+    this.gauges.set('tracking_queue_depth', {
+      name: 'tracking_queue_depth',
+      help: 'Current tracking queue depth',
+      value: 0
+    });
+
+    this.gauges.set('tracking_queue_inflight', {
+      name: 'tracking_queue_inflight',
+      help: 'Current tracking queue in-flight workers/jobs',
+      value: 0
+    });
   }
 
   /**
@@ -126,10 +447,10 @@ class MetricsService {
    * Increment a counter
    */
   incrementCounter(name: string, labels: Record<string, string> = {}, value: number = 1): void {
-    let counter = this.counters.get(name);
+    const counter = this.counters.get(name);
     if (!counter) {
-      counter = { name, help: `Auto: ${name}`, labels: {} };
-      this.counters.set(name, counter);
+      logger.warn(`Counter ${name} not found`);
+      return;
     }
 
     const labelKey = this.labelsToKey(labels);
@@ -178,18 +499,10 @@ class MetricsService {
    * Observe a value in a histogram
    */
   observeHistogram(name: string, value: number, labels: Record<string, string> = {}): void {
-    let histogram = this.histograms.get(name);
+    const histogram = this.histograms.get(name);
     if (!histogram) {
-      histogram = {
-        name,
-        help: `Auto: ${name}`,
-        buckets: this.latencyBuckets,
-        values: new Map(),
-        bucketCounts: new Map(),
-        sum: new Map(),
-        count: new Map()
-      };
-      this.histograms.set(name, histogram);
+      logger.warn(`Histogram ${name} not found`);
+      return;
     }
 
     const labelKey = this.labelsToKey(labels);
@@ -384,11 +697,8 @@ class MetricsService {
 
   private pruneHttpRequestSamples(nowMs: number): void {
     const minTimestamp = nowMs - this.maxHttpSampleWindowMs;
-    const idx = this.httpRequestSamples.findIndex(s => s.timestampMs >= minTimestamp);
-    if (idx === -1) {
-      this.httpRequestSamples.length = 0; // All entries are old
-    } else if (idx > 0) {
-      this.httpRequestSamples.splice(0, idx); // Remove all entries before idx
+    while (this.httpRequestSamples.length > 0 && this.httpRequestSamples[0].timestampMs < minTimestamp) {
+      this.httpRequestSamples.shift();
     }
   }
 

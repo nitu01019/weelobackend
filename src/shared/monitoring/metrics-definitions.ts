@@ -128,6 +128,32 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
     // Threshold: > 0.2 for 15m → investigate dispatch lag
     // Severity: WARN
     counter('fcm_push_priority_total', 'Total FCM pushes labelled by android priority (high|normal) and notification type'),
+
+    // === P1-T1.2 (t1-2-obs-postcommit) ===
+    // L2 — Post-commit best-effort cache write failures (fail-soft path).
+    // Order creation is NOT blocked on these cache writes; this counter makes
+    // the invisible failure rate visible to ops dashboards.
+    //   Labels: cache = 'google_directions' | 'idempotency'
+    //   Call sites (src/modules/order/order.service.ts):
+    //     * Google Directions catch branch
+    //     * Idempotency cache catch branch
+    counter(
+      'post_commit_cache_failure_total',
+      'Post-commit best-effort cache write failures by cache type (fail-soft path)'
+    ),
+
+    // M18 — Socket.IO Redis adapter degraded window: per-emit counter that
+    // fires every time emitToUser runs while `redisPubSubInitialized === false`.
+    // The existing `socket_adapter_failure_total` fires once on state
+    // transition; this one quantifies the blast radius of local-only emits.
+    //   Labels: event = <socket event name>, mode = redisAdapterMode
+    //   Call site: src/shared/services/socket.service.ts (emitToUser)
+    //   Alarm descriptor (owned by T1.7):
+    //     scripts/monitoring/alarm-m18-adapter-down.json
+    counter(
+      'socket_emit_while_adapter_down_total',
+      'Socket emits processed while Redis adapter is down (local-instance only broadcast)'
+    ),
   ];
 
   for (const def of defs) {
