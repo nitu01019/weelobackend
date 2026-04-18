@@ -101,6 +101,11 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
     counter('reconciliation.tracking_orphans_total', 'Orphaned tracking records found (Redis trip key exists, no active DB assignment)'),
     counter('reconciliation.hold_orphans_total', 'Orphaned hold records found during hold reconciliation'),
 
+    // F-A-85: Hold reconciliation backlog observability
+    // Lets operators alert on sustained backlog growth (e.g., BATCH_SIZE too small
+    // or upstream hold-expiry queue lagging).
+    counter('hold_reconciliation_processed_total', 'Cumulative count of expired holds reconciled by the periodic sweeper'),
+
     // Tracking initialization retry (Issue #46)
     counter('tracking.init_retry_total', 'Total tracking initialization retry attempts'),
     counter('tracking.init_failure_total', 'Total tracking initialization failures after all retries'),
@@ -134,6 +139,13 @@ export function registerDefaultGauges(gauges: Map<string, GaugeMetric>): void {
     gauge('tracking_queue_depth', 'Current tracking queue depth'),
     gauge('tracking_queue_inflight', 'Current tracking queue in-flight workers/jobs'),
     gauge('broadcast_queue_depth', 'Current broadcast queue depth'),
+
+    // F-A-85: Hold reconciliation observability gauges
+    gauge('hold_reconciliation_backlog', 'Number of expired holds still awaiting reconciliation after a sweep cycle'),
+    gauge('hold_reconciliation_oldest_expired_age_seconds', 'Age in seconds of the oldest unprocessed expired hold (0 when backlog is empty)'),
+
+    // F-A-86: Candidate-scorer weights boot validation (1 = valid, 0 = invalid/unchecked)
+    gauge('scorer_weights_boot_valid', 'Result of BEHAVIORAL_WEIGHTS Zod validation at module load (1 valid, 0 invalid)'),
   ];
 
   for (const def of defs) {
@@ -172,6 +184,13 @@ export function registerDefaultHistograms(histograms: Map<string, HistogramMetri
 
     // Reconciliation (Issue #59)
     hist('reconciliation.sweep_duration_ms', 'Duration of reconciliation sweep in milliseconds'),
+
+    // F-A-85: Hold reconciliation cycle duration (seconds buckets -- low-frequency loop)
+    hist(
+      'hold_reconciliation_cycle_duration_seconds',
+      'Per-cycle duration of the hold reconciliation sweeper in seconds',
+      [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30],
+    ),
   ];
 
   for (const def of defs) {

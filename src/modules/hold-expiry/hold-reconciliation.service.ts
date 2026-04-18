@@ -2,6 +2,27 @@ import * as crypto from 'crypto';
 import { prismaClient } from '../../shared/database/prisma.service';
 import { logger } from '../../shared/services/logger.service';
 import { redisService } from '../../shared/services/redis.service';
+import { metrics } from '../../shared/monitoring/metrics.service';
+
+// F-A-85: observability must never break the reconciliation loop. Tolerate
+// legacy partial metrics mocks used by several in-tree tests.
+type MetricsLike = {
+  setGauge?: (name: string, value: number) => void;
+  incrementCounter?: (name: string, labels?: Record<string, string>, value?: number) => void;
+  observeHistogram?: (name: string, value: number, labels?: Record<string, string>) => void;
+};
+function safeSetGauge(name: string, value: number): void {
+  const m = metrics as MetricsLike;
+  if (typeof m.setGauge === 'function') m.setGauge(name, value);
+}
+function safeIncrementCounter(name: string, value: number): void {
+  const m = metrics as MetricsLike;
+  if (typeof m.incrementCounter === 'function') m.incrementCounter(name, {}, value);
+}
+function safeObserveHistogram(name: string, value: number): void {
+  const m = metrics as MetricsLike;
+  if (typeof m.observeHistogram === 'function') m.observeHistogram(name, value);
+}
 
 export class HoldReconciliationService {
   private isRunning = false;
@@ -107,10 +128,19 @@ export class HoldReconciliationService {
       // H-6 FIX: Tag holds with known phase from initial queries to avoid
       // N+1 re-query inside processExpiredHoldById
       const allExpired = [
-        ...expiredFlexHolds.map(h => ({ ...h, phase: 'FLEX' as const })),
-        ...expiredConfirmedHolds.map(h => ({ ...h, phase: 'CONFIRMED' as const }))
+        ...expiredFlexHolds.map(h => ({ ...h, phase: 'FLEX' as const, expiresAt: h.flexExpiresAt })),
+        ...expiredConfirmedHolds.map(h => ({ ...h, phase: 'CONFIRMED' as const, expiresAt: h.confirmedExpiresAt }))
       ];
       let totalProcessed = 0;
+
+      // F-A-85: oldest expired hold age (seconds) -- 0 when nothing expired.
+      const oldestExpiredAgeSeconds = allExpired.reduce((maxAge, h) => {
+        const ts = h.expiresAt instanceof Date ? h.expiresAt.getTime() : null;
+        if (ts === null) return maxAge;
+        const age = (now.getTime() - ts) / 1000;
+        return age > maxAge ? age : maxAge;
+      }, 0);
+      safeSetGauge('hold_reconciliation_oldest_expired_age_seconds', Math.max(0, Math.round(oldestExpiredAgeSeconds)));
 
       if (allExpired.length > 0) {
         logger.info('[RECONCILIATION] Found expired holds', {
@@ -126,6 +156,11 @@ export class HoldReconciliationService {
           await Promise.all(batch.map(h => this.processExpiredHoldById(h.holdId, h.phase)));
           totalProcessed += batch.length;
         }
+      }
+
+      // F-A-85: cumulative processed counter -- ops can rate() this in Prometheus
+      if (totalProcessed > 0) {
+        safeIncrementCounter('hold_reconciliation_processed_total', totalProcessed);
       }
 
       // H-18 FIX: Query remaining backlog so operators know if the batch
@@ -144,7 +179,13 @@ export class HoldReconciliationService {
         logger.warn('[RECONCILIATION] Backlog remains', { remaining: remainingBacklog, processed: totalProcessed });
       }
 
+      // F-A-85: backlog gauge mirrors post-cycle count so alerts can fire on
+      // sustained nonzero values across multiple scrape intervals.
+      safeSetGauge('hold_reconciliation_backlog', remainingBacklog);
+
       const elapsedMs = Date.now() - startTime;
+      // F-A-85: cycle duration histogram (seconds)
+      safeObserveHistogram('hold_reconciliation_cycle_duration_seconds', elapsedMs / 1000);
       logger.debug('[RECONCILIATION] Scan complete', { elapsedMs, processed: totalProcessed, backlog: remainingBacklog });
 
     } catch (error: any) {
@@ -152,6 +193,8 @@ export class HoldReconciliationService {
         error: error.message,
         elapsedMs: Date.now() - startTime
       });
+      // F-A-85: record duration even on failure so Grafana sees the spike
+      safeObserveHistogram('hold_reconciliation_cycle_duration_seconds', (Date.now() - startTime) / 1000);
     } finally {
       // FIX-21: Always release lock
       await redisService.releaseLock(lockKey, instanceId).catch(() => {});

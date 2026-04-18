@@ -47,8 +47,10 @@
  * =============================================================================
  */
 
+import { z } from 'zod';
 import { directionsApiService, FF_DIRECTIONS_API_SCORING_ENABLED } from './directions-api.service';
 import { logger } from './logger.service';
+import { metrics } from '../monitoring/metrics.service';
 import { CIRCUITY_FACTORS } from '../utils/geospatial.utils';
 
 // =============================================================================
@@ -86,13 +88,72 @@ const ROAD_FACTOR = CIRCUITY_FACTORS.ETA_RANKING;
 
 const BEHAVIORAL_SCORING_ENABLED = process.env.FF_BEHAVIORAL_SCORING === 'true';
 
-/** Weights for composite scoring — lower score is better */
-const BEHAVIORAL_WEIGHTS = {
+/**
+ * F-A-86: Zod schema for weights. Each weight in [0, 1] and the sum must be
+ * 1.0 (+/- 5%) so composite scores remain comparable across releases. Exported
+ * for unit tests.
+ */
+export const WeightsSchema = z
+  .object({
+    eta: z.number().min(0).max(1),
+    acceptance: z.number().min(0).max(1),
+    responseTime: z.number().min(0).max(1),
+    rating: z.number().min(0).max(1),
+  })
+  .refine(
+    (w) => Math.abs(w.eta + w.acceptance + w.responseTime + w.rating - 1) < 0.05,
+    { message: 'weights must sum to 1.0 (+/- 5%)' },
+  );
+
+/** Raw weights from env (unvalidated). */
+const rawBehavioralWeights = {
   eta: parseFloat(process.env.BEHAVIORAL_WEIGHT_ETA || '0.5'),             // 50% proximity
   acceptance: parseFloat(process.env.BEHAVIORAL_WEIGHT_ACCEPTANCE || '0.2'), // 20% reliability
   responseTime: parseFloat(process.env.BEHAVIORAL_WEIGHT_RESPONSE || '0.2'), // 20% speed
   rating: parseFloat(process.env.BEHAVIORAL_WEIGHT_RATING || '0.1'),         // 10% quality
 };
+
+const weightsValidation = WeightsSchema.safeParse(rawBehavioralWeights);
+
+// Module-load setGauge call must tolerate partial metrics mocks used by
+// legacy unit tests that only mock incrementCounter/observeHistogram.
+function safeSetGauge(name: string, value: number): void {
+  if (typeof (metrics as { setGauge?: unknown }).setGauge === 'function') {
+    metrics.setGauge(name, value);
+  }
+}
+
+if (!weightsValidation.success) {
+  safeSetGauge('scorer_weights_boot_valid', 0);
+  const issues = weightsValidation.error.issues.map((i) => `${i.path.join('.') || 'weights'}: ${i.message}`).join('; ');
+  if (BEHAVIORAL_SCORING_ENABLED) {
+    // Fail-fast boot: misconfigured weights + flag ON would silently skew
+    // dispatch fairness. Blow up so the deploy is rolled back.
+    logger.error('[CandidateScorer] Invalid BEHAVIORAL_WEIGHTS with FF_BEHAVIORAL_SCORING=true', {
+      weights: rawBehavioralWeights,
+      issues,
+    });
+    throw new Error(`[CandidateScorer] Invalid BEHAVIORAL_WEIGHTS: ${issues}`);
+  }
+  // Flag OFF: log once at boot; legacy ETA-only path is safe regardless.
+  logger.warn('[CandidateScorer] Invalid BEHAVIORAL_WEIGHTS (FF_BEHAVIORAL_SCORING is OFF, tolerating)', {
+    weights: rawBehavioralWeights,
+    issues,
+  });
+} else {
+  safeSetGauge('scorer_weights_boot_valid', 1);
+}
+
+/** Weights for composite scoring - lower score is better. Frozen to prevent runtime mutation. */
+const BEHAVIORAL_WEIGHTS = Object.freeze({ ...rawBehavioralWeights });
+
+logger.info('[CandidateScorer] Effective BEHAVIORAL_WEIGHTS', {
+  weights: BEHAVIORAL_WEIGHTS,
+  behavioralScoringEnabled: BEHAVIORAL_SCORING_ENABLED,
+  validated: weightsValidation.success,
+});
+
+export { BEHAVIORAL_WEIGHTS };
 
 /** Safe defaults for transporters without behavioral data */
 const BEHAVIORAL_DEFAULTS = {
