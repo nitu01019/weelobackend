@@ -902,7 +902,9 @@ class OrderService {
           }
         }
       } catch (routeError: any) {
-        // Google API failure — keep customer distance, never block order creation
+        // L2 (P1-T1.2): Google API failure — keep customer distance, never block order creation.
+        // Fail-soft by design; counter gives ops visibility into outage rate.
+        metrics.incrementCounter('post_commit_cache_failure_total', { cache: 'google_directions' });
         logger.warn('[ORDER] Google Directions API failed — using client distance', {
           distanceSource: 'client_fallback',
           clientDistanceKm,
@@ -1467,6 +1469,9 @@ class OrderService {
           );
           logger.info(`Idempotency cached: ${cacheKey.substring(0, 50)}... (TTL: ${ttl}s)`);
         } catch (error: unknown) {
+          // L2 (P1-T1.2): idempotency cache write failure — fail-soft, non-critical.
+          // Counter tracks rate so ops can spot Redis pressure or degraded writes.
+          metrics.incrementCounter('post_commit_cache_failure_total', { cache: 'idempotency' });
           const message = error instanceof Error ? error.message : String(error);
           logger.warn(`⚠️ Failed to cache idempotency response: ${message}`);
           // Non-critical error, continue
