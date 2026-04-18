@@ -21,6 +21,7 @@ import { placesRateLimiter } from '../../shared/middleware/rate-limiter.middlewa
 import { authMiddleware } from '../../shared/middleware/auth.middleware';
 import { FLAGS, isEnabled } from '../../shared/config/feature-flags';
 import { checkAndIncrementIpBudget } from '../../shared/services/rate-limit.service';
+import { routeMultiSchema } from './route-multi.schema';
 
 const router = Router();
 
@@ -92,7 +93,11 @@ function getClientIp(req: Request): string {
     || 'unknown';
 }
 
-function checkIpBudgetLegacy(req: Request, type: 'search' | 'reverse' | 'route'): boolean {
+function checkIpBudgetLegacy(
+  req: Request,
+  type: 'search' | 'reverse' | 'route',
+  costUnits: number = 1,
+): boolean {
   const ip = getClientIp(req);
   const today = new Date().toDateString();
 
@@ -106,12 +111,12 @@ function checkIpBudgetLegacy(req: Request, type: 'search' | 'reverse' | 'route')
     ipBudgetMap.set(ip, budget);
   }
 
-  if (budget[type] >= PER_IP_LIMITS[type]) {
+  if (budget[type] + costUnits > PER_IP_LIMITS[type]) {
     logger.warn(`🚫 IP budget exceeded: ${ip} - ${type} (${budget[type]}/${PER_IP_LIMITS[type]})`);
     return false; // Budget exceeded
   }
 
-  budget[type]++;
+  budget[type] += costUnits;
   return true; // OK
 }
 
@@ -137,7 +142,7 @@ async function checkIpBudget(
     });
     return r.allowed;
   }
-  return checkIpBudgetLegacy(req, type);
+  return checkIpBudgetLegacy(req, type, costUnits);
 }
 
 // FIX-17: Require authentication on all geocoding routes (BREAKING CHANGE)
@@ -459,40 +464,38 @@ router.post('/route', placesRateLimiter, async (req: Request, res: Response) => 
  */
 router.post('/route-multi', placesRateLimiter, async (req: Request, res: Response) => {
     try {
-        // SECURITY: Per-IP daily budget check (route-multi is MOST expensive - uses multiple API calls)
-        if (!(await checkIpBudget(req, 'route'))) {
+        // F-A-38: Zod-first validation. The hand-rolled loop is replaced by
+        // `routeMultiSchema` which enforces lat/lng bounds, 2..25 points,
+        // and label length in one pass.
+        const parsed = routeMultiSchema.safeParse(req.body);
+        if (!parsed.success) {
+            const firstErr = parsed.error.errors[0];
+            return res.status(400).json({
+                success: false,
+                error: 'VALIDATION_ERROR',
+                message: firstErr?.message || 'Invalid request body',
+            });
+        }
+        const { points, truckMode, includePolyline } = parsed.data;
+
+        // F-A-38: Per-IP budget check. Under the weighted-budget flag, a
+        // 20-waypoint call deducts 19 units (one per leg). Without the flag,
+        // the legacy flat 1-unit path is used.
+        const weighted = isEnabled(FLAGS.ROUTE_MULTI_WEIGHTED_BUDGET);
+        const costUnits = weighted ? Math.max(1, points.length - 1) : 1;
+        if (!(await checkIpBudget(req, 'route', costUnits))) {
             return res.status(429).json({
                 success: false,
                 error: 'DAILY_LIMIT_EXCEEDED',
                 message: 'Daily route calculation limit exceeded. Try again tomorrow.',
+                cost: costUnits,
             });
         }
 
-        const { points, truckMode = true, includePolyline = true } = req.body;
-
-        // Validate points array
-        if (!Array.isArray(points) || points.length < 2) {
-            return res.status(400).json({
-                success: false,
-                error: 'VALIDATION_ERROR',
-                message: 'At least 2 points are required (pickup and drop)',
-            });
-        }
-
-        // Validate each point has lat/lng
-        for (let i = 0; i < points.length; i++) {
-            const point = points[i];
-            if (typeof point.lat !== 'number' || typeof point.lng !== 'number') {
-                return res.status(400).json({
-                    success: false,
-                    error: 'VALIDATION_ERROR',
-                    message: `Point ${i} must have valid lat and lng numbers`,
-                });
-            }
-        }
-
+        // Zod guarantees lat/lng are numbers post-parse; the cast satisfies
+        // the routing-service signature which declares them as required.
         const result = await routingService.calculateMultiPointRouteWithAWS(
-            points,
+            points as Array<{ lat: number; lng: number; label?: string }>,
             truckMode,
             includePolyline
         );

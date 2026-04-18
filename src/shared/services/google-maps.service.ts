@@ -19,6 +19,8 @@
 import { logger } from './logger.service';
 import { cacheService } from './cache.service';
 import { config as appConfig } from '../../config/environment';
+import { shortHash } from '../utils/canonical-hash';
+import { FLAGS, isEnabled } from '../config/feature-flags';
 
 // =============================================================================
 // CONFIGURATION
@@ -246,7 +248,13 @@ class GoogleMapsService {
                 params.append('waypoints', waypoints.join('|'));
             }
 
-            if (truckMode) {
+            // F-A-40: Indian truck routing actually PREFERS NH/expressways and
+            // FASTag tolls. The legacy `avoid=highways|tolls` forced detours
+            // through narrow streets that heavy vehicles cannot safely use.
+            // Safe default = flag OFF → do NOT append avoid=.
+            // Flag FF_TRUCK_ROUTE_AVOID_HIGHWAYS=true restores the legacy
+            // behavior for emergency rollback.
+            if (truckMode && isEnabled(FLAGS.TRUCK_ROUTE_AVOID_HIGHWAYS)) {
                 params.append('avoid', 'highways|tolls');
             }
 
@@ -617,7 +625,9 @@ class GoogleMapsService {
     // =========================================================================
 
     private buildCacheKey(prefix: string, data: Record<string, unknown>): string {
-        return `${prefix}:${Buffer.from(JSON.stringify(data)).toString('base64')}`;
+        // F-A-39: canonicalize + sha256-16. Stable across key-ordering and
+        // float-drift; capped length (≤ prefix + 17 chars) → Redis-friendly.
+        return `${prefix}:${shortHash(data)}`;
     }
 
     // =========================================================================

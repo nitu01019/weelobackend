@@ -367,6 +367,45 @@ export const FLAGS = {
     category: 'release' as const,
     description: 'Redis SSOT rate-limit for geocoding endpoints (F-A-37)',
   },
+
+  // --- F-A-11: Layered rate-limit keyGenerator ---
+  // Replaces the legacy (userId || req.ip) composite with an explicit
+  // u:/d:/ip:/spoof-slow: prefix scheme so that:
+  //   - authenticated users get isolated buckets (immune to IP changes)
+  //   - unauthenticated devices share one bucket per device fingerprint
+  //   - IPs behind our ALB/VPC get a dedicated bucket
+  //   - untrusted sources get a "spoof-slow" throttled bucket
+  // Default OFF for safe rollout — legacy behavior preserved when OFF.
+  LAYERED_RATE_LIMIT_KEY: {
+    env: 'FF_LAYERED_RATE_LIMIT_KEY',
+    category: 'release' as const,
+    description: 'Layered keyGenerator for rate-limit buckets (F-A-11)',
+  },
+
+  // --- F-A-38: /route-multi weighted IP budget + Zod ---
+  // When ON, /route-multi deducts (points.length - 1) units from the per-IP
+  // route-multi budget (reflecting the real per-waypoint cost of the call)
+  // rather than a flat 1 unit. Schema validation via routeMultiSchema is
+  // always on; only the budget weighting is gated.
+  // Default OFF for soak-safe rollout — at OFF the legacy 1-unit path runs.
+  ROUTE_MULTI_WEIGHTED_BUDGET: {
+    env: 'FF_ROUTE_MULTI_WEIGHTED_BUDGET',
+    category: 'release' as const,
+    description: 'Weighted IP budget for /route-multi (F-A-38)',
+  },
+
+  // --- F-A-40: Truck-route avoid=highways|tolls legacy gate ---
+  // The original code always appended avoid=highways|tolls for truckMode=true.
+  // That is INVERTED for Indian trucking: NH/expressways + FASTag tolls are
+  // the *preferred* truck corridors. Default OFF here = safe fix (avoid
+  // parameter is not appended). Flip ON only to restore the legacy behavior
+  // for emergency rollback or targeted regions that genuinely want the old
+  // behavior (rare).
+  TRUCK_ROUTE_AVOID_HIGHWAYS: {
+    env: 'FF_TRUCK_ROUTE_AVOID_HIGHWAYS',
+    category: 'release' as const,
+    description: 'Legacy avoid=highways|tolls for truckMode routes (F-A-40)',
+  },
 } as const;
 
 // ---------------------------------------------------------------------------

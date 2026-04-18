@@ -33,6 +33,9 @@ import { Request, Response } from 'express';
 import { config } from '../../config/environment';
 import { redisService } from '../services/redis.service';
 import { logger } from '../services/logger.service';
+import { FLAGS, isEnabled } from '../config/feature-flags';
+import { isInCidrList } from '../utils/net.utils';
+import { metrics } from '../monitoring/metrics.service';
 
 // =============================================================================
 // REDIS RATE LIMIT STORE (Distributed across all ECS instances)
@@ -230,6 +233,72 @@ function throttleHandler(code: string, message: string, fallbackWindowMs: number
 }
 
 // =============================================================================
+// F-A-11: LAYERED KEY GENERATOR
+// =============================================================================
+//
+// Replaces the legacy (userId || req.ip) composite with an explicit prefix
+// scheme. Provides correct bucket isolation:
+//
+//   u:<userId>           authenticated — bucket is user-unique (IP-agnostic)
+//   d:<deviceId>         unauthenticated but known device — per-device bucket
+//   ip:<ip>              IP originates inside our trusted proxy CIDRs
+//   spoof-slow:<ip>      IP originates outside our trust zone — slow bucket
+//
+// The trusted-proxy CIDR check leans on F-A-08 (isInCidrList +
+// config.trustedProxyCidrs). Device-id matches /^[a-zA-Z0-9-_]{8,64}$/ so
+// untrusted body/header content cannot be used as a pseudo-random key.
+//
+// When FF_LAYERED_RATE_LIMIT_KEY is OFF the legacy behavior is preserved:
+//   - userId → "user:<id>", otherwise req.ip — a single IP-wide bucket.
+//
+// Exported for unit testing so the key-selection rule can be asserted
+// deterministically without spinning up Express.
+// =============================================================================
+
+const DEVICE_ID_REGEX = /^[a-zA-Z0-9-_]{8,64}$/;
+
+function incrementKeySource(source: 'user' | 'dev' | 'ip' | 'spoof-slow' | 'legacy'): void {
+  try {
+    metrics.incrementCounter('rate_limit_key_source_total', { source });
+  } catch {
+    // Never fail the request on metric write.
+  }
+}
+
+export function layeredKeyGenerator(req: Request): string {
+  // Legacy (flag OFF): preserve the old (userId || req.ip) shape.
+  if (!isEnabled(FLAGS.LAYERED_RATE_LIMIT_KEY)) {
+    const legacyUserId = (req as any).user?.userId ?? (req as any).user?.id;
+    const legacyIp = req.ip ?? 'unknown';
+    incrementKeySource('legacy');
+    return legacyUserId ? `user:${legacyUserId}` : legacyIp;
+  }
+
+  // Layered (flag ON).
+  const userId = (req as any).user?.id ?? (req as any).user?.userId;
+  if (userId) {
+    incrementKeySource('user');
+    return `u:${userId}`;
+  }
+
+  const rawDeviceId = req.headers?.['x-device-id'];
+  const deviceId = Array.isArray(rawDeviceId) ? rawDeviceId[0] : rawDeviceId;
+  if (typeof deviceId === 'string' && DEVICE_ID_REGEX.test(deviceId)) {
+    incrementKeySource('dev');
+    return `d:${deviceId}`;
+  }
+
+  const ip = req.ip ?? 'unknown';
+  if (isInCidrList(ip, config.trustedProxyCidrs)) {
+    incrementKeySource('ip');
+    return `ip:${ip}`;
+  }
+
+  incrementKeySource('spoof-slow');
+  return `spoof-slow:${ip}`;
+}
+
+// =============================================================================
 // ROLE-BASED RATE LIMITS
 // =============================================================================
 // Different roles have different usage patterns:
@@ -261,12 +330,7 @@ export const rateLimiter = rateLimit({
     const role = (req as any).user?.role;
     return ROLE_RATE_LIMITS[role] || config.rateLimit.maxRequests;
   }) as any,
-  keyGenerator: (req: Request) => {
-    // Authenticated users: key by userId (consistent across IPs/devices)
-    // Unauthenticated: key by IP (standard fallback)
-    const userId = (req as any).user?.userId;
-    return userId ? `user:${userId}` : (req.ip || 'unknown');
-  },
+  keyGenerator: (req: Request) => layeredKeyGenerator(req),
   handler: throttleHandler(
     'RATE_LIMIT_EXCEEDED',
     'Too many requests. Please try again later.',
