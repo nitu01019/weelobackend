@@ -1,0 +1,58 @@
+-- =============================================================================
+-- M-003 — F-A-54 twin: Booking-side unique-active-booking guard (MEDIUM RISK)
+-- =============================================================================
+--
+-- Purpose: same concept as M-002 but on the Booking table. Weelo has two
+-- parallel customer-entry models (Order for multi-truck, Booking for single-
+-- truck). The F-A-54 TOCTOU exists on both: a customer can race two POST
+-- /booking requests past the application-level active-booking probe. This
+-- partial unique index turns the second insert into a DB-level constraint
+-- violation and closes the window.
+--
+-- RISK: MEDIUM (SCHEMA-ADD with data pre-check).
+--   - CREATE UNIQUE INDEX CONCURRENTLY fails if duplicates exist. If even
+--     one customer already has > 1 active Booking row, the CREATE aborts
+--     and the index is marked INVALID.
+--   - MUST run the pre-check query below BEFORE executing CREATE. If the
+--     pre-check returns any rows, product must remediate first (decide:
+--     UPDATE ... SET status='cancelled' for all but the newest, OR merge,
+--     OR manual triage) — do not blindly delete.
+--
+-- PRE-CODE SAFE once the pre-check is clean: existing code continues to work;
+-- the F-A-54 P4 consumer (the retry-on-constraint-violation handler) may
+-- land before or after this migration.
+--
+-- ---------------------------------------------------------------------------
+-- MANDATORY PRE-CHECK — RUN BEFORE `CREATE UNIQUE INDEX`:
+-- ---------------------------------------------------------------------------
+--   SELECT "customerId", count(*) AS active_count
+--   FROM "Booking"
+--   WHERE status IN ('created','broadcasting','active','partially_filled')
+--   GROUP BY "customerId"
+--   HAVING count(*) > 1;
+--
+-- EXPECTED: 0 rows. If non-zero: STOP. Do not proceed to CREATE INDEX.
+-- Product/ops decides remediation (e.g. `UPDATE "Booking" SET status='cancelled'
+-- WHERE id IN (...)` keeping newest per customer) before retry.
+-- ---------------------------------------------------------------------------
+--
+-- EXECUTION ORDER:
+--   1. Land this file in source control (PR merged — this PR).
+--   2. Operator runs pre-check query above; confirms 0 rows.
+--   3. Operator runs CREATE INDEX CONCURRENTLY on prod via direct psql,
+--      OUTSIDE any BEGIN/COMMIT block.
+--   4. Verify: `\d "Booking"` shows `uniq_customer_active_booking`, marked VALID.
+--      If INVALID: pre-check missed duplicates; investigate and rebuild.
+--   5. F-A-54 P4 consumer catches `unique_violation` (23505 on this index
+--      name) and returns a friendly 409 Conflict.
+--
+-- DO NOT EXECUTE AS PART OF THIS PR. Per CLAUDE.md, the production DB has no
+-- `_prisma_migrations` table — never use `prisma migrate deploy`.
+--
+-- ROLLBACK:
+--   DROP INDEX CONCURRENTLY IF EXISTS uniq_customer_active_booking;
+-- =============================================================================
+
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS uniq_customer_active_booking
+  ON "Booking" ("customerId")
+  WHERE status IN ('created','broadcasting','active','partially_filled');
