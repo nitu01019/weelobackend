@@ -20,16 +20,6 @@ export const EARTH_RADIUS = {
 };
 
 /**
- * F-A-28 — Default average truck speed in km/h.
- *
- * Single source of truth for cross-module ETA / on-time calculations
- * (driver dashboards, performance metrics). Services that need an
- * env-driven knob (HAVERSINE_AVG_SPEED_KMH for the matching pipeline)
- * read process.env directly and do NOT shadow this constant.
- */
-export const DEFAULT_AVG_SPEED_KMH = 30;
-
-/**
  * Calculate distance between two GPS coordinates using Haversine formula
  *
  * WHY HAVERSINE:

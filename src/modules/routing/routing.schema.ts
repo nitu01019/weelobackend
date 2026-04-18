@@ -43,11 +43,17 @@ export const ROUTING_CONFIG = {
    * - Vehicle type (lighter = faster)
    */
   AVERAGE_SPEED_KMH: 40,
-
-  // F-A-28: ROAD_DISTANCE_MULTIPLIER removed (orphan, never read by routing.service.ts).
-  // The single source of truth for road-circuity multipliers lives in
-  // src/shared/utils/geospatial.utils.ts (CIRCUITY_FACTORS / ROAD_DISTANCE_MULTIPLIER).
-
+  
+  /**
+   * Road distance multiplier
+   * 
+   * Haversine gives straight-line distance.
+   * Roads are typically 20-30% longer due to curves.
+   * 
+   * 1.25 = roads are 25% longer than straight line
+   */
+  ROAD_DISTANCE_MULTIPLIER: 1.25,
+  
   /**
    * Buffer time per stop (in minutes)
    * 

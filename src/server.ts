@@ -693,6 +693,21 @@ async function bootstrap(): Promise<void> {
     logger.warn(`[Startup] Broadcast expiry checker failed to start (non-fatal): ${msg}`);
   }
 
+  // F-A-64: Start VehicleTransitionOutbox poller. The poller is safe to run
+  // unconditionally — it no-ops when the outbox is empty. The in-TX write at
+  // order-accept.service.ts is flag-gated (FF_VEHICLE_TRANSITION_OUTBOX); until
+  // flipped ON, the outbox stays empty and the poller tick is a cheap count(*).
+  try {
+    const { startVehicleTransitionOutboxPoller } = await import(
+      './shared/services/vehicle-transition-outbox.service'
+    );
+    startVehicleTransitionOutboxPoller();
+    logger.info('[Startup] VehicleTransitionOutbox poller started (every 10s)');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn(`[Startup] VehicleTransitionOutbox poller failed to start (non-fatal): ${msg}`);
+  }
+
   // C-8 FIX: Recover orphaned progressive step timers after server restart.
   // Timer keys may exist in Redis but be missing from the timers:pending sorted
   // set if a previous instance crashed between reading and processing a timer.

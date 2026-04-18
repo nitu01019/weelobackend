@@ -14,7 +14,6 @@
  */
 
 import { Request, Response, NextFunction } from 'express';
-import { randomUUID } from 'crypto';
 import { logger } from '../services/logger.service';
 import { AppError } from '../types/error.types';
 import { config } from '../../config/environment';
@@ -30,13 +29,9 @@ export function errorHandler(
   _next: NextFunction
 ): void {
   const requestId = (req.headers['x-request-id'] as string) || undefined;
-  // F-A-19: per-error UUID fingerprint so SREs can grep the same id across
-  // CloudWatch logs and customer-facing error reports in O(1).
-  const errorId = randomUUID();
 
   // Log the full error server-side
   logger.error('Request error', {
-    errorId,
     error: error.message,
     stack: error.stack,
     path: req.path,
@@ -64,8 +59,7 @@ export function errorHandler(
         code: error.code,
         message: error.message,
         ...(safeDetails && { details: safeDetails }),
-        ...(requestId && { requestId }),
-        errorId
+        ...(requestId && { requestId })
       }
     });
     return;
@@ -80,8 +74,7 @@ export function errorHandler(
       message: config.isDevelopment
         ? error.message // Show details only in development
         : 'An unexpected error occurred. Please try again later.',
-      ...(requestId && { requestId }),
-      errorId
+      ...(requestId && { requestId })
     }
   });
 }

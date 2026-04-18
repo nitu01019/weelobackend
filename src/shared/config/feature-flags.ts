@@ -369,6 +369,13 @@ export const FLAGS = {
   },
 
   // --- F-A-11: Layered rate-limit keyGenerator ---
+  // Replaces the legacy (userId || req.ip) composite with an explicit
+  // u:/d:/ip:/spoof-slow: prefix scheme so that:
+  //   - authenticated users get isolated buckets (immune to IP changes)
+  //   - unauthenticated devices share one bucket per device fingerprint
+  //   - IPs behind our ALB/VPC get a dedicated bucket
+  //   - untrusted sources get a "spoof-slow" throttled bucket
+  // Default OFF for safe rollout — legacy behavior preserved when OFF.
   LAYERED_RATE_LIMIT_KEY: {
     env: 'FF_LAYERED_RATE_LIMIT_KEY',
     category: 'release' as const,
@@ -376,54 +383,43 @@ export const FLAGS = {
   },
 
   // --- F-A-38: /route-multi weighted IP budget + Zod ---
+  // When ON, /route-multi deducts (points.length - 1) units from the per-IP
+  // route-multi budget (reflecting the real per-waypoint cost of the call)
+  // rather than a flat 1 unit. Schema validation via routeMultiSchema is
+  // always on; only the budget weighting is gated.
+  // Default OFF for soak-safe rollout — at OFF the legacy 1-unit path runs.
   ROUTE_MULTI_WEIGHTED_BUDGET: {
     env: 'FF_ROUTE_MULTI_WEIGHTED_BUDGET',
     category: 'release' as const,
     description: 'Weighted IP budget for /route-multi (F-A-38)',
   },
 
+  // --- F-A-64: Vehicle transition outbox (durable dual-write fix) ---
+  // Replaces the post-TX try/catch at order-accept.service.ts:486-500 with an
+  // in-TX INSERT into VehicleTransitionOutbox + leader-elected poller that
+  // replays onVehicleTransition() with exp-backoff and 5-attempt DLQ.
+  // When OFF: legacy post-TX path — Redis failure silently desyncs DB from
+  // live-availability ("double-booking window").
+  // When ON: DB + outbox commit atomically; replay is retried until it
+  // succeeds or is DLQ'd for operator investigation.
+  // Default OFF for soak-safe rollout.
+  VEHICLE_TRANSITION_OUTBOX: {
+    env: 'FF_VEHICLE_TRANSITION_OUTBOX',
+    category: 'release' as const,
+    description: 'In-TX outbox + leader-elected poller for vehicle transitions (F-A-64)',
+  },
+
   // --- F-A-40: Truck-route avoid=highways|tolls legacy gate ---
-  // Default OFF = safe fix (NH/expressways + FASTag tolls preferred for trucks).
+  // The original code always appended avoid=highways|tolls for truckMode=true.
+  // That is INVERTED for Indian trucking: NH/expressways + FASTag tolls are
+  // the *preferred* truck corridors. Default OFF here = safe fix (avoid
+  // parameter is not appended). Flip ON only to restore the legacy behavior
+  // for emergency rollback or targeted regions that genuinely want the old
+  // behavior (rare).
   TRUCK_ROUTE_AVOID_HIGHWAYS: {
     env: 'FF_TRUCK_ROUTE_AVOID_HIGHWAYS',
     category: 'release' as const,
     description: 'Legacy avoid=highways|tolls for truckMode routes (F-A-40)',
-  },
-
-  // --- F-A-03: Idempotent-Replayed response header ---
-  IDEMPOTENT_REPLAY_HEADER: {
-    env: 'FF_IDEMPOTENT_REPLAY_HEADER',
-    category: 'release' as const,
-    description: 'Idempotent-Replayed header on cache/DB replay (F-A-03)',
-  },
-
-  // --- F-A-07: POST /orders edge chain reorder ---
-  ORDER_QUEUE_POST_VALIDATION: {
-    env: 'FF_ORDER_QUEUE_POST_VALIDATION',
-    category: 'release' as const,
-    description: 'Run Zod + rate-limit before queue admission (F-A-07)',
-  },
-
-  // --- F-A-24: Unified idempotency / active-broadcast TTL ---
-  UNIFIED_IDEMPOTENCY_TTL: {
-    env: 'FF_UNIFIED_IDEMPOTENCY_TTL',
-    category: 'release' as const,
-    description: 'Unified 24h TTL for idempotency + active-broadcast (F-A-24)',
-  },
-
-  // --- F-A-27: Reject stale prices with 409 PRICE_STALE ---
-  // ⚠ PRE-SHIP CHECKLIST: DO NOT FLIP until external Android F-A-26 DAU >=90%.
-  REJECT_STALE_PRICE_409: {
-    env: 'FF_REJECT_STALE_PRICE_409',
-    category: 'release' as const,
-    description: 'Throw 409 PRICE_STALE on price divergence (F-A-27); Android DAU-gated',
-  },
-
-  // --- F-A-30: Refactored calculateEstimate orchestrator (PricingV2) ---
-  PRICING_V2: {
-    env: 'FF_PRICING_V2',
-    category: 'release' as const,
-    description: 'Refactored calculateEstimate orchestrator (F-A-30); golden-master gated',
   },
 } as const;
 

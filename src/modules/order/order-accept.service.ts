@@ -34,6 +34,7 @@ import { clearProgressiveStepTimers } from './order-timer.service';
 import { clearCustomerActiveBroadcast } from './order-broadcast.service';
 import { orderExpiryTimerKey } from './order-timer.service';
 import { HOLD_CONFIG } from '../../core/config/hold-config';
+import { FLAGS, isEnabled } from '../../shared/config/feature-flags';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -326,6 +327,22 @@ export async function acceptTruckRequest(
           }
         });
 
+        // F-A-64: VehicleTransitionOutbox — in-TX INSERT so Redis/fleet-cache
+        // replay shares the same commit boundary as the Vehicle.status update.
+        // Legacy post-TX try/catch path (below) silently drops Redis failures
+        // and leaves live-availability desynced. The poller in
+        // `vehicle-transition-outbox.service.ts` drains this table.
+        if (isEnabled(FLAGS.VEHICLE_TRANSITION_OUTBOX)) {
+          await tx.$executeRaw`
+            INSERT INTO "VehicleTransitionOutbox"
+              ("vehicleId", "vehicleKey", "transporterId",
+               "fromStatus", "toStatus", "reason")
+            VALUES
+              (${vehicleId}, ${vehicle.vehicleKey || null}, ${transporterId},
+               ${'available'}, ${'on_hold'}, ${'orderAccept'})
+          `;
+        }
+
         // Parse JSON fields for notification use outside the transaction
         let pickup: unknown;
         try {
@@ -483,8 +500,14 @@ export async function acceptTruckRequest(
     });
   }
 
-  // C-04 FIX: Redis + fleet cache sync after vehicle set to on_hold in the transaction.
-  if (vehicleKey) {
+  // F-A-64: Redis + fleet cache sync after vehicle set to on_hold in the TX.
+  //   - Flag ON:  in-TX outbox write (see vehicle.updateMany above) owns the
+  //               replay; the leader-elected poller drains it. We skip the
+  //               post-TX try/catch so we do not double-emit Redis writes.
+  //   - Flag OFF: legacy behavior — fire onVehicleTransition() post-commit,
+  //               swallow Redis errors. This is the dual-write bug the outbox
+  //               fix replaces (flag kept off for soak-safe rollout).
+  if (vehicleKey && !isEnabled(FLAGS.VEHICLE_TRANSITION_OUTBOX)) {
     try {
       const { onVehicleTransition } = require('../../shared/services/vehicle-lifecycle.service');
       await onVehicleTransition(

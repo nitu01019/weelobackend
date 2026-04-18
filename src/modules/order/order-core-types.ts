@@ -103,15 +103,6 @@ export interface CreateOrderRequest {
   cargoWeightKg?: number;
   scheduledAt?: string;  // For scheduled bookings
 
-  // F-A-04: Contact / payment / notes participate in payloadHash so that two
-  // retries that share an idempotency key but differ in any of these fields
-  // are surfaced as IDEMPOTENCY_CONFLICT (when FF_DB_STRICT_IDEMPOTENCY=true)
-  // instead of silently collapsing onto the cached response.
-  contactName?: string;
-  contactPhone?: string;
-  paymentMode?: string;
-  notes?: string;
-
   // SCALABILITY: Idempotency key prevents duplicate orders on network retry
   idempotencyKey?: string;  // UUID from client (optional)
 }
