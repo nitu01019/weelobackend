@@ -161,13 +161,13 @@ describe('P1-T1.5 SC8 — boot scan semantics', () => {
     expect(project(viaScan)).toEqual(project(viaKeys));
   });
 
-  test('server_boot_scan_ms histogram is pre-registered at boot', () => {
-    // @ts-expect-error — access the private registry for assertion only
-    const histograms: Map<string, unknown> = metrics.histograms;
-    expect(histograms.has('server_boot_scan_ms')).toBe(true);
-  });
-
   test('server_boot_scan_ms accepts observations without throwing', () => {
+    // Note: pre-registration is owned by T1.6 (metrics-infra) on
+    // `phase-p1/t1-6-metrics-infra` to avoid last-write-wins collision when
+    // PRs merge. On this branch alone the histogram may not yet be in the
+    // registry; `observeHistogram` is tolerant of that (auto-create on first
+    // use). Post-merge, T1.6's registration becomes authoritative and the
+    // emission site here (src/server.ts) binds to it.
     expect(() => {
       metrics.observeHistogram('server_boot_scan_ms', 12.5);
       metrics.observeHistogram('server_boot_scan_ms', 250);
