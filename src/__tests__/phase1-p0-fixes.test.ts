@@ -158,12 +158,22 @@ const SOCKET_SERVICE_PATH = path.resolve(
   __dirname,
   '../shared/services/socket.service.ts'
 );
+// F-C-52: SocketEvent map moved to packages/contracts/events.generated.ts.
+// Concat both so inline-OR-generated assertions still match.
+const CONTRACTS_GENERATED_PATH = path.resolve(
+  __dirname,
+  '../../packages/contracts/events.generated.ts'
+);
 
 describe('FIX-2: Socket Reconnect Event', () => {
   let source: string;
 
   beforeAll(() => {
-    source = fs.readFileSync(SOCKET_SERVICE_PATH, 'utf-8');
+    const socketSrc = fs.readFileSync(SOCKET_SERVICE_PATH, 'utf-8');
+    const contractsSrc = fs.existsSync(CONTRACTS_GENERATED_PATH)
+      ? fs.readFileSync(CONTRACTS_GENERATED_PATH, 'utf-8')
+      : '';
+    source = socketSrc + '\n' + contractsSrc;
   });
 
   describe('Reconnect event name', () => {

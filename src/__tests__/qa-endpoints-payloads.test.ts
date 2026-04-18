@@ -600,13 +600,19 @@ describe('AB1: assignment_timeout event handling', () => {
   const socketServicePath = path.join(__dirname, '..', 'shared', 'services', 'socket.service.ts');
   const socketEventsPath = path.join(__dirname, '..', 'shared', 'types', 'socket-events.ts');
   const lifecyclePath = path.join(__dirname, '..', 'modules', 'assignment', 'assignment-lifecycle.service.ts');
+  // F-C-52: SocketEvent map moved to the generated contracts registry.
+  const contractsGeneratedPath = path.join(__dirname, '..', '..', 'packages', 'contracts', 'events.generated.ts');
 
   let socketServiceSource: string;
   let socketEventsSource: string;
   let lifecycleSource: string;
 
   beforeAll(() => {
-    socketServiceSource = fs.readFileSync(socketServicePath, 'utf-8');
+    const socketBase = fs.readFileSync(socketServicePath, 'utf-8');
+    const contractsSrc = fs.existsSync(contractsGeneratedPath)
+      ? fs.readFileSync(contractsGeneratedPath, 'utf-8')
+      : '';
+    socketServiceSource = socketBase + '\n' + contractsSrc;
     socketEventsSource = fs.readFileSync(socketEventsPath, 'utf-8');
     lifecycleSource = fs.readFileSync(lifecyclePath, 'utf-8');
   });

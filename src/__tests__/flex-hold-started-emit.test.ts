@@ -313,10 +313,16 @@ describe('F-C-50: socket.service constants + FCM fallback', () => {
   test('6: SocketEvent.FLEX_HOLD_STARTED maps to flex_hold_started', () => {
     const fs = require('fs');
     const path = require('path');
-    const source = fs.readFileSync(
+    // F-C-52: SocketEvent map moved to packages/contracts/events.generated.ts;
+    // read both so the assertion holds whether the constant is declared inline
+    // (legacy) or imported from the canonical contracts registry.
+    const socketSrc = fs.readFileSync(
       path.resolve(__dirname, '../shared/services/socket.service.ts'),
       'utf-8'
     );
+    const contractsPath = path.resolve(__dirname, '../../packages/contracts/events.generated.ts');
+    const contractsSrc = fs.existsSync(contractsPath) ? fs.readFileSync(contractsPath, 'utf-8') : '';
+    const source = socketSrc + '\n' + contractsSrc;
 
     // Canonical constant declaration inside the SocketEvent map
     expect(source).toMatch(/FLEX_HOLD_STARTED:\s*'flex_hold_started'/);

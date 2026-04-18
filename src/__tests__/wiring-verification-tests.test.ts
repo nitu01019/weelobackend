@@ -49,7 +49,17 @@ function extractSocketEventKeys(source: string): string[] {
 // Source snapshots — read once at suite level
 // ---------------------------------------------------------------------------
 
-const SOCKET_SERVICE_SOURCE = readSrc('shared/services/socket.service.ts');
+// F-C-52: socket.service.ts now re-exports SocketEvent from the generated registry
+// at packages/contracts/events.generated.ts. Concat both sources so every legacy
+// wiring assertion that greps socket.service.ts content still matches when the
+// event lives in the generated module. Concatenation preserves all existing
+// regex semantics (/.../ against combined text) with zero false positives —
+// the generated module shares the identical `KEY: 'value'` shape.
+const CONTRACTS_GENERATED_PATH = path.resolve(__dirname, '..', '..', 'packages', 'contracts', 'events.generated.ts');
+const CONTRACTS_GENERATED_SOURCE = fs.existsSync(CONTRACTS_GENERATED_PATH)
+  ? fs.readFileSync(CONTRACTS_GENERATED_PATH, 'utf8')
+  : '';
+const SOCKET_SERVICE_SOURCE = readSrc('shared/services/socket.service.ts') + '\n' + CONTRACTS_GENERATED_SOURCE;
 const ORDER_ACCEPT_SOURCE = readSrc('modules/order/order-accept.service.ts');
 const OTP_CHALLENGE_SOURCE = srcExists('modules/auth/otp-challenge.service.ts')
   ? readSrc('modules/auth/otp-challenge.service.ts')
@@ -71,9 +81,11 @@ const EMIT_SOURCE_FILES: string[] = [
 
 const ALL_EMIT_SOURCES: string = EMIT_SOURCE_FILES.map((f) => readSrc(f)).join('\n');
 
-// Extract the SocketEvent object block from socket.service.ts
+// Extract the SocketEvent object block. Post-F-C-52 the block lives in
+// packages/contracts/events.generated.ts, which ends with `} as const;` rather
+// than `};`. Accept both suffixes so legacy assertions work against either.
 const SOCKET_EVENT_BLOCK_MATCH = SOCKET_SERVICE_SOURCE.match(
-  /export const SocketEvent = \{([\s\S]*?)\};/
+  /export const SocketEvent\s*=\s*\{([\s\S]*?)\}(?:\s*as\s+const)?\s*;/
 );
 const SOCKET_EVENT_BLOCK = SOCKET_EVENT_BLOCK_MATCH ? SOCKET_EVENT_BLOCK_MATCH[1] : '';
 

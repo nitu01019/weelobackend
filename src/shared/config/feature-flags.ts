@@ -335,28 +335,6 @@ export const FLAGS = {
     category: 'release' as const,
     description: 'Consolidated createOrder: awaited dispatch + smart-timeout init (F-A-50)',
   },
-
-  // --- F-B-50: Outbox primary-write path (notification outbox canonical seed) ---
-  // Gate for the future outbox-first ordered-lifecycle primary-write path.
-  // Consumed by outbox-lifecycle-mutex.service.ts; downstream F-B-58/62
-  // flip this after the seed lands. OFF today — legacy nested circuit-guard
-  // path in socket.service.ts remains authoritative.
-  OUTBOX_FIRST_ENABLED: {
-    env: 'FF_OUTBOX_FIRST_ENABLED',
-    category: 'release' as const,
-    description: 'Outbox-first primary-write path for lifecycle emits (F-B-50 seed)',
-  },
-
-  // --- F-B-77: Broadcast entry dedup (canonical broadcast entry seed) ---
-  // Gate for the entry-level broadcast dedup SETNX gate. Consumed by
-  // broadcast-dedup.service.ts; downstream F-B-78/81/82 wire this into
-  // broadcastVehicleTypePayload callsites. OFF today — the helper is
-  // functional but unused at runtime.
-  BROADCAST_DEDUP_ENABLED: {
-    env: 'FF_BROADCAST_DEDUP_ENABLED',
-    category: 'release' as const,
-    description: 'Entry-level broadcast dedup SETNX gate (F-B-77 seed)',
-  },
 } as const;
 
 // ---------------------------------------------------------------------------

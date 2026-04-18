@@ -23,7 +23,17 @@ function readSrc(relativePath: string): string {
   if (!fs.existsSync(fullPath)) {
     throw new Error(`Source file not found: ${fullPath}`);
   }
-  return fs.readFileSync(fullPath, 'utf8');
+  const base = fs.readFileSync(fullPath, 'utf8');
+  // F-C-52: socket.service.ts now re-exports SocketEvent from the generated
+  // contracts registry. Concat the generated source so legacy audits that
+  // scan socket.service.ts content still find inline-looking `KEY: 'value'` pairs.
+  if (relativePath.endsWith('shared/services/socket.service.ts')) {
+    const contractsPath = path.resolve(SRC, '..', 'packages', 'contracts', 'events.generated.ts');
+    if (fs.existsSync(contractsPath)) {
+      return base + '\n' + fs.readFileSync(contractsPath, 'utf8');
+    }
+  }
+  return base;
 }
 
 // ---------------------------------------------------------------------------

@@ -56,10 +56,20 @@ jest.mock('../config/environment', () => ({
 // =============================================================================
 
 function readSource(relativePath: string): string {
-  return fs.readFileSync(
+  const base = fs.readFileSync(
     path.resolve(__dirname, '..', relativePath),
     'utf-8'
   );
+  // F-C-52: when asked for socket.service.ts, append the canonical generated
+  // events registry so wiring assertions match whether the SocketEvent map is
+  // inline or re-exported from packages/contracts/events.generated.ts.
+  if (relativePath.endsWith('shared/services/socket.service.ts')) {
+    const contractsPath = path.resolve(__dirname, '..', '..', 'packages', 'contracts', 'events.generated.ts');
+    if (fs.existsSync(contractsPath)) {
+      return base + '\n' + fs.readFileSync(contractsPath, 'utf-8');
+    }
+  }
+  return base;
 }
 
 // =============================================================================

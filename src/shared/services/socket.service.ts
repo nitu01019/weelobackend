@@ -1534,32 +1534,6 @@ const LIFECYCLE_EMIT_EVENTS: ReadonlySet<string> = new Set([
   'cascade_reassigned'
 ]);
 
-/**
- * F-B-26 canonical seed: opt-in scope expansion for the per-user durable-emit
- * path. When FF_DURABLE_EMIT_ENABLED is on AND an event name is in EITHER
- * LIFECYCLE_EMIT_EVENTS OR this set, emitToUser routes through durableEmit() —
- * stamping socket:seq:${userId} and writing the envelope to
- * socket:unacked:${userId} before fanout.
- *
- * Empty today. Downstream canonicalisation waves populate this set per event
- * family as they land:
- *   - F-B-31 (P7): split-brain FF_SEQUENCE_DELIVERY unify
- *   - F-B-34 (P7): per-user seq for broadcast surface
- *   - F-B-58/62 (P8): ordered-lifecycle primary write path
- *
- * Surface is exported (not const) so downstream can mutate at module load.
- */
-export const DURABLE_EMIT_EXPANDED_EVENTS: Set<string> = new Set<string>();
-
-/**
- * Returns true when the emit should take the durable path (envelope ZADD
- * before io.emit). Used by every user-scoped emit helper. Canonical seed for
- * F-B-26 — downstream expands the EXPANDED set without touching callsites.
- */
-function isDurableScoped(event: string): boolean {
-  return LIFECYCLE_EMIT_EVENTS.has(event) || DURABLE_EMIT_EXPANDED_EVENTS.has(event);
-}
-
 // TTL for the unacked-envelope ZSET. Mirrors queue.service.ts
 // UNACKED_QUEUE_TTL_SECONDS (600s) — duplicated here to avoid importing
 // queue.service.ts from socket.service.ts (would pull a large cycle).
@@ -1767,7 +1741,7 @@ export function emitToUser(userId: string, event: string, data: any): boolean {
   // F-B-26: Durable emit path — ZADD envelope to socket:unacked:{userId} under
   // a per-user seq BEFORE firing io.emit. Gated behind FF_DURABLE_EMIT_ENABLED
   // so rollout is controlled; default OFF = identical pre-fix behavior.
-  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && isDurableScoped(event)) {
+  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
     // Fire-and-forget: durableEmit handles its own errors & circuit recording.
     durableEmit(userId, event, data).catch((err: unknown) => {
       const msg = err instanceof Error ? err.message : String(err);
@@ -1817,7 +1791,7 @@ export function emitToBooking(bookingId: string, event: string, data: any): void
   // the unacked store is populated for reconnect replay. The io.to(room).emit
   // still fires once (cross-instance via Redis adapter) so connected users
   // receive exactly one payload. Telemetry and flag-off paths are unchanged.
-  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && isDurableScoped(event)) {
+  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
     const userIds = enumerateRoomUserIds(`booking:${bookingId}`);
     persistRoomEnvelopes(userIds, event, data).catch(() => { /* already logged per-user */ });
   }
@@ -1843,7 +1817,7 @@ export function emitToTrip(tripId: string, event: string, data: any): void {
   // F-B-26: Durable persistence for lifecycle trip events (trip_assigned,
   // order_completed, cascade_reassigned, etc.). LOCATION_UPDATED is
   // telemetry — never ZADDed regardless of flag state.
-  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && isDurableScoped(event)) {
+  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
     const userIds = enumerateRoomUserIds(roomName);
     persistRoomEnvelopes(userIds, event, data).catch(() => { /* already logged per-user */ });
   }
@@ -1919,7 +1893,7 @@ export function emitToOrder(orderId: string, event: string, data: any): void {
   // room before the room broadcast. Order events (order_cancelled,
   // order_expired, order_completed, truck_confirmed, new_broadcast) are
   // exactly the events dropped on reconnect per the audit reproduction.
-  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && isDurableScoped(event)) {
+  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
     const userIds = enumerateRoomUserIds(`order:${orderId}`);
     persistRoomEnvelopes(userIds, event, data).catch(() => { /* already logged per-user */ });
   }
@@ -1961,7 +1935,7 @@ export function emitToUsers(userIds: string[], event: string, data: any): void {
   // F-B-26: For lifecycle events, ZADD each recipient's envelope BEFORE the
   // batched emit so reconnect replay covers the fan-out. The envelope write
   // is per-user (independent seq counters), run in parallel.
-  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && isDurableScoped(event)) {
+  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
     persistRoomEnvelopes(uniqueUserIds, event, data).catch(() => { /* already logged per-user */ });
   }
 
@@ -1990,7 +1964,7 @@ export function emitToRoom(room: string, event: string, data: any): void {
   // F-B-26: For lifecycle events, enumerate local room members and ZADD each
   // userId's envelope before the broadcast. Covers ad-hoc rooms outside of
   // the booking/trip/order families (e.g., transporter scoped rooms).
-  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && isDurableScoped(event)) {
+  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
     const userIds = enumerateRoomUserIds(room);
     persistRoomEnvelopes(userIds, event, data).catch(() => { /* already logged per-user */ });
   }
@@ -2011,7 +1985,7 @@ export function emitToAllTransporters(event: string, data: any): void {
   // F-B-26: Lifecycle events to all transporters (e.g. new_broadcast
   // fan-out) must be durable per-recipient. Enumerate the local
   // role:transporter room and ZADD each user's envelope before the broadcast.
-  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && isDurableScoped(event)) {
+  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
     const userIds = enumerateRoomUserIds('role:transporter');
     persistRoomEnvelopes(userIds, event, data).catch(() => { /* already logged per-user */ });
   }
@@ -2036,7 +2010,7 @@ export function emitToTransporterDrivers(transporterId: string, event: string, d
   // F-B-26: Driver-room lifecycle fan-out (e.g., truck_confirmed reaching
   // drivers under a transporter). ZADD each local driver's envelope before
   // the room broadcast so reconnect replay recovers missed messages.
-  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && isDurableScoped(event)) {
+  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
     const userIds = enumerateRoomUserIds(`transporter:${transporterId}`);
     persistRoomEnvelopes(userIds, event, data).catch(() => { /* already logged per-user */ });
   }

@@ -98,13 +98,17 @@ describe('Edge Cases', () => {
 
   describe('Socket Events', () => {
     it('SocketEvent has required events', () => {
-      // Read the socket service to verify events exist
+      // F-C-52: SocketEvent map moved to packages/contracts/events.generated.ts;
+      // read both so `.toContain(name)` matches whether inline or imported.
       const fs = require('fs');
       const path = require('path');
-      const content = fs.readFileSync(
+      const socketSrc = fs.readFileSync(
         path.join(__dirname, '..', 'shared', 'services', 'socket.service.ts'),
         'utf-8'
       );
+      const contractsPath = path.join(__dirname, '..', '..', 'packages', 'contracts', 'events.generated.ts');
+      const contractsSrc = fs.existsSync(contractsPath) ? fs.readFileSync(contractsPath, 'utf-8') : '';
+      const content = socketSrc + '\n' + contractsSrc;
       expect(content).toContain('ASSIGNMENT_TIMEOUT');
       expect(content).toContain('BOOKING_CANCELLED');
       expect(content).toContain('DRIVER_PRESENCE_TIMEOUT');

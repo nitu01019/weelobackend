@@ -518,8 +518,11 @@ describe('B. Dead Socket Files (#25) -- socket/ directory cleanup', () => {
   });
 
   test('B2.16: socket.service.ts exports SocketEvent constants', () => {
+    // F-C-52: SocketEvent may be declared inline (`export const SocketEvent = {...}`)
+    // or re-exported from the canonical contracts registry
+    // (`export { SocketEvent } from '...'`). Both satisfy the public export contract.
     const content = readFile(socketMonolithPath);
-    expect(content).toMatch(/export\s+const\s+SocketEvent/);
+    expect(content).toMatch(/export\s+(?:const\s+SocketEvent|\{\s*SocketEvent\s*\}\s*from)/);
   });
 
   test('B2.17: socket.service.ts exports socketService object', () => {
