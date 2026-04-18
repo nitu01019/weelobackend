@@ -1575,6 +1575,16 @@ class RedisService {
       } catch (error: any) {
         logger.error(`[Redis] Failed to connect to Redis: ${error.message}`);
 
+        // F-B-06: notify coordination wrapper first. In production with
+        // FF_REDIS_FAIL_CLOSED=true, this flips readinessBlocked=true and
+        // schedules process.exit(1) after a 5s grace so ALB drains the task.
+        // Without the flag (default OFF), legacy fallback is preserved.
+        try {
+          // Lazy require to avoid a circular dependency at module load.
+          const { markCoordinationLost } = require('./redis-coordination.service');
+          markCoordinationLost(`connect_failed: ${error.message}`);
+        } catch { /* wrapper unavailable — treat as legacy path */ }
+
         // 4 PRINCIPLES: Allow graceful degradation in production
         // SCALABILITY: App continues running, OTP uses memory fallback
         // EASY UNDERSTANDING: Clear warning message explains fallback mode

@@ -78,89 +78,31 @@ import { logger } from './logger.service';
 import { db } from '../database/db';
 import { prismaClient } from '../database/prisma.service';
 import { redisService } from './redis.service';
+// F-B-02 Phase A: constants + shapes now live in fleet-cache-types.ts (single
+// source of truth). Local duplicates removed; the class below is marked
+// @deprecated — callers should migrate to the free-function module
+// (fleet-cache-read.service.ts / fleet-cache-write.service.ts) in Phase C.
+import {
+  FLEET_CACHE_PREFIX,
+  CACHE_KEYS,
+  CACHE_TTL,
+  CachedVehicle,
+  CachedDriver,
+  AvailabilitySnapshot,
+} from './fleet-cache-types';
 
 // =============================================================================
-// CACHE KEYS & CONFIG
+// FLEET CACHE SERVICE (@deprecated — see F-B-02 Phase C for deletion plan)
 // =============================================================================
 
-// F-B-03: FleetCache owns the `fleetcache:*` namespace. Tracking owns `fleet:*`
-// (fleet:{transporterId}, fleet:index:transporters). Do NOT collapse these two
-// prefixes — clearAll() scans only `fleetcache:*` and refuses to touch tracking.
-const FLEET_CACHE_PREFIX = 'fleetcache:';
-
-const CACHE_KEYS = {
-  // Vehicle caches
-  VEHICLES: (transporterId: string) => `fleetcache:vehicles:${transporterId}`,
-  VEHICLES_BY_TYPE: (transporterId: string, type: string, subtype?: string) =>
-    `fleetcache:vehicles:${transporterId}:type:${type.toLowerCase()}${subtype ? `:${subtype.toLowerCase()}` : ''}`,
-  VEHICLES_AVAILABLE: (transporterId: string) => `fleetcache:vehicles:available:${transporterId}`,
-  VEHICLE: (vehicleId: string) => `fleetcache:vehicle:${vehicleId}`,
-
-  // Driver caches
-  DRIVERS: (transporterId: string) => `fleetcache:drivers:${transporterId}`,
-  DRIVERS_AVAILABLE: (transporterId: string) => `fleetcache:drivers:available:${transporterId}`,
-  DRIVER: (driverId: string) => `fleetcache:driver:${driverId}`,
-
-  // Snapshot caches (for broadcasts)
-  AVAILABILITY_SNAPSHOT: (transporterId: string, vehicleType: string) =>
-    `fleetcache:snapshot:${transporterId}:${vehicleType.toLowerCase()}`
-};
-
-const CACHE_TTL = {
-  VEHICLE_LIST: 300,      // 5 minutes
-  DRIVER_LIST: 300,       // 5 minutes
-  INDIVIDUAL: 600,        // 10 minutes
-  SNAPSHOT: 60            // 1 minute (for broadcasts, needs fresher data)
-};
-
-// =============================================================================
-// INTERFACES
-// =============================================================================
-
-interface CachedVehicle {
-  id: string;
-  transporterId: string;
-  vehicleNumber: string;
-  vehicleType: string;
-  vehicleSubtype: string;
-  capacityTons: number;
-  status: 'available' | 'on_hold' | 'in_transit' | 'maintenance' | 'inactive';
-  currentTripId?: string;
-  assignedDriverId?: string;
-  isActive: boolean;
-  lastUpdated: string;
-}
-
-interface CachedDriver {
-  id: string;
-  transporterId: string;
-  name: string;
-  phone: string;
-  profilePhotoUrl?: string; // Driver profile photo (visible to transporter)
-  rating: number;
-  totalTrips: number;
-  status: 'active' | 'inactive' | 'suspended';
-  isAvailable: boolean;
-  isOnline: boolean;         // Real-time: DB isAvailable=true AND Redis presence exists
-  currentTripId?: string;
-  lastUpdated: string;
-}
-
-interface AvailabilitySnapshot {
-  transporterId: string;
-  transporterName: string;
-  vehicleType: string;
-  vehicleSubtype?: string;
-  totalOwned: number;
-  available: number;
-  inTransit: number;
-  lastUpdated: string;
-}
-
-// =============================================================================
-// FLEET CACHE SERVICE
-// =============================================================================
-
+/**
+ * @deprecated F-B-02: constants moved to `fleet-cache-types.ts`; split read
+ *   and write helpers live in `fleet-cache-read.service.ts` and
+ *   `fleet-cache-write.service.ts`. This class remains as a thin compatibility
+ *   wrapper for one release to avoid a disruptive change across the ~20 call
+ *   sites. Phase C (follow-up PR) replaces the wrapper with a re-export of
+ *   the free-function API and then removes this file.
+ */
 class FleetCacheService {
 
   /**

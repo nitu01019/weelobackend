@@ -718,7 +718,14 @@ describe('QA Vehicle/Redis Consistency', () => {
         require.resolve('../shared/services/availability.service'),
         'utf8'
       );
-      expect(source).toContain("keys('geo:transporters:*')");
+      // F-B-08: migrated from redisService.keys() (cluster-unsafe, only walks
+      // one node) to clusterScanAllFlat (fans out to every master). Accept
+      // either callsite shape so the invariant — "pruner enumerates the full
+      // geo:transporters:* keyspace" — stays pinned regardless of helper used.
+      const scansFullKeyspace =
+        source.includes("keys('geo:transporters:*')") ||
+        source.includes("clusterScanAllFlat('geo:transporters:*')");
+      expect(scansFullKeyspace).toBe(true);
     });
 
     it('should use SMISMEMBER for batch online check', () => {

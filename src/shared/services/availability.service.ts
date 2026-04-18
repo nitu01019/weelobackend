@@ -1092,7 +1092,9 @@ class AvailabilityService {
 
     let totalPruned = 0;
     try {
-      const geoKeys = await redisService.keys('geo:transporters:*');
+      // F-B-08: cluster-safe SCAN — legacy redisService.keys() only walked one cluster node
+      const { clusterScanAllFlat } = await import('./redis-cluster-scan');
+      const geoKeys = await clusterScanAllFlat('geo:transporters:*');
       if (geoKeys.length === 0) {
         logger.debug('[Availability] Geo prune: no geo keys found');
         return 0;

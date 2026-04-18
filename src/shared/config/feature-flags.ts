@@ -317,6 +317,26 @@ export const FLAGS = {
     description: 'Fail-open mode for cancelled order queue guard (allow on error)',
   },
 
+  // --- F-B-08: Cluster-safe SCAN fanout (redis-cluster-scan.ts) ---
+  // Default ON. When OFF, clusterScanAll collapses to single-node scanIterator
+  // (the legacy, cluster-unsafe behavior). Only flip OFF as an emergency rollback.
+  CLUSTER_SCAN_FANOUT: {
+    env: 'FF_CLUSTER_SCAN_FANOUT',
+    category: 'ops' as const,
+    description: 'Fan-out SCAN across all cluster master nodes (F-B-08)',
+  },
+
+  // --- F-B-06: Redis coordination fail-closed mode (redis-coordination.service.ts) ---
+  // Default OFF. When OFF: existing fail-open-to-in-memory behavior preserved on
+  // Redis connect failure. When ON (production only): process.exit(1) after 5s
+  // grace so ECS/ALB drains and schedules a fresh task — prevents silent
+  // coordination loss (distributed locks, rate-limits, idempotency keys).
+  REDIS_FAIL_CLOSED: {
+    env: 'FF_REDIS_FAIL_CLOSED',
+    category: 'release' as const,
+    description: 'Coordination Redis fails closed in production (F-B-06)',
+  },
+
   // --- F-A-50: Consolidated createOrder dispatch + smart-timeout path ---
   // When ON, order.service.ts::createOrder replaces two legacy behaviors with
   // the delegate-tested variants:

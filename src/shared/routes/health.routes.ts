@@ -27,6 +27,7 @@ import { prismaClient } from '../database/prisma.service';
 import { defaultQueue, bookingQueue, trackingQueue, authQueue } from '../resilience/request-queue';
 import { cacheService } from '../services/cache.service';
 import { redisService } from '../services/redis.service';
+import { redisCoordination } from '../services/redis-coordination.service';
 import { logger } from '../services/logger.service';
 import { getConnectionStats, getIO, getRedisAdapterStatus } from '../services/socket.service';
 import { smsService } from '../../modules/auth/sms.service';
@@ -118,9 +119,12 @@ router.get('/health/ready', async (_req: Request, res: Response) => {
       checks.cache = false;
     }
 
-    // Check Redis connectivity (real Redis vs in-memory fallback)
+    // Check Redis connectivity (real Redis vs in-memory fallback).
+    // F-B-06: also honor redisCoordination.isReady() — when
+    // FF_REDIS_FAIL_CLOSED=true and coordination has been marked lost, this
+    // returns false so ALB drains the task.
     try {
-      checks.redis = redisService.isConnected();
+      checks.redis = redisService.isConnected() && redisCoordination.isReady();
       // If using real Redis, do a PING to verify it's responsive
       if (redisService.isRedisEnabled()) {
         const pingStart = Date.now();

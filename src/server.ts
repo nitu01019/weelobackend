@@ -576,7 +576,9 @@ async function bootstrap(): Promise<void> {
   if (process.env.FF_H3_INDEX_ENABLED === 'true') {
     try {
       const { h3GeoIndexService } = await import('./shared/services/h3-geo-index.service');
-      const geoKeys = await redisService.keys('geo:transporters:*');
+      // F-B-08: cluster-safe SCAN — legacy redisService.keys() only walked one cluster node
+      const { clusterScanAllFlat } = await import('./shared/services/redis-cluster-scan');
+      const geoKeys = await clusterScanAllFlat('geo:transporters:*');
       const vehicleKeys = geoKeys.map(k => k.replace('geo:transporters:', '')).filter(Boolean);
 
       if (vehicleKeys.length > 0) {

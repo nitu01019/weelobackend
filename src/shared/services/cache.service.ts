@@ -183,7 +183,11 @@ class RedisCache implements CacheStore {
 
   async keys(pattern: string): Promise<string[]> {
     if (!redisService.isConnected()) return [];
-    return redisService.keys(pattern);
+    // F-B-08: cluster-safe SCAN — legacy redisService.keys() only walked one cluster node.
+    // Delegates to the cluster-aware helper which collapses to single-node scanIterator
+    // when the transport is not a cluster client.
+    const { clusterScanAllFlat } = await import('./redis-cluster-scan');
+    return clusterScanAllFlat(pattern);
   }
 
   async *scanIterator(pattern: string, count = 100): AsyncIterableIterator<string> {
