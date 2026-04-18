@@ -1,0 +1,165 @@
+{
+  "widgets": [
+    {
+      "type": "text",
+      "width": 24,
+      "height": 2,
+      "properties": {
+        "markdown": "# weelo-broadcast-baseline-p1\n**Phase 1 observability baseline** — customer → transporter broadcast reliability.\nTickets: L1, L2, L3, L4, L6, L7, M9, M18, SC1, SC2, SC8.\nPrometheus scrape endpoint (app): `GET /metrics`. CloudWatch custom metrics require Prometheus→CW bridge — see `.planning/verification/DASHBOARD-P1.md` §\"Metric pipeline: Prometheus → CloudWatch\"."
+      }
+    },
+    {
+      "type": "metric",
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "L3 — eta_ranking_fallback_total (rate / 1m, by reason)",
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "ap-south-1",
+        "period": 60,
+        "stat": "Sum",
+        "metrics": [
+          ["Weelo/Backend", "eta_ranking_fallback_total", "reason", "google_timeout", {"label": "reason=google_timeout"}],
+          ["...", "reason", "google_quota", {"label": "reason=google_quota"}],
+          ["...", "reason", "haversine_no_key", {"label": "reason=haversine_no_key"}],
+          ["...", "reason", "other", {"label": "reason=other"}]
+        ],
+        "annotations": {
+          "alarms": ["arn:aws:cloudwatch:ap-south-1:ACCOUNT_ID:alarm:weelo-p1-eta-fallback-spike"]
+        },
+        "yAxis": {"left": {"label": "calls/min", "showUnits": false}}
+      }
+    },
+    {
+      "type": "metric",
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "L7 — fleet_cache_corruption_total (rate / 1m)",
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "ap-south-1",
+        "period": 60,
+        "stat": "Sum",
+        "metrics": [
+          ["Weelo/Backend", "fleet_cache_corruption_total", {"label": "corrupt reads"}]
+        ],
+        "annotations": {
+          "alarms": ["arn:aws:cloudwatch:ap-south-1:ACCOUNT_ID:alarm:weelo-p1-fleet-cache-corruption"]
+        },
+        "yAxis": {"left": {"label": "events/min", "showUnits": false}}
+      }
+    },
+    {
+      "type": "metric",
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "L2 — post_commit_cache_failure_total (by cache label)",
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "ap-south-1",
+        "period": 60,
+        "stat": "Sum",
+        "metrics": [
+          ["Weelo/Backend", "post_commit_cache_failure_total", "cache", "google_directions", {"label": "cache=google_directions"}],
+          ["...", "cache", "idempotency", {"label": "cache=idempotency"}]
+        ],
+        "annotations": {
+          "alarms": ["arn:aws:cloudwatch:ap-south-1:ACCOUNT_ID:alarm:weelo-p1-post-commit-cache-failure-google_directions", "arn:aws:cloudwatch:ap-south-1:ACCOUNT_ID:alarm:weelo-p1-post-commit-cache-failure-idempotency"]
+        },
+        "yAxis": {"left": {"label": "failures/min", "showUnits": false}}
+      }
+    },
+    {
+      "type": "metric",
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "M18 — socket_emit_while_adapter_down_total (by event)",
+        "view": "timeSeries",
+        "stacked": true,
+        "region": "ap-south-1",
+        "period": 60,
+        "stat": "Sum",
+        "metrics": [
+          ["Weelo/Backend", "socket_emit_while_adapter_down_total", "event", "order_broadcast", {"label": "event=order_broadcast"}],
+          ["...", "event", "driver_accepted", {"label": "event=driver_accepted"}],
+          ["...", "event", "flex_hold_started", {"label": "event=flex_hold_started"}],
+          ["...", "event", "other", {"label": "event=other"}]
+        ],
+        "annotations": {
+          "alarms": ["arn:aws:cloudwatch:ap-south-1:ACCOUNT_ID:alarm:weelo-p1-socket-adapter-down"]
+        },
+        "yAxis": {"left": {"label": "emits/min", "showUnits": false}}
+      }
+    },
+    {
+      "type": "text",
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "markdown": "### L1 — booking_legacy_fallback_invoked\n**Owner:** T1.3 (customer-app Kotlin).\n**Source:** Firebase Analytics event on customer-app (not exported as CW custom metric).\n**Where to view:** Firebase Analytics → Events → `booking_legacy_fallback_invoked` (7-day view).\n**Alerting:** not wired to CloudWatch in P1 (analytics-only). Phase 2 may export via EMF if fallback rate exceeds threshold.\n**Verification:** T1.3 PR includes grep evidence that the legacy path is the only caller of the event."
+      }
+    },
+    {
+      "type": "text",
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "markdown": "### M9 — FLUTTER_NOTIFICATION_CLICK (no-op panel)\n**Owner:** T1.3.\n**Status:** Event string removed from codebase (Flutter legacy shim was never used on this Android native stack).\n**Metric:** NONE — verified by grep in T1.3 PR.\n**Purpose of this panel:** historical audit trail so a future dev doesn't re-add the string.\n**Evidence:** see P1-HANDOFF.md §M9 for the grep commands + SHA."
+      }
+    },
+    {
+      "type": "metric",
+      "width": 24,
+      "height": 6,
+      "properties": {
+        "title": "SC8 — server_boot_scan_ms (histogram, p50/p95/p99)",
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "ap-south-1",
+        "period": 300,
+        "metrics": [
+          ["Weelo/Backend", "server_boot_scan_ms", {"stat": "p50", "label": "p50"}],
+          ["...", {"stat": "p95", "label": "p95"}],
+          ["...", {"stat": "p99", "label": "p99"}]
+        ],
+        "yAxis": {"left": {"label": "ms", "showUnits": false}}
+      }
+    },
+    {
+      "type": "metric",
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "Infra — ECS CPU / Memory (weelobackendtask)",
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "ap-south-1",
+        "period": 60,
+        "metrics": [
+          ["AWS/ECS", "CPUUtilization", "ClusterName", "${ECS_CLUSTER}", "ServiceName", "${ECS_SERVICE}", {"stat": "Average", "label": "CPU avg"}],
+          ["AWS/ECS", "MemoryUtilization", "ClusterName", "${ECS_CLUSTER}", "ServiceName", "${ECS_SERVICE}", {"stat": "Average", "label": "Memory avg"}]
+        ]
+      }
+    },
+    {
+      "type": "text",
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "markdown": "### SC1 + SC2 — Postgres index scan counters (manual panel)\n**Owner:** T1.4 (DBA).\n**Indexes:**\n- `idx_user_kyc_broadcast`\n- `idx_vehicle_key_avail`\n\n**No CW custom metric** — pg_stat_user_indexes is not scraped. Run the queries below (or schedule via EventBridge → Lambda → PutMetricData if periodic export is desired in Phase 2).\n\n```sql\nSELECT relname, indexrelname, idx_scan, idx_tup_read, idx_tup_fetch\nFROM pg_stat_user_indexes\nWHERE indexrelname IN ('idx_user_kyc_broadcast','idx_vehicle_key_avail');\n```\n\n**Exit gate:** `idx_scan > 0` on both indexes within 1h of director executing `prisma/manual-migrations/phase-p1-sc1-sc2-indexes.sql`. See `.planning/verification/PRODUCTION-INDEX-RUNBOOK-P1.md` (authored by T1.4)."
+      }
+    },
+    {
+      "type": "text",
+      "width": 24,
+      "height": 4,
+      "properties": {
+        "markdown": "## Prometheus → CloudWatch bridge (required for live data)\nApp counters above are emitted as Prometheus text on `GET /metrics`. They will NOT render in CloudWatch until a bridge publishes them under namespace `Weelo/Backend`. **Recommended approach: EMF log-emission from `metrics.service.ts`** — see `.planning/verification/DASHBOARD-P1.md` §\"Metric pipeline: Prometheus → CloudWatch\" for full options analysis and the director follow-up item `P1-FOLLOWUP-1`.\n\nUntil the bridge is wired, every app-sourced panel shows `INSUFFICIENT_DATA` and alarms stay `notBreaching` (safe default). Infra panels (ECS CPU/Memory) render immediately."
+      }
+    }
+  ]
+}
