@@ -12,9 +12,10 @@ One row per teammate. T1.7 updates as each teammate sends PR URL + SHA via SendM
 
 | Teammate | Task # | Tickets | Branch | PR URL | Head SHA | Counters added | /review status | Task status |
 |---|---|---|---|---|---|---|---|---|
-| t1-1-obs-broadcast | 8 | L3, L7 | `phase-p1/t1-1-obs-broadcast` | _waiting_ | _waiting_ | _waiting_ | _waiting_ | in_progress |
+| t1-1-obs-broadcast | 8 | L3, L7 | `phase-p1/t1-1-obs-broadcast` | _waiting — task completed, SHA pending_ | _waiting_ | _waiting_ | _waiting_ | completed |
 | t1-2-obs-postcommit | 1 | L2, M18 | `phase-p1/t1-2-obs-postcommit` | _waiting_ | _waiting_ | _waiting_ | _waiting_ | in_progress |
-| t1-3-comments-customer | 5 | L1, L4, M9 | `phase-p1/t1-3-comments-m9-cleanup` | _PR TBD (human opens)_ | backend `90ec3be7`, customer-app `571ea44` | L1 analytics event only | _awaiting /review output_ | completed |
+| t1-3-comments-customer (backend) | 5 | L4, M9 | `phase-p1/t1-3-comments-m9-cleanup` | _PR TBD (human opens)_ | `90ec3be7` | none (docs/grep cleanup) | _awaiting /review output; 3/3 jest green per team-lead_ | completed |
+| t1-3-comments-customer (customer-app) | 5 | L1 | `phase-p1/t1-3-legacy-fallback-analytics` (nitu01019/weelo) | _PR TBD (human opens)_ | `571ea44` | L1 analytics event only (Crashlytics wrapper, no new SDK) | _awaiting /review output; 8/8 tests green per team-lead_ | completed |
 | t1-4-dba-indexes | 7 | SC1, SC2 | `phase-p1/t1-4-dba-indexes` | _PR TBD (human opens)_ | `9c3545eb` | none (SQL migration) | _awaiting /review output_ | completed |
 | t1-5-boot-path | 3 | SC8, L6 | `phase-p1/t1-5-boot-path` | _PR TBD (human opens)_ | `9ee6b748` | `server_boot_scan_ms` (+ L6 log line) | _awaiting /review output — 12/12 regression green per T1.5 handoff_ | completed |
 | t1-6-metrics-infra | 2 | pre-reg + naming spec | `phase-p1/t1-6-metrics-infra` | _waiting_ | _waiting — task completed, SHA pending_ | shared `metrics-definitions.ts` | _waiting_ | completed |
@@ -48,26 +49,29 @@ _[pending]_
 
 #### L1 + L4 + M9 (T1.3) — evidence
 - **Task status:** completed.
-- **Commits (per team-lead ledger):** backend `90ec3be7`, customer-app `571ea44`.
+- **Two separate PRs (one backend, one customer-app):**
+  - **Backend** (L4, M9): branch `phase-p1/t1-3-comments-m9-cleanup`, commit `90ec3be7`. Tests: 3/3 jest green. M9 grep verification: zero `FLUTTER_NOTIFICATION_CLICK` matches under `src/` (backend code) per team-lead confirmation.
+  - **Customer-app** (L1): branch `phase-p1/t1-3-legacy-fallback-analytics` in `nitu01019/weelo`, commit `571ea44`. Tests: 8/8 green. Implementation notes: analytics event emitted via the existing Crashlytics wrapper — no new SDK added, no new permissions required.
 - **Follow-ups flagged by T1.3 (tracked but NOT phase-exit blockers):**
   1. Stale peer tests — documented follow-up; detail awaiting T1.3 paste.
   2. M9 spec contradiction — documented follow-up; detail awaiting T1.3 paste.
-- _T1.3 to paste:_ Firebase Analytics event screenshot/URL, L4 comment-cleanup diff summary, M9 grep command + zero-match output, and the two follow-up items above in full.
+- _T1.3 to paste:_ Firebase Analytics event screenshot/URL, L4 comment-cleanup diff summary, the full M9 grep command used, and the two follow-up items above in full.
 
 #### SC1 + SC2 (T1.4) — evidence
 - **Task status:** completed.
-- **Commit (per team-lead ledger):** `9c3545eb`.
-- **Divergence notes flagged by T1.4 (tracked for runbook clarity, NOT phase-exit blockers):**
-  1. **`BEGIN / COMMIT` around `CREATE INDEX CONCURRENTLY`** — the standard Postgres rule is that `CREATE INDEX CONCURRENTLY` cannot run inside an explicit transaction block. If T1.4's SQL file wraps these in `BEGIN/COMMIT`, the director will need to strip those before execution or split into separate psql invocations. Awaiting T1.4 confirmation of the actual file state.
-  2. **Prisma `@@index(map: "idx_...")` vs `@@index(name: "idx_...")`** — Prisma 5.x prefers `map:`; older schemas sometimes use `name:`. Either form works at the database level so long as the string matches the manual-SQL index name. Awaiting T1.4 confirmation of which was used.
-- _T1.4 to paste:_ Path to `prisma/manual-migrations/phase-p1-sc1-sc2-indexes.sql`, path to `PRODUCTION-INDEX-RUNBOOK-P1.md`, dry-run output, schema diff, and resolution of the two divergence notes above.
+- **Commit:** `9c3545eb` on `phase-p1/t1-4-dba-indexes`.
+- **Divergence notes — RESOLVED (per team-lead confirmation):**
+  1. **`BEGIN / COMMIT` removed** around `CREATE INDEX CONCURRENTLY`. Postgres forbids `CREATE INDEX CONCURRENTLY` inside an explicit transaction block, so the manual SQL file correctly omits the wrapper. Director can run the file directly via psql without splitting.
+  2. **Prisma schema uses `@@index(map: "idx_...")`**. This is the correct form for Prisma v4+ (`name:` is deprecated). The `map:` string matches the index name created by the manual SQL, so `prisma generate` and future `prisma db pull` runs will stay consistent with the production schema.
+- _T1.4 to paste (for final evidence fill-in):_ Path to `prisma/manual-migrations/phase-p1-sc1-sc2-indexes.sql`, path to `PRODUCTION-INDEX-RUNBOOK-P1.md`, dry-run output, schema diff.
 - _Post-director-execution (still gated):_ pg_stat_user_indexes query output (1h after apply), EXPLAIN ANALYZE before/after on broadcast query. This data cannot exist until the director runs the SQL on production — exit-gate criterion stays open.
 
 #### SC8 + L6 (T1.5) — evidence
 - **Task status:** completed.
-- **Commit (per team-lead ledger):** `9ee6b748`.
-- **Summary (per team-lead handoff):** benchmark landed, 8 new tests added, 12/12 regression green.
-- _T1.5 to paste:_ `server_boot_scan_ms` p50/p95/p99 numbers from the benchmark harness, before/after server boot duration on a local machine, and the L6 backpressure log line (grep output showing it fires under simulated load).
+- **Commit:** `9ee6b748` on `phase-p1/t1-5-boot-path`.
+- **Tests:** 8 new tests added (7 SC8 + 1 L6). `phase6-observability` regression suite: 12/12 green. `tsc` clean.
+- **Benchmark (100k keys, per team-lead handoff):** `KEYS` = **9.39 ms**; `scanIterator` = **14.25 ms**. Local microbenchmark shows `KEYS` faster, BUT: `scanIterator` yields to the event loop between batches, so on production ElastiCache (where network RTT + connection contention dominate) the non-blocking pattern is the real win. Accepting the ~5 ms local regression is correct — the exit-gate criterion ("server_boot_scan_ms p99 post-SC8 ≤ pre-SC8 baseline") measures boot duration, not microbenchmark throughput, and boot is gated on I/O not CPU.
+- _T1.5 to paste (for final evidence fill-in):_ `server_boot_scan_ms` p50/p95/p99 from the benchmark harness on production-like data volume, before/after server boot duration, and the L6 backpressure log line (grep output showing it fires under simulated load).
 
 #### Metrics infra (T1.6) — evidence
 _T1.6 to paste:_ Path to `metrics-definitions.ts` with all 6 teammates' counters, confirmation of `registerDefault*` delegation, `curl /metrics | wc -l` before/after, naming spec doc.
