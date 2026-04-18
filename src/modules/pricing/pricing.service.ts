@@ -19,13 +19,16 @@
 
 import crypto from 'crypto';
 import { logger } from '../../shared/services/logger.service';
+import { FLAGS, isEnabled } from '../../shared/config/feature-flags';
 import {
   VEHICLE_CATALOG,
   getVehicleConfig,
   getSubtypeConfig,
   getDistanceSlabMultiplier,
   findSuitableVehicles,
-  getAllVehicleTypes
+  getAllVehicleTypes,
+  type VehicleTypeConfig,
+  type VehicleSubtypeConfig,
 } from './vehicle-catalog';
 
 /**
@@ -285,6 +288,263 @@ interface SuggestionsResponse {
 }
 
 // ============================================================================
+// F-A-30 — calculateEstimate refactor (PricingV2)
+// ============================================================================
+//
+// The legacy `calculateEstimate` mixed nine concerns (catalog lookup, distance
+// charge, tonnage charge, subtype multiplier, surge resolve, min-charge,
+// rounding, quote-token signing, response shape) into ~106 LOC. Following the
+// Martin Fowler "Replace Method with Method Object / Extract Method" pattern,
+// V2 splits the work across 7 pure helpers + a 15-line orchestrator. V1 is
+// retained verbatim and gated behind FF_PRICING_V2 so the refactor can soak.
+//
+// Parity contract: V2 output MUST match V1 byte-for-byte for all 50 canned
+// fixtures in `__fixtures__/pricing-golden-master-fixtures.json`.
+// ============================================================================
+
+/**
+ * Synthetic "catalog miss" fallback config. Used by v2's resolveCatalog when
+ * the customer asks for a vehicle type the catalog does not know about. The
+ * numbers MUST match v1's `calculateWithDefaults` (basePrice=2000, perKm=30,
+ * perTonPerKm=0, minCharge=1500) so byte-identical parity holds.
+ */
+const FALLBACK_CATALOG: VehicleTypeConfig = {
+  id: '__fallback__',
+  displayName: '__fallback__',
+  category: 'tonnage',
+  baseRate: 2000,
+  perKmRate: 30,
+  perTonPerKmRate: 0,
+  minCharge: 1500,
+  subtypes: {},
+};
+
+/** Synthetic capacity used by v2 when subtypeConfig is null (parity with v1). */
+const FALLBACK_CAPACITY = {
+  capacityKg: 10000,
+  capacityTons: 10,
+  minTonnage: 5,
+  maxTonnage: 15,
+};
+
+interface ResolvedCatalog {
+  catalog: VehicleTypeConfig;
+  subtypeConfig: VehicleSubtypeConfig | null;
+  /** True when the lookup missed and the fallback is in use. */
+  isFallback: boolean;
+}
+
+/**
+ * v2 helper #1 — resolveCatalog. Returns the vehicle catalog entry for the
+ * requested type+subtype, or a deterministic fallback when the type is
+ * unknown. Replaces v1's split between `calculateEstimate` (catalog hit) and
+ * `calculateWithDefaults` (catalog miss).
+ */
+export function resolveCatalog(
+  vehicleType: string,
+  vehicleSubtype: string | undefined
+): ResolvedCatalog {
+  const catalog = getVehicleConfig(vehicleType);
+  if (!catalog) {
+    logger.warn(`Vehicle type not found in catalog: ${vehicleType}, using defaults`);
+    return { catalog: FALLBACK_CATALOG, subtypeConfig: null, isFallback: true };
+  }
+  const subtypeConfig = vehicleSubtype ? getSubtypeConfig(vehicleType, vehicleSubtype) : null;
+  return { catalog, subtypeConfig, isFallback: false };
+}
+
+/** v2 helper #2 — distance charge: chargeable distance × per-km rate. */
+export function computeDistanceCharge(catalog: VehicleTypeConfig, distanceKm: number): number {
+  const chargeable = Math.max(distanceKm, MIN_DISTANCE_KM);
+  return chargeable * catalog.perKmRate;
+}
+
+/**
+ * v2 helper #3 — tonnage charge. Uses cargo weight when supplied, else falls
+ * back to subtype.maxTonnage (or 10t when no subtype). Matches v1 exactly.
+ */
+export function computeTonnageCharge(
+  catalog: VehicleTypeConfig,
+  distanceKm: number,
+  cargoWeightKg: number | undefined,
+  subtypeConfig: VehicleSubtypeConfig | null
+): number {
+  const chargeable = Math.max(distanceKm, MIN_DISTANCE_KM);
+  const effectiveTonnage = cargoWeightKg ? cargoWeightKg / 1000 : subtypeConfig?.maxTonnage || 10;
+  return effectiveTonnage * chargeable * catalog.perTonPerKmRate;
+}
+
+/**
+ * v2 helper #4 — apply the subtype rate multiplier. When no subtype is
+ * configured (catalog-miss fallback or absent subtype), the multiplier is
+ * 1.0 to preserve v1 parity in the catalog-miss path.
+ */
+export function applySubtypeMultiplier(
+  subtotal: number,
+  subtypeConfig: VehicleSubtypeConfig | null
+): number {
+  const multiplier = subtypeConfig?.baseRateMultiplier ?? 1.0;
+  return subtotal * multiplier;
+}
+
+interface SurgeApplied {
+  finalPrice: number;
+  surgeApplied: SurgeDecision;
+}
+
+/**
+ * v2 helper #5 — apply the surge decision to a subtotal, returning the
+ * surged price plus the SurgeDecision metadata used downstream by quote-token
+ * signing and response shaping.
+ */
+export function applySurgeDecision(
+  subtotal: number,
+  timestampMs: number | undefined,
+  cellId: string | undefined
+): SurgeApplied {
+  const surge = resolveSurgeDecision(timestampMs ?? Date.now(), cellId);
+  return { finalPrice: subtotal * surge.multiplier, surgeApplied: surge };
+}
+
+/**
+ * v2 helper #6 — enforce the minimum charge floor and round to the nearest
+ * rupee. Centralises v1's two-step `Math.max` then `Math.round`.
+ */
+export function enforceMinCharge(finalPrice: number, catalog: VehicleTypeConfig): number {
+  return Math.round(Math.max(finalPrice, catalog.minCharge));
+}
+
+interface QuoteTokenResponseFields {
+  quoteToken: string;
+  surgeRuleId: string;
+  surgeBucketStart: string;
+  surgeBucketEnd: string;
+}
+
+/**
+ * v2 helper #7 — sign the quote token and shape the response fields the
+ * F-A-26 client replays on order creation. `pickupH3` is reserved for the
+ * future H3 cell-id integration; today the cellId comes from the
+ * SurgeDecision via the surgeApplied metadata.
+ */
+export function buildQuoteTokenResponse(
+  finalPrice: number,
+  surgeApplied: SurgeDecision
+): QuoteTokenResponseFields {
+  const surgeBucketStart = surgeApplied.bucketStart.toISOString();
+  const surgeBucketEnd = surgeApplied.bucketEnd.toISOString();
+  const quoteToken = signQuoteToken({
+    pricePerTruck: finalPrice,
+    surgeRuleId: surgeApplied.ruleId,
+    surgeBucketStart,
+    surgeBucketEnd,
+  });
+  return { quoteToken, surgeRuleId: surgeApplied.ruleId, surgeBucketStart, surgeBucketEnd };
+}
+
+/**
+ * v2 — orchestrator. ~15 lines that compose the 7 pure helpers above.
+ * Output shape and numeric values are byte-identical to v1's
+ * `calculateEstimateLegacy`, validated by the golden-master fixtures.
+ */
+function calculateEstimateV2(request: PriceEstimateRequest): PriceEstimateResponse {
+  const { vehicleType, vehicleSubtype, distanceKm, trucksNeeded, cargoWeightKg, cellId, timestampMs } = request;
+  const { catalog, subtypeConfig, isFallback } = resolveCatalog(vehicleType, vehicleSubtype);
+
+  const distanceCharge = computeDistanceCharge(catalog, distanceKm);
+  const tonnageCharge = computeTonnageCharge(catalog, distanceKm, cargoWeightKg, subtypeConfig);
+  const distanceSlab = getDistanceSlabMultiplier(Math.max(distanceKm, MIN_DISTANCE_KM));
+  const subtypeMultiplier = subtypeConfig?.baseRateMultiplier ?? 1.0;
+
+  // The fallback path multiplies (basePrice + distanceCharge) only — no tonnage
+  // and no subtype multiplier — to preserve v1's `calculateWithDefaults` parity.
+  const subtotalBeforeSurge = isFallback
+    ? (catalog.baseRate + distanceCharge) * distanceSlab.multiplier
+    : applySubtypeMultiplier(catalog.baseRate + distanceCharge + tonnageCharge, subtypeConfig) * distanceSlab.multiplier;
+
+  const { finalPrice: surgedPrice, surgeApplied } = applySurgeDecision(subtotalBeforeSurge, timestampMs, cellId);
+  const pricePerTruck = enforceMinCharge(surgedPrice, catalog);
+  const quoteFields = buildQuoteTokenResponse(pricePerTruck, surgeApplied);
+
+  const totalPrice = pricePerTruck * trucksNeeded;
+  const chargeableDistance = Math.max(distanceKm, MIN_DISTANCE_KM);
+
+  // Parity log lines (v1 emits these inside the catalog-hit branch only).
+  if (!isFallback) {
+    logger.info(`Price calculated: ${vehicleType}/${vehicleSubtype || 'default'} x${trucksNeeded}, ${distanceKm}km = ₹${totalPrice}`);
+    logger.info(`Breakdown: Base=${catalog.baseRate}, Distance=${distanceCharge}, Tonnage=${tonnageCharge.toFixed(0)}, Slab=${distanceSlab.label}`);
+  }
+
+  if (isFallback) {
+    return {
+      basePrice: catalog.baseRate,
+      distanceCharge,
+      tonnageCharge: 0,
+      subtypeMultiplier: 1.0,
+      distanceSlabMultiplier: distanceSlab.multiplier,
+      surgeMultiplier: surgeApplied.multiplier,
+      pricePerTruck,
+      totalPrice,
+      trucksNeeded,
+      breakdown: {
+        vehicleType,
+        vehicleSubtype: vehicleSubtype || 'Standard',
+        distanceKm: chargeableDistance,
+        baseRate: catalog.baseRate,
+        perKmRate: catalog.perKmRate,
+        perTonPerKmRate: 0,
+        surgeFactor: surgeApplied.surgeFactor,
+        distanceSlab: distanceSlab.label,
+      },
+      currency: 'INR',
+      validForMinutes: 5,
+      capacityInfo: { ...FALLBACK_CAPACITY },
+      ...quoteFields,
+    };
+  }
+
+  return {
+    basePrice: Math.round(catalog.baseRate * subtypeMultiplier),
+    distanceCharge: Math.round(distanceCharge * distanceSlab.multiplier),
+    tonnageCharge: Math.round(tonnageCharge),
+    subtypeMultiplier,
+    distanceSlabMultiplier: distanceSlab.multiplier,
+    surgeMultiplier: surgeApplied.multiplier,
+    pricePerTruck,
+    totalPrice,
+    trucksNeeded,
+    breakdown: {
+      vehicleType,
+      vehicleSubtype: vehicleSubtype || 'Standard',
+      distanceKm: chargeableDistance,
+      baseRate: catalog.baseRate,
+      perKmRate: catalog.perKmRate,
+      perTonPerKmRate: catalog.perTonPerKmRate,
+      surgeFactor: surgeApplied.surgeFactor,
+      distanceSlab: distanceSlab.label,
+    },
+    currency: 'INR',
+    validForMinutes: 5,
+    capacityInfo: {
+      capacityKg: subtypeConfig?.capacityKg || 10000,
+      capacityTons: (subtypeConfig?.capacityKg || 10000) / 1000,
+      minTonnage: subtypeConfig?.minTonnage || 5,
+      maxTonnage: subtypeConfig?.maxTonnage || 15,
+    },
+    ...quoteFields,
+  };
+}
+
+/**
+ * Test-only indicator — true iff FF_PRICING_V2 is enabled. Used by
+ * `pricing-golden-master.test.ts` to verify the v2 orchestrator is actually
+ * wired and the legacy path is not silently servicing the fixtures.
+ */
+export function __pricingV2Active(): boolean {
+  return isEnabled(FLAGS.PRICING_V2);
+}
+
+// ============================================================================
 // PRICING SERVICE CLASS
 // ============================================================================
 
@@ -293,11 +553,27 @@ class PricingService {
   /**
    * Calculate price estimate for a booking
    * Uses enhanced tonnage-based pricing algorithm
-   * 
+   *
+   * F-A-30: when FF_PRICING_V2 is ON, dispatch to the refactored 7-helper
+   * orchestrator (`calculateEstimateV2`). The legacy ~106-LOC implementation
+   * below remains the default until the golden-master parity has soaked.
+   *
    * @param request - Pricing request parameters
    * @returns Detailed price estimate
    */
   calculateEstimate(request: PriceEstimateRequest): PriceEstimateResponse {
+    if (isEnabled(FLAGS.PRICING_V2)) {
+      return calculateEstimateV2(request);
+    }
+    return this.calculateEstimateLegacy(request);
+  }
+
+  /**
+   * Legacy v1 implementation — preserved verbatim. Do not edit; v2 must keep
+   * byte-identical parity with this method until the FF flips and v1 is
+   * deleted in a follow-up PR.
+   */
+  private calculateEstimateLegacy(request: PriceEstimateRequest): PriceEstimateResponse {
     const { vehicleType, vehicleSubtype, distanceKm, trucksNeeded, cargoWeightKg, cellId, timestampMs } = request;
 
     // Get vehicle config from catalog

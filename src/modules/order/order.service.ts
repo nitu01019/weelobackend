@@ -1008,7 +1008,28 @@ class OrderService {
           const priceDiff = (clientPrice - serverPrice) / serverPrice;
 
           if (priceDiff < -PRICE_TOLERANCE) {
-            // Client price is suspiciously low - use server price
+            // F-A-27: client price diverges below tolerance — gated behavior.
+            // ⚠ PRE-SHIP CHECKLIST (F-A-27)
+            // FF_REJECT_STALE_PRICE_409 stays OFF until external Android
+            // F-A-26 quoteToken rollout reaches >=90% DAU. See
+            // order-creation.service.ts for full rollout checklist.
+            if (isEnabled(FLAGS.REJECT_STALE_PRICE_409)) {
+              logger.warn(`⚠️ PRICE_STALE: ${req.vehicleType}/${req.vehicleSubtype} ` +
+                `client=₹${clientPrice} vs server=₹${serverPrice} (diff=${(priceDiff * 100).toFixed(1)}%). ` +
+                `Rejecting with 409.`);
+              throw new AppError(
+                409,
+                'PRICE_STALE',
+                'Price has changed. Please refresh your quote before submitting.',
+                {
+                  clientPrice,
+                  serverPrice,
+                  freshQuoteToken: serverEstimate.quoteToken,
+                  surgeBucketEnd: serverEstimate.surgeBucketEnd,
+                }
+              );
+            }
+            // Legacy fallback: silently overwrite with server price.
             logger.warn(`⚠️ PRICE TAMPER DETECTED: ${req.vehicleType}/${req.vehicleSubtype} ` +
               `client=₹${clientPrice} vs server=₹${serverPrice} (diff=${(priceDiff * 100).toFixed(1)}%). ` +
               `Using server price.`);
@@ -1019,6 +1040,9 @@ class OrderService {
               `client=₹${clientPrice} vs server=₹${serverPrice} (diff=${(priceDiff * 100).toFixed(1)}%)`);
           }
         } catch (error: unknown) {
+          // F-A-27: rethrow AppError (especially 409 PRICE_STALE) — only the
+          // pricing-service-down legacy path should fall through to client price.
+          if (error instanceof AppError) throw error;
           const message = error instanceof Error ? error.message : String(error);
           logger.warn(`⚠️ Price validation failed for ${req.vehicleType}: ${message}. Using client price.`);
           // If pricing service fails, allow client price to avoid blocking orders

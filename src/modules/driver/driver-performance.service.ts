@@ -13,6 +13,7 @@ import { AppError } from '../../shared/types/error.types';
 import { logger } from '../../shared/services/logger.service';
 import { redisService } from '../../shared/services/redis.service';
 import { safeJsonParse } from '../../shared/utils/safe-json.utils';
+import { DEFAULT_AVG_SPEED_KMH } from '../../shared/utils/geospatial.utils';
 import { prismaClient } from '../../shared/database/prisma.service';
 import { driverPresenceService } from './driver-presence.service';
 import { DashboardData, EarningsData, PerformanceData } from './driver.types';
@@ -129,8 +130,8 @@ class DriverPerformanceService {
       // Total distance
       const totalDistance = Array.from(distanceMap.values()).reduce((sum, d) => sum + d, 0);
 
-      // On-time calculation
-      const AVG_SPEED_KMH = 30;
+      // On-time calculation — F-A-28: pull AVG_SPEED_KMH from SSOT
+      const AVG_SPEED_KMH = DEFAULT_AVG_SPEED_KMH;
       const BUFFER_MINUTES = 30;
       const withTimes = completedAssignments.filter(a => a.startedAt && a.completedAt);
 

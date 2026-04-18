@@ -410,6 +410,21 @@ export const FLAGS = {
     category: 'release' as const,
     description: 'Unified 24h TTL for idempotency + active-broadcast (F-A-24)',
   },
+
+  // --- F-A-27: Reject stale prices with 409 PRICE_STALE ---
+  // ⚠ PRE-SHIP CHECKLIST: DO NOT FLIP until external Android F-A-26 DAU >=90%.
+  REJECT_STALE_PRICE_409: {
+    env: 'FF_REJECT_STALE_PRICE_409',
+    category: 'release' as const,
+    description: 'Throw 409 PRICE_STALE on price divergence (F-A-27); Android DAU-gated',
+  },
+
+  // --- F-A-30: Refactored calculateEstimate orchestrator (PricingV2) ---
+  PRICING_V2: {
+    env: 'FF_PRICING_V2',
+    category: 'release' as const,
+    description: 'Refactored calculateEstimate orchestrator (F-A-30); golden-master gated',
+  },
 } as const;
 
 // ---------------------------------------------------------------------------
