@@ -1684,15 +1684,10 @@ export function emitToUser(userId: string, event: string, data: any): boolean {
     return false;
   }
 
-  // FIX-9 (#44): Warn when Redis adapter is down — emit only reaches local instance
-  if (!redisPubSubInitialized) {
-    logger.warn('[Socket] Redis adapter down — broadcasting to local instance only');
-  }
-
-  // M18 (P1-T1.2): Warn + count when Redis adapter is down. Emit only reaches
-  // the local ECS task; counter quantifies blast radius of the outage window
-  // (existing socket_adapter_failure_total fires once on state transition,
-  // this one fires per-emit).
+  // FIX-9 (#44) + M18 (P1-T1.2): Warn + count when Redis adapter is down.
+  // Emit only reaches the local ECS task; counter quantifies blast radius of
+  // the outage window (existing socket_adapter_failure_total fires once on
+  // state transition, this one fires per-emit).
   if (!redisPubSubInitialized) {
     logger.warn('[Socket] Redis adapter down — broadcasting to local instance only', {
       event,
