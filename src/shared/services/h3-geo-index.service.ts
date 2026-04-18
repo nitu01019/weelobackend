@@ -409,13 +409,24 @@ class H3GeoIndexService {
 
     /**
      * Get approximate distance in km between two H3 cells.
-     * Used for sorting candidates by proximity without external API.
-     * Resolution 8 cell edge ≈ 0.461 km.
+     * Used for sorting candidates by proximity (RELATIVE ranking) — not for
+     * absolute radius checks.
+     *
+     * H3 resolution 8 reference numbers (https://h3geo.org/docs/core-library/restable/):
+     *   - Average edge length (circumradius):         ~0.461 km
+     *   - Average center-to-center step per ring:     ~0.798 km (≈ edge × √3)
+     *
+     * The multiplier used below (0.461) is the circumradius, not the
+     * flat-direction step. It under-estimates true center-to-center distance
+     * by ≈ 42 %. That's acceptable for sort-by-proximity (the ordering is
+     * preserved) but NOT safe for an absolute radius gate. Use Haversine on
+     * `h3.cellToLatLng` coordinates for any distance threshold.
      */
     getApproxDistanceKm(cell1: string, cell2: string): number {
         try {
             const gridDistance = h3.gridDistance(cell1, cell2);
-            // Each grid step ≈ 0.461 km (resolution 8 edge length)
+            // Ranking-only estimate: grid step × H3 res-8 circumradius (~0.461 km).
+            // This is NOT the true center-to-center distance; see docstring above.
             return gridDistance * 0.461;
         } catch {
             // gridDistance fails if cells are too far apart — fallback to lat/lng

@@ -727,7 +727,7 @@ class FCMService {
         notification: {
           channelId: this.getChannelId(notification.type),
           sound: 'default',
-          clickAction: 'FLUTTER_NOTIFICATION_CLICK',
+          // note: dropped legacy flutter click-action; Android uses setContentIntent
           // H11: Lock-screen visibility for driver notifications
           ...(isFullScreen ? { visibility: 'public' as const } : {}),
         }

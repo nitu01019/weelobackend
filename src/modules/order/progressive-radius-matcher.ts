@@ -64,7 +64,19 @@ export interface CandidateTransporter {
 
 /**
  * Fix H-X2: Unified 6-step progressive radius expansion with H3 ring mappings.
- * Ring K -> approximate radius: ringK x 0.461km (H3 res 8 edge length)
+ *
+ * H3 resolution 8 reference numbers (canonical: https://h3geo.org/docs/core-library/restable/):
+ *   - Average edge length (circumradius):        ~0.461 km
+ *   - Average center-to-center step per ring:    ~0.798 km (≈ edge × √3, flat direction)
+ *
+ * The `h3RingK` values below intentionally OVER-select the H3 ring so the true
+ * geographic radius is fully covered; the exact radius is enforced downstream
+ * by a Haversine trim (see candidate filter in this module). Do NOT estimate
+ * radius as `ringK × 0.461`: 0.461 km is the circumradius, not the step size,
+ * and that shortcut would UNDER-cover at large rings. If a future reader wants
+ * a ring-to-radius rule of thumb, use `ringK × 0.798` — but even then, the
+ * Haversine trim is still required.
+ *
  * Total: 10+10+15+15+15+15 = 80s < 108s (passes booking.service startup validation)
  */
 export const PROGRESSIVE_RADIUS_STEPS: RadiusStep[] = [
