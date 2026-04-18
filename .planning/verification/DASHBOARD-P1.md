@@ -202,7 +202,7 @@ Embedded Metric Format lines written to stdout on every counter increment. The e
 
 **Evidence it's a clean fit here**
 - `Dockerfile.production:36` logs to stdout; no file mounts to re-wire.
-- `metrics.service.ts:465` (`incrementCounter`) and `:572` (`getPrometheusMetrics`) are single chokepoints — one place to hook EMF.
+- `metrics.service.ts:128` (`incrementCounter`) and `:243` (`getPrometheusMetrics`) are single chokepoints — one place to hook EMF. (Line numbers verified against `origin/main-new` baseline; grep-pattern-stable even if lines drift further.)
 - `@aws-sdk/client-kinesis`/`-s3`/`-sns` are already in `package.json`; adding `aws-embedded-metrics` (~60KB) is not a footprint concern.
 - CLAUDE.md §"Metrics Counters Not Registered" shows the metrics path was recently consolidated into `metrics-definitions.ts`; EMF is a natural next layer on top.
 

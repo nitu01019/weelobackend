@@ -26,7 +26,7 @@ One row per teammate. T1.7 updates as each teammate sends PR URL + SHA via SendM
 
 From `.planning/verification/P1-TEAM-ONBOARDING.md` §"End-of-phase exit gate". All must be true before declaring Phase 1 done:
 
-- [ ] All 7 PRs merged to `main` (or ready-to-merge — director performs the actual merge).
+- [ ] All 7 PRs merged to `main-new` (or ready-to-merge — director performs the actual merge; `main-new` is the engineering trunk per the 2026-04-19 onboarding correction).
 - [ ] All new counters visible on `/metrics` endpoint, registered (no auto-create warnings in 24h window).
 - [ ] CloudWatch dashboard `weelo-broadcast-baseline-p1` populated with ≥1h of real-traffic data.
   - **PARTIAL by director agreement:** dashboard JSON + alarms shipped in this PR; live-data render contingent on the Prometheus→CloudWatch bridge being wired up (see §3 follow-up `P1-FOLLOWUP-1`). Panels stay in `INSUFFICIENT_DATA` until then. Director has accepted this partial state as acceptable for Phase 1 exit.
@@ -66,7 +66,7 @@ _[pending]_
 #### Dashboard + handoff (T1.7) — evidence
 - Dashboard JSON widget count: 11 (validated via `python3 -m json.tool`).
 - Alarms installed by script: 5 (1 P2, 4 P3).
-- `scripts/monitoring/setup-alarms.sh` unmodified — verified via `git diff main -- scripts/monitoring/setup-alarms.sh` returning empty.
+- `scripts/monitoring/setup-alarms.sh` unmodified — verified via `git diff main-new -- scripts/monitoring/setup-alarms.sh` returning empty.
 - Self-review log in PR body covers CRITICAL/HIGH bash + JSON findings (empty-array `set -u` safety, M18 threshold semantics).
 
 _[this PR is the deliverable]_
@@ -87,7 +87,7 @@ _Record anything that diverges from SPRINT-PLAN or was deliberately deferred._
 
 **Why this one (not ADOT sidecar or Lambda scraper):**
 1. **Zero new infra.** No new container in the ECS task definition, no IAM policy changes, no EventBridge schedule, no VPC/SG rework. `Dockerfile.production:36` already logs to stdout and task logs already flow to CloudWatch (see `weelobackendtask` log group references in CLAUDE.md §"How to Check CloudWatch Logs").
-2. **Smallest diff, single file.** `src/shared/monitoring/metrics.service.ts:465` (`incrementCounter`) and `:572` (`getPrometheusMetrics`) are the only chokepoints. Estimated ~30-40 LOC. T1.6 just consolidated this file, so the team's context is already loaded.
+2. **Smallest diff, single file.** `src/shared/monitoring/metrics.service.ts:128` (`incrementCounter`) and `:243` (`getPrometheusMetrics`) are the only chokepoints. Estimated ~30-40 LOC. T1.6 already consolidated this file on `main-new`, so the team's context is already loaded. Line numbers verified against `origin/main-new`; if lines drift, grep for the symbol names.
 3. **Footprint already paid.** `package.json` already includes `@aws-sdk/client-kinesis`, `@aws-sdk/client-s3`, `@aws-sdk/client-sns` — adding `aws-embedded-metrics` is not a new-dep concern.
 4. **ADOT is rejected for P1-FOLLOWUP-1** because a new sidecar changes the task definition + IAM + resource budget for every ECS task, which is a deploy-wide perturbation we do not want entangled with the Phase 2 canary. It's a legitimate option for a later phase if label cardinality explodes.
 5. **Lambda scraper is rejected** because it is sampling-based (misses sub-minute spikes on M18 alarm), requires a VPC Lambda for internal ECS reach, and is more code than the EMF approach it's meant to avoid writing.
