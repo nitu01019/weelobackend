@@ -12,7 +12,7 @@ One row per teammate. T1.7 updates as each teammate sends PR URL + SHA via SendM
 
 | Teammate | Task # | Tickets | Branch | PR URL | Head SHA | Counters added | /review status | Task status |
 |---|---|---|---|---|---|---|---|---|
-| t1-1-obs-broadcast | 8 | L3, L7 | `phase-p1/t1-1-obs-broadcast` | _PR TBD (human opens)_ | `9e53b32e` | `eta_ranking_fallback_total{reason,stepIndex,errorClass}`, `fleet_cache_corruption_total{keyPrefix}` | _awaiting /review output; 11 jest (4 L3 + 7 L7) per team-lead_ | completed |
+| t1-1-obs-broadcast | 8 | L3, L7 | `phase-p1/t1-1-obs-broadcast` | _PR TBD (human opens)_ | `f235f42e` (rebased onto main-new, supersedes `9e53b32e`) | `eta_ranking_fallback_total{reason,stepIndex,errorClass}`, `fleet_cache_corruption_total{keyPrefix}` | _awaiting /review output; 11/11 jest green per team-lead_ | completed |
 | t1-2-obs-postcommit | 1 | L2, M18 | `phase-p1/t1-2-obs-postcommit` | _waiting_ | _waiting_ | _waiting_ | _waiting_ | in_progress |
 | t1-3-comments-customer (backend) | 5 | L4, M9 | `phase-p1/t1-3-comments-m9-cleanup` | _PR TBD (human opens)_ | `16ce444c` (L4+M9) + `b8b3298e` (channel-rename test) — rebased onto main-new, supersedes `90ec3be7` | none (docs/grep cleanup) | _awaiting /review output; 3/3 jest green per team-lead_ | completed |
 | t1-3-comments-customer (customer-app) | 5 | L1 | `phase-p1/t1-3-legacy-fallback-analytics` (nitu01019/weelo) | _PR TBD (human opens)_ | `e3fbfe7` (supersedes `571ea44`) | L1 analytics event only (Crashlytics wrapper, no new SDK) | _awaiting /review output; 8/8 tests green per team-lead_ | completed |
@@ -41,7 +41,8 @@ From `.planning/verification/P1-TEAM-ONBOARDING.md` §"End-of-phase exit gate". 
 
 #### L3 + L7 (T1.1) — evidence
 - **Task status:** completed.
-- **Commit:** `9e53b32e` on `phase-p1/t1-1-obs-broadcast`.
+- **Commit:** `f235f42e` on `phase-p1/t1-1-obs-broadcast`, rebased onto `main-new` (supersedes pre-rebase `9e53b32e`). All 11 jest tests still green post-rebase.
+- **L3 label-cardinality note (per T1.1 confirmation via team-lead):** `errorClass` values come from the small closed set of Node stdlib error class names (`Error`, `TypeError`, `TimeoutError`, etc.), not user-provided strings — cardinality bounded. The dashboard's SEARCH-expression pivot on Panel #2 handles this correctly: it auto-discovers whatever `errorClass` values actually fire in production.
 - **Counters landed (authoritative schema, per team-lead ship report):**
   - `eta_ranking_fallback_total{reason, stepIndex, errorClass}` — 3 labels.
   - `fleet_cache_corruption_total{keyPrefix}` — 1 label.
