@@ -16,7 +16,7 @@ One row per teammate. T1.7 updates as each teammate sends PR URL + SHA via SendM
 | t1-2-obs-postcommit | 1 | L2, M18 | `phase-p1/t1-2-obs-postcommit` | _waiting_ | _waiting_ | _waiting_ | _waiting_ | in_progress |
 | t1-3-comments-customer (backend) | 5 | L4, M9 | `phase-p1/t1-3-comments-m9-cleanup` | _PR TBD (human opens)_ | `16ce444c` (L4+M9) + `b8b3298e` (channel-rename test) — rebased onto main-new, supersedes `90ec3be7` | none (docs/grep cleanup) | _awaiting /review output; 3/3 jest green per team-lead_ | completed |
 | t1-3-comments-customer (customer-app) | 5 | L1 | `phase-p1/t1-3-legacy-fallback-analytics` (nitu01019/weelo) | _PR TBD (human opens)_ | `e3fbfe7` (supersedes `571ea44`) | L1 analytics event only (Crashlytics wrapper, no new SDK) | _awaiting /review output; 8/8 tests green per team-lead_ | completed |
-| t1-4-dba-indexes | 7 | SC1, SC2 | `phase-p1/t1-4-dba-indexes` | _PR TBD (human opens)_ | `9c3545eb` | none (SQL migration) | _awaiting /review output_ | completed |
+| t1-4-dba-indexes | 7 | SC1, SC2 | `phase-p1/t1-4-dba-indexes` | https://github.com/nitu01019/weelobackend/pull/new/phase-p1/t1-4-dba-indexes | `ae60a1db` (supersedes earlier `9c3545eb`) | none (SQL migration + schema.prisma annotation comments only, no `@@index` additions) | _awaiting /review output_ | completed |
 | t1-5-boot-path | 3 | SC8, L6 | `phase-p1/t1-5-boot-path` | _PR TBD (human opens)_ | `9ee6b748` | `server_boot_scan_ms` (+ L6 log line) | _awaiting /review output — 12/12 regression green per T1.5 handoff_ | completed |
 | t1-6-metrics-infra | 2 | pre-reg + naming spec | `phase-p1/t1-6-metrics-infra` | _PR TBD (human opens)_ | `181666a6` (rebased onto main-new) | shared `metrics-definitions.ts` (additive — main-new already has the delegation refactor) | _awaiting /review output; 4/4 tests green per team-lead_ | completed |
 | t1-7-dashboard-handoff | 4 | dashboard + handoff | `phase-p1/t1-7-dashboard-handoff` | _this draft PR_ | _head-at-submit_ | none (consumer) | self-review in PR body | in_progress |
@@ -66,12 +66,26 @@ _[pending]_
 
 #### SC1 + SC2 (T1.4) — evidence
 - **Task status:** completed.
-- **Commit:** `9c3545eb` on `phase-p1/t1-4-dba-indexes`.
+- **Commit:** `ae60a1db` on `phase-p1/t1-4-dba-indexes`. (Supersedes earlier `9c3545eb` — T1.4 advanced their branch after that initial SHA was reported.)
+- **Index names (authoritative):**
+  - `idx_user_kyc_broadcast` (SC1) — non-partial composite on `User`.
+  - `idx_vehicle_key_avail` (SC2) — **partial** index on `Vehicle WHERE isActive AND status='available'`.
+- **Deliverables (4 files, 836 insertions per T1.4 ship report):**
+  - `prisma/manual-migrations/phase-p1-sc1-sc2-indexes.sql` — the production SQL.
+  - `prisma/schema.prisma` — **annotation comments only, no `@@index` additions.** Two reasons per T1.4: (a) SC1 needs `F-B-75`'s `kycStatus` field which may not yet be in the schema on `main`; (b) SC2 is a partial index and Prisma's DSL cannot express the partial predicate. Correcting a prior ledger claim that stated `@@index(map:…)` was present — that was wrong.
+  - `scripts/phase-p1-sc1-sc2-dry-run.ts` — Docker-based local harness. T1.4 reports Docker daemon was down on their workstation so the harness exited with code 2 (by design); **director MUST re-run this harness locally before the prod window** to validate the SQL against a disposable container.
+  - `.planning/verification/PRODUCTION-INDEX-RUNBOOK-P1.md` — execution runbook with snapshot → psql → verify → rollback steps + a Step 4 Appendix covering scheduled-Lambda export of `pg_stat_user_indexes.idx_scan` to CloudWatch namespace `Weelo/Database`, metric `PgIndexScans`, dimension `IndexName=<name>` (directly usable for a later dashboard panel).
 - **Divergence notes — RESOLVED (per team-lead confirmation):**
   1. **`BEGIN / COMMIT` removed** around `CREATE INDEX CONCURRENTLY`. Postgres forbids `CREATE INDEX CONCURRENTLY` inside an explicit transaction block, so the manual SQL file correctly omits the wrapper. Director can run the file directly via psql without splitting.
-  2. **Prisma schema uses `@@index(map: "idx_...")`**. This is the correct form for Prisma v4+ (`name:` is deprecated). The `map:` string matches the index name created by the manual SQL, so `prisma generate` and future `prisma db pull` runs will stay consistent with the production schema.
-- _T1.4 to paste (for final evidence fill-in):_ Path to `prisma/manual-migrations/phase-p1-sc1-sc2-indexes.sql`, path to `PRODUCTION-INDEX-RUNBOOK-P1.md`, dry-run output, schema diff.
-- _Post-director-execution (still gated):_ pg_stat_user_indexes query output (1h after apply), EXPLAIN ANALYZE before/after on broadcast query. This data cannot exist until the director runs the SQL on production — exit-gate criterion stays open.
+  2. **No `@@index` additions in schema.prisma** (corrected above). Prior ledger entry claiming `@@index(map: "idx_…")` is withdrawn as inaccurate — T1.4 chose annotation comments instead for the two reasons listed under Deliverables.
+- **Director handoff sequence (T1.4's specified order):**
+  1. Verify `F-B-75` has landed in prod (`kycStatus` column exists on `User`) — pre-flight SQL is in the runbook.
+  2. Take RDS snapshot.
+  3. `psql "$PROD_DATABASE_URL" -f prisma/manual-migrations/phase-p1-sc1-sc2-indexes.sql`.
+  4. Verify `indisvalid = true` on both indexes.
+  5. Wait 1h, confirm `idx_scan > 0`.
+  6. T1.7 (me) considers adding a CloudWatch panel once the Lambda-export pattern from the runbook Step 4 Appendix is live — **note: not a Phase-1 deliverable; queued as a potential Phase-2 follow-up since SC1/SC2 exit-gate uses manual psql, not CW.**
+- _Post-director-execution (still gated on human operator, not T1.4):_ pg_stat_user_indexes query output (1h after apply), EXPLAIN ANALYZE before/after on broadcast query. This data cannot exist until the director runs the SQL on production — exit-gate criterion stays open.
 
 #### SC8 + L6 (T1.5) — evidence
 - **Task status:** completed.
