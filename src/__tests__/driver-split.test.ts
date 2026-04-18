@@ -1064,10 +1064,14 @@ describe('Driver Presence Service', () => {
       lat: 12.97, lng: 77.59, battery: 85, speed: 30,
     });
 
+    // F-B-05: PRESENCE_TTL_SECONDS is now sourced from presence.config
+    // (36 = 3 × 12s heartbeat). Import the canonical constant instead of a
+    // literal to prevent silent drift.
+    const { DRIVER_PRESENCE_TTL_SECONDS } = require('../shared/config/presence.config');
     expect(mockRedisSet).toHaveBeenCalledWith(
       expect.stringContaining(`driver:presence:${DRIVER_ID}`),
       expect.any(String),
-      35 // PRESENCE_TTL_SECONDS
+      DRIVER_PRESENCE_TTL_SECONDS
     );
   });
 

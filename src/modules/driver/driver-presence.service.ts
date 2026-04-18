@@ -16,23 +16,23 @@ import { redisService } from '../../shared/services/redis.service';
 import { prismaClient } from '../../shared/database/prisma.service';
 import { AvailabilityData } from './driver.types';
 import { getErrorMessage } from '../../shared/utils/error.utils';
+import { DRIVER_PRESENCE_TTL_SECONDS as PRESENCE_TTL_SECONDS } from '../../shared/config/presence.config';
 
 // =============================================================================
 // REDIS KEY PATTERNS — Driver Online/Offline Presence System
 // =============================================================================
-// driver:presence:{driverId}                → SET with TTL 35s (live connectivity)
+// driver:presence:{driverId}                → SET with TTL from presence.config (F-B-05)
 // transporter:{transporterId}:onlineDrivers → SET of online driverIds
 //
 // TTL DESIGN:
-//   Heartbeat interval = 12 seconds
-//   Redis TTL = 35 seconds
+//   Heartbeat interval = 12 seconds (HEARTBEAT_INTERVAL_SECONDS)
+//   Redis TTL          = 36 seconds (DRIVER_PRESENCE_TTL_SECONDS = 3× heartbeat)
 //   → 3 retry windows before auto-offline
 //   → Handles 4G instability / network jitter
 //
 // ZERO DB WRITES for heartbeat — only Redis SET with TTL extension
 // DB writes ONLY on manual button press (isAvailable = true/false)
 // =============================================================================
-const PRESENCE_TTL_SECONDS = 35;  // Must be > 2x heartbeat interval
 const PRESENCE_KEY = (driverId: string) => `driver:presence:${driverId}`;
 const ONLINE_DRIVERS_KEY = (transporterId: string) => `transporter:${transporterId}:onlineDrivers`;
 

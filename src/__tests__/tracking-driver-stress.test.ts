@@ -273,6 +273,7 @@ import { driverPresenceService } from '../modules/driver/driver-presence.service
 import { driverPerformanceService } from '../modules/driver/driver-performance.service';
 import { REDIS_KEYS, TTL } from '../modules/tracking/tracking.types';
 import { AppError } from '../shared/types/error.types';
+import { DRIVER_PRESENCE_TTL_SECONDS } from '../shared/config/presence.config';
 
 // =============================================================================
 // HELPERS
@@ -1205,10 +1206,11 @@ describe('Tracking & Driver Stress Tests', () => {
         lat: 12.97, lng: 77.59, battery: 85, speed: 30
       });
 
+      // F-B-05: sourced from presence.config (36 = 3 × 12s heartbeat)
       expect(mockRedisSet).toHaveBeenCalledWith(
         `driver:presence:${DRIVER_ID}`,
         expect.any(String),
-        35 // PRESENCE_TTL_SECONDS
+        DRIVER_PRESENCE_TTL_SECONDS
       );
     });
 
@@ -1278,7 +1280,7 @@ describe('Tracking & Driver Stress Tests', () => {
       expect(mockRedisSet).toHaveBeenCalledWith(
         `driver:presence:${DRIVER_ID}`,
         expect.any(String),
-        35
+        DRIVER_PRESENCE_TTL_SECONDS
       );
       expect(mockRedisSAdd).toHaveBeenCalled();
     });

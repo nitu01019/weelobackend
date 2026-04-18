@@ -46,6 +46,7 @@ import { logger } from './logger.service';
 import { db } from '../database/db';
 import { prismaClient } from '../database/prisma.service';
 import { h3GeoIndexService } from './h3-geo-index.service';
+import { TRANSPORTER_PRESENCE_TTL_SECONDS } from '../config/presence.config';
 
 // =============================================================================
 // REDIS KEY CONSTANTS (shared with transporter.routes.ts)
@@ -57,8 +58,13 @@ export const ONLINE_TRANSPORTERS_SET = 'online:transporters';
 /** Redis presence key pattern — TTL-based auto-offline on app crash */
 export const TRANSPORTER_PRESENCE_KEY = (id: string) => `transporter:presence:${id}`;
 
-/** Presence key TTL in seconds (must match transporter.routes.ts) */
-export const PRESENCE_TTL_SECONDS = 60; // 6× normal heartbeat interval — generous buffer for 2G/EDGE networks
+/**
+ * Presence key TTL in seconds — sourced from the canonical presence config
+ * (F-B-05 SSOT). Transporter TTL is 5× heartbeat (vs 3× for drivers) as a
+ * documented exception: transporter apps spend more time backgrounded so
+ * cellular-suspension tolerance per Discord gateway docs applies.
+ */
+export const PRESENCE_TTL_SECONDS = TRANSPORTER_PRESENCE_TTL_SECONDS;
 
 // =============================================================================
 // SERVICE CLASS

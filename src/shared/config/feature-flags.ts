@@ -335,6 +335,18 @@ export const FLAGS = {
     category: 'release' as const,
     description: 'Consolidated createOrder: awaited dispatch + smart-timeout init (F-A-50)',
   },
+
+  // --- F-A-37: Redis-backed geocoding rate limit (SSOT) ---
+  // Replaces per-ECS-task in-memory Map at geocoding.routes.ts with a shared
+  // ElastiCache key scoped per {endpoint, ip}, capped via atomic Lua
+  // (INCRBY + EXPIRE + cap check). Default OFF for safe rollout — when OFF,
+  // the legacy Map path is retained. When ON, all tasks share one budget.
+  // Fail-open on Redis error with `geocode_ratelimit_fallopen_total` counter.
+  GEOCODE_RATELIMIT_REDIS: {
+    env: 'FF_GEOCODE_RATELIMIT_REDIS',
+    category: 'release' as const,
+    description: 'Redis SSOT rate-limit for geocoding endpoints (F-A-37)',
+  },
 } as const;
 
 // ---------------------------------------------------------------------------

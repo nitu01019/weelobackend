@@ -19,26 +19,32 @@ import { routingService } from './routing.service';
 import { logger } from '../../shared/services/logger.service';
 import { placesRateLimiter } from '../../shared/middleware/rate-limiter.middleware';
 import { authMiddleware } from '../../shared/middleware/auth.middleware';
+import { FLAGS, isEnabled } from '../../shared/config/feature-flags';
+import { checkAndIncrementIpBudget } from '../../shared/services/rate-limit.service';
 
 const router = Router();
 
 // =============================================================================
 // PER-IP DAILY BUDGET PROTECTION - Prevents Google Maps bill abuse
 // =============================================================================
-// 
+//
 // SCALABILITY: Per-IP tracking prevents any single user from abusing the API
-//   while allowing millions of legitimate users. Map auto-cleans every hour.
-// 
+//   while allowing millions of legitimate users.
+//
 // SECURITY: Even if someone bypasses rate limiter, budget hard-caps their calls.
 //   Tracked per-IP (not global), so one abuser doesn't block all users.
-// 
-// EASY UNDERSTANDING:
-//   - Each IP gets X calls per day per API type
-//   - Exceeding = 429 Too Many Requests
-//   - Counters reset at midnight
-//   - Old entries cleaned every hour to prevent memory leak
-// 
-// CODING STANDARDS: Uses Map for O(1) lookups, setInterval for cleanup
+//
+// TWO PATHS:
+//   - Legacy Map-based path (FF_GEOCODE_RATELIMIT_REDIS=false, default) — per
+//     process state. Susceptible to quota doubling under ECS scale-out. Kept
+//     for safe rollback during F-A-37 rollout.
+//   - Redis SSOT path (FF_GEOCODE_RATELIMIT_REDIS=true) — atomic Lua
+//     cap-and-incr against shared ElastiCache. Every task sees the same
+//     counter per {endpoint, ip}. Fails open on Redis error.
+//
+// F-A-37: delete-on-flip target. Once the flag flips ON in production and
+// soaks for 2 releases, the legacy block below + setInterval cleanup should
+// be removed.
 // =============================================================================
 interface IpBudget {
   search: number;
@@ -53,9 +59,19 @@ const PER_IP_LIMITS = {
   route: 50,      // 50 route calculations/day per IP (most expensive)
 };
 
+/** Seconds in a day — Redis TTL window for the per-IP bucket. */
+const DAY_WINDOW_SECONDS = 86_400;
+
+/** Map type → endpoint slug used in the Redis key and metric label. */
+const ENDPOINT_SLUG: Record<keyof typeof PER_IP_LIMITS, string> = {
+  search: 'geocode:search',
+  reverse: 'geocode:reverse',
+  route: 'geocode:route',
+};
+
 const ipBudgetMap = new Map<string, IpBudget>();
 
-// Clean up stale entries every hour to prevent memory leak
+// Clean up stale entries every hour to prevent memory leak (legacy path only)
 setInterval(() => {
   const today = new Date().toDateString();
   let cleaned = 0;
@@ -71,15 +87,15 @@ setInterval(() => {
 }, 60 * 60 * 1000); // Every hour
 
 function getClientIp(req: Request): string {
-  return (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() 
-    || req.socket.remoteAddress 
+  return (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim()
+    || req.socket.remoteAddress
     || 'unknown';
 }
 
-function checkIpBudget(req: Request, type: 'search' | 'reverse' | 'route'): boolean {
+function checkIpBudgetLegacy(req: Request, type: 'search' | 'reverse' | 'route'): boolean {
   const ip = getClientIp(req);
   const today = new Date().toDateString();
-  
+
   let budget = ipBudgetMap.get(ip);
   if (!budget || budget.date !== today) {
     // Prevent unbounded memory growth from IP map (memory leak protection)
@@ -89,14 +105,39 @@ function checkIpBudget(req: Request, type: 'search' | 'reverse' | 'route'): bool
     budget = { search: 0, reverse: 0, route: 0, date: today };
     ipBudgetMap.set(ip, budget);
   }
-  
+
   if (budget[type] >= PER_IP_LIMITS[type]) {
     logger.warn(`🚫 IP budget exceeded: ${ip} - ${type} (${budget[type]}/${PER_IP_LIMITS[type]})`);
     return false; // Budget exceeded
   }
-  
+
   budget[type]++;
   return true; // OK
+}
+
+/**
+ * F-A-37: Unified per-IP budget check. Dispatches to Redis SSOT when the
+ * feature flag is ON, otherwise retains legacy Map semantics.
+ *
+ * costUnits defaults to 1. Returns true (allow) on Redis fail-open to
+ * preserve availability. See SOL-2 §F-A-37.
+ */
+async function checkIpBudget(
+  req: Request,
+  type: 'search' | 'reverse' | 'route',
+  costUnits: number = 1,
+): Promise<boolean> {
+  if (isEnabled(FLAGS.GEOCODE_RATELIMIT_REDIS)) {
+    const r = await checkAndIncrementIpBudget({
+      endpoint: ENDPOINT_SLUG[type],
+      ip: getClientIp(req),
+      costUnits,
+      windowSec: DAY_WINDOW_SECONDS,
+      limit: PER_IP_LIMITS[type],
+    });
+    return r.allowed;
+  }
+  return checkIpBudgetLegacy(req, type);
 }
 
 // FIX-17: Require authentication on all geocoding routes (BREAKING CHANGE)
@@ -167,7 +208,7 @@ const routeCalculationSchema = z.object({
 router.post('/search', placesRateLimiter, async (req: Request, res: Response) => {
     try {
         // SECURITY: Per-IP daily budget check (prevents bill abuse)
-        if (!checkIpBudget(req, 'search')) {
+        if (!(await checkIpBudget(req, 'search'))) {
             return res.status(429).json({
                 success: false,
                 error: 'DAILY_LIMIT_EXCEEDED',
@@ -245,7 +286,7 @@ router.post('/search', placesRateLimiter, async (req: Request, res: Response) =>
 router.post('/reverse', placesRateLimiter, async (req: Request, res: Response) => {
     try {
         // SECURITY: Per-IP daily budget check (prevents bill abuse)
-        if (!checkIpBudget(req, 'reverse')) {
+        if (!(await checkIpBudget(req, 'reverse'))) {
             return res.status(429).json({
                 success: false,
                 error: 'DAILY_LIMIT_EXCEEDED',
@@ -326,7 +367,7 @@ router.post('/reverse', placesRateLimiter, async (req: Request, res: Response) =
 router.post('/route', placesRateLimiter, async (req: Request, res: Response) => {
     try {
         // SECURITY: Per-IP daily budget check (prevents bill abuse - route is most expensive)
-        if (!checkIpBudget(req, 'route')) {
+        if (!(await checkIpBudget(req, 'route'))) {
             return res.status(429).json({
                 success: false,
                 error: 'DAILY_LIMIT_EXCEEDED',
@@ -419,7 +460,7 @@ router.post('/route', placesRateLimiter, async (req: Request, res: Response) => 
 router.post('/route-multi', placesRateLimiter, async (req: Request, res: Response) => {
     try {
         // SECURITY: Per-IP daily budget check (route-multi is MOST expensive - uses multiple API calls)
-        if (!checkIpBudget(req, 'route')) {
+        if (!(await checkIpBudget(req, 'route'))) {
             return res.status(429).json({
                 success: false,
                 error: 'DAILY_LIMIT_EXCEEDED',
