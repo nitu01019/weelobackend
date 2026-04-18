@@ -18,7 +18,7 @@ One row per teammate. T1.7 updates as each teammate sends PR URL + SHA via SendM
 | t1-3-comments-customer (customer-app) | 5 | L1 | `phase-p1/t1-3-legacy-fallback-analytics` (nitu01019/weelo) | _PR TBD (human opens)_ | `e3fbfe7` (supersedes `571ea44`) | L1 analytics event only (Crashlytics wrapper, no new SDK) | _awaiting /review output; 8/8 tests green per team-lead_ | completed |
 | t1-4-dba-indexes | 7 | SC1, SC2 | `phase-p1/t1-4-dba-indexes` | _PR TBD (human opens)_ | `9c3545eb` | none (SQL migration) | _awaiting /review output_ | completed |
 | t1-5-boot-path | 3 | SC8, L6 | `phase-p1/t1-5-boot-path` | _PR TBD (human opens)_ | `9ee6b748` | `server_boot_scan_ms` (+ L6 log line) | _awaiting /review output — 12/12 regression green per T1.5 handoff_ | completed |
-| t1-6-metrics-infra | 2 | pre-reg + naming spec | `phase-p1/t1-6-metrics-infra` | _waiting_ | _waiting — task completed, SHA pending_ | shared `metrics-definitions.ts` | _waiting_ | completed |
+| t1-6-metrics-infra | 2 | pre-reg + naming spec | `phase-p1/t1-6-metrics-infra` | _PR TBD (human opens)_ | `181666a6` (rebased onto main-new) | shared `metrics-definitions.ts` (additive — main-new already has the delegation refactor) | _awaiting /review output; 4/4 tests green per team-lead_ | completed |
 | t1-7-dashboard-handoff | 4 | dashboard + handoff | `phase-p1/t1-7-dashboard-handoff` | _this draft PR_ | _head-at-submit_ | none (consumer) | self-review in PR body | in_progress |
 
 ---
@@ -81,8 +81,14 @@ _[pending]_
 - _T1.5 to paste (for final evidence fill-in):_ `server_boot_scan_ms` p50/p95/p99 from the benchmark harness on production-like data volume, before/after server boot duration, and the L6 backpressure log line (grep output showing it fires under simulated load).
 
 #### Metrics infra (T1.6) — evidence
-_T1.6 to paste:_ Path to `metrics-definitions.ts` with all 6 teammates' counters, confirmation of `registerDefault*` delegation, `curl /metrics | wc -l` before/after, naming spec doc.
-_[pending]_
+- **Task status:** completed.
+- **Commit:** `181666a6` on `phase-p1/t1-6-metrics-infra`, rebased onto `main-new`.
+- **Files shipped (per team-lead ledger):**
+  - `src/shared/monitoring/metrics-definitions.ts` (+42) — additive; `main-new` already had the consolidation refactor, so this commit only adds the new P1 counter registrations.
+  - `.planning/verification/METRICS-NAMING-V1.md` (+128) — naming specification; §4 includes the copy-paste reserved-block template teammates use for their per-ticket registrations.
+  - `src/__tests__/p1-t1-6-process-metrics.test.ts` (+45) — 4/4 tests green.
+- **Consistency with T1.7:** my `DASHBOARD-P1.md` §"Metric pipeline" cites `metrics.service.ts:128`/`:243` and `metrics-definitions.ts` as consolidated chokepoints for the EMF bridge — still accurate with T1.6's additive changes on top.
+- _T1.6 to paste:_ Link to `METRICS-NAMING-V1.md` in the PR body, `curl /metrics | wc -l` before/after (should grow by Σ new P1 counters), and confirmation that `registerDefault*` delegation in `metrics.service.ts` is untouched.
 
 #### Dashboard + handoff (T1.7) — evidence
 - Dashboard JSON widget count: 11 (validated via `python3 -m json.tool`).
