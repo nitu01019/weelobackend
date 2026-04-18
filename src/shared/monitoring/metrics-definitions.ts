@@ -111,6 +111,13 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
     counter('tracking.init_failure_total', 'Total tracking initialization failures after all retries'),
     counter('tracking.init_success_total', 'Total successful tracking initializations'),
 
+    // F-A-70 — Dispatch-outbox outcome capture observability.
+    // Labels: source=immediate|poller. `immediate` = awaited createOrder path
+    // captured a DispatchAttemptOutcome inline; `poller` = outcome landed via
+    // the background outbox retry loop. Ratio tells us whether the awaited
+    // (FF_CREATE_ORDER_CONSOLIDATED) path is the dominant success route.
+    counter('order_dispatch_outcome_captured_total', 'Order dispatch outcome captured by source (immediate vs poller)'),
+
     // W0-4 — FCM push priority canary (labels: priority, type).
     // Observability for W0-1's fix (commit 4d071a1 regression). Lets us see
     // the live high/normal breakdown per notification type so a silent flip
@@ -146,6 +153,11 @@ export function registerDefaultGauges(gauges: Map<string, GaugeMetric>): void {
 
     // F-A-86: Candidate-scorer weights boot validation (1 = valid, 0 = invalid/unchecked)
     gauge('scorer_weights_boot_valid', 'Result of BEHAVIORAL_WEIGHTS Zod validation at module load (1 valid, 0 invalid)'),
+
+    // F-A-70: Stale `dispatching` state counter — set to the number of orders
+    // whose `dispatchState='dispatching'` hasn't advanced past a threshold age.
+    // Non-zero and growing = the outbox poller is lagging, worth paging oncall.
+    gauge('order_stale_dispatching_state', 'Orders stuck in dispatchState=dispatching past the stale threshold (F-A-70)'),
   ];
 
   for (const def of defs) {

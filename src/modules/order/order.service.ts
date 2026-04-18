@@ -1269,12 +1269,21 @@ class OrderService {
               dispatchAttempts = outcome.dispatchAttempts;
               onlineCandidates = outcome.onlineCandidates;
               notifiedTransporters = outcome.notifiedTransporters;
+              // F-A-70: mark that we captured the outcome inline (awaited path).
+              // `source=immediate` vs `source=poller` lets Grafana show whether
+              // the awaited createOrder path is the dominant success route.
+              metrics.incrementCounter('order_dispatch_outcome_captured_total', { source: 'immediate' });
+              // Reset the stale-dispatching gauge on a successful immediate capture —
+              // the sweep job re-populates it from the authoritative row count.
+              metrics.setGauge('order_stale_dispatching_state', 0);
             } else {
               // Null outcome = flag disabled inside helper / lock contention —
               // leave state as 'dispatching' and let outbox poller retry.
               dispatchState = 'dispatching';
               dispatchReasonCode = 'DISPATCH_RETRYING';
               dispatchAttempts = 1;
+              // F-A-70: attribute the eventual outcome to the background poller.
+              metrics.incrementCounter('order_dispatch_outcome_captured_total', { source: 'poller' });
             }
           } catch (err: unknown) {
             const message = err instanceof Error ? err.message : String(err);

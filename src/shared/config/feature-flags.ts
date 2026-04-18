@@ -356,6 +356,26 @@ export const FLAGS = {
     description: 'Consolidated createOrder: awaited dispatch + smart-timeout init (F-A-50)',
   },
 
+  // --- F-A-69: Smart-timeout leader-election (sweep de-duplication) ---
+  // Today `smart-timeout.service.ts::startExpiryChecker` runs a 15s
+  // `setInterval(checkAndMarkExpired)` on EVERY ECS task. With 3 tasks and no
+  // row-level locking each expired `OrderTimeout` row is processed 3x, so
+  // `handleOrderExpiry` (which emits `order_expired` + FCM + lifecycle
+  // outbox inserts) fires 3x per order.
+  //
+  // Fix: wrap the sweep with `acquireLeader('smart-timeout-leader', ...)` from
+  // the F-A-56 helper AND add `FOR UPDATE SKIP LOCKED` to the inner row claim
+  // (belt-and-braces — leader lapse during GC pause still can't duplicate
+  // work because Postgres row locks block concurrent claims).
+  //
+  // Default OFF for soak-safe rollout. Matches the F-A-56 / F-M10 pattern
+  // already proven on the dispatch-outbox poller.
+  SMART_TIMEOUT_LEADER_ELECTION: {
+    env: 'FF_SMART_TIMEOUT_LEADER_ELECTION',
+    category: 'release' as const,
+    description: 'Leader-election + SKIP LOCKED for smart-timeout sweep (F-A-69)',
+  },
+
   // --- F-A-37: Redis-backed geocoding rate limit (SSOT) ---
   // Replaces per-ECS-task in-memory Map at geocoding.routes.ts with a shared
   // ElastiCache key scoped per {endpoint, ip}, capped via atomic Lua

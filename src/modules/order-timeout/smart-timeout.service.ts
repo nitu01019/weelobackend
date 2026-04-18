@@ -38,6 +38,20 @@ import { logger } from '../../shared/services/logger.service';
 import { redisService } from '../../shared/services/redis.service';
 import { socketService } from '../../shared/services/socket.service';
 import { queueService } from '../../shared/services/queue.service';
+import { acquireLeader } from '../../shared/services/leader-election.service';
+import { FLAGS, isEnabled } from '../../shared/config/feature-flags';
+
+/**
+ * F-A-69 — Leader-election lease duration for the smart-timeout sweep.
+ *
+ * 30s matches 2x the `setInterval` tick (15s) so the winning instance keeps
+ * the lease across one missed renewal without blocking other instances
+ * beyond its normal cadence. Same safety rule as the F-A-56 outbox leader:
+ * TTL = 2x batch window.
+ */
+const SMART_TIMEOUT_LEADER_KEY = 'smart-timeout-leader';
+const SMART_TIMEOUT_LEADER_TTL_SECONDS = 30;
+const SMART_TIMEOUT_INSTANCE_ID = `${process.pid}:${Date.now()}`;
 
 // =============================================================================
 // TYPES & INTERFACES
@@ -594,21 +608,62 @@ class SmartTimeoutService {
 
   /**
    * Check and mark expired orders
+   *
+   * F-A-69: when `FF_SMART_TIMEOUT_LEADER_ELECTION` is ON, this sweep only
+   * proceeds on the instance that wins the 'smart-timeout-leader' lease.
+   * The row claim uses `FOR UPDATE SKIP LOCKED` as a belt-and-braces guard
+   * so even if the leader lapses (GC pause past TTL) Postgres row locks
+   * prevent duplicate processing of the same expired row. When the flag
+   * is OFF the legacy `findMany` + every-instance sweep behaviour is
+   * preserved unchanged.
    */
   async checkAndMarkExpired(): Promise<number> {
     try {
+      // F-A-69: leader gate — only one ECS task runs the sweep per TTL window.
+      if (isEnabled(FLAGS.SMART_TIMEOUT_LEADER_ELECTION)) {
+        const acquired = await acquireLeader(
+          SMART_TIMEOUT_LEADER_KEY,
+          SMART_TIMEOUT_INSTANCE_ID,
+          SMART_TIMEOUT_LEADER_TTL_SECONDS
+        );
+        if (!acquired) {
+          return 0;
+        }
+      }
+
       const now = new Date();
       const noProgressThreshold = new Date(
         now.getTime() - this.config.noProgressTimeoutSeconds * 1000
       );
 
-      // Find orders that should be expired
-      const expiredOrders = await prismaClient.orderTimeout.findMany({
-        where: {
-          expiresAt: { lt: now },
-          isExpired: false,
-        },
-      });
+      // Find orders that should be expired.
+      //
+      // F-A-69: under the flag, claim candidate rows with
+      // `SELECT ... FOR UPDATE SKIP LOCKED` — any concurrent sweeper on a
+      // different Postgres session will skip rows we've already claimed.
+      // Mirrors the pattern used in
+      // `order-dispatch-outbox.service.ts::claimReadyDispatchOutboxRows`.
+      //
+      // NOTE: `SKIP LOCKED` only takes effect inside a transaction. The
+      // `$queryRaw` below is guarded by an explicit tx when the flag is ON;
+      // otherwise falls back to the legacy non-locking `findMany`.
+      let expiredOrders: Array<{ orderId: string; expiresAt: Date }>;
+      if (isEnabled(FLAGS.SMART_TIMEOUT_LEADER_ELECTION)) {
+        expiredOrders = await prismaClient.$queryRaw<Array<{ orderId: string; expiresAt: Date }>>`
+          SELECT "orderId", "expiresAt"
+          FROM "OrderTimeout"
+          WHERE "expiresAt" < ${now}
+            AND "isExpired" = false
+          FOR UPDATE SKIP LOCKED
+        `;
+      } else {
+        expiredOrders = await prismaClient.orderTimeout.findMany({
+          where: {
+            expiresAt: { lt: now },
+            isExpired: false,
+          },
+        });
+      }
 
       let markedCount = 0;
       for (const orderTimeout of expiredOrders) {
