@@ -1,0 +1,30 @@
+{
+  "owner": "t1-2-obs-postcommit",
+  "ticket": "P1-M18",
+  "purpose": "Alerts ops when Socket.IO emits fire while the Redis adapter is down — emits in this window only reach the local ECS task and miss users on other tasks (multi-instance broadcast gap).",
+  "metric": {
+    "name": "socket_emit_while_adapter_down_total",
+    "namespace": "Weelo/Backend",
+    "registeredIn": "src/shared/monitoring/metrics.service.ts",
+    "emittedIn": "src/shared/services/socket.service.ts (emitToUser)",
+    "labels": ["event", "mode"]
+  },
+  "alarm": {
+    "name": "weelo-socket-adapter-degraded-emits",
+    "description": "Socket.IO Redis adapter degraded — emits reaching local-only. Users on other ECS tasks are missing messages. Check ElastiCache health, task CPU/network, and socket.service.ts:setupRedisAdapter retry status.",
+    "statistic": "Sum",
+    "period": 60,
+    "evaluationPeriods": 2,
+    "threshold": 0,
+    "comparisonOperator": "GreaterThanThreshold",
+    "treatMissingData": "notBreaching",
+    "severity": "P2",
+    "runbook": "socket adapter degraded emits > 0 sustained for 2m → check ElastiCache Serverless health, task CPU/network saturation, socket.service.ts:setupRedisAdapter retry log."
+  },
+  "integration": {
+    "ownedBy": "t1-7-dashboard-handoff",
+    "targetScript": "scripts/monitoring/setup-broadcast-p1-alarms.sh",
+    "targetSnsTopic": "$ALARM_SNS_TOPIC_ARN",
+    "notes": "T1.2 does NOT run aws cloudwatch put-metric-alarm; T1.7 wires this descriptor into the Phase-1 alarms script during dashboard handoff."
+  }
+}
