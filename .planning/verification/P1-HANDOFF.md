@@ -15,7 +15,7 @@ One row per teammate. T1.7 updates as each teammate sends PR URL + SHA via SendM
 | t1-1-obs-broadcast | 8 | L3, L7 | `phase-p1/t1-1-obs-broadcast` | _PR TBD (human opens)_ | `9e53b32e` | `eta_ranking_fallback_total{reason,stepIndex,errorClass}`, `fleet_cache_corruption_total{keyPrefix}` | _awaiting /review output; 11 jest (4 L3 + 7 L7) per team-lead_ | completed |
 | t1-2-obs-postcommit | 1 | L2, M18 | `phase-p1/t1-2-obs-postcommit` | _waiting_ | _waiting_ | _waiting_ | _waiting_ | in_progress |
 | t1-3-comments-customer (backend) | 5 | L4, M9 | `phase-p1/t1-3-comments-m9-cleanup` | _PR TBD (human opens)_ | `16ce444c` (L4+M9) + `b8b3298e` (channel-rename test) — rebased onto main-new, supersedes `90ec3be7` | none (docs/grep cleanup) | _awaiting /review output; 3/3 jest green per team-lead_ | completed |
-| t1-3-comments-customer (customer-app) | 5 | L1 | `phase-p1/t1-3-legacy-fallback-analytics` (nitu01019/weelo) | _PR TBD (human opens)_ | `571ea44` | L1 analytics event only (Crashlytics wrapper, no new SDK) | _awaiting /review output; 8/8 tests green per team-lead_ | completed |
+| t1-3-comments-customer (customer-app) | 5 | L1 | `phase-p1/t1-3-legacy-fallback-analytics` (nitu01019/weelo) | _PR TBD (human opens)_ | `e3fbfe7` (supersedes `571ea44`) | L1 analytics event only (Crashlytics wrapper, no new SDK) | _awaiting /review output; 8/8 tests green per team-lead_ | completed |
 | t1-4-dba-indexes | 7 | SC1, SC2 | `phase-p1/t1-4-dba-indexes` | _PR TBD (human opens)_ | `9c3545eb` | none (SQL migration) | _awaiting /review output_ | completed |
 | t1-5-boot-path | 3 | SC8, L6 | `phase-p1/t1-5-boot-path` | _PR TBD (human opens)_ | `9ee6b748` | `server_boot_scan_ms` (+ L6 log line) | _awaiting /review output — 12/12 regression green per T1.5 handoff_ | completed |
 | t1-6-metrics-infra | 2 | pre-reg + naming spec | `phase-p1/t1-6-metrics-infra` | _waiting_ | _waiting — task completed, SHA pending_ | shared `metrics-definitions.ts` | _waiting_ | completed |
@@ -57,7 +57,7 @@ _[pending]_
 - **Task status:** completed.
 - **Two separate PRs (one backend, one customer-app):**
   - **Backend** (L4, M9): branch `phase-p1/t1-3-comments-m9-cleanup`, **rebased onto `main-new`.** Commits: `16ce444c` (L4 + M9 primary) + `b8b3298e` (channel-rename test). Supersedes the pre-rebase SHA `90ec3be7`. Tests: 3/3 jest green. M9 grep verification: zero `FLUTTER_NOTIFICATION_CLICK` matches under `src/` (backend code) per team-lead confirmation. Rebase preserved `main-new`'s richer `fcm.service.ts` `buildMessage` visibility conditional during 3-way conflict resolution.
-  - **Customer-app** (L1): branch `phase-p1/t1-3-legacy-fallback-analytics` in `nitu01019/weelo`, commit `571ea44`. Tests: 8/8 green. Implementation notes: analytics event emitted via the existing Crashlytics wrapper — no new SDK added, no new permissions required.
+  - **Customer-app** (L1): branch `phase-p1/t1-3-legacy-fallback-analytics` in `nitu01019/weelo`, top-of-branch `e3fbfe7` (supersedes earlier `571ea44`). Tests: 8/8 green. Implementation notes: analytics event emitted via the existing Crashlytics wrapper — no new SDK added, no new permissions required.
 - **Follow-ups flagged by T1.3 (tracked but NOT phase-exit blockers):**
   1. Stale peer tests — documented follow-up; detail awaiting T1.3 paste.
   2. M9 spec contradiction — documented follow-up; detail awaiting T1.3 paste.
