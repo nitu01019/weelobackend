@@ -13,12 +13,12 @@ One row per teammate. T1.7 updates as each teammate sends PR URL + SHA via SendM
 | Teammate | Task # | Tickets | Branch | PR URL | Head SHA | Counters added | /review status | Task status |
 |---|---|---|---|---|---|---|---|---|
 | t1-1-obs-broadcast | 8 | L3, L7 | `phase-p1/t1-1-obs-broadcast` | _PR TBD (human opens)_ | `f235f42e` (rebased onto main-new, supersedes `9e53b32e`) | `eta_ranking_fallback_total{reason,stepIndex,errorClass}`, `fleet_cache_corruption_total{keyPrefix}` | _awaiting /review output; 11/11 jest green per team-lead_ | completed |
-| t1-2-obs-postcommit | 1 | L2, M18 | `phase-p1/t1-2-obs-postcommit` | _waiting_ | _waiting_ | _waiting_ | _waiting_ | in_progress |
+| t1-2-obs-postcommit | 1 | L2, M18 | `phase-p1/t1-2-obs-postcommit` | _PR TBD (human opens)_ | `b0dae7f3` over 4 prior commits, **branched off stale `main` — needs rebase onto `main-new`** (see §2) | `post_commit_cache_failure_total{cache}` + `socket_emit_while_adapter_down_total{event,mode}` + shipped M18 alarm descriptor JSON | _awaiting /review output_ | completed |
 | t1-3-comments-customer (backend) | 5 | L4, M9 | `phase-p1/t1-3-comments-m9-cleanup` | _PR TBD (human opens)_ | `16ce444c` (L4+M9) + `b8b3298e` (channel-rename test) — rebased onto main-new, supersedes `90ec3be7` | none (docs/grep cleanup) | _awaiting /review output; 3/3 jest green per team-lead_ | completed |
 | t1-3-comments-customer (customer-app) | 5 | L1 | `phase-p1/t1-3-legacy-fallback-analytics` (nitu01019/weelo) | _PR TBD (human opens)_ | `e3fbfe7` (supersedes `571ea44`) | L1 analytics event only (Crashlytics wrapper, no new SDK) | _awaiting /review output; 8/8 tests green per team-lead_ | completed |
 | t1-4-dba-indexes | 7 | SC1, SC2 | `phase-p1/t1-4-dba-indexes` | https://github.com/nitu01019/weelobackend/pull/new/phase-p1/t1-4-dba-indexes | `9c3545eb` (verified as origin HEAD — intermediate `ae60a1db` never reached origin) | none (SQL migration + schema.prisma: SC1 as real `@@index`, SC2 as DB-only comment due to Prisma DSL partial-index limitation) | _awaiting /review output_ | completed |
 | t1-5-boot-path | 3 | SC8 ✅, L6 ✅ | `phase-p1/t1-5-boot-path` | https://github.com/nitu01019/weelobackend/pull/new/phase-p1/t1-5-boot-path | `e687faeb` over `9ee6b748` (rebased onto main-new; supersedes earlier `82bee32c`) | `server_boot_scan_ms` histogram **registered by T1.6**, T1.5 emits only; L6 ships as a log signal (`[BACKPRESSURE] In-memory mode engaged`) not a counter | _awaiting /review output — 7/7 SC8 + 1/1 L6 + 12/12 phase6 regression green_ | completed (both tickets shipped post-rebase) |
-| t1-6-metrics-infra | 2 | pre-reg + naming spec | `phase-p1/t1-6-metrics-infra` | _PR TBD (human opens)_ | `181666a6` (rebased onto main-new) | shared `metrics-definitions.ts` (additive — main-new already has the delegation refactor) | _awaiting /review output; 4/4 tests green per team-lead_ | completed |
+| t1-6-metrics-infra | 2 | pre-reg + naming spec | `phase-p1/t1-6-metrics-infra` | https://github.com/nitu01019/weelobackend/pull/new/phase-p1/t1-6-metrics-infra | `181666a6` (verified as origin HEAD — T1.6's reported `9d894927` never reached origin) | reserved blocks for T1.1/T1.2/T1.3/T1.5 + NEW gauge `phase1_landed_commit_sha`; §5 manifest note: T1.1 label-counts differ from spec — docs fix follow-up (see §2) | _awaiting /review output; 4/4 tests green per team-lead_ | completed |
 | t1-7-dashboard-handoff | 4 | dashboard + handoff | `phase-p1/t1-7-dashboard-handoff` | _this draft PR_ | _head-at-submit_ | none (consumer) | self-review in PR body | in_progress |
 
 ---
@@ -51,8 +51,24 @@ From `.planning/verification/P1-TEAM-ONBOARDING.md` §"End-of-phase exit gate". 
 - _T1.1 to paste:_ `curl /metrics | grep -E '^(eta_ranking_fallback_total|fleet_cache_corruption_total) '` output showing the full label-value set used in production, and a short description of when each `errorClass` fires (for runbook readers).
 
 #### L2 + M18 (T1.2) — evidence
-_T1.2 to paste:_ Post-commit wrapper grep, M18 simulation output, `alarm-m18-adapter-down.json` path.
-_[pending]_
+- **Task status:** completed.
+- **Commits on origin** (verified via `git log origin/phase-p1/t1-2-obs-postcommit -5`):
+  - `b0dae7f3` — test flake fix (snapshot cloning).
+  - `befa6010` — M18 alarm descriptor + unit tests.
+  - `7c3c5224` — M18 counter emit at `socket.service.ts:emitToUser`.
+  - `fc2172bd` — L2 counter emit at `order.service.ts` fail-soft cache branches.
+  - `f96a3a16` — L2/M18 counter registrations in `metrics.service.ts`.
+- **⚠ Rebase status:** merge-base with `origin/main-new` is `ada8a5430…` = `origin/main` (stale). **T1.2's branch is NOT rebased onto main-new.** This is the same pattern that hit T1.1, T1.3, T1.4, T1.5 earlier; all four rebased successfully. T1.2 will need to do the same before merge to avoid conflicts with `metrics-definitions.ts` (which `main-new` has but stale `main` doesn't — see T1.2's earlier note about registering inline in `metrics.service.ts:initializeDefaultMetrics` because the extraction file wasn't on their branch base). Once rebased, T1.2's inline registrations should be moved to the reserved T1.2 block in `metrics-definitions.ts` per T1.6's `// === P1-T1.2 ===` placeholder. **NOT a phase-exit blocker from T1.7's perspective, but will surface in `/review` — flagged.**
+- **Counter schemas verified at emit sites on origin:**
+  - `socket.service.ts:emitToUser` emits `socket_emit_while_adapter_down_total{event, mode: redisAdapterMode}` — matches T1.6 manifest and my Panel #5 SEARCH (`{Weelo/Backend,event,mode}`).
+  - `order.service.ts` emits `post_commit_cache_failure_total{cache: 'google_directions' | 'idempotency'}` — matches T1.6 manifest and my Panel #4's explicit 2-series definition + my alarm 4a/4b split.
+- **M18 alarm descriptor shipped** at `scripts/monitoring/alarm-m18-adapter-down.json`. Verified contents:
+  - Alarm name: `weelo-socket-adapter-degraded-emits` (not my script's default `weelo-p1-socket-adapter-down`).
+  - Threshold semantics: `statistic=Sum, period=60, evaluationPeriods=2, threshold=0, comparisonOperator=GreaterThanThreshold, treatMissingData=notBreaching` — this is **AND across two 60s windows** (i.e. each of 2 consecutive minutes has ≥1 emit), stricter than my script's default `period=120, evaluationPeriods=1` (OR / any single minute).
+  - Severity: P2. Runbook text embedded in the descriptor.
+  - Integration field declares `ownedBy: "t1-7-dashboard-handoff"`, `targetScript: scripts/monitoring/setup-broadcast-p1-alarms.sh`.
+- **T1.7 wiring (no code change needed):** my `setup-broadcast-p1-alarms.sh` already checks `if [[ -f "${M18_ALARM_JSON}" ]]` and uses `aws cloudwatch put-metric-alarm --cli-input-json "file://${M18_ALARM_JSON}"` when the descriptor is present (falling back to the inline `weelo-p1-socket-adapter-down` alarm otherwise). Once T1.2's branch is merged to trunk, the descriptor file appears and my script picks it up automatically. T1.2's AND-semantics (60s × 2) wins; the inline OR-default is preserved as a failsafe for pre-merge states.
+- _T1.2 to paste during PR review:_ `curl /metrics | grep -E '^(post_commit_cache_failure_total|socket_emit_while_adapter_down_total) '` output showing counter emits under simulated fault injection; rebase-onto-`main-new` confirmation; and a note that T1.6's reserved T1.2 block in `metrics-definitions.ts` is now populated (post-rebase).
 
 #### L1 + L4 + M9 (T1.3) — evidence
 - **Task status:** completed.
@@ -114,13 +130,22 @@ _[pending]_
 
 #### Metrics infra (T1.6) — evidence
 - **Task status:** completed.
-- **Commit:** `181666a6` on `phase-p1/t1-6-metrics-infra`, rebased onto `main-new`.
-- **Files shipped (per team-lead ledger):**
-  - `src/shared/monitoring/metrics-definitions.ts` (+42) — additive; `main-new` already had the consolidation refactor, so this commit only adds the new P1 counter registrations.
-  - `.planning/verification/METRICS-NAMING-V1.md` (+128) — naming specification; §4 includes the copy-paste reserved-block template teammates use for their per-ticket registrations.
+- **Commit:** `181666a6` on `phase-p1/t1-6-metrics-infra`, rebased onto `main-new`. Verified via `git log origin/phase-p1/t1-6-metrics-infra -1` — this is origin HEAD. T1.6's handoff message cited `9d894927` but that SHA **never reached origin** (same pattern as T1.4's `ae60a1db` and T1.3's `90ec3be7`).
+- **Files shipped (verified via `git show --stat origin/phase-p1/t1-6-metrics-infra`):**
+  - `src/shared/monitoring/metrics-definitions.ts` (+42) — adds reserved blocks for T1.1/T1.2/T1.3/T1.5 counter registrations (teammates extend these blocks in their own branches) + T1.6 process metrics (`phase1_landed_commit_sha` gauge + `server_boot_scan_ms` histogram).
+  - `src/shared/monitoring/metrics.service.ts` — type exports + additive register hook at end of `initializeDefaultMetrics` (per T1.6 handoff; not verified line-by-line in this ledger).
+  - `.planning/verification/METRICS-NAMING-V1.md` (+128) — naming specification; §4 includes the copy-paste reserved-block template; §5 carries the P1 counter manifest used by T1.7 dashboard wiring.
   - `src/__tests__/p1-t1-6-process-metrics.test.ts` (+45) — 4/4 tests green.
-- **Consistency with T1.7:** my `DASHBOARD-P1.md` §"Metric pipeline" cites `metrics.service.ts:128`/`:243` and `metrics-definitions.ts` as consolidated chokepoints for the EMF bridge — still accurate with T1.6's additive changes on top.
-- _T1.6 to paste:_ Link to `METRICS-NAMING-V1.md` in the PR body, `curl /metrics | wc -l` before/after (should grow by Σ new P1 counters), and confirmation that `registerDefault*` delegation in `metrics.service.ts` is untouched.
+- **New counter shipped by T1.6 (not referenced by T1.1–T1.5):** `phase1_landed_commit_sha` — gauge, informational, updated by deploy script to the HEAD commit SHA when P1 lands. **Not added to the Phase-1 dashboard** (not an operational signal); could become useful in Phase 2 to correlate alarm state with the last-deployed revision.
+- **Manifest discrepancy flagged** (NOT a T1.6 ship defect — documentation drift only):
+  - T1.6's handoff-message manifest lists L3 as `eta_ranking_fallback_total{reason}` (1 label) and L7 as `fleet_cache_corruption_total` (no labels).
+  - T1.1's actual emit sites on `origin/phase-p1/t1-1-obs-broadcast` use `{reason, stepIndex, errorClass}` (3 labels, verified via `git show origin/phase-p1/t1-1-obs-broadcast:src/modules/order/progressive-radius-matcher.ts | grep -A6 incrementCounter`) and `{keyPrefix}` (1 label, verified in `fleet-cache.service.ts`).
+  - **Authoritative label schema is T1.1's call-site shape**, because this backend's Prometheus wrapper auto-creates the label index from `incrementCounter(name, labels)` calls — the reserved-block comment in `metrics-definitions.ts` is informational and does not constrain the label set.
+  - **Dashboard is correct as-shipped.** Panel #2 uses `{Weelo/Backend,reason,stepIndex,errorClass}`; Panel #3 uses `{Weelo/Backend,keyPrefix}`. Both match T1.1's actual emit. My Panel #5 M18 SEARCH `{Weelo/Backend,event,mode}` matches T1.2's stated plan as well.
+  - **Follow-up owned by T1.6:** update `METRICS-NAMING-V1.md` §5 to reflect T1.1's actual 3-label/1-label schema so the naming spec matches reality. NOT a Phase-1 exit-gate blocker; `/review` may flag it but it's a docs edit not a code change.
+- **L1 backend mirror** — T1.6 lists `booking_legacy_fallback_total{status}` as an **optional backend mirror** of the customer-app Crashlytics event. **Not shipped by any teammate in Phase 1.** If operators want a backend-visible signal that the legacy fallback fired on server side, this is the counter name reserved; future work.
+- **Consistency with T1.7:** my `DASHBOARD-P1.md` §"Metric pipeline" cites `metrics.service.ts:128`/`:243` and `metrics-definitions.ts` as consolidated chokepoints for the EMF bridge — still accurate with T1.6's additive changes. The EMF recommendation stands.
+- _T1.6 to paste during PR review:_ Link to `METRICS-NAMING-V1.md` §5 in the PR body, `curl /metrics | wc -l` before/after showing growth by the number of new P1 counters, confirmation that `registerDefault*` delegation in `metrics.service.ts` is preserved, and the corrected L3/L7 label schema in §5.
 
 #### Dashboard + handoff (T1.7) — evidence
 - Dashboard JSON widget count: 11 (validated via `python3 -m json.tool`).
