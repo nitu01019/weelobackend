@@ -32,7 +32,9 @@ type CountersSnapshot = Record<string, number>;
 function countersFor(name: string): CountersSnapshot {
   const json = metrics.getMetricsJSON();
   const counters = json.counters as Record<string, CountersSnapshot>;
-  return counters[name] ?? {};
+  // getMetricsJSON returns the live label map by reference — clone so
+  // snapshots taken before and after an action are truly independent.
+  return { ...(counters[name] ?? {}) };
 }
 
 function readSource(relPath: string): string {
@@ -121,8 +123,12 @@ describe('P1-T1.2 M18 — socket_emit_while_adapter_down_total', () => {
 
   // Force single-instance mode BEFORE importing socket.service so that
   // `setupRedisAdapter` early-returns and leaves `redisPubSubInitialized = false`.
+  //
+  // NOTE: we intentionally do NOT call `jest.resetModules()` here — that would
+  // cause `require('../monitoring/metrics.service')` inside socket.service to
+  // load a fresh singleton that our top-level `metrics` import doesn't see,
+  // and the counter increment would be invisible to the test.
   beforeAll(async () => {
-    jest.resetModules();
     process.env.REDIS_ENABLED = 'false';
 
     socketModule = require('../shared/services/socket.service') as typeof import('../shared/services/socket.service');
