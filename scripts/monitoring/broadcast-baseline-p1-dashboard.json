@@ -74,14 +74,14 @@
       "width": 12,
       "height": 6,
       "properties": {
-        "title": "M18 — socket_emit_while_adapter_down_total (rate / 1m, grouped by event)",
+        "title": "M18 — socket_emit_while_adapter_down_total (rate / 1m, grouped by event×mode)",
         "view": "timeSeries",
         "stacked": true,
         "region": "ap-south-1",
         "period": 60,
         "stat": "Sum",
         "metrics": [
-          [{"expression": "SEARCH(' {Weelo/Backend,event} MetricName=\"socket_emit_while_adapter_down_total\" ', 'Sum', 60)", "label": "", "id": "e3"}]
+          [{"expression": "SEARCH(' {Weelo/Backend,event,mode} MetricName=\"socket_emit_while_adapter_down_total\" ', 'Sum', 60)", "label": "", "id": "e3"}]
         ],
         "annotations": {
           "alarms": ["arn:aws:cloudwatch:ap-south-1:ACCOUNT_ID:alarm:weelo-p1-socket-adapter-down"]

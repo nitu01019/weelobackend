@@ -106,7 +106,7 @@ Once the bridge is wired and real traffic flows, states should transition to `OK
 | 2 | `eta_ranking_fallback_total{reason,stepIndex,errorClass}` — SEARCH expression, 1 series per `reason` value | L3 (T1.1) | app (Prom → CW) | Yes |
 | 3 | `fleet_cache_corruption_total{keyPrefix}` — SEARCH expression, 1 series per `keyPrefix` value | L7 (T1.1) | app (Prom → CW) | Yes |
 | 4 | `post_commit_cache_failure_total` — 2 explicit series (`cache=google_directions`, `cache=idempotency`) | L2 (T1.2) | app (Prom → CW) | Yes |
-| 5 | `socket_emit_while_adapter_down_total{event}` — SEARCH expression, 1 series per `event` value | M18 (T1.2) | app (Prom → CW) | Yes |
+| 5 | `socket_emit_while_adapter_down_total{event, mode}` — SEARCH expression, 1 series per `event`×`mode` combination (operators can break down by either dimension) | M18 (T1.2) | app (Prom → CW) | Yes |
 | 6 | L1 note (Firebase Analytics only) | L1 (T1.3) | customer-app analytics | N/A (not CW) |
 | 7 | M9 note (removed; verified by grep) | M9 (T1.3) | — | N/A (no metric) |
 | 8 | `server_boot_scan_ms` histogram (p50/p95/p99) | SC8 (T1.5) | app (Prom → CW) | Yes |
