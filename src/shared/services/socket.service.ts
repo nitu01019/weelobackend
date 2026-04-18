@@ -1689,6 +1689,35 @@ export function emitToUser(userId: string, event: string, data: any): boolean {
     logger.warn('[Socket] Redis adapter down — broadcasting to local instance only');
   }
 
+  // M18 (P1-T1.2): Warn + count when Redis adapter is down. Emit only reaches
+  // the local ECS task; counter quantifies blast radius of the outage window
+  // (existing socket_adapter_failure_total fires once on state transition,
+  // this one fires per-emit).
+  if (!redisPubSubInitialized) {
+    logger.warn('[Socket] Redis adapter down — broadcasting to local instance only', {
+      event,
+      userId
+    });
+    try {
+      const { metrics: m } = require('../monitoring/metrics.service') as {
+        metrics: {
+          incrementCounter: (
+            name: string,
+            labels?: Record<string, string>,
+            value?: number
+          ) => void;
+        };
+      };
+      m.incrementCounter('socket_emit_while_adapter_down_total', {
+        event,
+        mode: redisAdapterMode
+      });
+    } catch {
+      // Metrics module unavailable (minimal test harness): observability is
+      // opt-in and must never break the emit path.
+    }
+  }
+
   // Observability: log local socket count (may be 0 in multi-server — that's OK)
   const localSocketCount = userSockets.get(userId)?.size || 0;
 
