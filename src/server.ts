@@ -575,13 +575,23 @@ async function bootstrap(): Promise<void> {
   // -------------------------------------------------------------------------
   // 2. Cache warming (non-blocking — failures are tolerable)
   // -------------------------------------------------------------------------
-  // H3 geo index rebuild
+  // H3 geo index rebuild.
+  // SC8 (P1-T1.5): SCAN path (via clusterScanAllFlat, F-B-08) replaced the
+  // legacy blocking `redisService.keys()` call. This block adds timing
+  // observability via the `server_boot_scan_ms` histogram so we can alarm
+  // if the warm loop regresses on a larger keyspace.
+  //   Reference: https://redis.io/commands/keys/ — "Use SCAN instead".
   if (process.env.FF_H3_INDEX_ENABLED === 'true') {
+    const scanStart = process.hrtime.bigint();
+    let scanRecorded = false;
     try {
       const { h3GeoIndexService } = await import('./shared/services/h3-geo-index.service');
-      // F-B-08: cluster-safe SCAN — legacy redisService.keys() only walked one cluster node
+      // F-B-08: cluster-safe SCAN — legacy redisService.keys() only walked one cluster node.
       const { clusterScanAllFlat } = await import('./shared/services/redis-cluster-scan');
       const geoKeys = await clusterScanAllFlat('geo:transporters:*');
+      const scanMs = Number(process.hrtime.bigint() - scanStart) / 1e6;
+      metrics.observeHistogram('server_boot_scan_ms', scanMs);
+      scanRecorded = true;
       const vehicleKeys = geoKeys.map(k => k.replace('geo:transporters:', '')).filter(Boolean);
 
       if (vehicleKeys.length > 0) {
@@ -597,12 +607,18 @@ async function bootstrap(): Promise<void> {
             };
           }
         );
-        logger.info(`[CacheWarm] H3 index rebuilt: ${count} transporters indexed`);
+        logger.info(`[CacheWarm] H3 index rebuilt: ${count} transporters indexed (scan=${scanMs.toFixed(1)}ms, keys=${geoKeys.length})`);
       } else {
-        logger.info('[CacheWarm] H3 rebuild skipped — no online transporters in Redis yet');
+        logger.info(`[CacheWarm] H3 rebuild skipped — no online transporters in Redis yet (scan=${scanMs.toFixed(1)}ms)`);
       }
-    } catch (err: any) {
-      logger.warn(`[CacheWarm] H3 rebuild failed (heartbeats will fill index): ${err.message}`);
+    } catch (err: unknown) {
+      // Record partial scan duration even on failure so the dashboard reflects where we got to.
+      if (!scanRecorded) {
+        const partialMs = Number(process.hrtime.bigint() - scanStart) / 1e6;
+        metrics.observeHistogram('server_boot_scan_ms', partialMs);
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      logger.warn(`[CacheWarm] H3 rebuild failed (heartbeats will fill index): ${message}`);
     }
   }
 

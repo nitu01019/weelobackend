@@ -203,6 +203,15 @@ export function registerDefaultHistograms(histograms: Map<string, HistogramMetri
       'Per-cycle duration of the hold reconciliation sweeper in seconds',
       [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30],
     ),
+
+    // === P1-T1.5 (t1-5-boot-path) ===
+    // SC8: Duration of the SCAN-based H3 geo-index warm at process boot.
+    // Emitted at most once per boot when FF_H3_INDEX_ENABLED=true. Replaces
+    // the legacy blocking `KEYS` command; the new path fans out SCAN across
+    // every cluster master (see `clusterScanAllFlat`). Dashboard panel
+    // populated by T1.7; suggested alert: p99 > 5000ms for 5m.
+    hist('server_boot_scan_ms', 'Duration of Redis SCAN-based startup warm loop in ms (H3 geo index rebuild).'),
+    // === /P1-T1.5 ===
   ];
 
   for (const def of defs) {

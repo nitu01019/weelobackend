@@ -46,7 +46,17 @@ import {
 
 // M-20 FIX: In-memory backpressure fallback when Redis is unavailable.
 // Not as accurate as Redis (per-instance only), but prevents total flood.
+//
+// L6 (P1-T1.5) — Per-instance drift note:
+//   `inMemoryInflight` is module-local state. With N ECS replicas, the total
+//   in-flight capacity during a Redis outage is N * IN_MEMORY_MAX (not the
+//   intended single-cluster-wide cap). Redis-up path uses a shared counter
+//   and is correct; this fallback intentionally trades accuracy for
+//   availability. A one-time `[BACKPRESSURE]` log below records the moment
+//   we fall into this degraded mode so oncall can correlate with Redis
+//   outage alarms. Documentation-only; no functional change.
 let inMemoryInflight = 0;
+let inMemoryModeLogged = false;
 
 /**
  * Build a SHA-256 hash of the order request payload for idempotency matching.
@@ -114,6 +124,13 @@ export async function acquireOrderBackpressure(ctx: OrderCreateContext): Promise
     if (err instanceof AppError) throw err;
     // M-20 FIX: In-memory backpressure fallback when Redis is unavailable
     const IN_MEMORY_MAX = Math.ceil(ctx.maxConcurrentOrders / 4); // Per-instance share
+    // L6 (P1-T1.5): log once per process when the in-memory path is first selected.
+    // This marks the moment the service dropped into degraded (per-instance) backpressure
+    // mode so oncall can correlate with Redis outage alarms. No functional change.
+    if (!inMemoryModeLogged) {
+      inMemoryModeLogged = true;
+      logger.warn(`[BACKPRESSURE] In-memory mode engaged; expected per-instance capacity = ${IN_MEMORY_MAX}. Redis unavailable or disabled. Per-instance drift expected across multiple ECS tasks.`);
+    }
     inMemoryInflight++;
     // Fix #34/#73: Track that in-memory counter was incremented
     ctx.inMemoryBackpressureIncremented = true;
