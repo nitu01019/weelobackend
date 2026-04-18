@@ -78,6 +78,7 @@ import { logger } from './logger.service';
 import { db } from '../database/db';
 import { prismaClient } from '../database/prisma.service';
 import { redisService } from './redis.service';
+import { metrics } from '../monitoring/metrics.service';
 // F-B-02 Phase A: constants + shapes now live in fleet-cache-types.ts (single
 // source of truth). Local duplicates removed; the class below is marked
 // @deprecated — callers should migrate to the free-function module
@@ -137,6 +138,7 @@ class FleetCacheService {
           return cached;
         }
         if (cached && !Array.isArray(cached)) {
+          metrics.incrementCounter('fleet_cache_corruption_total', { keyPrefix: 'vehicles' });
           logger.warn(`[FleetCache] Corrupted cache (not array) for vehicles:${transporterId.substring(0, 8)}, deleting`);
           await cacheService.delete(cacheKey).catch(() => {});
         }
@@ -207,6 +209,7 @@ class FleetCacheService {
         return cached;
       }
       if (cached && !Array.isArray(cached)) {
+        metrics.incrementCounter('fleet_cache_corruption_total', { keyPrefix: 'vehicles_by_type' });
         logger.warn(`[FleetCache] Corrupted cache (not array) for vehiclesByType:${transporterId.substring(0, 8)}, deleting`);
         await cacheService.delete(cacheKey).catch(() => {});
       }
@@ -268,6 +271,7 @@ class FleetCacheService {
         return cached;
       }
       if (cached && (typeof cached !== 'object' || !cached.id)) {
+        metrics.incrementCounter('fleet_cache_corruption_total', { keyPrefix: 'vehicle' });
         logger.warn(`[FleetCache] Corrupted cache for vehicle:${vehicleId.substring(0, 8)}, deleting`);
         await cacheService.delete(cacheKey).catch(() => {});
       }
@@ -324,6 +328,7 @@ class FleetCacheService {
           return cached;
         }
         if (cached && !Array.isArray(cached)) {
+          metrics.incrementCounter('fleet_cache_corruption_total', { keyPrefix: 'drivers' });
           logger.warn(`[FleetCache] Corrupted cache (not array) for drivers:${transporterId.substring(0, 8)}, deleting`);
           await cacheService.delete(cacheKey).catch(() => {});
         }
@@ -472,6 +477,7 @@ class FleetCacheService {
         return cached;
       }
       if (cached && (typeof cached !== 'object' || !cached.id)) {
+        metrics.incrementCounter('fleet_cache_corruption_total', { keyPrefix: 'driver' });
         logger.warn(`[FleetCache] Corrupted cache for driver:${driverId.substring(0, 8)}, deleting`);
         await cacheService.delete(cacheKey).catch(() => {});
       }
@@ -537,6 +543,7 @@ class FleetCacheService {
         return cached;
       }
       if (cached && (typeof cached !== 'object' || !cached.transporterId)) {
+        metrics.incrementCounter('fleet_cache_corruption_total', { keyPrefix: 'snapshot' });
         logger.warn(`[FleetCache] Corrupted cache for snapshot:${transporterId.substring(0, 8)}, deleting`);
         await cacheService.delete(cacheKey).catch(() => {});
       }

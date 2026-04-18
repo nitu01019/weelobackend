@@ -128,6 +128,25 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
     // Threshold: > 0.2 for 15m → investigate dispatch lag
     // Severity: WARN
     counter('fcm_push_priority_total', 'Total FCM pushes labelled by android priority (high|normal) and notification type'),
+
+    // === P1-T1.1 (t1-1-obs-broadcast) ===
+    // L3 — silent Haversine fallback when Google Distance Matrix ranking fails.
+    // Call site: src/modules/order/progressive-radius-matcher.ts catch block.
+    //   Labels:
+    //     reason     = 'distance_matrix_failure'  (reserved for future variants)
+    //     stepIndex  = '0'..'5' (progressive-radius step index)
+    //     errorClass = error constructor name (e.g. 'Error', 'TimeoutError')
+    //   Alert: rate > 1/sec for 120s → suspected Distance Matrix outage.
+    counter('eta_ranking_fallback_total', 'Fallback to Haversine when Distance Matrix ranking fails'),
+
+    // L7 — fleet cache JSON-corruption self-heal observability.
+    // Call sites: 6 corruption-detect paths in src/shared/services/fleet-cache.service.ts
+    // (vehicles, vehicles_by_type, vehicle, drivers, driver, snapshot).
+    //   Labels:
+    //     keyPrefix = 'vehicles' | 'vehicles_by_type' | 'vehicle' |
+    //                 'drivers'  | 'driver'            | 'snapshot'
+    //   Alert: rate > 10/min sustained → likely write-path regression.
+    counter('fleet_cache_corruption_total', 'Fleet cache corruption detected and self-healed by delete+recache'),
   ];
 
   for (const def of defs) {

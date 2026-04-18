@@ -30,6 +30,7 @@ import { h3GeoIndexService, FF_H3_INDEX_ENABLED } from '../../shared/services/h3
 import { distanceMatrixService } from '../../shared/services/distance-matrix.service';
 import { redisService } from '../../shared/services/redis.service';
 import { logger } from '../../shared/services/logger.service';
+import { metrics } from '../../shared/monitoring/metrics.service';
 // Fix F2: Import shared haversine instead of local duplicate
 import { haversineDistanceKm } from '../../shared/utils/geospatial.utils';
 
@@ -210,9 +211,21 @@ class ProgressiveRadiusMatcher {
       });
 
       return enriched;
-    } catch (error: any) {
-      // If ETA ranking completely fails, return haversine-sorted candidates
-      logger.warn(`[RadiusMatcher] ETA ranking failed, using haversine order: ${error.message}`);
+    } catch (error: unknown) {
+      // If ETA ranking completely fails, return haversine-sorted candidates.
+      // P1-L3: emit counter BEFORE the fallback so dashboards spike the moment
+      // Google Distance Matrix starts failing, instead of the prior silent-warn.
+      const errMessage = error instanceof Error ? error.message : String(error);
+      const errorClass = error instanceof Error && error.name ? error.name : 'Unknown';
+      metrics.incrementCounter('eta_ranking_fallback_total', {
+        reason: 'distance_matrix_failure',
+        stepIndex: String(stepIndex),
+        errorClass
+      });
+      logger.warn(`[RadiusMatcher] ETA ranking failed, using haversine order: ${errMessage}`, {
+        stepIndex,
+        errorClass
+      });
       return candidates.slice(0, limit);
     }
   }
