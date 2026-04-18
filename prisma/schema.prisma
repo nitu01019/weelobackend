@@ -249,6 +249,11 @@ model User {
   @@index([isActive, role]) // Active users by role
   @@index([phone])        // Fast phone lookup
   @@index([createdAt])    // For sorting/pagination
+  // Phase-P1 | T1.4 | SC1 — broadcast KYC gate index. Mirrored in
+  // prisma/manual-migrations/phase-p1-sc1-sc2-indexes.sql (direct psql —
+  // NOT prisma migrate). Used by order-broadcast.service.ts KYC filter:
+  // User WHERE id IN (...) AND isActive AND isVerified AND kycStatus='VERIFIED'.
+  @@index([kycStatus, isVerified, isActive], map: "idx_user_kyc_broadcast")
 }
 
 // =============================================================================
@@ -333,6 +338,12 @@ model Vehicle {
   @@index([status, isActive, vehicleType])    // Combined query optimization
   @@index([transporterId, status, isActive])  // Transporter's available trucks
   @@index([assignedDriverId])                 // M-13: Fast lookup by assigned driver
+  // Phase-P1 | T1.4 | SC2 — DB-only partial index `idx_vehicle_key_avail`
+  // on ("vehicleKey", "transporterId") WHERE "isActive"=true AND "status"='available'.
+  // Prisma's schema DSL has no partial-index syntax, so this index lives in
+  // prisma/manual-migrations/phase-p1-sc1-sc2-indexes.sql (direct psql — NOT
+  // prisma migrate). Used by vehicle.repository.ts `vehicleKey IN (...)` +
+  // hot-path filter to skip heap scans on dispatch fanout.
 }
 
 // =============================================================================
