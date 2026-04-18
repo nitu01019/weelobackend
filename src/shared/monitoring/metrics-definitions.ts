@@ -128,6 +128,35 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
     // Threshold: > 0.2 for 15m → investigate dispatch lag
     // Severity: WARN
     counter('fcm_push_priority_total', 'Total FCM pushes labelled by android priority (high|normal) and notification type'),
+
+    // ---------------------------------------------------------------
+    // Reserved P1 registration blocks (T1.6 — cross-cutting owner).
+    //
+    // Each teammate appends their own `counter(...)` entries inside
+    // their labeled block in their own PR. Ownership + naming audits
+    // are tracked in `.planning/verification/METRICS-NAMING-V1.md`
+    // section 5. Block marker comments below do NOT count as array
+    // elements; `fcm_push_priority_total` keeps its trailing comma.
+    //
+    // === P1-L3 (t1-1-obs-broadcast) ===
+    //   eta_ranking_fallback_total{reason} — T1.1 appends here.
+    //
+    // === P1-L7 (t1-1-obs-broadcast) ===
+    //   fleet_cache_corruption_total — T1.1 appends here.
+    //
+    // === P1-L2 (t1-2-obs-postcommit) ===
+    //   post_commit_cache_failure_total{cache} — T1.2 appends here.
+    //
+    // === P1-M18 (t1-2-obs-postcommit) ===
+    //   socket_emit_while_adapter_down_total{event,mode} — T1.2 appends here.
+    //
+    // === P1-L1 (t1-3-comments-customer) ===
+    //   booking_legacy_fallback_total{status} (optional backend mirror
+    //   of the customer-app analytics event) — T1.3 appends here.
+    //
+    // === P1-SC8 (t1-5-boot-path) ===
+    //   counter(s) if introduced — T1.5 appends here.
+    // ---------------------------------------------------------------
   ];
 
   for (const def of defs) {
@@ -158,6 +187,12 @@ export function registerDefaultGauges(gauges: Map<string, GaugeMetric>): void {
     // whose `dispatchState='dispatching'` hasn't advanced past a threshold age.
     // Non-zero and growing = the outbox poller is lagging, worth paging oncall.
     gauge('order_stale_dispatching_state', 'Orders stuck in dispatchState=dispatching past the stale threshold (F-A-70)'),
+
+    // === P1 process metrics (T1.6) ===
+    // SHA of HEAD commit when P1 landed. Informational — set by deploy script;
+    // default 0. Consumed by T1.7 dashboard "last-deploy" stat panel to prove
+    // which build a given sample came from after rolling deploys.
+    gauge('phase1_landed_commit_sha', 'SHA of HEAD commit when P1 landed (informational; updated by deploy script)'),
   ];
 
   for (const def of defs) {
@@ -203,6 +238,13 @@ export function registerDefaultHistograms(histograms: Map<string, HistogramMetri
       'Per-cycle duration of the hold reconciliation sweeper in seconds',
       [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30],
     ),
+
+    // === P1 process metrics (T1.6) ===
+    // Duration of Redis geo-key scan at server boot. Consumed by the SC8
+    // exit-criteria check: post-SC8 p99 must be <= pre-SC8 baseline. T1.5
+    // is the emitter; this histogram is registered here so T1.5 never has
+    // to auto-create inside the boot path (blocking-time-sensitive).
+    hist('server_boot_scan_ms', 'Duration of Redis geo-key scan at server boot (ms)'),
   ];
 
   for (const def of defs) {
