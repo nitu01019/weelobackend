@@ -67,6 +67,7 @@ import {
 } from './shared/middleware/security.middleware';
 import { backwardCompatMiddleware } from './shared/middleware/backward-compat.middleware';
 import { correlationMiddleware } from './shared/context/correlation';
+import { authMiddleware, roleGuard } from './shared/middleware/auth.middleware';
 // import { cache } from './shared/middleware/cache.middleware'; // TODO: Create cache middleware
 
 // Database
@@ -352,7 +353,9 @@ app.use('/', healthRoutes);
 // M-8 FIX: Feature flag debugging endpoint
 app.use('/', flagHealthRouter);
 
-app.get('/health/runtime', async (_req, res) => {
+// F-A-09: /health/runtime leaks DB counts + Redis/socket adapter status + connected
+// user counts. Restrict it to authenticated admin users only.
+app.get('/health/runtime', authMiddleware, roleGuard(['admin']), async (_req, res) => {
   try {
     const stats = await db.getStats();
     const socketAdapter = getRedisAdapterStatus();

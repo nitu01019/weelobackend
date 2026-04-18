@@ -658,9 +658,15 @@ describe('Route Facade Mounting', () => {
       expect(typeof transporterRouter).toBe('function');
     });
 
-    it('should mount transporterAvailabilityRouter', () => {
-      const { transporterAvailabilityRouter } = require('../modules/transporter/transporter-availability.routes');
-      expect(transporterAvailabilityRouter).toBeDefined();
+    // F-B-41: availability routes were never extracted into their own sub-router.
+    // The 501-stub file has been deleted; the real handlers live on
+    // transporterRouter itself. This test now validates the real router
+    // instead of the removed stub.
+    it('should expose availability routes on the main transporter router', () => {
+      const transporterRouter = require('../modules/transporter/transporter.routes').default;
+      const routes = extractRoutes(transporterRouter);
+      expect(routes).toContainEqual({ method: 'put', path: '/availability' });
+      expect(routes).toContainEqual({ method: 'get', path: '/availability' });
     });
 
     it('should mount transporterProfileRouter', () => {
@@ -1697,9 +1703,11 @@ describe('Route Path Verification', () => {
     expect(routes).toContainEqual({ method: 'post', path: '/regenerate-urls' });
   });
 
-  it('transporterAvailabilityRouter should register all expected paths', () => {
-    const { transporterAvailabilityRouter } = require('../modules/transporter/transporter-availability.routes');
-    const routes = extractRoutes(transporterAvailabilityRouter);
+  it('transporterRouter should register all expected availability paths (F-B-41)', () => {
+    // F-B-41: validate that the real transporterRouter owns the five
+    // availability-surface routes that the deleted stub file used to shadow.
+    const transporterRouter = require('../modules/transporter/transporter.routes').default;
+    const routes = extractRoutes(transporterRouter);
     expect(routes).toContainEqual({ method: 'put', path: '/availability' });
     expect(routes).toContainEqual({ method: 'get', path: '/availability' });
     expect(routes).toContainEqual({ method: 'post', path: '/heartbeat' });
