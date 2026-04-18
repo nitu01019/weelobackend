@@ -77,7 +77,7 @@ describe('P1-M9: FCM payload drops legacy Flutter click-action', () => {
       priority: 'high'
     });
 
-    expect(msg.android.notification.channelId).toBe('broadcasts');
+    expect(msg.android.notification.channelId).toBe('broadcasts_v2');
     expect(msg.android.notification.sound).toBe('default');
   });
 });
