@@ -14,25 +14,27 @@ import { logger } from '../../shared/services/logger.service';
 import { socketService } from '../../shared/services/socket.service';
 import { fleetCacheService } from '../../shared/services/fleet-cache.service';
 import { redisService } from '../../shared/services/redis.service';
+import { safeJsonParse } from '../../shared/utils/safe-json.utils';
 import { CreateDriverInput } from './driver.schema';
 import { prismaClient } from '../../shared/database/prisma.service';
+import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
+import { DRIVER_PRESENCE_TTL_SECONDS as PRESENCE_TTL_SECONDS } from '../../shared/config/presence.config';
 
 // =============================================================================
 // REDIS KEY PATTERNS — Driver Online/Offline Presence System
 // =============================================================================
-// driver:presence:{driverId}                → SET with TTL 35s (live connectivity)
+// driver:presence:{driverId}                → SET with TTL from presence.config (F-B-05)
 // transporter:{transporterId}:onlineDrivers → SET of online driverIds
 //
 // TTL DESIGN:
-//   Heartbeat interval = 12 seconds
-//   Redis TTL = 35 seconds
+//   Heartbeat interval = 12 seconds (HEARTBEAT_INTERVAL_SECONDS)
+//   Redis TTL          = 36 seconds (DRIVER_PRESENCE_TTL_SECONDS = 3× heartbeat)
 //   → 3 retry windows before auto-offline
 //   → Handles 4G instability / network jitter
 //
 // ZERO DB WRITES for heartbeat — only Redis SET with TTL extension
 // DB writes ONLY on manual button press (isAvailable = true/false)
 // =============================================================================
-const PRESENCE_TTL_SECONDS = 35;  // Must be > 2x heartbeat interval
 const PRESENCE_KEY = (driverId: string) => `driver:presence:${driverId}`;
 const ONLINE_DRIVERS_KEY = (transporterId: string) => `transporter:${transporterId}:onlineDrivers`;
 
@@ -149,7 +151,7 @@ class DriverService {
       const cacheKey = `driver:rating:${driverId}`;
       const cached = await redisService.get(cacheKey);
       if (cached) {
-        const parsed = JSON.parse(cached);
+        const parsed = safeJsonParse<{ avg?: number; count?: number }>(cached, { avg: 0, count: 0 });
         return { avg: parsed.avg || 0, count: parsed.count || 0 };
       }
 
@@ -526,6 +528,37 @@ class DriverService {
     onTimeDeliveryRate = onTimeResult.rate;
     totalDistance = onTimeResult.totalDistance;
 
+    // Calculate today's distance from completed assignments (not all-time total)
+    let todayDistance = 0;
+    try {
+      const todayStart = new Date();
+      todayStart.setHours(0, 0, 0, 0);
+      const todayAssignments = await prismaClient.assignment.findMany({
+        where: {
+          driverId: userId,
+          status: 'completed',
+          completedAt: { gte: todayStart.toISOString() }
+        },
+        select: { bookingId: true, orderId: true }
+      });
+      if (todayAssignments.length > 0) {
+        const todayBookingIds = todayAssignments.map(a => a.bookingId).filter((id): id is string => id !== null);
+        const todayOrderIds = todayAssignments.map(a => a.orderId).filter((id): id is string => id !== null && !todayBookingIds.includes(id));
+        const [todayBookingDists, todayOrderDists] = await Promise.all([
+          todayBookingIds.length > 0
+            ? prismaClient.booking.findMany({ where: { id: { in: todayBookingIds } }, select: { distanceKm: true } })
+            : [],
+          todayOrderIds.length > 0
+            ? prismaClient.order.findMany({ where: { id: { in: todayOrderIds } }, select: { distanceKm: true } })
+            : []
+        ]);
+        todayDistance = [...todayBookingDists, ...todayOrderDists].reduce((sum, r) => sum + Math.max(0, r.distanceKm || 0), 0);
+        todayDistance = Math.round(todayDistance * 10) / 10;
+      }
+    } catch (err: any) {
+      logger.warn('[DRIVER SERVICE] Today distance calc failed, using 0', { userId, error: err.message });
+    }
+
     return {
       stats: {
         totalTrips: completedBookings.length,
@@ -537,7 +570,7 @@ class DriverService {
         acceptanceRate,
         onTimeDeliveryRate,
         totalDistance,
-        todayDistance: totalDistance // Backward compat for ViewModel
+        todayDistance
       },
       recentTrips: completedBookings.slice(0, 5).map((b: BookingRecord) => ({
         id: b.id,
@@ -1156,9 +1189,6 @@ class DriverService {
    * Get driver earnings
    */
   async getEarnings(userId: string, period: string = 'week'): Promise<EarningsData> {
-    const bookings = await db.getBookingsByDriver(userId);
-    const completedBookings = bookings.filter((b: BookingRecord) => b.status === 'completed');
-
     const now = new Date();
     let startDate: Date;
 
@@ -1176,24 +1206,34 @@ class DriverService {
         startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
     }
 
-    const periodBookings = completedBookings.filter((b: BookingRecord) =>
-      new Date(b.updatedAt || b.createdAt) >= startDate
-    );
-
-    const totalEarnings = periodBookings.reduce((sum: number, b: BookingRecord) => sum + (b.totalAmount || 0), 0);
-
-    // Group by date for breakdown
-    const byDate: { [key: string]: { amount: number; trips: number } } = {};
-    periodBookings.forEach((b: BookingRecord) => {
-      const date = (b.updatedAt || b.createdAt).split('T')[0];
-      if (!byDate[date]) {
-        byDate[date] = { amount: 0, trips: 0 };
-      }
-      byDate[date].amount += b.totalAmount || 0;
-      byDate[date].trips += 1;
+    // Query Assignment table (drivers exist in Assignment, not Booking)
+    // C-7 fix: push startDate into WHERE clause + safety cap to prevent OOM
+    const periodAssignments = await prismaClient.assignment.findMany({
+      where: {
+        driverId: userId,
+        status: 'completed',
+        completedAt: { gte: startDate.toISOString() },
+      },
+      include: { order: { select: { totalAmount: true, distanceKm: true } } },
+      orderBy: { completedAt: 'desc' },
+      take: 1000,
     });
 
-    const tripCount = periodBookings.length;
+    const totalEarnings = periodAssignments.reduce((sum: number, a: any) => sum + (a.order?.totalAmount || 0), 0);
+
+    // Group by date for breakdown
+    const byDate: { [key: string]: { amount: number; trips: number; distance: number } } = {};
+    periodAssignments.forEach((a: any) => {
+      const date = (a.completedAt || a.assignedAt).split('T')[0];
+      if (!byDate[date]) {
+        byDate[date] = { amount: 0, trips: 0, distance: 0 };
+      }
+      byDate[date].amount += a.order?.totalAmount || 0;
+      byDate[date].trips += 1;
+      byDate[date].distance += Math.max(0, a.order?.distanceKm || 0);
+    });
+
+    const tripCount = periodAssignments.length;
     const avgPerTrip = tripCount > 0 ? totalEarnings / tripCount : 0;
 
     return {
@@ -1209,7 +1249,7 @@ class DriverService {
         earnings: data.amount,    // Captain app expects 'earnings'
         amount: data.amount,      // Backward compat — old field name
         trips: data.trips,
-        distance: 0               // Captain app expects 'distance' (placeholder)
+        distance: Math.round(data.distance * 10) / 10
       }))
     };
   }
@@ -1252,32 +1292,41 @@ class DriverService {
    * Get active trip for driver
    */
   async getActiveTrip(userId: string) {
-    const bookings = await db.getBookingsByDriver(userId);
-    const activeStatuses = ['active', 'partially_filled', 'in_progress'];
+    // Query Assignment table (drivers' active trips are in Assignment, not Booking)
+    const activeAssignment = await prismaClient.assignment.findFirst({
+      where: {
+        driverId: userId,
+        status: { in: ['driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit', 'arrived_at_drop'] }
+      },
+      include: { order: true, vehicle: true },
+      orderBy: { assignedAt: 'desc' }
+    });
 
-    const activeTrip = bookings.find((b: BookingRecord) => activeStatuses.includes(b.status));
-
-    if (!activeTrip) {
+    if (!activeAssignment) {
       return null;
     }
 
+    const order = activeAssignment.order;
+    const pickup = order?.pickup as any;
+    const drop = order?.drop as any;
+
     return {
-      id: activeTrip.id,
-      status: activeTrip.status,
+      id: activeAssignment.id,
+      status: activeAssignment.status,
       pickup: {
-        address: activeTrip.pickup?.address,
-        location: { lat: activeTrip.pickup?.latitude, lng: activeTrip.pickup?.longitude }
+        address: pickup?.address,
+        location: { lat: pickup?.latitude, lng: pickup?.longitude }
       },
       dropoff: {
-        address: activeTrip.drop?.address,
-        location: { lat: activeTrip.drop?.latitude, lng: activeTrip.drop?.longitude }
+        address: drop?.address,
+        location: { lat: drop?.latitude, lng: drop?.longitude }
       },
-      price: activeTrip.totalAmount,
+      price: order?.totalAmount || 0,
       customer: {
-        name: activeTrip.customerName,
-        phone: activeTrip.customerPhone
+        name: order?.customerName || 'Customer',
+        phone: maskPhoneForExternal(order?.customerPhone || '')
       },
-      createdAt: activeTrip.createdAt
+      createdAt: activeAssignment.assignedAt
     };
   }
 

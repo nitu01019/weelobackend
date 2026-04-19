@@ -36,6 +36,7 @@ import { queueService } from '../../shared/services/queue.service';
 import { redisService } from '../../shared/services/redis.service';
 import { CreateOrderInput, TruckSelection } from './booking.schema';
 import { transporterOnlineService } from '../../shared/services/transporter-online.service';
+import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
 
 // =============================================================================
 // CONFIGURATION
@@ -133,7 +134,15 @@ function startOrderExpiryChecker(): void {
  */
 async function processExpiredOrders(): Promise<void> {
   const expiredTimers = await redisService.getExpiredTimers<OrderTimerData>('timer:booking-order:');
-  
+
+  // Fix H-A3: Phase 1 deprecation logging — track usage so we know when to remove this file.
+  if (expiredTimers.length > 0) {
+    logger.warn('[DEPRECATED] Legacy booking/order.service processing expired timers', {
+      count: expiredTimers.length,
+      keys: expiredTimers.map(t => t.key),
+    });
+  }
+
   for (const timer of expiredTimers) {
     // Try to acquire lock for this order (prevents duplicate processing)
     const lockKey = `lock:booking-order-expiry:${timer.data.orderId}`;
@@ -158,8 +167,13 @@ async function processExpiredOrders(): Promise<void> {
   }
 }
 
-// Start expiry checker when module loads
-startOrderExpiryChecker();
+// F-M3 FIX: Feature flag for legacy expiry checker — allows disabling without code removal.
+// Default: ON (no behavior change). Set FF_LEGACY_ORDER_EXPIRY_CHECKER=false to disable.
+if (process.env.FF_LEGACY_ORDER_EXPIRY_CHECKER !== 'false') {
+  startOrderExpiryChecker();
+} else {
+  logger.info('[DEPRECATED] Legacy order expiry checker disabled by feature flag FF_LEGACY_ORDER_EXPIRY_CHECKER');
+}
 
 /** Stop the order expiry checker (for graceful shutdown) */
 export function stopOrderExpiryChecker(): void {
@@ -214,7 +228,7 @@ class OrderService {
     logger.info(`║  🚛 NEW ORDER REQUEST                                        ║`);
     logger.info(`╠══════════════════════════════════════════════════════════════╣`);
     logger.info(`║  Order ID: ${orderId}`);
-    logger.info(`║  Customer: ${customerName} (${customerPhone})`);
+    logger.info(`║  Customer: ${customerName} (${maskPhoneForExternal(customerPhone)})`);
     logger.info(`║  Total Trucks: ${totalTrucks}`);
     logger.info(`║  Total Amount: ₹${totalAmount}`);
     logger.info(`║  Truck Types: ${data.trucks.map(t => `${t.quantity}x ${t.vehicleType} ${t.vehicleSubtype}`).join(', ')}`);
@@ -222,6 +236,9 @@ class OrderService {
 
     // ==========================================================================
     // STEP 1: Create parent Order record
+    // F-H3 FIX: Order creation should be atomic with truck request creation.
+    // db.createOrder and db.createTruckRequestsBatch don't accept a TX client.
+    // Using compensating pattern: if truck request creation fails, delete the order.
     // ==========================================================================
     const order = await db.createOrder({
       id: orderId,
@@ -258,9 +275,24 @@ class OrderService {
     // STEP 2: Expand truck selections into individual TruckRequests
     // ==========================================================================
     const truckRequests = this.expandTruckSelections(orderId, data.trucks);
-    
+
     // Batch create all truck requests
-    const createdRequests = await db.createTruckRequestsBatch(truckRequests);
+    // F-H3 FIX: Compensating transaction — if batch creation fails, delete the orphan order
+    let createdRequests: TruckRequestRecord[];
+    try {
+      createdRequests = await db.createTruckRequestsBatch(truckRequests);
+    } catch (err) {
+      logger.error(`[F-H3] Truck request batch creation failed for order ${orderId}, compensating by deleting order`, {
+        orderId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      await prismaClient.order.delete({ where: { id: orderId } }).catch((delErr) => {
+        logger.error(`[F-H3] Compensating order delete also failed for ${orderId}`, {
+          error: delErr instanceof Error ? delErr.message : String(delErr),
+        });
+      });
+      throw err;
+    }
     
     // ==========================================================================
     // STEP 3: Group requests by vehicle type for efficient broadcasting
@@ -383,104 +415,83 @@ class OrderService {
   }
 
   /**
-   * Broadcast to transporters - the core matching algorithm
-   * 
-   * OPTIMIZED:
-   * - Finds transporters for each vehicle type group in parallel
-   * - Sends grouped notifications (less WebSocket calls)
-   * - Updates notifiedTransporters in batch
+   * Broadcast to transporters — THIN-WRAP per F-B-77 (Strangler Fig).
+   *
+   * Delegates to the canonical `order-broadcast.service.ts::broadcastToTransporters`
+   * via `order-delegates-bridge.service.ts`. Adapts fork-shaped input
+   * `(OrderRecord, GroupedRequests[], distanceKm)` into the canonical
+   * `(orderId, CreateOrderRequest, TruckRequestRecord[], expiresAt, resolvedPickup)` shape
+   * and back-fills `CreateOrderResult['broadcastSummary']` from the canonical result.
+   *
+   * The only consumed field on the return type is `totalTransportersNotified`;
+   * group-level breakdown is reconstructed from the input groupedRequests for
+   * shape parity with the legacy return type.
    */
   private async broadcastToTransporters(
     order: OrderRecord,
     groupedRequests: GroupedRequests[],
     distanceKm: number
   ): Promise<CreateOrderResult['broadcastSummary']> {
-    
-    const allTransporterIds = new Set<string>();
-    const groupSummaries: CreateOrderResult['broadcastSummary']['groupedBy'] = [];
-    
-    // Process each vehicle type group
-    for (const group of groupedRequests) {
-      // Find transporters with this vehicle type
-      const allTransporterIdsForType = await db.getTransportersWithVehicleType(
-        group.vehicleType,
-        group.vehicleSubtype
-      );
-      
-      // Phase 3 optimization: Filter to only ONLINE transporters using Redis set
-      // O(1) per transporter instead of N+1 DB queries
-      const transporterIds = await transporterOnlineService.filterOnline(allTransporterIdsForType);
-      
-      group.transporterIds = transporterIds;
-      
-      // Update notifiedTransporters for each request in this group
-      const requestIds = group.requests.map(r => r.id);
-      await db.updateTruckRequestsBatch(requestIds, { notifiedTransporters: transporterIds });
-      
-      // Track unique transporters
-      transporterIds.forEach(id => allTransporterIds.add(id));
-      
-      // Add to summary
-      groupSummaries.push({
-        vehicleType: group.vehicleType,
-        vehicleSubtype: group.vehicleSubtype,
-        count: group.requests.length,
-        transportersNotified: transporterIds.length
-      });
-      
-      // Broadcast to each transporter in this group
-      if (transporterIds.length > 0) {
-        const broadcastPayload = {
-          orderId: order.id,
-          customerName: order.customerName,
-          
-          // Vehicle info for this group
-          vehicleType: group.vehicleType,
-          vehicleSubtype: group.vehicleSubtype,
-          trucksNeeded: group.requests.length,
-          
-          // Individual request IDs (transporters can accept specific ones)
-          requestIds: group.requests.map(r => r.id),
-          
-          // Pricing
-          pricePerTruck: group.requests[0].pricePerTruck,
-          totalFare: group.requests.reduce((sum, r) => sum + r.pricePerTruck, 0),
-          
-          // Location info
-          pickupAddress: order.pickup.address,
-          pickupCity: order.pickup.city,
-          dropAddress: order.drop.address,
-          dropCity: order.drop.city,
-          distanceKm,
-          
-          // Goods info
-          goodsType: order.goodsType,
-          weight: order.weight,
-          
-          // Timing
-          createdAt: order.createdAt,
-          expiresAt: order.expiresAt,
-          timeoutSeconds: ORDER_CONFIG.TIMEOUT_MS / 1000,
-          
-          isUrgent: false
-        };
-        
-        // Emit to all transporters in this group
-        // Phase 3: Removed per-transporter db.getUserById() — already filtered by Redis online set.
-        // Name lookup is non-critical for broadcast; transporter ID is logged instead.
-        for (const transporterId of transporterIds) {
-          emitToUser(transporterId, SocketEvent.NEW_BROADCAST, broadcastPayload);
-          logger.info(`📢 Notified: ${transporterId.substring(0, 8)}... for ${group.vehicleType} ${group.vehicleSubtype} (${group.requests.length} trucks)`);
-        }
-      } else {
-        logger.warn(`⚠️ No transporters found for ${group.vehicleType} ${group.vehicleSubtype}`);
-      }
-    }
-    
+    const { broadcastToTransporters: canonicalBroadcast } = require('../order/order-delegates-bridge.service') as typeof import('../order/order-delegates-bridge.service');
+
+    const truckRequests = groupedRequests.flatMap(g => g.requests);
+
+    const canonicalRequest = {
+      customerId: order.customerId,
+      customerName: order.customerName,
+      customerPhone: order.customerPhone,
+      pickup: {
+        latitude: order.pickup.latitude,
+        longitude: order.pickup.longitude,
+        address: order.pickup.address || '',
+        city: order.pickup.city,
+        state: order.pickup.state,
+      },
+      drop: {
+        latitude: order.drop.latitude,
+        longitude: order.drop.longitude,
+        address: order.drop.address || '',
+        city: order.drop.city,
+        state: order.drop.state,
+      },
+      distanceKm,
+      vehicleRequirements: groupedRequests.map(g => ({
+        vehicleType: g.vehicleType,
+        vehicleSubtype: g.vehicleSubtype,
+        quantity: g.requests.length,
+        pricePerTruck: g.requests[0]?.pricePerTruck ?? 0,
+      })),
+      goodsType: order.goodsType ?? undefined,
+      cargoWeightKg: order.cargoWeightKg ?? undefined,
+    };
+
+    const resolvedPickup = {
+      latitude: order.pickup.latitude,
+      longitude: order.pickup.longitude,
+      address: order.pickup.address || '',
+      city: order.pickup.city,
+      state: order.pickup.state,
+    };
+
+    const result = await canonicalBroadcast(
+      order.id,
+      canonicalRequest,
+      truckRequests,
+      order.expiresAt,
+      resolvedPickup
+    );
+
+    const groupedBy: CreateOrderResult['broadcastSummary']['groupedBy'] = groupedRequests.map(g => ({
+      vehicleType: g.vehicleType,
+      vehicleSubtype: g.vehicleSubtype,
+      count: g.requests.length,
+      transportersNotified: 0,
+    }));
+
     return {
       totalRequests: groupedRequests.reduce((sum, g) => sum + g.requests.length, 0),
-      groupedBy: groupSummaries,
-      totalTransportersNotified: allTransporterIds.size
+      groupedBy,
+      totalTransportersNotified: result.notifiedTransporters,
     };
   }
 
@@ -554,6 +565,16 @@ class OrderService {
       await db.updateOrder(orderId, { status: 'expired' });
       
       emitToUser(customerId, SocketEvent.BOOKING_EXPIRED, {
+        orderId,
+        status: 'partially_filled_expired',
+        totalTrucks: order.totalTrucks,
+        trucksFilled: filledCount,
+        message: `Only ${filledCount} of ${order.totalTrucks} trucks were assigned. Would you like to continue with partial fulfillment?`,
+        options: ['continue_partial', 'search_again', 'cancel']
+      });
+
+      // Also emit order_expired for customer app compatibility (C1 fix)
+      emitToUser(customerId, 'order_expired', {
         orderId,
         status: 'partially_filled_expired',
         totalTrucks: order.totalTrucks,

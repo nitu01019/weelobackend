@@ -19,6 +19,13 @@
  * - JWT authentication required
  * - Room-based isolation
  * - Users only receive their own data
+ *
+ * TODO: Improvements from deleted src/shared/services/socket/ directory:
+ * - Reconnect semaphore pattern: adapter uses a distinct 'reconnecting' mode
+ *   state to prevent concurrent reconnection attempts (socket-adapter.ts)
+ * - Tighter presence TTL: deleted code used 30s vs current 60s (from
+ *   transporter-online.service.ts). Consider tightening if heartbeat interval
+ *   (12s) proves reliable on 2G/EDGE networks.
  * =============================================================================
  */
 
@@ -27,8 +34,11 @@ import { Server, Socket } from 'socket.io';
 import { createAdapter } from '@socket.io/redis-streams-adapter';
 import jwt from 'jsonwebtoken';
 import { config } from '../../config/environment';
+import { HOLD_CONFIG } from '../../core/config/hold-config';
 import { logger } from './logger.service';
 import { redisService } from './redis.service';
+import { socketCircuit } from './circuit-breaker.service';
+import { isEnabled, FLAGS } from '../config/feature-flags';
 import {
   TRANSPORTER_PRESENCE_KEY,
   PRESENCE_TTL_SECONDS as TRANSPORTER_PRESENCE_TTL,
@@ -36,19 +46,61 @@ import {
 } from './transporter-online.service';
 
 // Lazy import to avoid circular dependency (socket.service ↔ driver.service)
-let _driverService: any = null;
+// H18 FIX: Add type annotation to preserve type safety across lazy require()
+let _driverService: typeof import('../../modules/driver/driver.service')['driverService'] | null = null;
 function getDriverService() {
   if (!_driverService) {
-    _driverService = require('../../modules/driver/driver.service').driverService;
+    const mod: typeof import('../../modules/driver/driver.service') = require('../../modules/driver/driver.service');
+    _driverService = mod.driverService;
   }
   return _driverService;
 }
 
 let io: Server | null = null;
+let adapterReconnectTimer: NodeJS.Timeout | null = null;
+
+// C-6 FIX: Counting semaphore to limit concurrent DB operations from socket connections.
+// Prevents DB pool exhaustion during mass reconnect (e.g., ECS deploy, network blip).
+// Default 10 = half of Prisma's default pool_size (20), leaving headroom for API requests.
+const MAX_CONCURRENT_SOCKET_DB = parseInt(process.env.SOCKET_DB_CONCURRENCY || '10', 10);
+let activeSocketDbOps = 0;
+const socketDbQueue: Array<() => void> = [];
+
+async function withSocketDbLimit<T>(fn: () => Promise<T>): Promise<T> {
+  if (activeSocketDbOps >= MAX_CONCURRENT_SOCKET_DB) {
+    await new Promise<void>(resolve => socketDbQueue.push(resolve));
+  }
+  activeSocketDbOps++;
+  try { return await fn(); }
+  finally {
+    activeSocketDbOps--;
+    socketDbQueue.shift()?.();
+  }
+}
 
 // Track user connections
 const userSockets = new Map<string, Set<string>>();  // userId -> Set of socketIds
 const socketUsers = new Map<string, string>();        // socketId -> userId
+
+// Per-connection rate limiter (Problem 17 fix)
+const eventCounts = new Map<string, { count: number; resetAt: number }>();
+
+// H-S4 FIX: Per-event debounce for socket join events (prevents DB query spam on rapid reconnect)
+const recentJoinAttempts = new Map<string, number>();
+const MAX_EVENTS_PER_SECOND = 30;
+
+// Fix E8: Rate limit keyed by userId (falls back to socketId pre-auth)
+function checkRateLimit(socketId: string, userId?: string): boolean {
+  const key = userId || socketId;
+  const now = Date.now();
+  const entry = eventCounts.get(key);
+  if (!entry || now > entry.resetAt) {
+    eventCounts.set(key, { count: 1, resetAt: now + 1000 });
+    return true;
+  }
+  entry.count++;
+  return entry.count <= MAX_EVENTS_PER_SECOND;
+}
 
 // Industry Standard: DoorDash O(1) role counters
 // Updated atomically on connect/disconnect - eliminates O(n) forEach traversal
@@ -63,6 +115,9 @@ const roleCounters = {
 // 5 allows multi-device + reconnect overlap without abuse.
 const MAX_CONNECTIONS_PER_USER = 5;
 
+// TTL for per-user Redis connection counters (auto-cleanup if instance dies)
+const CONNECTION_COUNTER_TTL_SECONDS = 300;
+
 // Server instance ID (for debugging multi-server issues)
 const SERVER_INSTANCE_ID = `server_${process.pid}_${Date.now().toString(36)}`;
 
@@ -71,77 +126,22 @@ let redisPubSubInitialized = false;
 let redisAdapterMode: 'enabled' | 'disabled' | 'disabled_by_config' | 'disabled_by_capability' | 'failed' = 'disabled';
 let redisAdapterLastError: string | null = null;
 const SOCKET_EVENT_VERSION = 1;
-const SOCKET_MULTI_ROOM_EMIT_CHUNK_SIZE = Math.max(
-  25,
-  parseInt(process.env.SOCKET_MULTI_ROOM_EMIT_CHUNK_SIZE || '300', 10) || 300
-);
+const SOCKET_MULTI_ROOM_EMIT_CHUNK_SIZE = Math.min(500, Math.max(25, parseInt(process.env.SOCKET_MULTI_ROOM_EMIT_CHUNK_SIZE || '300', 10) || 300));
 
 /**
- * Socket Events
- * 
- * ENHANCED: Added booking lifecycle events for timeout handling
- * ENHANCED: Added real-time truck count updates for multi-truck requests
+ * Socket Events — F-C-52 canonical registry
+ *
+ * The hand-rolled map that used to live here (67+ LOC, prone to 3-repo drift
+ * against captain + customer apps — see TM-8.md:47-56) has moved to
+ * `packages/contracts/events.generated.ts`, codegen'd from
+ * `packages/contracts/events.asyncapi.yaml`. See `packages/contracts/README.md`
+ * for the contract and rollout plan.
+ *
+ * All existing call sites keep their `SocketEvent.FOO` shape — this module
+ * re-exports the generated registry so no downstream changes are required.
  */
-export const SocketEvent = {
-  // Server -> Client
-  CONNECTED: 'connected',
-  BOOKING_UPDATED: 'booking_updated',
-  TRUCK_ASSIGNED: 'truck_assigned',
-  TRIP_ASSIGNED: 'trip_assigned',
-  LOCATION_UPDATED: 'location_updated',
-  ASSIGNMENT_STATUS_CHANGED: 'assignment_status_changed',
-  NEW_BROADCAST: 'new_broadcast',
-  TRUCK_CONFIRMED: 'truck_confirmed',
-
-  // Booking lifecycle events
-  BOOKING_EXPIRED: 'booking_expired',           // No transporters accepted in time
-  BOOKING_FULLY_FILLED: 'booking_fully_filled', // All trucks assigned
-  BOOKING_PARTIALLY_FILLED: 'booking_partially_filled', // Some trucks assigned
-  NO_VEHICLES_AVAILABLE: 'no_vehicles_available', // No matching transporters found
-  BROADCAST_COUNTDOWN: 'broadcast_countdown',   // Timer tick for UI
-
-  // NEW: Real-time truck request updates (for multi-truck system)
-  TRUCK_REQUEST_ACCEPTED: 'truck_request_accepted',     // A transporter accepted 1 truck
-  TRUCKS_REMAINING_UPDATE: 'trucks_remaining_update',   // Update remaining truck count
-  REQUEST_NO_LONGER_AVAILABLE: 'request_no_longer_available', // Request taken by someone else
-  ORDER_STATUS_UPDATE: 'order_status_update',           // Overall order status changed
-
-  // Fleet/Vehicle events (for real-time fleet updates)
-  VEHICLE_REGISTERED: 'vehicle_registered',
-  VEHICLE_UPDATED: 'vehicle_updated',
-  VEHICLE_DELETED: 'vehicle_deleted',
-  VEHICLE_STATUS_CHANGED: 'vehicle_status_changed',
-  FLEET_UPDATED: 'fleet_updated',
-
-  // Driver events (for real-time driver updates)
-  DRIVER_ADDED: 'driver_added',
-  DRIVER_UPDATED: 'driver_updated',
-  DRIVER_DELETED: 'driver_deleted',
-  DRIVER_STATUS_CHANGED: 'driver_status_changed',
-  DRIVERS_UPDATED: 'drivers_updated',
-
-  // Lightning-fast notification events
-  NEW_ORDER_ALERT: 'new_order_alert',           // Urgent notification with sound
-  ACCEPT_CONFIRMATION: 'accept_confirmation',   // Confirm acceptance to transporter
-
-  ERROR: 'error',
-
-  // Driver presence events
-  HEARTBEAT: 'heartbeat',                       // Driver sends every 12s
-  DRIVER_ONLINE: 'driver_online',               // Driver came online
-  DRIVER_OFFLINE: 'driver_offline',             // Driver went offline
-  DRIVER_TIMEOUT: 'driver_timeout',             // Driver didn't accept in time
-
-  // Client -> Server
-  JOIN_BOOKING: 'join_booking',
-  LEAVE_BOOKING: 'leave_booking',
-  JOIN_ORDER: 'join_order',                     // Join order room for updates
-  LEAVE_ORDER: 'leave_order',
-  UPDATE_LOCATION: 'update_location',
-  JOIN_TRANSPORTER: 'join_transporter', // Driver joins transporter room for broadcasts
-  LEAVE_TRANSPORTER: 'leave_transporter',   // Driver leaves transporter room
-  BROADCAST_ACK: 'broadcast_ack'            // Phase 4: client ACKs sequence-numbered message
-};
+export { SocketEvent } from '../../../packages/contracts/events.generated';
+import { SocketEvent } from '../../../packages/contracts/events.generated';
 
 /**
  * =============================================================================
@@ -159,18 +159,19 @@ export const SocketEvent = {
 export function initializeSocket(server: HttpServer): Server {
   io = new Server(server, {
     cors: {
-      origin: config.isDevelopment ? '*' : [
-        'https://weelo.app',
-        'https://captain.weelo.app',
-        /\.weelo\.app$/
-      ],
+      // FIX-33 (#66): Exact whitelist replaces regex to prevent subdomain spoofing
+      origin: config.isDevelopment ? '*' : (
+        process.env.CORS_ORIGINS
+          ? process.env.CORS_ORIGINS.split(',')
+          : ['https://weelo.app', 'https://captain.weelo.app', 'https://admin.weelo.app']
+      ),
       methods: ['GET', 'POST'],
       credentials: true
     },
 
     // Performance optimizations
-    pingTimeout: 10000,           // 10s - Detect dead sockets faster (was 20s)
-    pingInterval: 12000,          // 12s - Probe more frequently (was 25s)
+    pingTimeout: parseInt(process.env.SOCKET_PING_TIMEOUT_MS || '20000', 10),    // 20s default — safe for slow 2G/3G Indian networks
+    pingInterval: parseInt(process.env.SOCKET_PING_INTERVAL_MS || '15000', 10),  // 15s default
     upgradeTimeout: 10000,        // 10s - Timeout for upgrade
 
     // Transports - WebSocket ONLY (no polling handshake)
@@ -202,13 +203,27 @@ export function initializeSocket(server: HttpServer): Server {
     }
   });
 
-  // FIX #4: One-time startup warning if guaranteed delivery is disabled
-  if (process.env.FF_SEQUENCE_DELIVERY_ENABLED !== 'true') {
-    logger.warn('⚠️ FF_SEQUENCE_DELIVERY_ENABLED is OFF — RAMEN sequence delivery disabled. Set to "true" in .env for guaranteed message delivery.');
+  // H-9 FIX: Default to ON for guaranteed delivery (opt-OUT instead of opt-IN)
+  // Changed from !== 'true' (opt-in) to === 'false' (opt-out) so sequence delivery is enabled by default
+  if (process.env.FF_SEQUENCE_DELIVERY_ENABLED === 'false') {
+    logger.warn('FF_SEQUENCE_DELIVERY_ENABLED is explicitly OFF — sequence delivery disabled.');
   }
 
-  // Authentication middleware
+  // H-5 FIX: Global WebSocket connection cap — reject new connections when at capacity.
+  // Prevents unbounded memory growth from bot attacks or misconfigured clients.
+  // Must run BEFORE auth middleware to avoid DB lookups for connections we'll reject.
+  const MAX_GLOBAL_CONNECTIONS = parseInt(process.env.SOCKET_MAX_GLOBAL_CONNECTIONS || '10000', 10);
   io.use((socket, next) => {
+    const currentCount = io!.engine.clientsCount;
+    if (currentCount >= MAX_GLOBAL_CONNECTIONS) {
+      logger.warn(`[Socket] Global connection cap reached: ${currentCount}/${MAX_GLOBAL_CONNECTIONS}`);
+      return next(new Error('Server at capacity. Please retry.'));
+    }
+    next();
+  });
+
+  // Authentication middleware
+  io.use(async (socket, next) => {
     const token = socket.handshake.auth.token;
 
     if (!token) {
@@ -216,15 +231,53 @@ export function initializeSocket(server: HttpServer): Server {
     }
 
     try {
-      const decoded = jwt.verify(token, config.jwt.secret) as {
+      const decoded = jwt.verify(token, config.jwt.secret, { algorithms: ['HS256'] }) as {
         userId: string;
         role: string;
         phone: string;
+        jti?: string;
       };
+
+      // Check JTI blacklist for token revocation
+      if (decoded.jti) {
+        try {
+          const isBlacklisted = await redisService.exists(`blacklist:${decoded.jti}`);
+          if (isBlacklisted) {
+            return next(new Error('Token has been revoked'));
+          }
+        } catch (redisErr: unknown) {
+          logger.warn('[SocketAuth] JTI blacklist check failed — Redis unreachable', {
+            jti: decoded.jti,
+            userId: decoded.userId,
+            error: redisErr instanceof Error ? redisErr.message : String(redisErr),
+          });
+          try {
+            const { metrics } = require('../monitoring/metrics.service');
+            metrics.incrementCounter('jwt_blacklist_check_failures_total', { reason: 'redis_down' });
+          } catch { /* metrics unavailable — non-critical */ }
+          // Fail-open for socket auth (non-financial). Token signature still valid.
+        }
+      }
 
       socket.data.userId = decoded.userId;
       socket.data.role = decoded.role;
       socket.data.phone = decoded.phone;
+
+      // Problem 13 fix: Set transporterId for drivers during auth
+      if (decoded.role === 'driver') {
+        try {
+          const { prismaClient: pc } = require('../database/prisma.service');
+          const driverRecord = await pc.driver.findFirst({
+            where: { id: decoded.userId },
+            select: { transporterId: true }
+          });
+          socket.data.transporterId = driverRecord?.transporterId || null;
+        } catch (dbErr: any) {
+          logger.warn(`[Socket] transporterId lookup failed for driver ${decoded.userId}: ${dbErr?.message}`);
+          socket.data.transporterId = null;
+        }
+      }
+
       next();
     } catch (error) {
       next(new Error('Invalid token'));
@@ -233,6 +286,10 @@ export function initializeSocket(server: HttpServer): Server {
 
   // Connection handler
   io.on('connection', async (socket: Socket) => {
+    // FIX-46 (#110): Jitter to prevent thundering herd on mass reconnect
+    // C-6 FIX: Increased from 500ms to 2000ms — spreads DB load over 4x wider window during ECS deploys
+    await new Promise(resolve => setTimeout(resolve, Math.random() * 2000));
+
     const userId = socket.data.userId;
     const role = socket.data.role;
     const phone = socket.data.phone;
@@ -253,7 +310,7 @@ export function initializeSocket(server: HttpServer): Server {
     let globalCount = 0;
     try {
       globalCount = await redisService.incr(connKey);
-      await redisService.expire(connKey, 3600); // 1hr TTL (auto-cleanup)
+      await redisService.expire(connKey, CONNECTION_COUNTER_TTL_SECONDS); // auto-cleanup, reconciled every 60s
     } catch {
       // Redis unavailable — fall back to local count
       globalCount = userSocketSet.size + 1;
@@ -284,6 +341,114 @@ export function initializeSocket(server: HttpServer): Server {
     socket.join(`user:${userId}`);
     socket.join(`role:${role}`);
 
+    // H8 FIX: Auto-join transporter/driver room on connection
+    // Captain app's SocketConnectionManager.joinRoom() has zero callers,
+    // so the server must auto-join based on JWT role
+    if (role === 'transporter') {
+      socket.join(`transporter:${userId}`);
+    } else if (role === 'driver') {
+      socket.join(`driver:${userId}`);
+      // Also join the transporter's room if driver has a transporterId
+      if (socket.data.transporterId) {
+        socket.join(`transporter:${socket.data.transporterId}`);
+      }
+    } else if (role === 'customer') {
+      socket.join(`customer:${userId}`);
+    }
+
+    // H14 FIX: Auto-join active booking/order rooms on connection
+    // TripStatusManagementViewModel never calls joinBookingRoom(),
+    // so the server auto-joins the user to any active bookings/orders
+    // C-6 FIX: Wrapped in withSocketDbLimit() to prevent DB pool exhaustion during mass reconnect
+    try {
+      await withSocketDbLimit(async () => {
+        const { prismaClient } = await import('../database/prisma.service');
+
+        if (role === 'transporter' || role === 'driver') {
+          // Find active assignments for this user
+          const activeAssignments = await prismaClient.assignment.findMany({
+            where: {
+              OR: [
+                { transporterId: userId },
+                { driverId: userId }
+              ],
+              status: { in: ['pending', 'driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit', 'arrived_at_drop'] }
+            },
+            select: { bookingId: true, orderId: true },
+            take: 10 // Limit to prevent excessive joins
+          });
+          for (const a of activeAssignments) {
+            if (a.bookingId) socket.join(`booking:${a.bookingId}`);
+            if (a.orderId) socket.join(`order:${a.orderId}`);
+          }
+        } else if (role === 'customer') {
+          // Find active bookings/orders for this customer
+          const activeBookings = await prismaClient.booking.findMany({
+            where: {
+              customerId: userId,
+              status: { in: ['created', 'broadcasting', 'active', 'partially_filled', 'fully_filled', 'in_progress'] }
+            },
+            select: { id: true },
+            take: 10
+          });
+          for (const b of activeBookings) {
+            socket.join(`booking:${b.id}`);
+          }
+
+          const activeOrders = await prismaClient.order.findMany({
+            where: {
+              customerId: userId,
+              status: { in: ['created', 'broadcasting', 'active', 'partially_filled', 'fully_filled', 'in_progress'] }
+            },
+            select: { id: true },
+            take: 10
+          });
+          for (const o of activeOrders) {
+            socket.join(`order:${o.id}`);
+          }
+
+          // C-16 FIX: Auto-join customer to trip:{tripId} rooms for active assignments
+          // Enables per-truck real-time tracking via emitToTrip()
+          try {
+            const bookingIds = activeBookings.map((b: { id: string }) => b.id);
+            const orderIds = activeOrders.map((o: { id: string }) => o.id);
+
+            if (bookingIds.length > 0 || orderIds.length > 0) {
+              const orConditions: any[] = [];
+              if (bookingIds.length > 0) orConditions.push({ bookingId: { in: bookingIds } });
+              if (orderIds.length > 0) orConditions.push({ orderId: { in: orderIds } });
+
+              const activeTrips = await prismaClient.assignment.findMany({
+                where: {
+                  OR: orConditions,
+                  status: { in: ['pending', 'driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit', 'arrived_at_drop'] },
+                  tripId: { not: undefined }
+                },
+                select: { tripId: true },
+                take: 20
+              });
+
+              for (const trip of activeTrips) {
+                if (trip.tripId) {
+                  socket.join(`trip:${trip.tripId}`);
+                }
+              }
+
+              if (activeTrips.length > 0) {
+                logger.debug(`[Socket] Customer ${userId} auto-joined ${activeTrips.length} trip room(s)`);
+              }
+            }
+          } catch (tripJoinErr: any) {
+            // Non-fatal: customer still gets updates via booking/order rooms
+            logger.warn(`[Socket] Customer trip room auto-join failed for ${userId}: ${tripJoinErr?.message}`);
+          }
+        }
+      });
+    } catch (autoJoinErr: any) {
+      // Non-fatal: user still has personal room, just missing resource rooms
+      logger.warn(`[Socket] Auto-join active rooms failed for ${userId}: ${autoJoinErr?.message}`);
+    }
+
     // Industry Standard: DoorDash O(1) role counter increment
     // Updated atomically on connect - eliminates O(n) forEach traversal later
     const roleCounterKey = role + 's' as keyof typeof roleCounters;
@@ -299,28 +464,82 @@ export function initializeSocket(server: HttpServer): Server {
     });
 
     // Handle joining booking room
-    socket.on(SocketEvent.JOIN_BOOKING, (bookingId: string) => {
-      socket.join(`booking:${bookingId}`);
-      logger.debug(`User ${userId} joined booking room: ${bookingId}`);
+    // H-S4 FIX: Verify ownership before allowing room join
+    socket.on(SocketEvent.JOIN_BOOKING, async (bookingId: string) => {
+      const joinKey = `${userId}:booking:${bookingId}`;
+      const now = Date.now();
+      if (recentJoinAttempts.get(joinKey) && now - recentJoinAttempts.get(joinKey)! < 5000) {
+        return; // Debounce: ignore duplicate join within 5s
+      }
+      recentJoinAttempts.set(joinKey, now);
+
+      try {
+        const { prismaClient } = await import('../database/prisma.service');
+        const booking = await prismaClient.booking.findUnique({
+          where: { id: bookingId },
+          select: { customerId: true }
+        });
+        if (!booking) {
+          socket.emit(SocketEvent.ERROR, { message: 'Booking not found' });
+          return;
+        }
+        if (socket.data.role === 'customer' && booking.customerId !== socket.data.userId) {
+          socket.emit(SocketEvent.ERROR, { message: 'Unauthorized: not your booking' });
+          return;
+        }
+        if (socket.data.role === 'driver' || socket.data.role === 'transporter') {
+          const assignment = await prismaClient.assignment.findFirst({
+            where: { bookingId, OR: [{ driverId: socket.data.userId }, { transporterId: socket.data.userId }] },
+            select: { id: true }
+          });
+          if (!assignment) {
+            socket.emit(SocketEvent.ERROR, { message: 'Unauthorized: not assigned to this booking' });
+            return;
+          }
+        }
+        socket.join(`booking:${bookingId}`);
+        logger.debug(`User ${userId} joined booking room: ${bookingId}`);
+      } catch (err: any) {
+        logger.warn(`[Socket] join_booking ownership check failed, denying: ${err?.message}`);
+        socket.emit(SocketEvent.ERROR, { message: 'Failed to verify booking access' });
+      }
     });
 
     // Handle joining transporter room - for driver notifications
+    // Problem 13 fix: enforce ownership check (transporterId now set during auth)
+    // H-S7 FIX: Block competitor transporters and non-driver/transporter roles
     socket.on('join_transporter', async ({ transporterId }: { transporterId: string }) => {
-      // Verify driver belongs to this transporter
-      const driverId = socket.data.userId;
-      const driverTransporterId = socket.data.transporterId;
-
       if (!transporterId) {
         return socket.emit('error', { message: 'Transporter ID required' });
       }
 
-      // Verify the user is a driver and belongs to this transporter
-      if (driverTransporterId && driverTransporterId !== transporterId) {
-        logger.warn(`Socket ${socket.id} rejected: driver ${driverId} trying to join transporter ${transporterId} (doesn't belong)`);
-        return socket.emit('error', { message: 'Access denied' });
+      // H-S7 FIX: Block all roles except driver and transporter
+      if (socket.data.role !== 'driver' && socket.data.role !== 'transporter') {
+        socket.emit('error', { message: 'Unauthorized: only drivers and transporters can join transporter rooms' });
+        return;
       }
 
-      // Join transporter room
+      // Drivers can only join their own transporter's room
+      if (socket.data.role === 'driver' && socket.data.transporterId !== transporterId) {
+        logger.warn('[Socket] Driver tried to join unauthorized transporter room', {
+          driverId: socket.data.userId,
+          requestedTransporter: transporterId,
+          actualTransporter: socket.data.transporterId || 'none'
+        });
+        socket.emit('error', { message: 'Unauthorized: you do not belong to this transporter' });
+        return;
+      }
+
+      // H-S7 FIX: Transporters can only join their OWN room — prevent competitor eavesdropping
+      if (socket.data.role === 'transporter' && socket.data.userId !== transporterId) {
+        logger.warn('[Socket] Transporter tried to join another transporter\'s room', {
+          transporterId: socket.data.userId,
+          requestedTransporter: transporterId
+        });
+        socket.emit('error', { message: 'Unauthorized: you can only join your own transporter room' });
+        return;
+      }
+
       await socket.join(`transporter:${transporterId}`);
       logger.debug(`Socket ${socket.id} joined transporter:${transporterId}`);
     });
@@ -331,7 +550,7 @@ export function initializeSocket(server: HttpServer): Server {
       logger.debug(`User ${userId} left booking room: ${bookingId}`);
     });
 
-    // Handle location updates (from drivers)
+    // Handle location updates (from drivers) - rate limited (Problem 17)
     socket.on(SocketEvent.UPDATE_LOCATION, (data: {
       tripId: string;
       latitude: number;
@@ -339,6 +558,10 @@ export function initializeSocket(server: HttpServer): Server {
       speed?: number;
       bearing?: number;
     }) => {
+      if (!checkRateLimit(socket.id, socket.data?.userId)) {
+        logger.warn(`[Socket] Rate limited update_location from ${socket.id}`);
+        return;
+      }
       if (role !== 'driver') {
         socket.emit(SocketEvent.ERROR, { message: 'Only drivers can update location' });
         return;
@@ -359,6 +582,9 @@ export function initializeSocket(server: HttpServer): Server {
     // Handle disconnect
     socket.on('disconnect', (reason) => {
       logger.info(`Socket disconnected: ${socket.id} (Reason: ${reason})`);
+      // H-P5 FIX: checkRateLimit keys by userId, not socket.id — delete the correct key
+      const disconnectingUserId = socketUsers.get(socket.id);
+      eventCounts.delete(disconnectingUserId || socket.id);
 
       // Remove from tracking
       const userId = socketUsers.get(socket.id);
@@ -369,15 +595,23 @@ export function initializeSocket(server: HttpServer): Server {
         }
 
         // Industry Standard: DoorDash O(1) role counter decrement
-        const role = socket.data.role;
-        const roleCounterKey = role + 's' as keyof typeof roleCounters;
-        if (roleCounterKey in roleCounters) {
-          (roleCounters[roleCounterKey] as number) =
-            Math.max(0, (roleCounters[roleCounterKey] as number) - 1);
+        // F-4-20 FIX: Guard against undefined role to prevent NaN drift
+        const disconnectRole = socket.data?.role;
+        if (disconnectRole) {
+          const roleCounterKey = disconnectRole + 's' as keyof typeof roleCounters;
+          if (roleCounterKey in roleCounters) {
+            (roleCounters[roleCounterKey] as number) = Math.max(0, (roleCounters[roleCounterKey] as number) - 1);
+          }
         }
 
         // Decrement Redis connection counter (cross-instance tracking)
-        try { redisService.incrBy(`socket:conncount:${userId}`, -1).catch(() => { }); } catch { }
+        // FIX-45 (#109): Log counter decrement failures instead of swallowing silently
+        try { redisService.incrBy(`socket:conncount:${userId}`, -1).catch(err => logger.warn('[Socket] Counter decrement failed', { error: err.message })); } catch { }
+
+        // H-S4 FIX: Clean up join debounce entries for disconnected user
+        for (const [key] of recentJoinAttempts) {
+          if (key.startsWith(`${userId}:`)) recentJoinAttempts.delete(key);
+        }
       }
       socketUsers.delete(socket.id);
     });
@@ -398,6 +632,10 @@ export function initializeSocket(server: HttpServer): Server {
     // → key doesn't exist → heartbeat ignored → stays offline ✅
     // ================================================================
     socket.on(SocketEvent.HEARTBEAT, (data: any) => {
+      if (!checkRateLimit(socket.id, socket.data?.userId)) {
+        logger.warn(`[Socket] Rate limited heartbeat from ${socket.id}`);
+        return;
+      }
       if (role === 'driver') {
         // Driver heartbeat → extends driver:presence:{id}
         try {
@@ -419,7 +657,8 @@ export function initializeSocket(server: HttpServer): Server {
             const presenceKey = TRANSPORTER_PRESENCE_KEY(userId);
             const presenceExists = await redisService.exists(presenceKey);
             if (!presenceExists) {
-              // No presence key — transporter is offline, ignore stale heartbeat
+              // No presence key — transporter toggled OFFLINE, ignore stale heartbeat
+              // This guard prevents ghost-online: OFF → DEL key → heartbeat arrives → must NOT recreate
               return;
             }
 
@@ -479,24 +718,67 @@ export function initializeSocket(server: HttpServer): Server {
 
           if (pendingAssignment) {
             // Calculate remaining seconds — must match the setTimeout timer in queue.service.ts
-            // ASSIGNMENT_TIMEOUT_MS defaults to 30s (same as scheduleAssignmentTimeout)
-            const ASSIGNMENT_TIMEOUT_MS = parseInt(process.env.ASSIGNMENT_TIMEOUT_MS || '30000', 10);
+            // Fix H-X1: Use centralized HOLD_CONFIG instead of local parseInt
+            const ASSIGNMENT_TIMEOUT_MS = HOLD_CONFIG.driverAcceptTimeoutMs;
             const assignedAtMs = new Date(pendingAssignment.assignedAt || '').getTime();
             const elapsedMs = Date.now() - assignedAtMs;
             const remainingMs = ASSIGNMENT_TIMEOUT_MS - elapsedMs;
 
             if (remainingMs > 2000) {
-              // Still within timeout window — re-send the assignment
-              socket.emit(SocketEvent.ASSIGNMENT_STATUS_CHANGED, {
+              // FIX-2: Fetch full assignment with order details for enriched reconnect payload.
+              // Uber RAMEN pattern: reconnect re-delivery must use the SAME event + payload
+              // as initial delivery. Captain app only shows trip overlay for 'trip_assigned'
+              // events (SocketEventRouter.kt:130), NOT 'assignment_status_changed'.
+              const fullAssignment = await prismaClient.assignment.findUnique({
+                where: { id: pendingAssignment.id },
+                include: {
+                  order: { select: { id: true, pickup: true, drop: true, distanceKm: true } },
+                  truckRequest: { select: { pricePerTruck: true } }
+                }
+              });
+
+              const orderPickup = fullAssignment?.order?.pickup ?? null;
+              const orderDrop = fullAssignment?.order?.drop ?? null;
+
+              // Still within timeout window — re-send using TRIP_ASSIGNED (matches initial delivery)
+              socket.emit(SocketEvent.TRIP_ASSIGNED, {
+                type: 'trip_assigned',
                 assignmentId: pendingAssignment.id,
                 tripId: pendingAssignment.tripId,
                 bookingId: pendingAssignment.bookingId,
+                orderId: fullAssignment?.order?.id || pendingAssignment.orderId || null,
+                pickup: orderPickup,
+                drop: orderDrop,
+                vehicleNumber: pendingAssignment.vehicleNumber || '',
+                farePerTruck: fullAssignment?.truckRequest?.pricePerTruck || 0,
+                distanceKm: fullAssignment?.order?.distanceKm || 0,
                 status: 'pending',
                 message: 'New trip assigned to you',
                 remainingSeconds: Math.floor(remainingMs / 1000),
                 _reconnectDelivery: true
               });
-              logger.info(`[Socket] 📡 Re-sent pending assignment ${pendingAssignment.id} to driver ${userId} on reconnect (${Math.floor(remainingMs / 1000)}s remaining)`);
+              logger.info(`[Socket] Re-sent pending assignment ${pendingAssignment.id} to driver ${userId} on reconnect via trip_assigned (${Math.floor(remainingMs / 1000)}s remaining)`);
+
+              // Dual-channel: FCM fallback for 2G/3G (Gojek Courier pattern)
+              // Socket emit may silently fail if driver's connection is flaky.
+              // FCM push ensures driver sees the assignment even if socket drops again.
+              try {
+                const { sendPushNotification } = await import('./fcm.service');
+                await sendPushNotification(userId, {
+                  title: 'New Trip Assigned',
+                  body: 'You have a pending trip assignment',
+                  data: {
+                    type: 'trip_assigned',
+                    assignmentId: pendingAssignment.id,
+                    tripId: pendingAssignment.tripId || '',
+                    bookingId: pendingAssignment.bookingId || '',
+                    remainingSeconds: String(Math.floor(remainingMs / 1000)),
+                    _reconnectDelivery: 'true'
+                  }
+                });
+              } catch (fcmErr: any) {
+                logger.debug(`[Socket] FCM fallback failed for driver ${userId}: ${fcmErr?.message}`);
+              }
             } else {
               logger.debug(`[Socket] Pending assignment ${pendingAssignment.id} for driver ${userId} has <2s remaining — skipping re-send`);
             }
@@ -548,12 +830,14 @@ export function initializeSocket(server: HttpServer): Server {
       //   - try/catch: failure here is silent — client has API reconcile fallback
       //   - _reconnectDelivery: true flag lets client BroadcastFlowCoordinator
       //     deduplicate with any Socket.IO or FCM delivery already in flight
-      //   - Capped at 20 broadcasts to avoid flooding slow connections
+      //   - Capped at MAX_RECONNECT_BROADCASTS to avoid flooding slow connections
       // ================================================================
       (async () => {
         try {
           const { bookingService } = await import('../../modules/booking/booking.service');
-          const result = await bookingService.getActiveBroadcasts(userId, { limit: 20 } as any);
+          // L-5 FIX: Env-configurable reconnect broadcast cap (was hardcoded 20)
+          const MAX_RECONNECT_BROADCASTS = parseInt(process.env.MAX_RECONNECT_BROADCASTS || '50', 10);
+          const result = await bookingService.getActiveBroadcasts(userId, { page: 1, limit: MAX_RECONNECT_BROADCASTS });
           // bookingService returns { bookings, total, hasMore }
           const broadcasts = (result as any)?.bookings ?? (result as any)?.broadcasts ?? [];
 
@@ -572,17 +856,180 @@ export function initializeSocket(server: HttpServer): Server {
           logger.warn(`[Socket] Failed to push active broadcasts on connect for ${userId}: ${e.message}`);
         }
       })();
+
+      // C-6 FIX: Also replay order-path broadcasts (not just booking-path)
+      (async () => {
+        try {
+          const { prismaClient } = await import('../database/prisma.service');
+          const activeOrderBroadcasts = await prismaClient.order.findMany({
+            where: {
+              status: { in: ['broadcasting' as any, 'active'] },
+              // Only orders where this transporter was notified
+              notifiedTransporters: { has: userId },
+            } as any,
+            select: {
+              id: true,
+              status: true,
+              customerId: true,
+              pickup: true,
+              drop: true,
+              totalAmount: true,
+              createdAt: true,
+            },
+            // L-5 FIX: Use same configurable cap for order-path replays
+            take: parseInt(process.env.MAX_RECONNECT_BROADCASTS || '50', 10),
+            orderBy: { createdAt: 'desc' },
+          });
+
+          for (const order of activeOrderBroadcasts) {
+            emitToUser(userId, 'new_broadcast', {
+              orderId: order.id,
+              status: order.status,
+              pickupAddress: (order.pickup as any)?.address,
+              dropAddress: (order.drop as any)?.address,
+              totalAmount: order.totalAmount,
+              _reconnectDelivery: true,
+              _replayed: true,
+            });
+          }
+
+          if (activeOrderBroadcasts.length > 0) {
+            logger.info(`[Socket] Transporter ${userId} reconnect: replayed ${activeOrderBroadcasts.length} order-path broadcast(s)`);
+          }
+        } catch (orderReplayErr: any) {
+          logger.warn(`[Socket] Order-path reconnect replay failed: ${orderReplayErr?.message}`);
+        }
+      })();
+    } else if (role === 'customer') {
+      // ================================================================
+      // CUSTOMER ORDER STATE SYNC ON RECONNECT (C-1 FIX)
+      // ================================================================
+      // When a customer reconnects, push current order state so they
+      // see live status immediately. Mirrors transporter reconnect pattern.
+      // ================================================================
+      (async () => {
+        try {
+          const { prismaClient } = await import('../database/prisma.service');
+
+          // Find active orders for this customer
+          const activeOrders = await prismaClient.order.findMany({
+            where: {
+              customerId: userId,
+              status: { in: ['broadcasting' as any, 'active', 'partially_filled'] },
+            },
+            include: {
+              truckRequests: {
+                select: { id: true, status: true, vehicleType: true },
+              },
+            },
+            take: 10,
+            orderBy: { createdAt: 'desc' },
+          });
+
+          if (activeOrders.length > 0) {
+            logger.info(`[Socket] Customer ${userId} reconnected — pushing ${activeOrders.length} active order(s)`);
+          }
+
+          for (const order of activeOrders) {
+            const confirmedCount = order.truckRequests.filter(
+              (tr: any) => tr.status === 'confirmed' || tr.status === 'assigned'
+            ).length;
+            const totalCount = order.truckRequests.length;
+
+            emitToUser(userId, 'order_state_sync', {
+              orderId: order.id,
+              status: order.status,
+              dispatchState: (order as any).dispatchState || 'unknown',
+              trucksConfirmed: confirmedCount,
+              totalTrucks: totalCount,
+              _reconnectDelivery: true,
+              _replayed: true,
+            });
+
+            // Re-join customer to order room
+            const orderRoom = `order:${order.id}`;
+            const userSocketSet = userSockets.get(userId);
+            if (userSocketSet) {
+              for (const sid of userSocketSet) {
+                const s = io?.sockets.sockets.get(sid);
+                if (s) s.join(orderRoom);
+              }
+            }
+          }
+
+          // Also check legacy bookings
+          try {
+            const { bookingService } = await import('../../modules/booking/booking.service');
+            const activeBookingsResult = await bookingService.getActiveBroadcasts(userId, { page: 1, limit: 10 });
+            const activeBookings = activeBookingsResult?.bookings ?? [];
+            if (activeBookings.length > 0) {
+              for (const booking of (activeBookings as any[]).slice(0, 10)) {
+                emitToUser(userId, 'order_state_sync', {
+                  orderId: (booking as any).id || (booking as any).bookingId,
+                  status: (booking as any).status || 'active',
+                  _reconnectDelivery: true,
+                  _replayed: true,
+                });
+              }
+            }
+          } catch (bookingErr: any) {
+            logger.warn(`[Socket] Customer reconnect booking lookup failed: ${bookingErr?.message}`);
+          }
+        } catch (e: any) {
+          logger.warn(`[Socket] Customer reconnect state sync failed: ${e?.message}`);
+        }
+      })();
     }
 
-    // Handle ping from client (for connection quality)
+    // Handle ping from client (for connection quality) - rate limited
     socket.on('ping', () => {
+      if (!checkRateLimit(socket.id, socket.data?.userId)) return;
       socket.emit('pong');
     });
 
     // Handle joining order room (for multi-truck updates)
-    socket.on(SocketEvent.JOIN_ORDER, (orderId: string) => {
-      socket.join(`order:${orderId}`);
-      logger.debug(`User ${userId} joined order room: ${orderId}`);
+    // H-S4 FIX: Verify ownership before allowing room join
+    socket.on(SocketEvent.JOIN_ORDER, async (orderId: string) => {
+      const joinKey = `${userId}:order:${orderId}`;
+      const now = Date.now();
+      if (recentJoinAttempts.get(joinKey) && now - recentJoinAttempts.get(joinKey)! < 5000) {
+        return; // Debounce: ignore duplicate join within 5s
+      }
+      recentJoinAttempts.set(joinKey, now);
+
+      try {
+        const { prismaClient } = await import('../database/prisma.service');
+        const order = await prismaClient.order.findUnique({
+          where: { id: orderId },
+          select: { customerId: true }
+        });
+        if (!order) {
+          socket.emit(SocketEvent.ERROR, { message: 'Order not found' });
+          return;
+        }
+        if (socket.data.role === 'customer' && order.customerId !== socket.data.userId) {
+          socket.emit(SocketEvent.ERROR, { message: 'Unauthorized: not your order' });
+          return;
+        }
+        if (socket.data.role === 'driver' || socket.data.role === 'transporter') {
+          const assignment = await prismaClient.assignment.findFirst({
+            where: {
+              orderId,
+              OR: [{ driverId: socket.data.userId }, { transporterId: socket.data.userId }]
+            },
+            select: { id: true }
+          });
+          if (!assignment) {
+            socket.emit(SocketEvent.ERROR, { message: 'Unauthorized: not assigned to this order' });
+            return;
+          }
+        }
+        socket.join(`order:${orderId}`);
+        logger.debug(`User ${userId} joined order room: ${orderId}`);
+      } catch (err: any) {
+        logger.warn(`[Socket] join_order ownership check failed, denying: ${err?.message}`);
+        socket.emit(SocketEvent.ERROR, { message: 'Failed to verify order access' });
+      }
     });
 
     // Handle leaving order room
@@ -592,13 +1039,164 @@ export function initializeSocket(server: HttpServer): Server {
     });
 
     // ================================================================
+    // C-16 FIX: Handle joining trip room (customer per-truck tracking)
+    // ================================================================
+    // Customer sends { tripId } to join trip room for real-time updates.
+    // Ownership verified: customer must own the booking associated with
+    // the trip's assignment. Transporters/drivers auto-join via H14 block.
+    // ================================================================
+    socket.on(SocketEvent.JOIN_TRIP, async (data: { tripId?: string }) => {
+      const tripId = data?.tripId;
+      if (!tripId) {
+        socket.emit(SocketEvent.ERROR, { message: 'tripId required' });
+        return;
+      }
+
+      const joinKey = `${userId}:trip:${tripId}`;
+      const now = Date.now();
+      if (recentJoinAttempts.get(joinKey) && now - recentJoinAttempts.get(joinKey)! < 5000) {
+        return; // Debounce: ignore duplicate join within 5s
+      }
+      recentJoinAttempts.set(joinKey, now);
+
+      try {
+        const { prismaClient } = await import('../database/prisma.service');
+        const assignment = await prismaClient.assignment.findFirst({
+          where: { tripId },
+          select: {
+            id: true,
+            bookingId: true,
+            orderId: true,
+            transporterId: true,
+            driverId: true,
+            booking: { select: { customerId: true } },
+            order: { select: { customerId: true } }
+          }
+        });
+
+        if (!assignment) {
+          socket.emit(SocketEvent.ERROR, { message: 'Trip not found' });
+          return;
+        }
+
+        // Ownership verification
+        if (socket.data.role === 'customer') {
+          const bookingOwner = assignment.booking?.customerId;
+          const orderOwner = assignment.order?.customerId;
+          if (bookingOwner !== userId && orderOwner !== userId) {
+            socket.emit(SocketEvent.ERROR, { message: 'Unauthorized: not your trip' });
+            return;
+          }
+        } else if (socket.data.role === 'driver' || socket.data.role === 'transporter') {
+          if (assignment.transporterId !== userId && assignment.driverId !== userId) {
+            socket.emit(SocketEvent.ERROR, { message: 'Unauthorized: not assigned to this trip' });
+            return;
+          }
+        }
+
+        socket.join(`trip:${tripId}`);
+        logger.debug(`User ${userId} joined trip room: ${tripId}`);
+      } catch (err: any) {
+        logger.warn(`[Socket] join_trip ownership check failed, denying: ${err?.message}`);
+        socket.emit(SocketEvent.ERROR, { message: 'Failed to verify trip access' });
+      }
+    });
+
+    // ================================================================
+    // C13 FIX: DRIVER SOS HANDLER
+    // ================================================================
+    // Driver sends SOS from the app → log, notify transporter, store in Redis.
+    // Without this handler, driver_sos events were silently dropped.
+    // ================================================================
+    socket.on('driver_sos', async (data: { location?: { lat: number; lng: number }; message?: string }) => {
+      try {
+        if (!checkRateLimit(socket.id, socket.data?.userId)) return;
+        if (socket.data.role !== 'driver') return;
+
+        logger.warn('[SOCKET] Driver SOS received', {
+          driverId: userId,
+          location: data?.location,
+          message: data?.message
+        });
+
+        // Emit to transporter room if available
+        const transporterId = socket.data.transporterId;
+        if (transporterId && io) {
+          io.to(`transporter:${transporterId}`).emit('driver_sos_alert', {
+            driverId: userId,
+            location: data?.location,
+            message: data?.message,
+            timestamp: new Date().toISOString()
+          });
+
+          // FCM push fallback: ensures transporter sees SOS even if Captain app is backgrounded
+          try {
+            const { sendPushNotification } = await import('./fcm.service');
+            await sendPushNotification(transporterId, {
+              title: 'DRIVER SOS ALERT',
+              body: `Driver ${userId} triggered SOS! Tap for location.`,
+              data: {
+                type: 'driver_sos_alert',
+                driverId: userId,
+                lat: String(data?.location?.lat || ''),
+                lng: String(data?.location?.lng || ''),
+                message: data?.message || '',
+                timestamp: new Date().toISOString()
+              }
+            });
+          } catch (fcmErr: unknown) {
+            const fcmMsg = fcmErr instanceof Error ? fcmErr.message : String(fcmErr);
+            logger.error('[SOCKET] SOS FCM fallback failed', { transporterId, error: fcmMsg });
+          }
+        }
+
+        // Store in Redis for tracking (5 min TTL)
+        await redisService.setJSON(`sos:${userId}`, {
+          driverId: userId,
+          location: data?.location,
+          message: data?.message,
+          timestamp: new Date().toISOString()
+        }, 300);
+      } catch (err) {
+        logger.error('[SOCKET] Error handling driver_sos', { error: err });
+      }
+    });
+
+    // ================================================================
+    // M15 FIX: Handle mid-session FCM token refresh via socket
+    // ================================================================
+    socket.on('fcm_token_refresh', async (data: { fcmToken?: string; token?: string }) => {
+      try {
+        // F-C-54: Accept both `fcmToken` (canonical, emitted by captain) and
+        // `token` (legacy alias). Prefer `fcmToken`. Silent-return on bad payload.
+        const receivedToken = data?.fcmToken ?? data?.token;
+        if (!receivedToken || receivedToken.length < 10) {
+          try {
+            const { metrics } = require('../monitoring/metrics.service');
+            metrics.incrementCounter('fcm_token_refresh_bad_payload_total');
+          } catch { /* metrics unavailable — non-critical */ }
+          return;
+        }
+        if (!userId) return;
+        const { fcmService } = await import('./fcm.service');
+        await fcmService.registerToken(userId, receivedToken);
+        logger.info('[FCM] Mid-session token refresh via socket', { userId });
+        socket.emit('fcm_token_refresh_ack', { success: true });
+      } catch (error) {
+        logger.error('[FCM] Token refresh failed', { userId, error });
+        socket.emit('fcm_token_refresh_ack', { success: false });
+      }
+    });
+
+    // ================================================================
     // PHASE 4: SEQUENCE REPLAY ON RECONNECT (flag-gated)
     // ================================================================
     // If FF_SEQUENCE_DELIVERY_ENABLED and client sends lastSeq in auth,
     // replay all unacked messages with seq > lastSeq.
     // This ensures no message is ever lost, even on 2G reconnect.
     // ================================================================
-    const FF_SEQ = process.env.FF_SEQUENCE_DELIVERY_ENABLED === 'true';
+    // H-9 FIX: Default to ON — opt-out with FF_SEQUENCE_DELIVERY_ENABLED=false
+    const FF_SEQ = process.env.FF_SEQUENCE_DELIVERY_ENABLED !== 'false';
     if (FF_SEQ) {
       const lastSeq = Number(socket.handshake.auth?.lastSeq || 0);
       if (lastSeq > 0) {
@@ -653,6 +1251,82 @@ export function initializeSocket(server: HttpServer): Server {
   });
 
   logger.info('Socket.IO initialized with optimized settings');
+
+  // FIX-32 (#63): Cleanup stale eventCounts entries every 60s to prevent memory leak
+  setInterval(() => {
+    const cutoff = Date.now() - 60_000;
+    for (const [key, entry] of eventCounts) {
+      if (entry.resetAt && entry.resetAt < cutoff) {
+        eventCounts.delete(key);
+      }
+    }
+  }, 60_000).unref();
+
+  // FIX-13 (#62): Cleanup stale recentJoinAttempts every 60s to prevent memory leak
+  setInterval(() => {
+    const cutoff = Date.now() - 5 * 60 * 1000;
+    for (const [key, timestamp] of recentJoinAttempts) {
+      if (typeof timestamp === 'number' && timestamp < cutoff) {
+        recentJoinAttempts.delete(key);
+      }
+    }
+  }, 60_000).unref();
+
+  // FIX A5#11: TTL refresh interval — keep alive counters for active users
+  // The 300s TTL ensures counters auto-expire if this instance dies.
+  // We only refresh TTL, never overwrite count (safe for multi-instance).
+  setInterval(async () => {
+    try {
+      for (const [userId] of userSockets) {
+        const connKey = `socket:conncount:${userId}`;
+        await redisService.expire(connKey, CONNECTION_COUNTER_TTL_SECONDS).catch(() => {});
+      }
+    } catch { /* non-fatal */ }
+  }, 60_000).unref();
+
+  // FIX A5#10: Periodic sweep for leaked socket entries
+  // Detects socketUsers entries whose socket.io handle no longer exists (disconnect missed)
+  setInterval(() => {
+    if (!io) return;
+    let swept = 0;
+    for (const [socketId, data] of socketUsers) {
+      if (!io.sockets.sockets.has(socketId)) {
+        socketUsers.delete(socketId);
+        const userId = typeof data === 'string' ? data : (data as any).userId;
+        userSockets.get(userId)?.delete(socketId);
+        if (userSockets.get(userId)?.size === 0) userSockets.delete(userId);
+        // Decrement Redis connection counter to prevent inflation (QA-6 fix)
+        // FIX-45 (#109): Log counter decrement failures instead of swallowing silently
+        const connKey = `socket:conncount:${userId}`;
+        redisService.incrBy(connKey, -1).catch(err => logger.warn('[Socket] Counter decrement failed', { error: err.message }));
+        swept++;
+      }
+    }
+    if (swept > 0) logger.info(`[Socket] Swept ${swept} leaked socket entries`);
+  }, 5 * 60_000).unref();
+
+  // F-4-20 FIX: Periodic reconciliation of roleCounters (every 60s)
+  setInterval(() => {
+    if (!io) return;
+    const counted = { customers: 0, transporters: 0, drivers: 0 };
+    for (const [, socket] of io.sockets.sockets) {
+      const r = socket.data?.role;
+      if (r === 'customer') counted.customers++;
+      else if (r === 'transporter') counted.transporters++;
+      else if (r === 'driver') counted.drivers++;
+    }
+    const hasDrift = roleCounters.customers !== counted.customers ||
+      roleCounters.transporters !== counted.transporters ||
+      roleCounters.drivers !== counted.drivers;
+    if (hasDrift) {
+      logger.warn('[Socket] roleCounters drift detected — reconciling', {
+        before: { ...roleCounters }, actual: counted
+      });
+    }
+    roleCounters.customers = counted.customers;
+    roleCounters.transporters = counted.transporters;
+    roleCounters.drivers = counted.drivers;
+  }, 60_000).unref();
 
   // Wire @socket.io/redis-adapter for cross-instance delivery
   // All io.to(room).emit() calls automatically sync across ECS tasks
@@ -731,9 +1405,64 @@ async function setupRedisAdapter(socketServer: Server): Promise<void> {
   redisAdapterMode = 'failed';
   logger.error(`[Socket] Redis Streams adapter failed after ${MAX_RETRIES} attempts: ${redisAdapterLastError}`);
   logger.warn('[Socket] Falling back to single-instance mode — cross-task socket delivery disabled');
+  // FIX A5#5: Track adapter failures in metrics for alerting
+  try { const { metrics } = require('../monitoring/metrics.service'); metrics.incrementCounter('socket_adapter_failure_total'); } catch { }
+
+  // Fix H-R4: Schedule periodic reconnection attempts (every 30s)
+  const ADAPTER_RECONNECT_INTERVAL_MS = 30_000;
+  if (adapterReconnectTimer) clearInterval(adapterReconnectTimer);
+  adapterReconnectTimer = setInterval(async () => {
+    if (redisAdapterMode === 'enabled') {
+      if (adapterReconnectTimer) clearInterval(adapterReconnectTimer);
+      adapterReconnectTimer = null;
+      return;
+    }
+    try {
+      const client = redisService.getClient();
+      if (!client || !io) return;
+      io.adapter(createAdapter(client));
+      redisPubSubInitialized = true;
+      redisAdapterMode = 'enabled';
+      redisAdapterLastError = null;
+      logger.info('[Socket] Redis Streams adapter RECOVERED via background reconnect');
+      try { const { metrics } = require('../monitoring/metrics.service'); metrics.incrementCounter('socket_adapter_recovery_total'); } catch { }
+      if (adapterReconnectTimer) clearInterval(adapterReconnectTimer);
+      adapterReconnectTimer = null;
+    } catch (err: any) {
+      redisAdapterLastError = err?.message || 'unknown';
+      logger.warn(`[Socket] Adapter reconnect attempt failed: ${err?.message}`);
+    }
+  }, ADAPTER_RECONNECT_INTERVAL_MS);
+  adapterReconnectTimer.unref();
 }
 
-function withSocketMeta(data: any): any {
+// M-17 FIX: Cross-instance sequence counter via Redis range pre-fetch
+// Uses Twitter Snowflake-style range allocation: pre-fetch a batch of sequence
+// numbers from Redis INCRBY, then hand them out locally without per-event I/O.
+// Falls back to local-only counter if Redis is unavailable (fail-open).
+const SEQ_BATCH_SIZE = 1000;
+let seqRangeStart = 0;
+let seqRangeEnd = 0;
+let currentSeq = 0;
+let seqFetchInFlight = false;
+
+function getNextSequenceSync(): number {
+  if (currentSeq >= seqRangeEnd && !seqFetchInFlight) {
+    // Asynchronously fetch next batch (non-blocking, fire-and-forget)
+    seqFetchInFlight = true;
+    redisService.incrBy('socket:global_seq', SEQ_BATCH_SIZE)
+      .then((newEnd) => {
+        seqRangeStart = newEnd - SEQ_BATCH_SIZE;
+        seqRangeEnd = newEnd;
+        currentSeq = seqRangeStart;
+      })
+      .catch(() => { /* fail-open: local counter continues */ })
+      .finally(() => { seqFetchInFlight = false; });
+  }
+  return ++currentSeq;
+}
+
+function withSocketMeta(data: any, seqOverride?: number): any {
   if (!data || typeof data !== 'object' || Array.isArray(data)) {
     return data;
   }
@@ -744,25 +1473,244 @@ function withSocketMeta(data: any): any {
   return {
     ...data,
     eventVersion: SOCKET_EVENT_VERSION,
-    serverTimeMs: Date.now()
+    serverTimeMs: Date.now(),
+    _seq: typeof seqOverride === 'number' ? seqOverride : getNextSequenceSync()
   };
 }
+
+// =============================================================================
+// F-B-26: DURABLE EMIT — at-least-once delivery via per-user ZSET + monotonic seq
+// =============================================================================
+// Pattern: Transactional Outbox (microservices.io) + Socket.IO ZSET unacked
+// queue (Sigma Computing) + per-user monotonic seq (Kafka idempotent producer).
+//
+// Problem (per Phase-1 F-B-26): the only two production ZADD sites for
+// `socket:unacked:{userId}` live in the broadcast-queue processor. Every
+// direct `emitToUser` / room emit stamps a global `_seq` on the payload but
+// never writes the envelope, so the ACK/replay path has nothing to replay.
+//
+// Fix: `durableEmit(userId, event, data)` writes envelope -> ZADD -> TTL refresh
+// -> io.to('user:'+userId).emit with the per-user seq stamped back on the
+// payload. Emit helpers below route LIFECYCLE_EMIT_EVENTS through this path
+// when FF_DURABLE_EMIT_ENABLED is on; telemetry remains fire-and-forget.
+// =============================================================================
+
+/**
+ * Lifecycle events that require at-least-once durable delivery. When
+ * FF_DURABLE_EMIT_ENABLED is on, emit helpers route these through durableEmit
+ * (ZADD envelope before io.emit). Telemetry events (location_updated,
+ * broadcast_countdown, heartbeat) remain fire-and-forget to avoid ZSET spam.
+ */
+const LIFECYCLE_EMIT_EVENTS: ReadonlySet<string> = new Set([
+  'trip_assigned',
+  'truck_confirmed',
+  'driver_accepted',
+  'driver_declined',
+  'booking_updated',
+  'booking_expired',
+  'booking_cancelled',
+  'booking_completed',
+  'assignment_status_changed',
+  'assignment_stale',
+  'assignment_timeout',
+  'driver_timeout',
+  'hold_expired',
+  'hold_confirmed',
+  'hold_released',
+  'flex_hold_started',
+  'flex_hold_extended',
+  'new_broadcast',
+  'broadcast_state_changed',
+  'order_cancelled',
+  'order_expired',
+  'order_completed',
+  'order_status_update',
+  'order_state_sync',
+  'payment_pending',
+  'payment_confirmed',
+  'payment_succeeded',
+  'payment_failed',
+  'sos_alert',
+  'cascade_reassigned'
+]);
+
+// TTL for the unacked-envelope ZSET. Mirrors queue.service.ts
+// UNACKED_QUEUE_TTL_SECONDS (600s) — duplicated here to avoid importing
+// queue.service.ts from socket.service.ts (would pull a large cycle).
+const DURABLE_EMIT_TTL_SECONDS = 600;
+
+/**
+ * F-B-26: Write an envelope to `socket:unacked:{userId}` under a per-user
+ * monotonic sequence, refresh TTL, then emit. On reconnect the replay handler
+ * (lines ~1295-1324) drains unacked in seq order; BROADCAST_ACK (lines ~1328-
+ * 1341) prunes by score.
+ *
+ * Best-effort: any Redis failure degrades to a plain emit with a global seq
+ * (matches pre-F-B-26 behavior). Never throws.
+ *
+ * @param userId Target user ID (room = `user:${userId}`)
+ * @param event Socket.IO event name
+ * @param data Event payload (object)
+ * @returns true if emit fired (regardless of whether ZADD succeeded)
+ */
+async function durableEmit(userId: string, event: string, data: any): Promise<boolean> {
+  if (!io) return false;
+  let seq: number | undefined;
+  try {
+    seq = await redisService.incr(`socket:seq:${userId}`);
+    const envelope = JSON.stringify({
+      seq,
+      event,
+      payload: data,
+      createdAt: Date.now()
+    });
+    // ZADD + TTL refresh in parallel (independent ops)
+    await Promise.all([
+      redisService.zAdd(`socket:unacked:${userId}`, seq, envelope),
+      redisService.expire(`socket:unacked:${userId}`, DURABLE_EMIT_TTL_SECONDS)
+    ]);
+  } catch (persistErr: unknown) {
+    // ZSET write failed — fall back to non-durable emit. Over-delivery is
+    // safe; under-delivery is not. Log and carry on.
+    const msg = persistErr instanceof Error ? persistErr.message : String(persistErr);
+    logger.warn('[durableEmit] ZSET write failed, emitting without durable persistence', {
+      userId, event, error: msg
+    });
+    seq = undefined;
+  }
+  try {
+    io.to(`user:${userId}`).emit(event, withSocketMeta(data, seq));
+  } catch (emitErr: unknown) {
+    socketCircuit.reportFailure();
+    const msg = emitErr instanceof Error ? emitErr.message : String(emitErr);
+    logger.warn('[durableEmit] Emit failed, circuit breaker recording', {
+      userId, event, error: msg
+    });
+    return false;
+  }
+  return true;
+}
+
+/**
+ * F-B-26: Enumerate LOCAL members of a room → distinct userIds. Used by room
+ * helpers (emitToBooking/emitToTrip/...) when the event is in
+ * LIFECYCLE_EMIT_EVENTS and FF_DURABLE_EMIT_ENABLED is on. Only local
+ * members are visible (enumerating across peers would require async
+ * fetchSockets which adds latency to every lifecycle emit). Peer instances
+ * handle ZADD persistence for their own locally-connected users when the
+ * business event executes on their side; for multi-instance deployments the
+ * emitting instance covers its local users and the adapter-backed room emit
+ * still reaches disconnected-here-but-connected-there users for live delivery.
+ */
+function enumerateRoomUserIds(room: string): string[] {
+  if (!io) return [];
+  const socketIds = io.of('/').adapter.rooms?.get(room);
+  if (!socketIds || socketIds.size === 0) return [];
+  const userIds = new Set<string>();
+  for (const socketId of socketIds) {
+    const uid = socketUsers.get(socketId);
+    if (typeof uid === 'string' && uid.length > 0) userIds.add(uid);
+  }
+  return Array.from(userIds);
+}
+
+/**
+ * F-B-26: Persist an envelope under each userId's unacked ZSET without
+ * emitting (the caller owns the subsequent room emit). Returns silently on
+ * any Redis error — best-effort. This is the room-emit companion to the
+ * full `durableEmit(userId, event, data)` which does both ZADD and emit.
+ */
+async function persistRoomEnvelopes(userIds: string[], event: string, data: any): Promise<void> {
+  if (userIds.length === 0) return;
+  await Promise.all(userIds.map(async (uid) => {
+    try {
+      const seq = await redisService.incr(`socket:seq:${uid}`);
+      const envelope = JSON.stringify({
+        seq,
+        event,
+        payload: data,
+        createdAt: Date.now()
+      });
+      await Promise.all([
+        redisService.zAdd(`socket:unacked:${uid}`, seq, envelope),
+        redisService.expire(`socket:unacked:${uid}`, DURABLE_EMIT_TTL_SECONDS)
+      ]);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn('[persistRoomEnvelopes] ZSET write failed for user', { userId: uid, event, error: msg });
+    }
+  }));
+}
+
+// H-1 FIX: Critical lifecycle events that warrant FCM push when user has no local sockets.
+// Excludes high-frequency events (location_updated, heartbeat, broadcast_countdown) to avoid FCM spam.
+const FCM_FALLBACK_EVENTS = new Set([
+  'trip_assigned', 'assignment_status_changed', 'new_broadcast',
+  'booking_updated', 'driver_accepted', 'driver_declined',
+  'booking_expired', 'booking_cancelled', 'order_status_update',
+  'driver_timeout', 'assignment_timeout', 'hold_expired',
+  'payment_pending', 'payment_confirmed',
+  'flex_hold_started',
+  // F-B-53: expanded lifecycle coverage — over-delivery is safe, under-delivery
+  // is not. Every critical state transition should reach the user even if they
+  // have no live socket at emit time (background app, stale connection).
+  'order_cancelled', 'order_expired',
+  'payment_succeeded', 'payment_failed',
+  'sos_alert',
+  'hold_released'
+]);
 
 /**
  * Emit to a specific user (by userId)
  * Used to send notifications to specific transporters
- * 
+ *
  * MULTI-SERVER: Socket.IO Redis adapter handles cross-instance delivery.
  * io.to(room).emit() publishes to Redis streams → all instances deliver.
- * 
+ *
  * NOTE: rooms.get() only returns LOCAL sockets. With multi-server (ECS 2+ tasks),
  * the transporter may be connected to another instance. NEVER return early based
  * on local room count — always let io.to().emit() fire through the adapter.
  */
-export function emitToUser(userId: string, event: string, data: any): void {
+// Fix E7: Return boolean — false when io=null, true on success
+export function emitToUser(userId: string, event: string, data: any): boolean {
+  // FIX-4 (#88): Guard against undefined/null event names
+  if (!event) {
+    logger.error(`[Socket] BUG: Attempted to emit undefined event to ${userId}`);
+    return false;
+  }
+
   if (!io) {
     logger.error(`[emitToUser] Socket.IO not initialized! Cannot emit ${event} to ${userId}`);
-    return;
+    return false;
+  }
+
+  // FIX-9 (#44) + M18 (P1-T1.2): Warn + count when Redis adapter is down.
+  // Emit only reaches the local ECS task; counter quantifies blast radius of
+  // the outage window (existing socket_adapter_failure_total fires once on
+  // state transition, this one fires per-emit).
+  if (!redisPubSubInitialized) {
+    logger.warn('[Socket] Redis adapter down — broadcasting to local instance only', {
+      event,
+      userId
+    });
+    try {
+      const { metrics: m } = require('../monitoring/metrics.service') as {
+        metrics: {
+          incrementCounter: (
+            name: string,
+            labels?: Record<string, string>,
+            value?: number
+          ) => void;
+        };
+      };
+      m.incrementCounter('socket_emit_while_adapter_down_total', {
+        event,
+        mode: redisAdapterMode
+      });
+    } catch {
+      // Metrics module unavailable (minimal test harness): observability is
+      // opt-in and must never break the emit path.
+    }
   }
 
   // Observability: log local socket count (may be 0 in multi-server — that's OK)
@@ -772,10 +1720,88 @@ export function emitToUser(userId: string, event: string, data: any): void {
     logger.debug(`[emitToUser] No LOCAL sockets for user:${userId} — ${event} will route via Redis adapter to other instances`);
   }
 
-  // ALWAYS emit — Redis adapter handles cross-instance delivery
-  io.to(`user:${userId}`).emit(event, withSocketMeta(data));
+  // Issue #13: Socket.IO circuit breaker — skip emit if socket layer is degraded
+  if (socketCircuit.isLocallyOpen()) {
+    logger.warn('[Socket] Circuit open, triggering FCM fallback', { userId, event });
+
+    // H-05 FIX: Fire-and-forget FCM fallback for lifecycle events when socket circuit is open.
+    // Without this, users receive NO notification when socket layer is degraded.
+    try {
+      const { fcmService: fcm } = require('./fcm.service');
+      fcm.sendToUser(userId, {
+        title: event.replace(/_/g, ' '),
+        body: JSON.stringify(data).slice(0, 200),
+        data: { type: event, ...(data && typeof data === 'object' ? data : {}) }
+      }).catch(() => {});
+    } catch { /* FCM import failed — non-fatal */ }
+
+    // H-17 FIX: Detect total notification blackout (both Socket AND FCM circuits open).
+    // This is a critical operational alert — the user has NO way to receive notifications.
+    try {
+      const { fcmCircuit: fcmCb } = require('./circuit-breaker.service');
+      if (fcmCb?.isLocallyOpen?.()) {
+        logger.error('[CRITICAL] ALL notification channels down — Socket AND FCM circuits open', { userId, event });
+        try {
+          const { metrics: m } = require('../monitoring/metrics.service');
+          m.incrementCounter('notification_blackhole_total');
+        } catch { /* metrics unavailable */ }
+
+        // C-2 FIX: Buffer notification in Redis outbox for later delivery when a circuit recovers.
+        // Without this, bufferNotification had zero callers and blackhole notifications were permanently lost.
+        try {
+          const { bufferNotification } = require('./notification-outbox.service');
+          bufferNotification(userId, {
+            title: event.replace(/_/g, ' '),
+            body: JSON.stringify(data).slice(0, 200),
+            data: { type: event, ...(data && typeof data === 'object' ? data : {}) }
+          }).catch(() => {});
+        } catch { /* outbox import failed — non-fatal */ }
+      }
+    } catch { /* circuit import failed — non-fatal */ }
+
+    return false;
+  }
+
+  // F-B-26: Durable emit path — ZADD envelope to socket:unacked:{userId} under
+  // a per-user seq BEFORE firing io.emit. Gated behind FF_DURABLE_EMIT_ENABLED
+  // so rollout is controlled; default OFF = identical pre-fix behavior.
+  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
+    // Fire-and-forget: durableEmit handles its own errors & circuit recording.
+    durableEmit(userId, event, data).catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn('[Socket] durableEmit rejected unexpectedly', { userId, event, error: msg });
+    });
+  } else {
+    // ALWAYS emit — Redis adapter handles cross-instance delivery
+    try {
+      io.to(`user:${userId}`).emit(event, withSocketMeta(data));
+    } catch (emitErr: unknown) {
+      socketCircuit.reportFailure();
+      const msg = emitErr instanceof Error ? emitErr.message : String(emitErr);
+      logger.warn('[Socket] Emit failed, circuit breaker recording', { userId, event, error: msg });
+      return false;
+    }
+  }
+
+  // H-1 FIX: FCM fallback for offline users on critical lifecycle events.
+  // When the user has zero local sockets, the socket emit may reach them via
+  // Redis adapter on another instance — but if they're truly offline, only FCM
+  // can deliver. Fire-and-forget so it never blocks the emit path.
+  // Excludes high-frequency events (location, heartbeat) to avoid FCM spam.
+  if (localSocketCount === 0 && FCM_FALLBACK_EVENTS.has(event)) {
+    try {
+      const { fcmService: fcm } = require('./fcm.service');
+      fcm.sendToUser(userId, {
+        type: event,
+        title: event.replace(/_/g, ' '),
+        body: typeof data?.body === 'string' ? data.body : JSON.stringify(data).slice(0, 200),
+        data: { type: event, ...(data && typeof data === 'object' ? data : {}) }
+      }).catch(() => {});
+    } catch { /* FCM import failed — non-fatal */ }
+  }
 
   logger.debug(`[Socket] Emitted ${event} to user:${userId} (${localSocketCount} local sockets)`);
+  return true;
 }
 
 /**
@@ -784,6 +1810,15 @@ export function emitToUser(userId: string, event: string, data: any): void {
  */
 export function emitToBooking(bookingId: string, event: string, data: any): void {
   if (!io) return;
+  // F-B-26: When durable emit is on and the event is lifecycle, ZADD an
+  // envelope for each local user in the room BEFORE the room broadcast, so
+  // the unacked store is populated for reconnect replay. The io.to(room).emit
+  // still fires once (cross-instance via Redis adapter) so connected users
+  // receive exactly one payload. Telemetry and flag-off paths are unchanged.
+  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
+    const userIds = enumerateRoomUserIds(`booking:${bookingId}`);
+    persistRoomEnvelopes(userIds, event, data).catch(() => { /* already logged per-user */ });
+  }
   io.to(`booking:${bookingId}`).emit(event, withSocketMeta(data));
   logger.debug(`Emitted ${event} to booking ${bookingId}`);
 }
@@ -794,7 +1829,24 @@ export function emitToBooking(bookingId: string, event: string, data: any): void
  */
 export function emitToTrip(tripId: string, event: string, data: any): void {
   if (!io) return;
-  io.to(`trip:${tripId}`).emit(event, withSocketMeta(data));
+  const roomName = `trip:${tripId}`;
+
+  // Fix H-R1: Skip serialization for high-frequency location updates to empty rooms.
+  // Status change events MUST always go through adapter for cross-instance delivery.
+  if (event === SocketEvent.LOCATION_UPDATED) {
+    const room = io.of('/').adapter.rooms?.get(roomName);
+    if (!room || room.size === 0) return;
+  }
+
+  // F-B-26: Durable persistence for lifecycle trip events (trip_assigned,
+  // order_completed, cascade_reassigned, etc.). LOCATION_UPDATED is
+  // telemetry — never ZADDed regardless of flag state.
+  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
+    const userIds = enumerateRoomUserIds(roomName);
+    persistRoomEnvelopes(userIds, event, data).catch(() => { /* already logged per-user */ });
+  }
+
+  io.to(roomName).emit(event, withSocketMeta(data));
 }
 
 /**
@@ -815,10 +1867,36 @@ export function getConnectedUserCount(): number {
 }
 
 /**
- * Check if user is connected
+ * Check if user has active socket connections on THIS instance.
+ * WARNING: In multi-instance mode, this only checks the local instance.
+ * For cross-instance checks, use io.in('user:' + userId).fetchSockets()
+ * which queries all instances via the Redis adapter.
  */
 export function isUserConnected(userId: string): boolean {
   return userSockets.has(userId) && userSockets.get(userId)!.size > 0;
+}
+
+/**
+ * Async cross-instance user connection check.
+ * Checks Redis presence sets first (online:transporters, driver:presence:{id}),
+ * falls back to local isUserConnected() if Redis is unavailable.
+ * Used by booking-broadcast.service.ts for FCM push decisions.
+ */
+export async function isUserConnectedAsync(userId: string): Promise<boolean> {
+  try {
+    const { redisService } = require('./redis.service');
+    // Check transporter presence
+    const isOnline = await redisService.sIsMember('online:transporters', userId);
+    if (isOnline) return true;
+    // Check driver presence
+    const driverPresence = await redisService.exists(`driver:presence:${userId}`);
+    if (driverPresence) return true;
+    // Fall back to local check
+    return isUserConnected(userId);
+  } catch {
+    // Redis down — fall back to local-only check
+    return isUserConnected(userId);
+  }
 }
 
 /**
@@ -835,6 +1913,14 @@ export function getIO(): Server | null {
  */
 export function emitToOrder(orderId: string, event: string, data: any): void {
   if (!io) return;
+  // F-B-26: Persist lifecycle envelopes for each local user in the order
+  // room before the room broadcast. Order events (order_cancelled,
+  // order_expired, order_completed, truck_confirmed, new_broadcast) are
+  // exactly the events dropped on reconnect per the audit reproduction.
+  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
+    const userIds = enumerateRoomUserIds(`order:${orderId}`);
+    persistRoomEnvelopes(userIds, event, data).catch(() => { /* already logged per-user */ });
+  }
   io.to(`order:${orderId}`).emit(event, withSocketMeta(data));
   logger.debug(`Emitted ${event} to order ${orderId}`);
 }
@@ -869,11 +1955,22 @@ export function emitToUsers(userIds: string[], event: string, data: any): void {
   if (!io || userIds.length === 0) return;
 
   const uniqueUserIds = Array.from(new Set(userIds));
+
+  // F-B-26: For lifecycle events, ZADD each recipient's envelope BEFORE the
+  // batched emit so reconnect replay covers the fan-out. The envelope write
+  // is per-user (independent seq counters), run in parallel.
+  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
+    persistRoomEnvelopes(uniqueUserIds, event, data).catch(() => { /* already logged per-user */ });
+  }
+
   const payload = withSocketMeta(data);
   const userRooms = uniqueUserIds.map((userId) => `user:${userId}`);
+  const chunkSize = SOCKET_MULTI_ROOM_EMIT_CHUNK_SIZE;
 
-  for (let index = 0; index < userRooms.length; index += SOCKET_MULTI_ROOM_EMIT_CHUNK_SIZE) {
-    const roomChunk = userRooms.slice(index, index + SOCKET_MULTI_ROOM_EMIT_CHUNK_SIZE);
+  // A5#24: Socket.IO internally buffers — synchronous loop queues messages.
+  // Yielding deferred to future scale (1000+ users). Current callers are sync fire-and-forget.
+  for (let index = 0; index < userRooms.length; index += chunkSize) {
+    const roomChunk = userRooms.slice(index, index + chunkSize);
     io.to(roomChunk).emit(event, payload);
   }
 
@@ -888,6 +1985,14 @@ export function emitToUsers(userIds: string[], event: string, data: any): void {
 export function emitToRoom(room: string, event: string, data: any): void {
   if (!io) return;
 
+  // F-B-26: For lifecycle events, enumerate local room members and ZADD each
+  // userId's envelope before the broadcast. Covers ad-hoc rooms outside of
+  // the booking/trip/order families (e.g., transporter scoped rooms).
+  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
+    const userIds = enumerateRoomUserIds(room);
+    persistRoomEnvelopes(userIds, event, data).catch(() => { /* already logged per-user */ });
+  }
+
   io.to(room).emit(event, withSocketMeta(data));
 
   logger.debug(`Emitted ${event} to room ${room}`);
@@ -900,6 +2005,14 @@ export function emitToRoom(room: string, event: string, data: any): void {
  */
 export function emitToAllTransporters(event: string, data: any): void {
   if (!io) return;
+
+  // F-B-26: Lifecycle events to all transporters (e.g. new_broadcast
+  // fan-out) must be durable per-recipient. Enumerate the local
+  // role:transporter room and ZADD each user's envelope before the broadcast.
+  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
+    const userIds = enumerateRoomUserIds('role:transporter');
+    persistRoomEnvelopes(userIds, event, data).catch(() => { /* already logged per-user */ });
+  }
 
   io.to('role:transporter').emit(event, withSocketMeta(data));
   logger.debug(`Broadcast ${event} to transporters`);
@@ -917,6 +2030,14 @@ export function emitToAllTransporters(event: string, data: any): void {
  */
 export function emitToTransporterDrivers(transporterId: string, event: string, data: any): void {
   if (!io) return;
+
+  // F-B-26: Driver-room lifecycle fan-out (e.g., truck_confirmed reaching
+  // drivers under a transporter). ZADD each local driver's envelope before
+  // the room broadcast so reconnect replay recovers missed messages.
+  if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
+    const userIds = enumerateRoomUserIds(`transporter:${transporterId}`);
+    persistRoomEnvelopes(userIds, event, data).catch(() => { /* already logged per-user */ });
+  }
 
   // Emit to all drivers in transporter room
   io.to(`transporter:${transporterId}`).emit(event, withSocketMeta(data));
@@ -976,6 +2097,7 @@ export const socketService = {
 
   // Connection utilities
   isUserConnected,
+  isUserConnectedAsync,
   getConnectedUserCount,
   getConnectionStats,
 
@@ -989,3 +2111,27 @@ export const socketService = {
   // Emit to transporter's drivers
   emitToTransporterDrivers,
 };
+
+export function cleanupAdapterReconnect(): void {
+  if (adapterReconnectTimer) {
+    clearInterval(adapterReconnectTimer);
+    adapterReconnectTimer = null;
+  }
+}
+
+/**
+ * F-B-26: Test-only hook. Lets durable-emit contract tests inject a fake
+ * Socket.IO Server (plus populate the local `socketUsers` map) without going
+ * through the full `initializeSocket` handshake path. Production code must
+ * NEVER call this — if NODE_ENV is not 'test', the helper is a no-op.
+ */
+export function __setIoForTesting(fakeIo: unknown, localUsers?: Map<string, string>): void {
+  if (process.env.NODE_ENV !== 'test') return;
+  io = fakeIo as Server | null;
+  if (localUsers) {
+    socketUsers.clear();
+    for (const [socketId, userId] of localUsers) {
+      socketUsers.set(socketId, userId);
+    }
+  }
+}

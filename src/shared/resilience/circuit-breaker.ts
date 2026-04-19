@@ -31,15 +31,9 @@
 
 import { logger } from '../services/logger.service';
 import { metrics } from '../monitoring/metrics.service';
+import { CircuitState } from '../services/circuit-breaker.service';
 
-/**
- * Circuit breaker states
- */
-export enum CircuitState {
-  CLOSED = 'CLOSED',     // Normal operation
-  OPEN = 'OPEN',         // Failing, reject requests
-  HALF_OPEN = 'HALF_OPEN' // Testing recovery
-}
+export { CircuitState };
 
 /**
  * Circuit breaker configuration

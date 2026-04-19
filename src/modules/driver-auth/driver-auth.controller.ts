@@ -75,6 +75,7 @@ class DriverAuthController {
       },
     });
   });
+
 }
 
 // Export singleton instance

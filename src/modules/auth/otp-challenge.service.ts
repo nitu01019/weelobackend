@@ -99,15 +99,13 @@ class OtpChallengeService {
     // FIX: Pass Date object instead of ISO string for expires_at.
     // PostgreSQL rejects implicit text→timestamptz conversion when using
     // parameterised $4::timestamptz with a string value.
-    const dbStorePromise = db.prisma?.$executeRawUnsafe(
-      `INSERT INTO "OtpStore" (phone, role, otp, expires_at, attempts)
-       VALUES ($1, $2, $3, $4, 0)
-       ON CONFLICT (phone, role) DO UPDATE SET otp = $3, expires_at = $4, attempts = 0`,
-      params.dbKey.phone,
-      params.dbKey.role,
-      record.hash,
-      expiresAt          // Date object — Prisma/pg driver handles timestamptz natively
-    ) ?? Promise.resolve(0);
+    const dbStorePromise = db.prisma
+      ? db.prisma.$executeRaw`
+          INSERT INTO "OtpStore" (phone, role, otp, expires_at, attempts)
+          VALUES (${params.dbKey.phone}, ${params.dbKey.role}, ${record.hash}, ${expiresAt}, 0)
+          ON CONFLICT (phone, role) DO UPDATE SET otp = ${record.hash}, expires_at = ${expiresAt}, attempts = 0
+        `
+      : Promise.resolve(0);
 
     const [redisResult, dbResult] = await Promise.allSettled([
       redisStorePromise,
@@ -142,11 +140,11 @@ class OtpChallengeService {
   async deleteChallenge(params: DeleteChallengeParams): Promise<void> {
     await Promise.allSettled([
       redisService.deleteOtpWithAttempts(params.redisKey),
-      db.prisma?.$executeRawUnsafe(
-        `DELETE FROM "OtpStore" WHERE phone = $1 AND role = $2`,
-        params.dbKey.phone,
-        params.dbKey.role
-      )
+      db.prisma
+        ? db.prisma.$executeRaw`
+            DELETE FROM "OtpStore" WHERE phone = ${params.dbKey.phone} AND role = ${params.dbKey.role}
+          `
+        : Promise.resolve(0)
     ]);
 
     if (params.logContext) {
@@ -161,7 +159,7 @@ class OtpChallengeService {
 
     try {
       try {
-        const lockResult = await (redisService as any).client.eval(
+        const lockResult = await redisService.eval(
           `
           if redis.call('set', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then
             return 1
@@ -234,11 +232,11 @@ class OtpChallengeService {
       }
 
       try {
-        await db.prisma?.$executeRawUnsafe(
-          `UPDATE "OtpStore" SET attempts = attempts + 1 WHERE phone = $1 AND role = $2`,
-          params.dbKey.phone,
-          params.dbKey.role
-        );
+        if (db.prisma) {
+          await db.prisma.$executeRaw`
+            UPDATE "OtpStore" SET attempts = attempts + 1 WHERE phone = ${params.dbKey.phone} AND role = ${params.dbKey.role}
+          `;
+        }
       } catch {
         // Best effort - DB is backup for Redis path
       }
@@ -268,15 +266,13 @@ class OtpChallengeService {
     const maxAttempts = config.otp.maxAttempts;
 
     const txResult = await db.prisma.$transaction(async (tx: any) => {
-      const rows: any[] = await tx.$queryRawUnsafe(
-        `SELECT otp, expires_at, attempts
-         FROM "OtpStore"
-         WHERE phone = $1 AND role = $2
-         LIMIT 1
-         FOR UPDATE`,
-        params.dbKey.phone,
-        params.dbKey.role
-      );
+      const rows: any[] = await tx.$queryRaw`
+        SELECT otp, expires_at, attempts
+        FROM "OtpStore"
+        WHERE phone = ${params.dbKey.phone} AND role = ${params.dbKey.role}
+        LIMIT 1
+        FOR UPDATE
+      `;
 
       if (!rows || rows.length === 0) {
         return { ok: false, code: 'OTP_NOT_FOUND' } as OtpChallengeVerifyResult;
@@ -290,20 +286,16 @@ class OtpChallengeService {
       };
 
       if (new Date() > new Date(stored.expiresAt)) {
-        await tx.$executeRawUnsafe(
-          `DELETE FROM "OtpStore" WHERE phone = $1 AND role = $2`,
-          params.dbKey.phone,
-          params.dbKey.role
-        );
+        await tx.$executeRaw`
+          DELETE FROM "OtpStore" WHERE phone = ${params.dbKey.phone} AND role = ${params.dbKey.role}
+        `;
         return { ok: false, code: 'OTP_EXPIRED' } as OtpChallengeVerifyResult;
       }
 
       if (stored.attempts >= maxAttempts) {
-        await tx.$executeRawUnsafe(
-          `DELETE FROM "OtpStore" WHERE phone = $1 AND role = $2`,
-          params.dbKey.phone,
-          params.dbKey.role
-        );
+        await tx.$executeRaw`
+          DELETE FROM "OtpStore" WHERE phone = ${params.dbKey.phone} AND role = ${params.dbKey.role}
+        `;
         return { ok: false, code: 'MAX_ATTEMPTS' } as OtpChallengeVerifyResult;
       }
 
@@ -311,19 +303,15 @@ class OtpChallengeService {
       if (!isValid) {
         const nextAttempts = stored.attempts + 1;
         if (nextAttempts >= maxAttempts) {
-          await tx.$executeRawUnsafe(
-            `DELETE FROM "OtpStore" WHERE phone = $1 AND role = $2`,
-            params.dbKey.phone,
-            params.dbKey.role
-          );
+          await tx.$executeRaw`
+            DELETE FROM "OtpStore" WHERE phone = ${params.dbKey.phone} AND role = ${params.dbKey.role}
+          `;
           return { ok: false, code: 'MAX_ATTEMPTS' } as OtpChallengeVerifyResult;
         }
 
-        await tx.$executeRawUnsafe(
-          `UPDATE "OtpStore" SET attempts = attempts + 1 WHERE phone = $1 AND role = $2`,
-          params.dbKey.phone,
-          params.dbKey.role
-        );
+        await tx.$executeRaw`
+          UPDATE "OtpStore" SET attempts = attempts + 1 WHERE phone = ${params.dbKey.phone} AND role = ${params.dbKey.role}
+        `;
 
         return {
           ok: false,
@@ -332,11 +320,9 @@ class OtpChallengeService {
         } as OtpChallengeVerifyResult;
       }
 
-      await tx.$executeRawUnsafe(
-        `DELETE FROM "OtpStore" WHERE phone = $1 AND role = $2`,
-        params.dbKey.phone,
-        params.dbKey.role
-      );
+      await tx.$executeRaw`
+        DELETE FROM "OtpStore" WHERE phone = ${params.dbKey.phone} AND role = ${params.dbKey.role}
+      `;
 
       return { ok: true, consumed: true } as OtpChallengeVerifyResult;
     });
@@ -372,12 +358,11 @@ class OtpChallengeService {
     }
 
     try {
-      const rows: any[] | null = await db.prisma?.$queryRawUnsafe(
-        `SELECT otp, expires_at, attempts FROM "OtpStore"
-         WHERE phone = $1 AND role = $2 LIMIT 1`,
-        dbKey.phone,
-        dbKey.role
-      );
+      if (!db.prisma) return null;
+      const rows: any[] = await db.prisma.$queryRaw`
+        SELECT otp, expires_at, attempts FROM "OtpStore"
+        WHERE phone = ${dbKey.phone} AND role = ${dbKey.role} LIMIT 1
+      `;
       if (!rows || rows.length === 0) return null;
 
       const row = rows[0];
@@ -444,7 +429,7 @@ class OtpChallengeService {
 
   private async releaseRedisVerifyLock(lockKey: string, lockToken: string, logContext: Record<string, unknown>): Promise<void> {
     try {
-      await (redisService as any).client.eval(
+      await redisService.eval(
         `
         if redis.call('get', KEYS[1]) == ARGV[1] then
           return redis.call('del', KEYS[1])

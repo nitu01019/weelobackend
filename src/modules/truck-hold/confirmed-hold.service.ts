@@ -35,6 +35,11 @@ import { redisService } from '../../shared/services/redis.service';
 import { socketService } from '../../shared/services/socket.service';
 import { queueService } from '../../shared/services/queue.service';
 import { holdExpiryCleanupService } from '../hold-expiry/hold-expiry-cleanup.service';
+import { releaseVehicle } from '../../shared/services/vehicle-lifecycle.service';
+import { HOLD_CONFIG } from '../../core/config/hold-config';
+import { smartTimeoutService } from '../order-timeout/smart-timeout.service';
+import { tryAutoRedispatch } from '../assignment/auto-redispatch.service';
+import { validateActorEligibility, HoldEligibilityError } from './hold-eligibility';
 
 // =============================================================================
 // TYPES & INTERFACES
@@ -75,6 +80,7 @@ export interface DriverAcceptResponse {
   declined: boolean;
   timeout: boolean;
   message: string;
+  errorCode?: string;
 }
 
 // =============================================================================
@@ -82,13 +88,14 @@ export interface DriverAcceptResponse {
 // =============================================================================
 
 const DEFAULT_CONFIG: ConfirmedHoldConfig = {
-  maxDurationSeconds: 180,     // Max 180s in Phase 2
-  driverAcceptTimeoutSeconds: 45, // Driver has 45s to respond
+  maxDurationSeconds: HOLD_CONFIG.confirmedHoldMaxSeconds,
+  driverAcceptTimeoutSeconds: HOLD_CONFIG.driverAcceptTimeoutSeconds,
 };
 
 // Redis keys for distributed locking and state
 const REDIS_KEYS = {
-  CONFIRMED_HOLD_LOCK: (holdId: string) => `lock:confirmed-hold:${holdId}`,
+  // Standardized: lock: prefix for all distributed locks (added by acquireLock automatically)
+  CONFIRMED_HOLD_LOCK: (holdId: string) => `confirmed-hold:${holdId}`,
   CONFIRMED_HOLD_STATE: (holdId: string) => `confirmed-hold:${holdId}:state`,
   DRIVER_ACCEPTANCE: (assignmentId: string) => `driver-acceptance:${assignmentId}`,
 };
@@ -106,39 +113,141 @@ class ConfirmedHoldService {
 
   /**
    * Initialize a confirmed hold (transition from FLEX)
+   * FIX-6: Added transporterId parameter for ownership verification.
+   * FIX-39: Uses a single `now` timestamp for all writes in this operation.
    */
   async initializeConfirmedHold(
     holdId: string,
+    transporterId: string,
     assignments: Array<{
       assignmentId: string;
       driverId: string;
       truckRequestId: string;
     }>
-  ): Promise<{ success: boolean; message: string; confirmedExpiresAt?: Date }> {
+  ): Promise<{
+    success: boolean;
+    message: string;
+    confirmedExpiresAt?: Date;
+    missingAssignmentIds?: string[];
+    errorCode?: string;
+    httpStatus?: number;
+  }> {
     logger.info('[CONFIRMED HOLD] Initializing confirmed hold', {
       holdId,
+      transporterId,
       assignmentsCount: assignments.length,
     });
 
     try {
-      const now = new Date();
-      const confirmedExpiresAt = new Date(
-        now.getTime() + this.config.maxDurationSeconds * 1000
-      );
+      // H-8 FIX: Wrap read-check-write in a Prisma $transaction with SELECT FOR UPDATE
+      // to prevent TOCTOU race where two concurrent requests both read phase=FLEX
+      // and both update to CONFIRMED.
+      const txResult = await prismaClient.$transaction(async (tx) => {
+        // F-A-75: row-locked KYC+isActive re-check (same TX as the phase transition).
+        await validateActorEligibility(tx, transporterId, 'confirmed_hold');
 
-      // Update hold to confirmed phase
-      const updated = await prismaClient.truckHoldLedger.update({
-        where: { holdId },
-        data: {
-          phase: HoldPhase.CONFIRMED,
-          phaseChangedAt: now,
-          status: 'confirmed',
-          confirmedAt: now,
-          confirmedExpiresAt,
-         expiresAt: confirmedExpiresAt,
-          updatedAt: now,
-        },
+        // Lock the row with FOR UPDATE to prevent concurrent phase transitions
+        const rows = await tx.$queryRaw<Array<{
+          holdId: string;
+          phase: string;
+          transporterId: string;
+          confirmedExpiresAt: Date | null;
+        }>>`
+          SELECT "holdId", "phase", "transporterId", "confirmedExpiresAt"
+          FROM "TruckHoldLedger"
+          WHERE "holdId" = ${holdId}
+          FOR UPDATE
+        `;
+        const existing = rows[0];
+
+        if (!existing) {
+          return { success: false as const, message: 'Hold not found', errorCode: 'HOLD_NOT_FOUND', httpStatus: 404 };
+        }
+
+        // FIX-6: Ownership verification — only the transporter who created the hold can confirm it
+        if (existing.transporterId !== transporterId) {
+          logger.warn('[CONFIRMED HOLD] Ownership check failed for initializeConfirmedHold', {
+            holdId,
+            requestedBy: transporterId,
+            ownedBy: existing.transporterId,
+          });
+          return { success: false as const, message: 'Not your hold', errorCode: 'FORBIDDEN', httpStatus: 403 };
+        }
+
+        if (existing.phase === HoldPhase.CONFIRMED) {
+          logger.info('[CONFIRMED HOLD] Already initialized, returning existing', { holdId });
+          return {
+            success: true as const,
+            message: 'Already in CONFIRMED phase (idempotent)',
+            confirmedExpiresAt: existing.confirmedExpiresAt ?? undefined,
+          };
+        }
+
+        if (existing.phase === HoldPhase.EXPIRED || existing.phase === HoldPhase.RELEASED) {
+          return {
+            success: false as const,
+            message: `Hold has expired or been released (current phase: ${existing.phase})`,
+            errorCode: 'HOLD_EXPIRED',
+            httpStatus: 410,
+          };
+        }
+
+        if (existing.phase !== HoldPhase.FLEX) {
+          return {
+            success: false as const,
+            message: `Cannot move to CONFIRMED from ${existing.phase} -- must be FLEX`,
+            errorCode: 'HOLD_ALREADY_CONFIRMED',
+            httpStatus: 409,
+          };
+        }
+
+        const now = new Date();
+        const confirmedExpiresAt = new Date(
+          now.getTime() + this.config.maxDurationSeconds * 1000
+        );
+
+        // Update hold to confirmed phase (within the same TX that holds the row lock)
+        const updated = await tx.truckHoldLedger.update({
+          where: { holdId },
+          data: {
+            phase: HoldPhase.CONFIRMED,
+            phaseChangedAt: now,
+            status: 'confirmed',
+            confirmedAt: now,
+            confirmedExpiresAt,
+            expiresAt: confirmedExpiresAt,
+            updatedAt: now,
+          },
+        });
+
+        return { success: true as const, updated, now, confirmedExpiresAt };
       });
+
+      // Handle early-return cases from the transaction
+      if (!txResult.success) {
+        return {
+          success: false,
+          message: txResult.message,
+          errorCode: (txResult as any).errorCode,
+          httpStatus: (txResult as any).httpStatus,
+        };
+      }
+      if (txResult.message) {
+        // Idempotent return — already CONFIRMED
+        return {
+          success: true,
+          message: txResult.message,
+          confirmedExpiresAt: txResult.confirmedExpiresAt,
+        };
+      }
+
+      // Transaction succeeded with a phase transition — extract results
+      const { updated, now, confirmedExpiresAt } = txResult as {
+        success: true;
+        updated: { orderId: string; transporterId: string; quantity: number };
+        now: Date;
+        confirmedExpiresAt: Date;
+      };
 
       // Cache state
       await this.cacheConfirmedHoldState(holdId, {
@@ -187,21 +296,26 @@ class ConfirmedHoldService {
       );
 
       // Schedule driver acceptance timeouts with full data
+      const missingIds: string[] = [];
       for (const assignment of assignments) {
         const fullData = assignmentMap.get(assignment.assignmentId);
 
         if (!fullData) {
-          logger.warn('[CONFIRMED HOLD] Assignment not found in database', {
-            assignmentId: assignment.assignmentId
-          });
+          missingIds.push(assignment.assignmentId);
           continue;
         }
 
+        // FIX-39: Pass the operation-level `now` timestamp for consistency
         await this.scheduleDriverAcceptanceTimeout(
           assignment.assignmentId,
           fullData,
-          this.config.driverAcceptTimeoutSeconds
+          this.config.driverAcceptTimeoutSeconds,
+          now
         );
+      }
+
+      if (missingIds.length > 0) {
+        logger.warn('[CONFIRMED HOLD] Some assignments not found', { missingIds });
       }
 
       logger.info('[CONFIRMED HOLD] Confirmed hold initialized', {
@@ -213,8 +327,14 @@ class ConfirmedHoldService {
         success: true,
         message: 'Confirmed hold initialized',
         confirmedExpiresAt,
+        missingAssignmentIds: missingIds.length > 0 ? missingIds : undefined,
       };
     } catch (error: any) {
+      // F-A-75: map KYC/isActive ineligibility to 403 (not generic 500).
+      if (error instanceof HoldEligibilityError) {
+        logger.warn('[CONFIRMED HOLD] Eligibility denied', { code: error.code, transporterId, holdId });
+        return { success: false, message: error.message, errorCode: error.code, httpStatus: 403 };
+      }
       logger.error('[CONFIRMED HOLD] Failed to initialize confirmed hold', {
         error: error.message,
         holdId,
@@ -223,6 +343,8 @@ class ConfirmedHoldService {
       return {
         success: false,
         message: 'Failed to initialize confirmed hold',
+        errorCode: 'INITIALIZE_FAILED',
+        httpStatus: 500,
       };
     }
   }
@@ -231,13 +353,15 @@ class ConfirmedHoldService {
    * Handle driver acceptance
    */
   async handleDriverAcceptance(
-    assignmentId: string
+    assignmentId: string,
+    driverId: string
   ): Promise<DriverAcceptResponse> {
     logger.info('[CONFIRMED HOLD] Handling driver acceptance', { assignmentId });
 
     try {
       const lockKey = REDIS_KEYS.DRIVER_ACCEPTANCE(assignmentId);
-      const lock = await redisService.acquireLock(lockKey, 'driver-acceptance', 10);
+      const lockHolder = uuidv4();
+      const lock = await redisService.acquireLock(lockKey, lockHolder, 10);
 
       if (!lock.acquired) {
         return {
@@ -251,45 +375,116 @@ class ConfirmedHoldService {
       }
 
       try {
-        // Update assignment status
-        const assignment = await prismaClient.assignment.update({
-          where: { tripId: assignmentId },
-          data: {
-            status: AssignmentStatus.driver_accepted,
-          },
+        // FIX-39: Single timestamp for the entire acceptance operation
+        const now = new Date();
+        const nowIso = now.toISOString();
+
+        // F-A-75: CAS + driver-row KYC check run in the same TX (FOR UPDATE).
+        const updated = await prismaClient.$transaction(async (tx) => {
+          await validateActorEligibility(tx, driverId, 'driver_accept');
+          return tx.assignment.updateMany({
+            where: { id: assignmentId, driverId, status: AssignmentStatus.pending },
+            data: { status: AssignmentStatus.driver_accepted, driverAcceptedAt: nowIso },
+          });
         });
 
-        // Update confirmed hold state
-        const holdRecord = await prismaClient.truckRequest.findFirst({
-          where: { tripId: assignmentId },
-          select: {
-            id: true,
-            orderId: true,
-          },
+        if (updated.count === 0) {
+          // Assignment was already accepted/declined/cancelled/timed-out
+          const current = await prismaClient.assignment.findUnique({
+            where: { id: assignmentId },
+            select: { status: true },
+          });
+          logger.warn('[CONFIRMED HOLD] Driver accept rejected -- assignment not in pending state', {
+            assignmentId,
+            currentStatus: current?.status,
+          });
+          return {
+            success: false,
+            assignmentId,
+            accepted: false,
+            declined: false,
+            timeout: false,
+            message: `Assignment is no longer pending (current: ${current?.status})`,
+          };
+        }
+
+        // Fetch full assignment record for downstream side effects
+        const assignment = await prismaClient.assignment.findUniqueOrThrow({
+          where: { id: assignmentId },
         });
 
-        if (holdRecord) {
+        // FIX A5#3: Apply post-accept side effects (Redis availability, tracking, GPS, notifications)
+        // FIX M12: Pass bookingId and orderId separately so order-path customer lookup works
+        try {
+          const { applyPostAcceptSideEffects } = require('../assignment/post-accept.effects');
+          await applyPostAcceptSideEffects({
+            assignmentId,
+            driverId: assignment.driverId,
+            vehicleId: assignment.vehicleId,
+            vehicleNumber: assignment.vehicleNumber,
+            tripId: assignment.tripId,
+            bookingId: assignment.bookingId,
+            orderId: assignment.orderId,
+            transporterId: assignment.transporterId,
+            driverName: assignment.driverName || 'Driver',
+          });
+        } catch (effectsErr: any) {
+          logger.warn('[CONFIRMED HOLD] Post-accept side effects failed (non-fatal)', {
+            assignmentId, error: effectsErr?.message,
+          });
+        }
+
+        // FIX #25 + F-L10: FK traversal via DRY helper
+        const { orderId: resolvedOrderId } = await this.resolveAssignmentTruckRequest(assignmentId);
+
+        if (resolvedOrderId) {
           // Find any hold ledger for this order
           const holdLedger = await prismaClient.truckHoldLedger.findFirst({
-            where: { orderId: holdRecord.orderId, phase: HoldPhase.CONFIRMED },
+            where: { orderId: resolvedOrderId, phase: HoldPhase.CONFIRMED },
           });
 
           if (holdLedger) {
-            // Update truck accepted count
-            const state = await this.getConfirmedHoldState(holdLedger.holdId);
-            if (state) {
-              state.trucksAccepted++;
-              state.trucksPending--;
-              await this.cacheConfirmedHoldState(holdLedger.holdId, state);
+            // FIX #28: Atomic Redis counter with HINCRBY — prevents lost increments
+            // under concurrent driver acceptances (was read-modify-write race).
+            //
+            // NOTE: If Redis is unavailable during accept/decline, the counter may drift.
+            // The 5-minute reconciliation in live-availability.service.ts corrects this.
+            // This is an intentional tradeoff: availability is best-effort, DB is truth.
+            const holdKey = REDIS_KEYS.CONFIRMED_HOLD_STATE(holdLedger.holdId);
+            const [newAccepted, newPending] = await Promise.all([
+              redisService.hIncrBy(holdKey, 'trucksAccepted', 1),
+              redisService.hIncrBy(holdKey, 'trucksPending', -1),
+            ]);
 
-              // Emit progress update
-              await socketService.emitToUser(holdLedger.transporterId, 'driver_accepted', {
-                holdId: holdLedger.holdId,
-                assignmentId,
+            // Read full state for the socket event payload
+            const state = await this.getConfirmedHoldState(holdLedger.holdId);
+            const trucksCount = state?.trucksCount ?? (newAccepted + Math.max(0, newPending));
+
+            // Emit progress update
+            await socketService.emitToUser(holdLedger.transporterId, 'driver_accepted', {
+              holdId: holdLedger.holdId,
+              assignmentId,
+              driverId: assignment.driverId,
+              trucksAccepted: newAccepted,
+              trucksPending: Math.max(0, newPending),
+              message: `Driver accepted. ${newAccepted}/${trucksCount} confirmed.`,
+            });
+
+            // M10 FIX: Extend smart timeout when driver accepts in Phase 2.
+            // First acceptance adds +60s, subsequent adds +30s.
+            try {
+              await smartTimeoutService.extendTimeout({
+                orderId: resolvedOrderId,
                 driverId: assignment.driverId,
-                trucksAccepted: state.trucksAccepted,
-                trucksPending: state.trucksPending,
-                message: `Driver accepted. ${state.trucksAccepted}/${state.trucksCount} confirmed.`,
+                driverName: assignment.driverName || 'Driver',
+                assignmentId,
+                truckRequestId: assignment.truckRequestId ?? undefined,
+                isFirstDriver: newAccepted === 1,
+                reason: 'Driver accepted in confirmed hold (Phase 2)',
+              });
+            } catch (extErr: any) {
+              logger.warn('[CONFIRMED HOLD] Smart timeout extension failed (non-fatal)', {
+                assignmentId, orderId: resolvedOrderId, error: extErr?.message,
               });
             }
           }
@@ -309,9 +504,14 @@ class ConfirmedHoldService {
           message: 'Driver accepted successfully',
         };
       } finally {
-        await redisService.releaseLock(lockKey, 'driver-acceptance').catch(() => {});
+        await redisService.releaseLock(lockKey, lockHolder).catch(() => {});
       }
     } catch (error: any) {
+      // F-A-75: surface driver KYC/isActive ineligibility so client can prompt re-verify.
+      if (error instanceof HoldEligibilityError) {
+        logger.warn('[CONFIRMED HOLD] Driver eligibility denied on accept', { code: error.code, driverId, assignmentId });
+        return { success: false, assignmentId, accepted: false, declined: false, timeout: false, message: error.message, errorCode: error.code };
+      }
       logger.error('[CONFIRMED HOLD] Failed to handle driver acceptance', {
         error: error.message,
         assignmentId,
@@ -333,6 +533,7 @@ class ConfirmedHoldService {
    */
   async handleDriverDecline(
     assignmentId: string,
+    driverId: string,
     reason: string = ''
   ): Promise<DriverAcceptResponse> {
     logger.info('[CONFIRMED HOLD] Handling driver decline', {
@@ -342,7 +543,8 @@ class ConfirmedHoldService {
 
     try {
       const lockKey = REDIS_KEYS.DRIVER_ACCEPTANCE(assignmentId);
-      const lock = await redisService.acquireLock(lockKey, 'driver-decline', 10);
+      const lockHolder = uuidv4();
+      const lock = await redisService.acquireLock(lockKey, lockHolder, 10);
 
       if (!lock.acquired) {
         return {
@@ -356,24 +558,87 @@ class ConfirmedHoldService {
       }
 
       try {
-        // Update assignment status
-        const assignment = await prismaClient.assignment.update({
-          where: { tripId: assignmentId },
-          data: {
-            status: AssignmentStatus.driver_declined,
-          },
+        // F-M14 FIX: Atomic decline — CAS assignment update + trucksFilled decrement in one TX.
+        // Previously these were two standalone calls; if the decrement failed, trucksFilled drifted.
+        let txCasMiss = false;
+        let txOrderId: string | null = null;
+
+        try {
+          await prismaClient.$transaction(async (tx) => {
+            // CAS guard: only decline if assignment is still pending
+            const updated = await tx.assignment.updateMany({
+              where: {
+                id: assignmentId,
+                driverId,
+                status: AssignmentStatus.pending,  // CAS precondition
+              },
+              data: {
+                status: AssignmentStatus.driver_declined,
+              },
+            });
+
+            if (updated.count === 0) {
+              txCasMiss = true;
+              return; // TX commits with no-op — handled below
+            }
+
+            // Fetch orderId inside TX so the decrement targets the correct row
+            const asnForOrder = await tx.assignment.findUnique({
+              where: { id: assignmentId },
+              select: { orderId: true },
+            });
+            txOrderId = asnForOrder?.orderId ?? null;
+
+            // Decrement trucksFilled atomically with the decline
+            if (txOrderId) {
+              await tx.$executeRaw`
+                UPDATE "Order" SET "trucksFilled" = GREATEST(0, "trucksFilled" - 1), "updatedAt" = NOW()
+                WHERE "id" = ${txOrderId}
+              `;
+            }
+          });
+        } catch (txErr: any) {
+          logger.error('[CONFIRMED HOLD] Atomic decline TX failed', {
+            assignmentId, error: txErr?.message,
+          });
+          throw txErr; // propagate — outer catch returns failure response
+        }
+
+        if (txCasMiss) {
+          const current = await prismaClient.assignment.findUnique({
+            where: { id: assignmentId },
+            select: { status: true },
+          });
+          logger.warn('[CONFIRMED HOLD] Driver decline rejected -- assignment not in pending state', {
+            assignmentId,
+            currentStatus: current?.status,
+          });
+          return {
+            success: false,
+            assignmentId,
+            accepted: false,
+            declined: false,
+            timeout: false,
+            message: `Assignment is no longer pending (current: ${current?.status})`,
+          };
+        }
+
+        // Fetch full assignment record for downstream side effects
+        const assignment = await prismaClient.assignment.findUniqueOrThrow({
+          where: { id: assignmentId },
         });
 
-        // Update truck request to searching (back to pool)
-        const truckRequest = await prismaClient.truckRequest.findFirst({
-          where: { tripId: assignmentId },
-        });
+        // FIX #41 + F-L10: FK traversal via DRY helper
+        const { truckRequest, orderId: resolvedOrderId } = await this.resolveAssignmentTruckRequest(assignmentId);
 
         if (truckRequest) {
+          // FIX #41: Keep truck in transporter's exclusive hold on decline.
+          // Was 'searching' which released to public pool, breaking Phase 2 exclusivity.
           await prismaClient.truckRequest.update({
             where: { id: truckRequest.id },
             data: {
-              status: 'searching', // Back to search pool
+              status: 'held',           // Stays in transporter's hold (was 'searching')
+              heldById: assignment.transporterId,  // QA-4 fix: restore heldById so release/cleanup can find it
               assignedDriverId: null,
               assignedDriverName: null,
               assignedVehicleId: null,
@@ -383,30 +648,68 @@ class ConfirmedHoldService {
         }
 
         // Update confirmed hold state
-        if (truckRequest) {
+        if (resolvedOrderId) {
           const holdLedger = await prismaClient.truckHoldLedger.findFirst({
-            where: { orderId: truckRequest.orderId, phase: HoldPhase.CONFIRMED },
+            where: { orderId: resolvedOrderId, phase: HoldPhase.CONFIRMED },
           });
 
           if (holdLedger) {
-            const state = await this.getConfirmedHoldState(holdLedger.holdId);
-            if (state) {
-              state.trucksDeclined++;
-              state.trucksPending--;
-              await this.cacheConfirmedHoldState(holdLedger.holdId, state);
+            // FIX #36 (partial): Atomic Redis counter with HINCRBY for decline
+            // (mirrors FIX #28 pattern from handleDriverAcceptance)
+            //
+            // NOTE: If Redis is unavailable during accept/decline, the counter may drift.
+            // The 5-minute reconciliation in live-availability.service.ts corrects this.
+            // This is an intentional tradeoff: availability is best-effort, DB is truth.
+            const holdKey = REDIS_KEYS.CONFIRMED_HOLD_STATE(holdLedger.holdId);
+            const [newDeclined, newPending] = await Promise.all([
+              redisService.hIncrBy(holdKey, 'trucksDeclined', 1),
+              redisService.hIncrBy(holdKey, 'trucksPending', -1),
+            ]);
 
-              // Emit decline notification
-              await socketService.emitToUser(holdLedger.transporterId, 'driver_declined', {
-                holdId: holdLedger.holdId,
-                assignmentId,
-                driverId: assignment.driverId,
-                reason,
-                trucksDeclined: state.trucksDeclined,
-                trucksPending: state.trucksPending,
-                message: `Driver declined. ${state.trucksDeclined}/${state.trucksCount} declined.`,
-              });
-            }
+            // Read full state for the socket event payload
+            const state = await this.getConfirmedHoldState(holdLedger.holdId);
+            const trucksCount = state?.trucksCount ?? (newDeclined + Math.max(0, newPending));
+
+            // Emit decline notification
+            await socketService.emitToUser(holdLedger.transporterId, 'driver_declined', {
+              holdId: holdLedger.holdId,
+              assignmentId,
+              driverId: assignment.driverId,
+              reason,
+              trucksDeclined: newDeclined,
+              trucksPending: Math.max(0, newPending),
+              message: `Driver declined. ${newDeclined}/${trucksCount} declined.`,
+            });
           }
+        }
+
+        // P6 fix: Release vehicle back to available (Saga compensation)
+        if (assignment.vehicleId) {
+          await releaseVehicle(assignment.vehicleId, 'confirmedHoldDecline').catch((err: any) => {
+            logger.warn('[CONFIRMED HOLD] Vehicle release on decline failed (non-fatal)', {
+              vehicleId: assignment.vehicleId, error: err?.message,
+            });
+          });
+        }
+
+        // H9 FIX: Cascade auto-redispatch after decline (Grab/Uber pattern).
+        // Wrapped in try/catch so cascade failure never breaks the decline flow.
+        try {
+          await tryAutoRedispatch({
+            bookingId: assignment.bookingId ?? undefined,
+            orderId: assignment.orderId ?? undefined,
+            transporterId: assignment.transporterId,
+            vehicleId: assignment.vehicleId,
+            vehicleType: assignment.vehicleType,
+            vehicleSubtype: assignment.vehicleSubtype ?? undefined,
+            declinedDriverId: driverId,
+            assignmentId,
+          });
+        } catch (redispatchErr: any) {
+          logger.warn('[CONFIRMED HOLD] Auto-redispatch after decline failed (non-fatal)', {
+            assignmentId,
+            error: redispatchErr?.message,
+          });
         }
 
         logger.info('[CONFIRMED HOLD] Driver declined', {
@@ -424,7 +727,7 @@ class ConfirmedHoldService {
           message: 'Driver declined successfully',
         };
       } finally {
-        await redisService.releaseLock(lockKey, 'driver-decline').catch(() => {});
+        await redisService.releaseLock(lockKey, lockHolder).catch(() => {});
       }
     } catch (error: any) {
       logger.error('[CONFIRMED HOLD] Failed to handle driver decline', {
@@ -449,22 +752,52 @@ class ConfirmedHoldService {
   async handleDriverTimeout(assignmentId: string): Promise<DriverAcceptResponse> {
     logger.info('[CONFIRMED HOLD] Handling driver timeout', { assignmentId });
 
-    return await this.handleDriverDecline(assignmentId, 'Driver timed out');
+    const assignment = await prismaClient.assignment.findUnique({
+      where: { id: assignmentId },
+      select: { driverId: true },
+    });
+    if (!assignment?.driverId) {
+      return {
+        success: false,
+        assignmentId,
+        accepted: false,
+        declined: false,
+        timeout: true,
+        message: 'Assignment not found for timeout',
+      };
+    }
+
+    return await this.handleDriverDecline(assignmentId, assignment.driverId, 'Driver timed out');
   }
 
   /**
    * Get confirmed hold state
+   * FIX #28: Now reads from Redis Hash (HGETALL) instead of JSON blob (GET+parse).
    */
   async getConfirmedHoldState(
     holdId: string
   ): Promise<ConfirmedHoldState | null> {
     try {
-      // Try Redis first
-      const cached = await redisService.getJSON<ConfirmedHoldState>(
+      // Try Redis Hash first
+      const hashData = await redisService.hGetAll(
         REDIS_KEYS.CONFIRMED_HOLD_STATE(holdId)
       );
-      if (cached) {
-        return this.refreshRemainingSeconds(cached);
+
+      if (hashData && Object.keys(hashData).length > 0 && hashData.holdId) {
+        const state: ConfirmedHoldState = {
+          holdId: hashData.holdId,
+          orderId: hashData.orderId,
+          transporterId: hashData.transporterId,
+          phase: hashData.phase as HoldPhase,
+          confirmedAt: new Date(hashData.confirmedAt),
+          confirmedExpiresAt: new Date(hashData.confirmedExpiresAt),
+          remainingSeconds: parseInt(hashData.remainingSeconds || '0', 10),
+          trucksCount: parseInt(hashData.trucksCount || '0', 10),
+          trucksAccepted: parseInt(hashData.trucksAccepted || '0', 10),
+          trucksDeclined: parseInt(hashData.trucksDeclined || '0', 10),
+          trucksPending: parseInt(hashData.trucksPending || '0', 10),
+        };
+        return this.refreshRemainingSeconds(state);
       }
 
       // Fall back to database
@@ -483,6 +816,14 @@ class ConfirmedHoldService {
           status: {
             in: ['assigned', 'accepted', 'in_progress'],
           },
+        },
+      });
+
+      // Count declined assignments for this order (driver_declined lives on Assignment, not TruckRequest)
+      const declinedCount = await prismaClient.assignment.count({
+        where: {
+          orderId: holdLedger.orderId,
+          status: AssignmentStatus.driver_declined,
         },
       });
 
@@ -505,7 +846,7 @@ class ConfirmedHoldService {
         trucksAccepted: truckRequests.filter((tr) =>
           ['accepted', 'in_progress'].includes(tr.status)
         ).length,
-        trucksDeclined: 0, // Need to track separately
+        trucksDeclined: declinedCount,
         trucksPending: truckRequests.filter((tr) =>
           tr.status === 'assigned'
         ).length,
@@ -540,18 +881,65 @@ class ConfirmedHoldService {
   // =========================================================================
 
   /**
+   * F-L10 FIX: DRY — extracted shared FK traversal for Assignment → TruckRequest.
+   * Used by both handleDriverAcceptance and handleDriverDecline to resolve
+   * the TruckRequest and orderId from an assignment's FK chain.
+   */
+  private async resolveAssignmentTruckRequest(assignmentId: string): Promise<{
+    truckRequest: { id: string; orderId: string } | null;
+    orderId: string | null;
+  }> {
+    const record = await prismaClient.assignment.findUnique({
+      where: { id: assignmentId },
+      select: { truckRequestId: true, orderId: true },
+    });
+
+    const truckRequest = record?.truckRequestId
+      ? await prismaClient.truckRequest.findFirst({
+          where: { id: record.truckRequestId },
+          select: { id: true, orderId: true },
+        })
+      : null;
+
+    return {
+      truckRequest,
+      orderId: truckRequest?.orderId ?? record?.orderId ?? null,
+    };
+  }
+
+  /**
    * Cache confirmed hold state in Redis
+   * FIX #28: Now writes to Redis Hash (HMSET + EXPIRE) instead of JSON blob (SET).
+   * This enables atomic HINCRBY for counter fields (trucksAccepted, trucksPending, etc.).
    */
   private async cacheConfirmedHoldState(
     holdId: string,
     state: ConfirmedHoldState
   ): Promise<void> {
+    const key = REDIS_KEYS.CONFIRMED_HOLD_STATE(holdId);
     const ttl = Math.max(1, state.remainingSeconds) + 10;
-    await redisService.setJSON(
-      REDIS_KEYS.CONFIRMED_HOLD_STATE(holdId),
-      state,
-      ttl
-    );
+
+    // Serialize all fields to strings for Redis Hash storage
+    const hashFields: Record<string, string> = {
+      holdId: state.holdId,
+      orderId: state.orderId,
+      transporterId: state.transporterId,
+      phase: String(state.phase),
+      confirmedAt: state.confirmedAt instanceof Date
+        ? state.confirmedAt.toISOString()
+        : String(state.confirmedAt),
+      confirmedExpiresAt: state.confirmedExpiresAt instanceof Date
+        ? state.confirmedExpiresAt.toISOString()
+        : String(state.confirmedExpiresAt),
+      remainingSeconds: String(state.remainingSeconds),
+      trucksCount: String(state.trucksCount),
+      trucksAccepted: String(state.trucksAccepted),
+      trucksDeclined: String(state.trucksDeclined),
+      trucksPending: String(state.trucksPending),
+    };
+
+    await redisService.hMSet(key, hashFields);
+    await redisService.expire(key, ttl);
   }
 
   /**
@@ -582,8 +970,11 @@ class ConfirmedHoldService {
       orderId: string;
       truckRequestId?: string;
     },
-    timeoutSeconds: number
+    timeoutSeconds: number,
+    now?: Date
   ): Promise<void> {
+    // FIX-39: Use caller-provided timestamp or create one once for consistency
+    const ts = now ?? new Date();
     await queueService.scheduleAssignmentTimeout({
       assignmentId,
       driverId: assignmentData.driverId,
@@ -594,7 +985,7 @@ class ConfirmedHoldService {
       tripId: assignmentData.tripId,
       orderId: assignmentData.orderId,
       truckRequestId: assignmentData.truckRequestId,
-      createdAt: new Date().toISOString(),
+      createdAt: ts.toISOString(),
     }, timeoutSeconds * 1000);
 
     logger.debug('[CONFIRMED HOLD] Driver acceptance timeout scheduled', {
@@ -610,8 +1001,6 @@ class ConfirmedHoldService {
 // =============================================================================
 
 export const confirmedHoldService = new ConfirmedHoldService({
-  maxDurationSeconds: parseInt(process.env.CONFIRMED_HOLD_MAX_SECONDS || '180'),
-  driverAcceptTimeoutSeconds: parseInt(
-    process.env.DRIVER_ACCEPT_TIMEOUT_SECONDS || '45'
-  ),
+  maxDurationSeconds: HOLD_CONFIG.confirmedHoldMaxSeconds,
+  driverAcceptTimeoutSeconds: HOLD_CONFIG.driverAcceptTimeoutSeconds,
 });

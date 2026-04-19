@@ -1,7 +1,15 @@
 /**
  * =============================================================================
- * DIRECTIONS API SERVICE — Cached Google Directions API Wrapper
+ * DIRECTIONS API SERVICE — Single Route Calculation via Google Directions API
  * =============================================================================
+ *
+ * Google Directions API — single route calculation with polyline.
+ * Used for: server-side distance/duration verification of customer-provided route.
+ * Cache: 3 minutes per route (geohash6 precision for cache sharing).
+ *
+ * NOTE: distance-matrix.service.ts handles BATCH ETA lookups for matching
+ * (up to 25 origins per request). These are separate Google APIs with different
+ * pricing and use cases. Do NOT consolidate — they serve different purposes.
  *
  * WHAT THIS DOES:
  * Fetches road-time ETA (duration in traffic) between two geographic points
@@ -28,9 +36,10 @@
  * - With 3-min cache at geohash6, effective QPS is very low
  *
  * FEATURE FLAG:
- * - FF_DIRECTIONS_API_SCORING_ENABLED=false (default)
- * - When false: Haversine distance scoring (zero API calls)
- * - When true: Google Directions for top-N, Haversine for rest
+ * - FF_DIRECTIONS_API_SCORING_ENABLED defaults to ON (true) when env var is unset
+ * - Set to 'false' explicitly to disable Google Directions API scoring
+ * - When disabled: Haversine distance scoring (zero API calls)
+ * - When enabled: Google Directions for top-N, Haversine for rest
  *
  * LATENCY IMPACT:
  * - Cache hit: ~1ms (Redis GET)
@@ -46,12 +55,14 @@
 import { redisService } from './redis.service';
 import { logger } from './logger.service';
 import { config } from '../../config/environment';
+import { CIRCUITY_FACTORS } from '../utils/geospatial.utils';
 
 // =============================================================================
 // CONSTANTS
 // =============================================================================
 
-/** Feature flag — Google Directions API scoring (default: ON in production) */
+// FF_DIRECTIONS_API_SCORING_ENABLED: defaults to ON (true) when env var is unset.
+// Set to 'false' explicitly to disable Google Directions API scoring.
 export const FF_DIRECTIONS_API_SCORING_ENABLED =
     process.env.FF_DIRECTIONS_API_SCORING_ENABLED !== 'false';
 
@@ -302,7 +313,8 @@ class DirectionsApiService {
 
         // Approximate road-time: assume 30 km/h average speed in Indian cities
         // This is a conservative estimate (real road distance is 1.3-1.5x straight line)
-        const roadDistanceKm = distanceKm * 1.4; // Road factor
+        // Now uses shared CIRCUITY_FACTORS for single source of truth.
+        const roadDistanceKm = distanceKm * CIRCUITY_FACTORS.ETA_RANKING;
         const durationSeconds = (roadDistanceKm / 30) * 3600; // 30 km/h avg
 
         return {

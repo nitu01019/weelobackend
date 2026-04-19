@@ -17,11 +17,12 @@
  * =============================================================================
  */
 
+import crypto from 'crypto';
 import { logger } from '../../shared/services/logger.service';
-import { 
-  VEHICLE_CATALOG, 
-  getVehicleConfig, 
-  getSubtypeConfig, 
+import {
+  VEHICLE_CATALOG,
+  getVehicleConfig,
+  getSubtypeConfig,
   getDistanceSlabMultiplier,
   findSuitableVehicles,
   getAllVehicleTypes
@@ -45,6 +46,156 @@ const SURGE_CONFIG = {
 const MIN_DISTANCE_KM = 5;
 
 // ============================================================================
+// F-A-26 — Surge determinism + signed quote token (Uber H3 × 5-min + Stripe
+// PaymentIntent + Adyen HMAC)
+// ============================================================================
+
+/**
+ * Surge bucket size (5 minutes) — matches Uber's real-time surge pipeline
+ * and gives every quote a deterministic (cellId, bucketStart) anchor.
+ */
+const SURGE_BUCKET_MS = 5 * 60 * 1000;
+
+/**
+ * IST (Asia/Kolkata) extractor used for hour-of-day / day-of-week decisions.
+ * This makes surge decisions independent of the container's local timezone,
+ * which previously caused UTC-hosted ECS tasks to compute the wrong hour.
+ */
+const IST_FORMATTER = new Intl.DateTimeFormat('en-IN', {
+  timeZone: 'Asia/Kolkata',
+  hour: 'numeric',
+  hour12: false,
+  weekday: 'short'
+});
+
+/**
+ * HMAC key for quote tokens. Reuses JWT_SECRET to avoid introducing another
+ * secret; if unset we fall back to a deterministic dev-only string so unit
+ * tests remain reproducible. The production env validator enforces a
+ * non-empty JWT_SECRET (see src/core/config/env.validation.ts).
+ */
+function getQuoteHmacKey(): string {
+  return process.env.JWT_SECRET || 'weelo-dev-pricing-hmac-key';
+}
+
+/**
+ * Internal shape returned by the surge resolver. Callers use the multiplier
+ * and the auxiliary fields (ruleId, bucket boundaries) to sign a quote token.
+ */
+interface SurgeDecision {
+  multiplier: number;
+  ruleId: string;
+  bucketStart: Date;
+  bucketEnd: Date;
+  surgeFactor: string;
+}
+
+function computeSurgeLabel(multiplier: number): string {
+  if (multiplier > 1.15) return 'Peak Hours';
+  if (multiplier > 1.05) return 'Moderate Demand';
+  return 'Normal';
+}
+
+/**
+ * Deterministic surge resolution:
+ *   bucket  = floor(now / 5min) * 5min   (Uber real-time pipeline)
+ *   hour/dw = Asia/Kolkata-resolved, NOT container-local
+ *   ruleId  = SHA-256({cellId, bucketStart, parts}).slice(0, 16)
+ */
+function resolveSurgeDecision(timestampMs: number, cellId?: string): SurgeDecision {
+  const bucketStartMs = Math.floor(timestampMs / SURGE_BUCKET_MS) * SURGE_BUCKET_MS;
+  const bucketStart = new Date(bucketStartMs);
+  const bucketEnd = new Date(bucketStartMs + SURGE_BUCKET_MS);
+
+  // Extract IST hour + weekday deterministically regardless of container TZ.
+  const parts = IST_FORMATTER.formatToParts(bucketStart);
+  const hour = Number(parts.find((p) => p.type === 'hour')?.value ?? '0');
+  const weekdayShort = parts.find((p) => p.type === 'weekday')?.value ?? '';
+  const isWeekend = weekdayShort === 'Sat' || weekdayShort === 'Sun';
+
+  let multiplier = 1.0;
+  const active: string[] = [];
+  if (SURGE_CONFIG.peakHours.includes(hour)) {
+    multiplier *= SURGE_CONFIG.peakMultiplier;
+    active.push('peak');
+  }
+  if (SURGE_CONFIG.nightHours.includes(hour)) {
+    multiplier *= SURGE_CONFIG.nightMultiplier;
+    active.push('night');
+  }
+  if (isWeekend) {
+    multiplier *= SURGE_CONFIG.weekendMultiplier;
+    active.push('weekend');
+  }
+  multiplier = Math.round(multiplier * 100) / 100;
+
+  const ruleId = crypto
+    .createHash('sha256')
+    .update(
+      JSON.stringify({
+        cellId: cellId ?? null,
+        bucketStart: bucketStart.toISOString(),
+        parts: active.length > 0 ? active : ['baseline'],
+      })
+    )
+    .digest('hex')
+    .slice(0, 16);
+
+  return {
+    multiplier,
+    ruleId,
+    bucketStart,
+    bucketEnd,
+    surgeFactor: computeSurgeLabel(multiplier),
+  };
+}
+
+/**
+ * Sign a price quote with HMAC-SHA256 so the order-creation path can verify
+ * the client didn't tamper with a previously issued price. Follows the
+ * Agentic Commerce Protocol / Adyen HMAC signing pattern.
+ */
+export function signQuoteToken(payload: {
+  pricePerTruck: number;
+  surgeRuleId: string;
+  surgeBucketStart: string;
+  surgeBucketEnd: string;
+}): string {
+  const canonical = JSON.stringify({
+    p: payload.pricePerTruck,
+    r: payload.surgeRuleId,
+    s: payload.surgeBucketStart,
+    e: payload.surgeBucketEnd,
+  });
+  return crypto.createHmac('sha256', getQuoteHmacKey()).update(canonical).digest('hex');
+}
+
+/**
+ * Verify a quote token. Returns true only if the HMAC matches AND the
+ * quote's 5-min bucket has not expired relative to `nowMs`.
+ */
+export function verifyQuoteToken(
+  token: string,
+  payload: {
+    pricePerTruck: number;
+    surgeRuleId: string;
+    surgeBucketStart: string;
+    surgeBucketEnd: string;
+  },
+  nowMs: number = Date.now()
+): boolean {
+  if (!token || typeof token !== 'string') return false;
+  const expected = signQuoteToken(payload);
+  const tokenBuf = Buffer.from(token, 'utf8');
+  const expectedBuf = Buffer.from(expected, 'utf8');
+  if (tokenBuf.length !== expectedBuf.length) return false;
+  if (!crypto.timingSafeEqual(tokenBuf, expectedBuf)) return false;
+  const bucketEndMs = Date.parse(payload.surgeBucketEnd);
+  if (!Number.isFinite(bucketEndMs)) return false;
+  return nowMs < bucketEndMs;
+}
+
+// ============================================================================
 // INTERFACES
 // ============================================================================
 
@@ -54,6 +205,12 @@ interface PriceEstimateRequest {
   distanceKm: number;
   trucksNeeded: number;
   cargoWeightKg?: number;  // Optional: for tonnage-based calculation
+  // F-A-26: caller may pass a stable cellId (e.g. pickup city code or future H3
+  // index) so the surge decision is deterministic per (cellId, bucketStart).
+  cellId?: string;
+  // F-A-26: override the surge bucket timestamp; primarily for tests.
+  // In production this defaults to Date.now() inside calculateSurgeMultiplier.
+  timestampMs?: number;
 }
 
 interface PriceEstimateResponse {
@@ -70,6 +227,13 @@ interface PriceEstimateResponse {
   currency: string;
   validForMinutes: number;
   capacityInfo: CapacityInfo;
+  // F-A-26 (additive/backward-compatible): deterministic surge anchor + HMAC
+  // signed quote. Customers replay these on order-creation so the server can
+  // verify the price wasn't tampered with and doesn't silently re-price.
+  quoteToken?: string;
+  surgeRuleId?: string;
+  surgeBucketStart?: string;
+  surgeBucketEnd?: string;
 }
 
 interface PriceBreakdown {
@@ -134,12 +298,12 @@ class PricingService {
    * @returns Detailed price estimate
    */
   calculateEstimate(request: PriceEstimateRequest): PriceEstimateResponse {
-    const { vehicleType, vehicleSubtype, distanceKm, trucksNeeded, cargoWeightKg } = request;
-    
+    const { vehicleType, vehicleSubtype, distanceKm, trucksNeeded, cargoWeightKg, cellId, timestampMs } = request;
+
     // Get vehicle config from catalog
     const vehicleConfig = getVehicleConfig(vehicleType);
     const subtypeConfig = vehicleSubtype ? getSubtypeConfig(vehicleType, vehicleSubtype) : null;
-    
+
     // Use default if vehicle type not found
     if (!vehicleConfig) {
       logger.warn(`Vehicle type not found in catalog: ${vehicleType}, using defaults`);
@@ -148,37 +312,39 @@ class PricingService {
 
     // Calculate base price
     const basePrice = vehicleConfig.baseRate;
-    
+
     // Calculate distance (minimum distance applies)
     const chargeableDistance = Math.max(distanceKm, MIN_DISTANCE_KM);
-    
+
     // Get distance slab multiplier
     const distanceSlab = getDistanceSlabMultiplier(chargeableDistance);
     const distanceSlabMultiplier = distanceSlab.multiplier;
-    
+
     // Calculate distance charge
     const distanceCharge = chargeableDistance * vehicleConfig.perKmRate;
-    
+
     // Calculate tonnage charge (if cargo weight provided or use max capacity)
-    const effectiveTonnage = cargoWeightKg 
-      ? cargoWeightKg / 1000 
+    const effectiveTonnage = cargoWeightKg
+      ? cargoWeightKg / 1000
       : (subtypeConfig?.maxTonnage || 10);
     const tonnageCharge = effectiveTonnage * chargeableDistance * vehicleConfig.perTonPerKmRate;
 
     // Get subtype multiplier
     const subtypeMultiplier = subtypeConfig?.baseRateMultiplier || 1.0;
 
-    // Calculate surge multiplier
-    const surgeMultiplier = this.calculateSurgeMultiplier();
-    const surgeFactor = this.getSurgeFactor();
+    // F-A-26: resolve the surge decision ONCE (deterministic per 5-min bucket
+    // and cellId) so multiplier, label, ruleId, and quote-token all agree.
+    const surgeDecision = resolveSurgeDecision(timestampMs ?? Date.now(), cellId);
+    const surgeMultiplier = surgeDecision.multiplier;
+    const surgeFactor = surgeDecision.surgeFactor;
 
     // Calculate price per truck using enhanced formula
     // Formula: (BaseRate + DistanceCharge + TonnageCharge) * SubtypeMultiplier * DistanceSlabMultiplier * SurgeMultiplier
-    let pricePerTruck = (basePrice + distanceCharge + tonnageCharge) 
-      * subtypeMultiplier 
-      * distanceSlabMultiplier 
+    let pricePerTruck = (basePrice + distanceCharge + tonnageCharge)
+      * subtypeMultiplier
+      * distanceSlabMultiplier
       * surgeMultiplier;
-    
+
     // Apply minimum charge
     pricePerTruck = Math.max(pricePerTruck, vehicleConfig.minCharge);
     pricePerTruck = Math.round(pricePerTruck); // Round to nearest rupee
@@ -196,6 +362,15 @@ class PricingService {
 
     logger.info(`Price calculated: ${vehicleType}/${vehicleSubtype || 'default'} x${trucksNeeded}, ${distanceKm}km = ₹${totalPrice}`);
     logger.info(`Breakdown: Base=${basePrice}, Distance=${distanceCharge}, Tonnage=${tonnageCharge.toFixed(0)}, Slab=${distanceSlab.label}`);
+
+    const surgeBucketStart = surgeDecision.bucketStart.toISOString();
+    const surgeBucketEnd = surgeDecision.bucketEnd.toISOString();
+    const quoteToken = signQuoteToken({
+      pricePerTruck,
+      surgeRuleId: surgeDecision.ruleId,
+      surgeBucketStart,
+      surgeBucketEnd,
+    });
 
     return {
       basePrice: Math.round(basePrice * subtypeMultiplier),
@@ -218,8 +393,14 @@ class PricingService {
         distanceSlab: distanceSlab.label
       },
       currency: 'INR',
-      validForMinutes: 15,
-      capacityInfo
+      // F-A-26: align validForMinutes with the 5-min surge bucket so clients
+      // don't display a freshness window the server won't actually honour.
+      validForMinutes: 5,
+      capacityInfo,
+      quoteToken,
+      surgeRuleId: surgeDecision.ruleId,
+      surgeBucketStart,
+      surgeBucketEnd,
     };
   }
 
@@ -227,20 +408,32 @@ class PricingService {
    * Calculate with default values when vehicle type not in catalog
    */
   private calculateWithDefaults(request: PriceEstimateRequest): PriceEstimateResponse {
-    const { vehicleType, vehicleSubtype, distanceKm, trucksNeeded } = request;
-    
+    const { vehicleType, vehicleSubtype, distanceKm, trucksNeeded, cellId, timestampMs } = request;
+
     const basePrice = 2000;
     const perKmRate = 30;
     const chargeableDistance = Math.max(distanceKm, MIN_DISTANCE_KM);
     const distanceCharge = chargeableDistance * perKmRate;
-    const surgeMultiplier = this.calculateSurgeMultiplier();
-    const surgeFactor = this.getSurgeFactor();
+    // F-A-26: share the same deterministic surge decision + signed quote in the
+    // fallback/catalog-miss path so downstream behaviour is consistent.
+    const surgeDecision = resolveSurgeDecision(timestampMs ?? Date.now(), cellId);
+    const surgeMultiplier = surgeDecision.multiplier;
+    const surgeFactor = surgeDecision.surgeFactor;
     const distanceSlab = getDistanceSlabMultiplier(chargeableDistance);
-    
+
     let pricePerTruck = (basePrice + distanceCharge) * distanceSlab.multiplier * surgeMultiplier;
     pricePerTruck = Math.max(pricePerTruck, 1500);
     pricePerTruck = Math.round(pricePerTruck);
-    
+
+    const surgeBucketStart = surgeDecision.bucketStart.toISOString();
+    const surgeBucketEnd = surgeDecision.bucketEnd.toISOString();
+    const quoteToken = signQuoteToken({
+      pricePerTruck,
+      surgeRuleId: surgeDecision.ruleId,
+      surgeBucketStart,
+      surgeBucketEnd,
+    });
+
     return {
       basePrice,
       distanceCharge,
@@ -262,13 +455,17 @@ class PricingService {
         distanceSlab: distanceSlab.label
       },
       currency: 'INR',
-      validForMinutes: 15,
+      validForMinutes: 5,
       capacityInfo: {
         capacityKg: 10000,
         capacityTons: 10,
         minTonnage: 5,
         maxTonnage: 15
-      }
+      },
+      quoteToken,
+      surgeRuleId: surgeDecision.ruleId,
+      surgeBucketStart,
+      surgeBucketEnd,
     };
   }
 
@@ -366,41 +563,31 @@ class PricingService {
   }
 
   /**
-   * Calculate surge multiplier based on current time
+   * F-A-26: Deterministic surge multiplier.
+   *
+   * Previously this used `new Date().getHours()` / `getDay()`, which made the
+   * surge decision depend on the container's local timezone. The ECS task
+   * runs in UTC but Weelo's hour-of-day rules are in IST, so peak hours were
+   * off by 5.5 hours in production. We now:
+   *   1. Accept an explicit `timestampMs` (defaults to Date.now()) and a
+   *      stable `cellId` (for future H3 integration; today just pickup city).
+   *   2. Quantize to a 5-min bucket — two back-to-back calls in the same
+   *      bucket return the same multiplier AND the same ruleId/token.
+   *   3. Extract hour-of-day and weekday in Asia/Kolkata via Intl so the
+   *      decision is container-TZ-independent.
+   *
+   * The public shape is preserved (`number` return) for existing callers;
+   * deterministic metadata is exposed via `resolveSurgeDecisionPublic` below.
    */
-  private calculateSurgeMultiplier(): number {
-    const now = new Date();
-    const hour = now.getHours();
-    const dayOfWeek = now.getDay();
-
-    let multiplier = 1.0;
-
-    // Check peak hours
-    if (SURGE_CONFIG.peakHours.includes(hour)) {
-      multiplier *= SURGE_CONFIG.peakMultiplier;
-    }
-
-    // Check night hours
-    if (SURGE_CONFIG.nightHours.includes(hour)) {
-      multiplier *= SURGE_CONFIG.nightMultiplier;
-    }
-
-    // Check weekend
-    if (dayOfWeek === 0 || dayOfWeek === 6) {
-      multiplier *= SURGE_CONFIG.weekendMultiplier;
-    }
-
-    return Math.round(multiplier * 100) / 100; // Round to 2 decimal places
+  private calculateSurgeMultiplier(timestampMs?: number, cellId?: string): number {
+    return resolveSurgeDecision(timestampMs ?? Date.now(), cellId).multiplier;
   }
 
   /**
-   * Get human-readable surge factor
+   * Get human-readable surge factor for the same bucket as the multiplier.
    */
-  private getSurgeFactor(): string {
-    const multiplier = this.calculateSurgeMultiplier();
-    if (multiplier > 1.15) return 'Peak Hours';
-    if (multiplier > 1.05) return 'Moderate Demand';
-    return 'Normal';
+  private getSurgeFactor(timestampMs?: number, cellId?: string): string {
+    return resolveSurgeDecision(timestampMs ?? Date.now(), cellId).surgeFactor;
   }
 
   /**

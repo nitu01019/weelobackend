@@ -112,6 +112,11 @@ const ENV_VARS: EnvVar[] = [
   // REDIS CACHE
   // ==========================================================================
   {
+    name: 'REDIS_URL',
+    required: false, // M-9: validated separately — required in production, localhost fallback in dev
+    description: 'Redis connection URL (required in production)'
+  },
+  {
     name: 'REDIS_ENABLED',
     required: false,
     default: 'false',
@@ -184,15 +189,15 @@ const ENV_VARS: EnvVar[] = [
     name: 'ORDER_TRANSPORTER_FANOUT_QUEUE_CHUNK_SIZE',
     required: false,
     default: '500',
-    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 25,
-    description: 'Chunk size for queued transporter fanout batches'
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 25 && parseInt(v) <= 500,
+    description: 'Chunk size for queued transporter fanout batches (25-500)'
   },
   {
     name: 'SOCKET_MULTI_ROOM_EMIT_CHUNK_SIZE',
     required: false,
     default: '300',
-    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 25,
-    description: 'Socket.IO room chunk size for multi-user direct emits'
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 25 && parseInt(v) <= 500,
+    description: 'Socket.IO room chunk size for multi-user direct emits (25-500)'
   },
 
   // ==========================================================================
@@ -342,7 +347,7 @@ const ENV_VARS: EnvVar[] = [
   // CORS
   // ==========================================================================
   {
-    name: 'CORS_ORIGINS',
+    name: 'CORS_ORIGIN',
     required: false,
     default: '*',
     description: 'Allowed CORS origins (comma-separated)'
@@ -357,7 +362,200 @@ const ENV_VARS: EnvVar[] = [
     default: 'info',
     validator: (v) => ['error', 'warn', 'info', 'debug'].includes(v),
     description: 'Logging level'
-  }
+  },
+
+  // ==========================================================================
+  // HOLD SYSTEM (PRD 7777)
+  // ==========================================================================
+  {
+    name: 'DRIVER_ACCEPT_TIMEOUT_SECONDS',
+    required: false,
+    default: '45',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 10 && parseInt(v) <= 120,
+    description: 'Driver accept/decline timeout in seconds (PRD 7777: 45s)'
+  },
+  {
+    name: 'CONFIRMED_HOLD_MAX_SECONDS',
+    required: false,
+    default: '180',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 30 && parseInt(v) <= 600,
+    description: 'Maximum confirmed hold duration in seconds'
+  },
+  {
+    name: 'FLEX_HOLD_DURATION_SECONDS',
+    required: false,
+    default: '90',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 10 && parseInt(v) <= 300,
+    description: 'Flex hold base duration in seconds'
+  },
+  // F-C-75: keys referenced by hold-config.ts but previously undeclared here,
+  // so validation passed silently without any contract check.
+  {
+    name: 'FLEX_HOLD_EXTENSION_SECONDS',
+    required: false,
+    default: '30',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 5 && parseInt(v) <= 120,
+    description: 'Flex hold per-extension bump in seconds (PRD 7777: +30s per driver assignment)'
+  },
+  {
+    name: 'FLEX_HOLD_MAX_DURATION_SECONDS',
+    required: false,
+    default: '130',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 30 && parseInt(v) <= 600,
+    description: 'Flex hold absolute max duration in seconds (base + all extensions)'
+  },
+  {
+    name: 'ORDER_BASE_TIMEOUT_SECONDS',
+    required: false,
+    default: '120',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 30 && parseInt(v) <= 600,
+    description: 'Base order broadcast/expiry timeout in seconds (PRD 7777: 120s)'
+  },
+
+  // ==========================================================================
+  // ORDER CREATION GUARDS
+  // ==========================================================================
+  {
+    name: 'REQUIRE_IDEMPOTENCY_KEY',
+    required: false,
+    default: 'true',
+    validator: (v) => ['true', 'false'].includes(v),
+    description: 'Require x-idempotency-key header on POST /orders (set false during client migration)'
+  },
+  {
+    name: 'ORDER_MAX_CONCURRENT_CREATES',
+    required: false,
+    default: '200',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 10 && parseInt(v) <= 1000,
+    description: 'Max concurrent order creates (Redis backpressure + in-memory fallback)'
+  },
+
+  // ==========================================================================
+  // FEATURE FLAGS
+  // ==========================================================================
+  {
+    name: 'FF_H3_INDEX_ENABLED',
+    required: false,
+    default: 'false',
+    validator: (v) => ['true', 'false'].includes(v),
+    description: 'Enable H3 geo index for transporter lookup'
+  },
+  {
+    name: 'FF_CIRCUIT_BREAKER_ENABLED',
+    required: false,
+    default: 'true',
+    validator: (v) => ['true', 'false'].includes(v),
+    description: 'Enable circuit breaker for external API calls'
+  },
+  {
+    name: 'FF_SEQUENCE_DELIVERY_ENABLED',
+    required: false,
+    default: 'false',
+    validator: (v) => ['true', 'false'].includes(v),
+    description: 'Enable sequence-numbered socket delivery'
+  },
+  {
+    name: 'FF_DIRECTIONS_API_SCORING_ENABLED',
+    required: false,
+    default: 'true',
+    validator: (v) => ['true', 'false'].includes(v),
+    description: 'Enable Google Directions API for candidate scoring'
+  },
+  {
+    name: 'FF_HOLD_DB_ATOMIC_CLAIM',
+    required: false,
+    default: 'true',
+    validator: (v) => ['true', 'false'].includes(v),
+    description: 'Enable DB-level atomic hold claim'
+  },
+  {
+    name: 'FF_QUEUE_DEPTH_CAP',
+    required: false,
+    default: '10000',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 100,
+    description: 'Queue depth backpressure cap'
+  },
+  {
+    name: 'FF_LEGACY_BOOKING_PROXY_TO_ORDER',
+    required: false,
+    default: 'true',
+    validator: (v) => ['true', 'false'].includes(v),
+    description: 'Proxy legacy booking endpoints to canonical order service'
+  },
+  {
+    name: 'FF_CANCEL_POLICY_TRUCK_V1',
+    required: false,
+    default: 'true',
+    validator: (v) => ['true', 'false'].includes(v),
+    description: 'Enable truck cancellation policy v1'
+  },
+
+  // ==========================================================================
+  // DISPATCH TUNING
+  // ==========================================================================
+  {
+    name: 'DIRECTIONS_API_MAX_QPS',
+    required: false,
+    default: '450',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 10 && parseInt(v) <= 1000,
+    description: 'Google Directions API max QPS per instance'
+  },
+  {
+    name: 'BROADCAST_TIMEOUT_SECONDS',
+    required: false,
+    default: '120',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 30 && parseInt(v) <= 600,
+    description: 'Broadcast timeout for booking expiry'
+  },
+
+  // ==========================================================================
+  // TRACKING THRESHOLDS
+  // ==========================================================================
+  {
+    name: 'MAX_ARRIVAL_DISTANCE_METERS',
+    required: false,
+    default: '200',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 50 && parseInt(v) <= 5000,
+    description: 'Distance threshold for arrival detection'
+  },
+  {
+    name: 'DRIVER_PROXIMITY_NOTIFICATION_KM',
+    required: false,
+    default: '2',
+    validator: (v) => !isNaN(parseFloat(v)) && parseFloat(v) >= 0.1 && parseFloat(v) <= 50,
+    description: 'Distance threshold for driver proximity notifications'
+  },
+
+  // ==========================================================================
+  // FIREBASE
+  // ==========================================================================
+  {
+    name: 'FIREBASE_SERVICE_ACCOUNT_PATH',
+    required: false,
+    description: 'Path to Firebase service account JSON file for FCM push notifications'
+  },
+
+  // ==========================================================================
+  // REDIS
+  // ==========================================================================
+  {
+    name: 'REDIS_PUBSUB_DISABLED',
+    required: false,
+    default: 'false',
+    validator: (v) => ['true', 'false'].includes(v),
+    description: 'Disable Redis pub/sub adapter (single-instance mode)'
+  },
+
+  // ==========================================================================
+  // DEPRECATED (to be removed after H-X1 lands)
+  // ==========================================================================
+  {
+    name: 'ASSIGNMENT_TIMEOUT_MS',
+    required: false,
+    default: '45000',
+    validator: (v) => !isNaN(parseInt(v)) && parseInt(v) >= 5000 && parseInt(v) <= 120000,
+    description: 'DEPRECATED: Use DRIVER_ACCEPT_TIMEOUT_SECONDS via hold-config.ts instead'
+  },
 ];
 
 /**
@@ -407,6 +605,12 @@ export function validateEnvironment(): ValidationResult {
         result.errors.push('GOOGLE_MAPS_API_KEY is required in production for Places/Geocoding');
       }
       
+      // M-9 FIX: REDIS_URL is required in production — fail-fast
+      if (envVar.name === 'REDIS_URL' && !value) {
+        result.valid = false;
+        result.errors.push('REDIS_URL is required in production (no localhost fallback)');
+      }
+
       // Redis should be enabled in production
       if (envVar.name === 'REDIS_ENABLED' && value !== 'true') {
         result.warnings.push('REDIS_ENABLED should be true in production for caching and rate limiting');
@@ -431,7 +635,9 @@ export function validateEnvironment(): ValidationResult {
       // Store loaded value
       result.loaded[envVar.name] = finalValue;
 
-      // Set default in process.env if not already set
+      // NOTE: process.env mutation — kept because downstream code may read process.env
+      // directly (e.g., Prisma, Redis clients). The config object in environment.ts
+      // also provides these defaults, but removing this could break third-party libs.
       if (!value && envVar.default) {
         process.env[envVar.name] = envVar.default;
       }
@@ -461,6 +667,13 @@ export function validateEnvironment(): ValidationResult {
     }
   }
 
+  // Critical environment variables that must always be present — halt startup if missing
+  const criticalVars = ['DATABASE_URL', 'JWT_SECRET'];
+  const missing = criticalVars.filter(v => !process.env[v]);
+  if (missing.length > 0) {
+    throw new Error(`FATAL: Missing critical env vars: ${missing.join(', ')}`);
+  }
+
   const trackingStreamEnabled = process.env.TRACKING_STREAM_ENABLED === 'true';
   const trackingStreamProvider = (process.env.TRACKING_STREAM_PROVIDER || 'none').toLowerCase();
   if (trackingStreamEnabled) {
@@ -484,45 +697,34 @@ export function validateEnvironment(): ValidationResult {
  * Exits process if validation fails in production
  */
 export function validateAndLogEnvironment(): void {
-  console.log('');
-  console.log('╔════════════════════════════════════════════════════════════════════╗');
-  console.log('║                   ENVIRONMENT VALIDATION                           ║');
-  console.log('╚════════════════════════════════════════════════════════════════════╝');
-  
+  logger.info('--- ENVIRONMENT VALIDATION ---');
+
   const result = validateEnvironment();
   const isProduction = process.env.NODE_ENV === 'production';
 
   // Log errors
   if (result.errors.length > 0) {
-    console.log('');
-    console.log('❌ ERRORS:');
     result.errors.forEach(error => {
-      console.log(`   • ${error}`);
       logger.error(`Environment validation error: ${error}`);
     });
   }
 
   // Log warnings
   if (result.warnings.length > 0) {
-    console.log('');
-    console.log('⚠️  WARNINGS:');
     result.warnings.forEach(warning => {
-      console.log(`   • ${warning}`);
       logger.warn(`Environment validation warning: ${warning}`);
     });
   }
 
   // Log success
   if (result.valid) {
-    console.log('');
-    console.log('✅ Environment validation passed');
-    console.log(`   Mode: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`   Port: ${process.env.PORT || '3000'}`);
-    console.log(`   Redis: ${process.env.REDIS_ENABLED === 'true' ? 'Enabled' : 'Disabled'}`);
-    console.log(`   SMS Provider: ${process.env.SMS_PROVIDER || 'mock'}`);
+    logger.info('Environment validation passed', {
+      mode: process.env.NODE_ENV || 'development',
+      port: process.env.PORT || '3000',
+      redis: process.env.REDIS_ENABLED === 'true' ? 'Enabled' : 'Disabled',
+      smsProvider: process.env.SMS_PROVIDER || 'mock'
+    });
   }
-
-  console.log('');
 
   // Exit in production if validation failed
   if (!result.valid && isProduction) {

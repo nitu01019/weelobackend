@@ -30,9 +30,10 @@
  * - If everything fails → Original Haversine sort is preserved
  *
  * FEATURE FLAG:
- * - FF_DIRECTIONS_API_SCORING_ENABLED=false (default)
- * - When false: Tier 1 only (zero API calls, zero latency impact)
- * - When true: Tier 1 + Tier 2 (API calls for top-20 only)
+ * - FF_DIRECTIONS_API_SCORING_ENABLED defaults to ON (true) when env var is unset
+ * - Set to 'false' explicitly to disable Google Directions API scoring
+ * - When disabled: Tier 1 only (zero API calls, zero latency impact)
+ * - When enabled: Tier 1 + Tier 2 (API calls for top-N only)
  *
  * LATENCY IMPACT (when flag is ON):
  * - Tier 1: 0ms (pure math)
@@ -46,21 +47,156 @@
  * =============================================================================
  */
 
+import { z } from 'zod';
 import { directionsApiService, FF_DIRECTIONS_API_SCORING_ENABLED } from './directions-api.service';
 import { logger } from './logger.service';
+import { metrics } from '../monitoring/metrics.service';
+import { CIRCUITY_FACTORS } from '../utils/geospatial.utils';
 
 // =============================================================================
 // CONSTANTS
 // =============================================================================
 
-/** How many top candidates to score with Google Directions API (Tier 2) */
-const TIER2_TOP_N = parseInt(process.env.TIER2_TOP_N || '20', 10);
+/**
+ * How many top candidates to score with Google Directions API (Tier 2).
+ * FIX #25: Increased default from 20 to 50 (2 Google API batches of 25 origins).
+ * Env-configurable via CANDIDATE_SCORER_TOP_N for cost/accuracy tradeoff.
+ */
+const TIER2_TOP_N = Math.max(1, parseInt(process.env.CANDIDATE_SCORER_TOP_N || '50', 10) || 50);
 
-/** Average city speed assumption for Tier 1 (km/h) */
-const AVERAGE_CITY_SPEED_KMH = 30;
+/**
+ * Average city speed assumption for Tier 1 (km/h).
+ * FIX #34: Env-configurable via HAVERSINE_AVG_SPEED_KMH.
+ * Default 30 matches Indian urban truck speed.
+ */
+const AVERAGE_CITY_SPEED_KMH = Math.max(1, parseInt(process.env.HAVERSINE_AVG_SPEED_KMH || '30', 10) || 30);
 
-/** Road distance multiplier (straight-line → road distance) */
-const ROAD_FACTOR = 1.4;
+/**
+ * Road distance multiplier (straight-line to road distance).
+ * FIX #34: Env-configurable via HAVERSINE_ROAD_FACTOR.
+ * Default 1.4 based on Ballou et al. (2002) India urban circuity: 1.25-1.50.
+ * Now imported from shared CIRCUITY_FACTORS for single source of truth.
+ */
+const ROAD_FACTOR = CIRCUITY_FACTORS.ETA_RANKING;
+
+// =============================================================================
+// M-3 FIX: Multi-factor transporter scoring (Uber DISCO pattern)
+// =============================================================================
+// Configurable: FF_BEHAVIORAL_SCORING=true enables it (default: false for safe rollout)
+// When disabled, compositeScore === etaSeconds (pure ETA ranking, zero behavioral impact)
+// =============================================================================
+
+const BEHAVIORAL_SCORING_ENABLED = process.env.FF_BEHAVIORAL_SCORING === 'true';
+
+/**
+ * F-A-86: Zod schema for weights. Each weight in [0, 1] and the sum must be
+ * 1.0 (+/- 5%) so composite scores remain comparable across releases. Exported
+ * for unit tests.
+ */
+export const WeightsSchema = z
+  .object({
+    eta: z.number().min(0).max(1),
+    acceptance: z.number().min(0).max(1),
+    responseTime: z.number().min(0).max(1),
+    rating: z.number().min(0).max(1),
+  })
+  .refine(
+    (w) => Math.abs(w.eta + w.acceptance + w.responseTime + w.rating - 1) < 0.05,
+    { message: 'weights must sum to 1.0 (+/- 5%)' },
+  );
+
+/** Raw weights from env (unvalidated). */
+const rawBehavioralWeights = {
+  eta: parseFloat(process.env.BEHAVIORAL_WEIGHT_ETA || '0.5'),             // 50% proximity
+  acceptance: parseFloat(process.env.BEHAVIORAL_WEIGHT_ACCEPTANCE || '0.2'), // 20% reliability
+  responseTime: parseFloat(process.env.BEHAVIORAL_WEIGHT_RESPONSE || '0.2'), // 20% speed
+  rating: parseFloat(process.env.BEHAVIORAL_WEIGHT_RATING || '0.1'),         // 10% quality
+};
+
+const weightsValidation = WeightsSchema.safeParse(rawBehavioralWeights);
+
+// Module-load setGauge call must tolerate partial metrics mocks used by
+// legacy unit tests that only mock incrementCounter/observeHistogram.
+function safeSetGauge(name: string, value: number): void {
+  if (typeof (metrics as { setGauge?: unknown }).setGauge === 'function') {
+    metrics.setGauge(name, value);
+  }
+}
+
+if (!weightsValidation.success) {
+  safeSetGauge('scorer_weights_boot_valid', 0);
+  const issues = weightsValidation.error.issues.map((i) => `${i.path.join('.') || 'weights'}: ${i.message}`).join('; ');
+  if (BEHAVIORAL_SCORING_ENABLED) {
+    // Fail-fast boot: misconfigured weights + flag ON would silently skew
+    // dispatch fairness. Blow up so the deploy is rolled back.
+    logger.error('[CandidateScorer] Invalid BEHAVIORAL_WEIGHTS with FF_BEHAVIORAL_SCORING=true', {
+      weights: rawBehavioralWeights,
+      issues,
+    });
+    throw new Error(`[CandidateScorer] Invalid BEHAVIORAL_WEIGHTS: ${issues}`);
+  }
+  // Flag OFF: log once at boot; legacy ETA-only path is safe regardless.
+  logger.warn('[CandidateScorer] Invalid BEHAVIORAL_WEIGHTS (FF_BEHAVIORAL_SCORING is OFF, tolerating)', {
+    weights: rawBehavioralWeights,
+    issues,
+  });
+} else {
+  safeSetGauge('scorer_weights_boot_valid', 1);
+}
+
+/** Weights for composite scoring - lower score is better. Frozen to prevent runtime mutation. */
+const BEHAVIORAL_WEIGHTS = Object.freeze({ ...rawBehavioralWeights });
+
+logger.info('[CandidateScorer] Effective BEHAVIORAL_WEIGHTS', {
+  weights: BEHAVIORAL_WEIGHTS,
+  behavioralScoringEnabled: BEHAVIORAL_SCORING_ENABLED,
+  validated: weightsValidation.success,
+});
+
+export { BEHAVIORAL_WEIGHTS };
+
+/** Safe defaults for transporters without behavioral data */
+const BEHAVIORAL_DEFAULTS = {
+  acceptanceRate: 0.5,   // 50% acceptance (neutral)
+  avgResponseTime: 30,   // 30 seconds (neutral)
+  rating: 3.0,           // 3/5 (neutral)
+};
+
+export interface BehavioralFactors {
+  acceptanceRate?: number;  // 0-1
+  avgResponseTime?: number; // seconds
+  rating?: number;          // 1-5
+}
+
+/**
+ * Calculate composite score from ETA + behavioral factors.
+ * Lower score = better candidate.
+ *
+ * When FF_BEHAVIORAL_SCORING is OFF, returns etaSeconds unchanged.
+ * When ON, blends ETA with acceptance rate, response time, and rating.
+ */
+function calculateCompositeScore(
+    etaSeconds: number,
+    factors: BehavioralFactors
+): number {
+    if (!BEHAVIORAL_SCORING_ENABLED) {
+        return etaSeconds; // Legacy: ETA-only ranking
+    }
+
+    const acceptanceRate = factors.acceptanceRate ?? BEHAVIORAL_DEFAULTS.acceptanceRate;
+    const avgResponseTime = factors.avgResponseTime ?? BEHAVIORAL_DEFAULTS.avgResponseTime;
+    const rating = factors.rating ?? BEHAVIORAL_DEFAULTS.rating;
+
+    // Weighted scoring — lower is better
+    // (1 - acceptanceRate) * 100: low acceptance = high penalty
+    // (6 - rating) * 10: low rating = high penalty
+    return (
+        (etaSeconds * BEHAVIORAL_WEIGHTS.eta) +
+        ((1 - acceptanceRate) * 100 * BEHAVIORAL_WEIGHTS.acceptance) +
+        (avgResponseTime * BEHAVIORAL_WEIGHTS.responseTime) +
+        ((6 - rating) * 10 * BEHAVIORAL_WEIGHTS.rating)
+    );
+}
 
 // =============================================================================
 // TYPES
@@ -78,6 +214,9 @@ export interface ScoredCandidate {
     latitude: number;
     /** Longitude of transporter */
     longitude: number;
+    /** M-3: Composite score blending ETA + behavioral factors (lower is better).
+     *  When FF_BEHAVIORAL_SCORING is OFF, equals etaSeconds. */
+    compositeScore: number;
 }
 
 export interface CandidateInput {
@@ -85,6 +224,8 @@ export interface CandidateInput {
     distanceKm: number;
     latitude: number;
     longitude: number;
+    /** M-3: Optional behavioral data (acceptance rate, response time, rating) */
+    behavioralFactors?: BehavioralFactors;
 }
 
 // =============================================================================
@@ -123,17 +264,21 @@ class CandidateScorerService {
         // =======================================================================
         // TIER 1 — Haversine Approximation (ALL candidates, zero API calls)
         // =======================================================================
-        const tier1Scored = candidates.map((c): ScoredCandidate => ({
-            transporterId: c.transporterId,
-            distanceKm: c.distanceKm,
-            etaSeconds: this.haversineEtaSeconds(c.distanceKm),
-            etaSource: 'haversine',
-            latitude: c.latitude,
-            longitude: c.longitude
-        }));
+        const tier1Scored = candidates.map((c): ScoredCandidate => {
+            const eta = this.haversineEtaSeconds(c.distanceKm);
+            return {
+                transporterId: c.transporterId,
+                distanceKm: c.distanceKm,
+                etaSeconds: eta,
+                etaSource: 'haversine',
+                latitude: c.latitude,
+                longitude: c.longitude,
+                compositeScore: calculateCompositeScore(eta, c.behavioralFactors || {}),
+            };
+        });
 
-        // Sort by Tier 1 ETA
-        tier1Scored.sort((a, b) => a.etaSeconds - b.etaSeconds);
+        // Sort by composite score (ETA-only when behavioral scoring is OFF)
+        tier1Scored.sort((a, b) => a.compositeScore - b.compositeScore);
 
         // If Directions API scoring is disabled, return Tier 1 results
         if (!FF_DIRECTIONS_API_SCORING_ENABLED) {
@@ -160,26 +305,47 @@ class CandidateScorerService {
                 pickupLng
             );
 
-            // Apply Tier 2 scores to top-N
+            // Apply Tier 2 scores to top-N + recalculate composite
+            const candidateBehavioralMap = new Map(
+                candidates.map(c => [c.transporterId, c.behavioralFactors || {}])
+            );
             for (const candidate of topN) {
                 const result = directionsResults.get(candidate.transporterId);
                 if (result) {
                     candidate.etaSeconds = result.durationSeconds;
                     candidate.etaSource = result.source;
+                    // M-3: Recalculate composite with real ETA
+                    const factors = candidateBehavioralMap.get(candidate.transporterId) || {};
+                    candidate.compositeScore = calculateCompositeScore(result.durationSeconds, factors);
                 }
             }
 
-            // Re-sort top-N by Tier 2 ETA
-            topN.sort((a, b) => a.etaSeconds - b.etaSeconds);
+            // Re-sort top-N by composite score (ETA-only when behavioral OFF)
+            topN.sort((a, b) => a.compositeScore - b.compositeScore);
 
-            // Combine: re-ranked top-N + rest (Tier 1 scores)
-            const finalResults = [...topN, ...rest];
+            // FIX #25: Apply confidence penalty to haversine-only candidates.
+            // Haversine ETA can be 12-110% inaccurate depending on road network.
+            // 20% penalty pushes uncertain estimates below API-scored candidates.
+            const penalizedRest = rest.map(c => {
+              const penalizedEta = Math.round(c.etaSeconds * 1.2);
+              const factors = candidateBehavioralMap.get(c.transporterId) || {};
+              return {
+                ...c,
+                etaSeconds: penalizedEta,
+                etaSource: 'haversine_penalized',
+                compositeScore: calculateCompositeScore(penalizedEta, factors),
+              };
+            });
+
+            // Combine: re-ranked top-N + penalized rest
+            const finalResults = [...topN, ...penalizedRest];
 
             const cacheHits = Array.from(directionsResults.values()).filter(r => r.cached).length;
             const apiCalls = directionsResults.size - cacheHits;
 
             logger.info('[CandidateScorer] Two-tier scoring', {
                 scoringMode: 'tier2_directions',
+                behavioralScoring: BEHAVIORAL_SCORING_ENABLED,
                 totalCandidates: candidates.length,
                 tier2Candidates: topN.length,
                 cacheHits,

@@ -62,7 +62,11 @@ export const vehicleNumberSchema = z.string()
 export const coordinatesSchema = z.object({
   latitude: z.number().min(-90).max(90),
   longitude: z.number().min(-180).max(180)
-});
+}).refine(
+  (coords) => coords.latitude >= 6.5 && coords.latitude <= 37.0 &&
+              coords.longitude >= 68.0 && coords.longitude <= 97.5,
+  { message: 'Coordinates must be within India service area' }
+);
 
 /**
  * Location schema
@@ -85,6 +89,14 @@ export const locationSchema = z.object({
     return false;
   },
   { message: 'Either coordinates object OR latitude+longitude fields are required' }
+).refine(
+  (data) => {
+    const lat = data.coordinates?.latitude ?? data.latitude;
+    const lng = data.coordinates?.longitude ?? data.longitude;
+    if (lat === undefined || lng === undefined) return true; // let other validators catch missing
+    return lat >= 6.5 && lat <= 37.0 && lng >= 68.0 && lng <= 97.5;
+  },
+  { message: 'Location must be within India service area' }
 );
 
 /**
@@ -99,6 +111,8 @@ export const paginationSchema = z.object({
  * Booking status schema
  */
 export const bookingStatusSchema = z.enum([
+  'created',
+  'broadcasting',
   'active',
   'partially_filled',
   'fully_filled',
@@ -114,10 +128,13 @@ export const bookingStatusSchema = z.enum([
 export const assignmentStatusSchema = z.enum([
   'pending',
   'driver_accepted',
+  'driver_declined',
   'en_route_pickup',
   'at_pickup',
   'in_transit',
+  'arrived_at_drop',
   'completed',
+  'partial_delivery', // L-17: Driver marks delivery as partial with reason
   'cancelled'
 ]);
 
@@ -205,13 +222,6 @@ export function validateRequest<T extends z.ZodSchema>(schema: T) {
           message: e.message
         }));
 
-        // Log validation errors for debugging
-        console.log('=== VALIDATION ERROR ===');
-        console.log('Path:', req.path);
-        console.log('Request body:', JSON.stringify(req.body, null, 2));
-        console.log('Validation errors:', JSON.stringify(details, null, 2));
-        console.log('========================');
-
         next(new AppError(400, 'VALIDATION_ERROR', 'Invalid request data', { fields: details }));
       } else {
         next(error);
@@ -243,6 +253,35 @@ export function validateQuery<T extends z.ZodSchema>(schema: T) {
       }
     }
   };
+}
+
+// ============================================================
+// PAGINATION UTILITIES
+// ============================================================
+
+/**
+ * Maximum allowed page size for API queries
+ */
+export const MAX_PAGE_SIZE = 100;
+
+/**
+ * Default page size when none is provided or value is invalid
+ */
+export const DEFAULT_PAGE_SIZE = 20;
+
+/**
+ * Clamp a requested page size to a safe range.
+ * Returns defaultSize for invalid/falsy/non-positive values.
+ * Caps at MAX_PAGE_SIZE for values exceeding the maximum.
+ *
+ * @param requested - The raw page size value (may be number, string, undefined, etc.)
+ * @param defaultSize - Fallback when requested is invalid (defaults to DEFAULT_PAGE_SIZE)
+ * @returns A safe page size number
+ */
+export function clampPageSize(requested: any, defaultSize: number = DEFAULT_PAGE_SIZE): number {
+  const num = Number(requested);
+  if (isNaN(num) || num < 1) return defaultSize;
+  return Math.min(num, MAX_PAGE_SIZE);
 }
 
 // ============================================================

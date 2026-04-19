@@ -28,6 +28,7 @@
 
 import { config } from '../../config/environment';
 import { logger } from './logger.service';
+import { redisService } from './redis.service';
 
 // =============================================================================
 // CACHE INTERFACE
@@ -153,103 +154,54 @@ class InMemoryCache implements CacheStore {
 // REDIS CACHE (Production / Horizontal Scaling)
 // =============================================================================
 
+/**
+ * Redis cache that delegates to the shared redisService singleton
+ * instead of creating its own connection.  This avoids an extra
+ * Redis connection (and the node-redis dependency).
+ */
 class RedisCache implements CacheStore {
-  private client: any = null;
-  private isConnected = false;
-
-  constructor() {
-    this.initialize();
-  }
-
-  private async initialize(): Promise<void> {
-    try {
-      // Dynamic import to avoid loading Redis if not used
-      const { createClient } = await import('redis');
-
-      this.client = createClient({
-        url: config.redis.url,
-        socket: {
-          reconnectStrategy: (retries: number) => {
-            if (retries > 10) {
-              logger.error('Redis: Max reconnection attempts reached');
-              return new Error('Max reconnection attempts reached');
-            }
-            return Math.min(retries * 100, 3000);
-          }
-        }
-      });
-
-      this.client.on('error', (err: Error) => {
-        logger.error('Redis error:', err);
-        this.isConnected = false;
-      });
-
-      this.client.on('connect', () => {
-        logger.info('🔴 Redis connected');
-        this.isConnected = true;
-      });
-
-      this.client.on('reconnecting', () => {
-        logger.warn('Redis reconnecting...');
-      });
-
-      await this.client.connect();
-
-    } catch (error) {
-      logger.error('Failed to initialize Redis:', error);
-      throw error;
-    }
-  }
 
   async get(key: string): Promise<string | null> {
-    if (!this.isConnected) return null;
-    return await this.client.get(key);
+    if (!redisService.isConnected()) return null;
+    return redisService.get(key);
   }
 
   async set(key: string, value: string, ttlSeconds?: number): Promise<void> {
-    if (!this.isConnected) return;
-
-    if (ttlSeconds && ttlSeconds > 0) {
-      await this.client.setEx(key, ttlSeconds, value);
-    } else {
-      await this.client.set(key, value);
-    }
+    if (!redisService.isConnected()) return;
+    await redisService.set(key, value, ttlSeconds);
   }
 
   async delete(key: string): Promise<boolean> {
-    if (!this.isConnected) return false;
-    const result = await this.client.del(key);
-    return result > 0;
+    if (!redisService.isConnected()) return false;
+    return redisService.del(key);
   }
 
   async exists(key: string): Promise<boolean> {
-    if (!this.isConnected) return false;
-    const result = await this.client.exists(key);
-    return result > 0;
+    if (!redisService.isConnected()) return false;
+    return redisService.exists(key);
   }
 
   async keys(pattern: string): Promise<string[]> {
-    if (!this.isConnected) return [];
-    return await this.client.keys(pattern);
+    if (!redisService.isConnected()) return [];
+    // F-B-08: cluster-safe SCAN — legacy redisService.keys() only walked one cluster node.
+    // Delegates to the cluster-aware helper which collapses to single-node scanIterator
+    // when the transport is not a cluster client.
+    const { clusterScanAllFlat } = await import('./redis-cluster-scan');
+    return clusterScanAllFlat(pattern);
   }
 
   async *scanIterator(pattern: string, count = 100): AsyncIterableIterator<string> {
-    if (!this.isConnected) return;
-
-    // node-redis supports scanIterator
-    const iterator = this.client.scanIterator({
-      MATCH: pattern,
-      COUNT: count
-    });
-
+    if (!redisService.isConnected()) return;
+    const iterator = redisService.scanIterator(pattern, count);
     for await (const key of iterator) {
       yield key;
     }
   }
 
   async clear(): Promise<void> {
-    if (!this.isConnected) return;
-    await this.client.flushDb();
+    // Intentionally not implemented — flushing the shared Redis
+    // would destroy data belonging to other services.
+    logger.warn('RedisCache.clear() called — no-op on shared Redis connection');
   }
 }
 
@@ -259,7 +211,9 @@ class RedisCache implements CacheStore {
 
 class CacheService {
   private cache: CacheStore;
-  private prefix: string = 'weelo:';
+  // M-15 FIX: Use REDIS_KEY_PREFIX env var for environment-aware prefix.
+  // Falls back to 'weelo' for backward compatibility.
+  private prefix: string = `${process.env.REDIS_KEY_PREFIX || 'weelo'}:`;
 
   constructor() {
     // Use Redis if enabled, otherwise use in-memory
@@ -282,7 +236,10 @@ class CacheService {
     try {
       return JSON.parse(value) as T;
     } catch {
-      return value as unknown as T;
+      // If JSON parse fails, the cached value is corrupted (e.g. "[object Object]").
+      // Return null to trigger a cache miss rather than returning an invalid type.
+      logger.warn(`[CacheService] JSON parse failed for key ${key}, treating as cache miss`);
+      return null;
     }
   }
 
@@ -389,7 +346,11 @@ class CacheService {
    */
   async setRefreshToken(token: string, userId: string, expiryDays: number = 30): Promise<void> {
     const key = `refresh:${token}`;
-    await this.set(key, { userId, createdAt: new Date().toISOString() }, expiryDays * 24 * 60 * 60);
+    const ttlSeconds = expiryDays * 24 * 60 * 60;
+    await this.set(key, { userId, createdAt: new Date().toISOString() }, ttlSeconds);
+    // Fix C3/F-5-6: Maintain per-user token index for O(M) deletion instead of O(N^2) KEYS scan
+    await redisService.sAdd(`user_tokens:${userId}`, token).catch(() => {});
+    await redisService.expire(`user_tokens:${userId}`, ttlSeconds).catch(() => {});
   }
 
   /**
@@ -410,16 +371,18 @@ class CacheService {
 
   /**
    * Delete all refresh tokens for a user (logout from all devices)
+   * Fix C3/F-5-6: Uses per-user token index instead of O(N^2) KEYS scan.
+   * Token IDs are tracked in a Redis SET `user_tokens:{userId}`.
    */
   async deleteAllUserRefreshTokens(userId: string): Promise<void> {
-    const keys = await this.keys('refresh:*');
-
-    for (const key of keys) {
-      const data = await this.get<{ userId: string }>(`refresh:${key.replace('refresh:', '')}`);
-      if (data && data.userId === userId) {
-        await this.delete(key);
+    const indexKey = `user_tokens:${userId}`;
+    const tokenIds = await redisService.sMembers(indexKey).catch(() => [] as string[]);
+    if (tokenIds.length > 0) {
+      for (const tokenId of tokenIds) {
+        await this.delete(`refresh:${tokenId}`);
       }
     }
+    await redisService.del(indexKey).catch(() => {});
   }
 }
 

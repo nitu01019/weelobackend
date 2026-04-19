@@ -458,13 +458,13 @@ class VehicleService {
     if (newStatus === 'in_transit' && options?.tripId) {
       updates.currentTripId = options.tripId;
     } else if (newStatus === 'available') {
-      updates.currentTripId = undefined;
-      updates.maintenanceReason = undefined;
-      updates.maintenanceEndDate = undefined;
+      updates.currentTripId = null;
+      updates.maintenanceReason = null;
+      updates.maintenanceEndDate = null;
     } else if (newStatus === 'maintenance') {
-      updates.maintenanceReason = options?.maintenanceReason;
-      updates.maintenanceEndDate = options?.maintenanceEndDate;
-      updates.currentTripId = undefined;
+      updates.maintenanceReason = options?.maintenanceReason ?? null;
+      updates.maintenanceEndDate = options?.maintenanceEndDate ?? null;
+      updates.currentTripId = null;
     }
 
     const updatedResult = await db.updateVehicle(vehicleId, updates);
@@ -757,7 +757,7 @@ class VehicleService {
       throw new AppError(403, 'FORBIDDEN', 'This vehicle does not belong to you');
     }
 
-    const updatedResult = await db.updateVehicle(vehicleId, { assignedDriverId: undefined });
+    const updatedResult = await db.updateVehicle(vehicleId, { assignedDriverId: null });
     const updated = updatedResult && typeof updatedResult.then === 'function' 
       ? await updatedResult 
       : updatedResult;

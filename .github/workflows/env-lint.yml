@@ -1,0 +1,45 @@
+name: Env Lint
+
+# -----------------------------------------------------------------------------
+# F-C-75 — CI gate for `.env.example` vs `src/shared/config/env.config.ts` drift.
+# Author: Wave 1 Agent W1-4 (phase3-to-100 plan).
+#
+# Script (package.json `lint:env`): `ts-node scripts/verify-env-example.ts`.
+# Fails the job (non-zero exit) if any env key declared in the runtime config
+# is missing from `.env.example`, or vice-versa. This prevents merged PRs
+# from silently breaking onboarding / deploy config parity.
+#
+# Triggers: every pull_request + every push to main.
+# Style mirrors `.github/workflows/security.yml` (Node 20, npm cache).
+# Shape is locked by src/__tests__/phase3to100-env-lint-workflow.test.ts.
+# -----------------------------------------------------------------------------
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  env-lint:
+    name: Verify .env.example matches env.config.ts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify env.example parity
+        run: npm run lint:env

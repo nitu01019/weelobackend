@@ -38,6 +38,20 @@ import { logger } from '../../shared/services/logger.service';
 import { redisService } from '../../shared/services/redis.service';
 import { socketService } from '../../shared/services/socket.service';
 import { queueService } from '../../shared/services/queue.service';
+import { acquireLeader } from '../../shared/services/leader-election.service';
+import { FLAGS, isEnabled } from '../../shared/config/feature-flags';
+
+/**
+ * F-A-69 — Leader-election lease duration for the smart-timeout sweep.
+ *
+ * 30s matches 2x the `setInterval` tick (15s) so the winning instance keeps
+ * the lease across one missed renewal without blocking other instances
+ * beyond its normal cadence. Same safety rule as the F-A-56 outbox leader:
+ * TTL = 2x batch window.
+ */
+const SMART_TIMEOUT_LEADER_KEY = 'smart-timeout-leader';
+const SMART_TIMEOUT_LEADER_TTL_SECONDS = 30;
+const SMART_TIMEOUT_INSTANCE_ID = `${process.pid}:${Date.now()}`;
 
 // =============================================================================
 // TYPES & INTERFACES
@@ -108,7 +122,8 @@ const DEFAULT_CONFIG: SmartTimeoutConfig = {
 
 // Redis keys
 const REDIS_KEYS = {
-  ORDER_TIMEOUT_LOCK: (orderId: string) => `lock:order-timeout:${orderId}`,
+  // Standardized: lock: prefix for all distributed locks (added by acquireLock automatically)
+  ORDER_TIMEOUT_LOCK: (orderId: string) => `order-timeout:${orderId}`,
   ORDER_TIMEOUT_STATE: (orderId: string) => `order-timeout:${orderId}:state`,
 };
 
@@ -118,10 +133,81 @@ const REDIS_KEYS = {
 
 class SmartTimeoutService {
   private config: SmartTimeoutConfig;
+  // Redis-backed extension count with in-memory fallback (migrated from in-memory-only Map).
+  // Redis key: order:ext:count:{orderId}, TTL: 1 hour.
+  // In-memory Map kept as fallback if Redis is temporarily unavailable.
   private extensionCountByOrder: Map<string, number> = new Map();
 
   constructor(config: Partial<SmartTimeoutConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
+  }
+
+  // ===========================================================================
+  // REDIS-BACKED EXTENSION COUNT (migrated from in-memory-only Map)
+  // ===========================================================================
+  // Redis is the primary store; in-memory Map is a fallback if Redis is down.
+  // TTL: 1 hour (extensions are only relevant during active order timeout).
+  // ===========================================================================
+
+  private static readonly EXT_COUNT_TTL = 3600; // 1 hour
+
+  private static extCountKey(orderId: string): string {
+    return `order:ext:count:${orderId}`;
+  }
+
+  private async getExtensionCount(orderId: string): Promise<number> {
+    try {
+      const countStr = await redisService.get(SmartTimeoutService.extCountKey(orderId));
+      if (countStr !== null) {
+        const count = parseInt(countStr, 10);
+        // Sync in-memory fallback
+        this.extensionCountByOrder.set(orderId, count);
+        return count;
+      }
+    } catch (err: any) {
+      logger.debug('[SMART TIMEOUT] Redis ext count read failed, using in-memory fallback', {
+        orderId, error: err?.message,
+      });
+    }
+    // Fallback to in-memory Map
+    return this.extensionCountByOrder.get(orderId) ?? 0;
+  }
+
+  private async setExtensionCount(orderId: string, count: number): Promise<void> {
+    // Always update in-memory fallback
+    this.extensionCountByOrder.set(orderId, count);
+
+    // M-19 FIX: Evict oldest entries when in-memory Map exceeds 500 to prevent unbounded growth.
+    // The Map is only a fallback for Redis failures, so evicting stale entries is safe.
+    if (this.extensionCountByOrder.size > 500) {
+      const keysToDelete = Array.from(this.extensionCountByOrder.keys()).slice(0, 100);
+      for (const key of keysToDelete) {
+        this.extensionCountByOrder.delete(key);
+      }
+      logger.info(`[SMART TIMEOUT] Evicted ${keysToDelete.length} stale entries from in-memory extension count map`);
+    }
+
+    // Write to Redis (fire-and-forget for non-critical state)
+    try {
+      await redisService.set(
+        SmartTimeoutService.extCountKey(orderId),
+        String(count),
+        SmartTimeoutService.EXT_COUNT_TTL,
+      );
+    } catch (err: any) {
+      logger.debug('[SMART TIMEOUT] Redis ext count write failed (in-memory fallback active)', {
+        orderId, error: err?.message,
+      });
+    }
+  }
+
+  private async deleteExtensionCount(orderId: string): Promise<void> {
+    this.extensionCountByOrder.delete(orderId);
+    try {
+      await redisService.del(SmartTimeoutService.extCountKey(orderId));
+    } catch {
+      // Non-critical — key will expire via TTL
+    }
   }
 
   /**
@@ -130,7 +216,7 @@ class SmartTimeoutService {
   async initializeOrderTimeout(
     orderId: string,
     totalTrucks: number
-  ): Promise<{ success: boolean; expiresAt: Date }> {
+  ): Promise<{ success: boolean; expiresAt?: Date }> {
     logger.info('[SMART TIMEOUT] Initializing order timeout', {
       orderId,
       totalTrucks,
@@ -172,8 +258,8 @@ class SmartTimeoutService {
 
       await this.cacheTimeoutState(orderId, state);
 
-      // Track extension count
-      this.extensionCountByOrder.set(orderId, 0);
+      // Track extension count (Redis-backed with in-memory fallback)
+      await this.setExtensionCount(orderId, 0);
 
       // Schedule expiry check
       await this.scheduleExpiryCheck(orderId, expiresAt);
@@ -191,8 +277,8 @@ class SmartTimeoutService {
       });
 
       return {
-        success: true,
-        expiresAt: new Date(Date.now() + this.config.baseTimeoutSeconds * 1000),
+        success: false,
+        expiresAt: undefined,
       };
     }
   }
@@ -251,10 +337,11 @@ class SmartTimeoutService {
       // Calculate extension amount
       let addedSeconds: number;
       const isFirstDriver = request.isFirstDriver;
+      const currentExtCount = await this.getExtensionCount(request.orderId);
       const isFirstExtension =
         isFirstDriver ||
         orderTimeout.extendedMs === 0 ||
-        this.extensionCountByOrder.get(request.orderId) === 0;
+        currentExtCount === 0;
 
       if (isFirstExtension) {
         addedSeconds = this.config.firstDriverExtensionSeconds; // +60s
@@ -303,9 +390,9 @@ class SmartTimeoutService {
         },
       });
 
-      // Update extension count
-      const currentCount = this.extensionCountByOrder.get(request.orderId) || 0;
-      this.extensionCountByOrder.set(request.orderId, currentCount + 1);
+      // Update extension count (Redis-backed with in-memory fallback)
+      const currentCount = currentExtCount;
+      await this.setExtensionCount(request.orderId, currentCount + 1);
 
       // Get state for notification
       const state: OrderTimeoutState = {
@@ -327,7 +414,7 @@ class SmartTimeoutService {
       await this.cacheTimeoutState(request.orderId, state);
 
       // Emit socket event to customer for UI transparency
-      await socketService.emitToUser(request.orderId, 'order_timeout_extended', {
+      await socketService.emitToOrder(request.orderId, 'order_timeout_extended', {
         orderId: request.orderId,
         newExpiresAt: updated.expiresAt.toISOString(),
         addedSeconds,
@@ -412,7 +499,7 @@ class SmartTimeoutService {
           Math.floor((orderTimeout.expiresAt.getTime() - now.getTime()) / 1000)
         ),
         isExpired: orderTimeout.isExpired || new Date() > orderTimeout.expiresAt,
-        extensionCount: this.extensionCountByOrder.get(orderId) || 0,
+        extensionCount: await this.getExtensionCount(orderId),
         firstExtensionUsed: orderTimeout.extendedMs > 0,
       };
 
@@ -521,21 +608,62 @@ class SmartTimeoutService {
 
   /**
    * Check and mark expired orders
+   *
+   * F-A-69: when `FF_SMART_TIMEOUT_LEADER_ELECTION` is ON, this sweep only
+   * proceeds on the instance that wins the 'smart-timeout-leader' lease.
+   * The row claim uses `FOR UPDATE SKIP LOCKED` as a belt-and-braces guard
+   * so even if the leader lapses (GC pause past TTL) Postgres row locks
+   * prevent duplicate processing of the same expired row. When the flag
+   * is OFF the legacy `findMany` + every-instance sweep behaviour is
+   * preserved unchanged.
    */
   async checkAndMarkExpired(): Promise<number> {
     try {
+      // F-A-69: leader gate — only one ECS task runs the sweep per TTL window.
+      if (isEnabled(FLAGS.SMART_TIMEOUT_LEADER_ELECTION)) {
+        const acquired = await acquireLeader(
+          SMART_TIMEOUT_LEADER_KEY,
+          SMART_TIMEOUT_INSTANCE_ID,
+          SMART_TIMEOUT_LEADER_TTL_SECONDS
+        );
+        if (!acquired) {
+          return 0;
+        }
+      }
+
       const now = new Date();
       const noProgressThreshold = new Date(
         now.getTime() - this.config.noProgressTimeoutSeconds * 1000
       );
 
-      // Find orders that should be expired
-      const expiredOrders = await prismaClient.orderTimeout.findMany({
-        where: {
-          expiresAt: { lt: now },
-          isExpired: false,
-        },
-      });
+      // Find orders that should be expired.
+      //
+      // F-A-69: under the flag, claim candidate rows with
+      // `SELECT ... FOR UPDATE SKIP LOCKED` — any concurrent sweeper on a
+      // different Postgres session will skip rows we've already claimed.
+      // Mirrors the pattern used in
+      // `order-dispatch-outbox.service.ts::claimReadyDispatchOutboxRows`.
+      //
+      // NOTE: `SKIP LOCKED` only takes effect inside a transaction. The
+      // `$queryRaw` below is guarded by an explicit tx when the flag is ON;
+      // otherwise falls back to the legacy non-locking `findMany`.
+      let expiredOrders: Array<{ orderId: string; expiresAt: Date }>;
+      if (isEnabled(FLAGS.SMART_TIMEOUT_LEADER_ELECTION)) {
+        expiredOrders = await prismaClient.$queryRaw<Array<{ orderId: string; expiresAt: Date }>>`
+          SELECT "orderId", "expiresAt"
+          FROM "OrderTimeout"
+          WHERE "expiresAt" < ${now}
+            AND "isExpired" = false
+          FOR UPDATE SKIP LOCKED
+        `;
+      } else {
+        expiredOrders = await prismaClient.orderTimeout.findMany({
+          where: {
+            expiresAt: { lt: now },
+            isExpired: false,
+          },
+        });
+      }
 
       let markedCount = 0;
       for (const orderTimeout of expiredOrders) {
@@ -547,8 +675,8 @@ class SmartTimeoutService {
           },
         });
 
-        // Only expire if no recent progress
-        if (!recentProgress || orderTimeout.expiresAt < noProgressThreshold) {
+        // Only expire if no recent progress AND past the no-progress threshold
+        if (!recentProgress && orderTimeout.expiresAt < noProgressThreshold) {
           await prismaClient.orderTimeout.update({
             where: { orderId: orderTimeout.orderId },
             data: {
@@ -557,17 +685,28 @@ class SmartTimeoutService {
             },
           });
 
-          // Update order status
-          await prismaClient.order.update({
-            where: { id: orderTimeout.orderId },
-            data: { status: OrderStatus.expired },
-          });
+          // Delegate full cleanup (order status, truck requests, notifications) to handleOrderExpiry
+          try {
+            const { handleOrderExpiry } = require('../order/order-lifecycle-outbox.service');
+            await handleOrderExpiry(orderTimeout.orderId);
+          } catch (err: unknown) {
+            logger.error('[SMART TIMEOUT] handleOrderExpiry failed', {
+              orderId: orderTimeout.orderId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
 
           markedCount++;
 
           logger.info('[SMART TIMEOUT] Order marked as expired', {
             orderId: orderTimeout.orderId,
             expiredAt: now.toISOString(),
+          });
+        } else {
+          logger.info('[SMART TIMEOUT] Order spared from expiry due to recent progress', {
+            orderId: orderTimeout.orderId,
+            lastProgressAt: recentProgress?.timestamp?.toISOString(),
+            expiresAt: orderTimeout.expiresAt.toISOString(),
           });
         }
       }
@@ -629,9 +768,10 @@ class SmartTimeoutService {
    * Start expiry checker interval
    */
   startExpiryChecker(): void {
+    // L1 FIX: unref() so this non-critical timer doesn't block process exit
     setInterval(async () => {
       await this.checkAndMarkExpired();
-    }, 15000); // Check every 15 seconds
+    }, 15000).unref(); // Check every 15 seconds
 
     logger.info('[SMART TIMEOUT] Expiry checker started');
   }

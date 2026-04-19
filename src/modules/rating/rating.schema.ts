@@ -49,3 +49,17 @@ export const driverRatingsQuerySchema = z.object({
 });
 
 export type DriverRatingsQuery = z.infer<typeof driverRatingsQuerySchema>;
+
+/**
+ * F-M22: Driver rates customer (bidirectional rating).
+ */
+export const submitDriverRatingSchema = z.object({
+  assignmentId: z.string().uuid('Invalid assignment ID'),
+  rating: z.number().int().min(1, 'Minimum 1 star').max(5, 'Maximum 5 stars'),
+  feedback: z.string()
+    .max(500, 'Feedback must be 500 characters or less')
+    .optional()
+    .nullable(),
+});
+
+export type SubmitDriverRatingInput = z.infer<typeof submitDriverRatingSchema>;

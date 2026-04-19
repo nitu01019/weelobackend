@@ -80,6 +80,18 @@ const VEHICLE_TYPE_DISPLAY: Record<string, string> = {
 /**
  * Canonical subtype aliases used to reconcile customer/captain naming variants.
  * Keys/values are normalized keys (post normalizeString).
+ *
+ * Convention:
+ *   - Canonical form is SIZE_FIRST, e.g. '14_ft_open' not 'open_14_ft'.
+ *   - Direction is MANY-TO-ONE: variant keys on the left map to a single
+ *     canonical key on the right. Multiple aliases may point to the same
+ *     canonical form.
+ *
+ * How to add new aliases:
+ *   1. Normalize the variant string through normalizeString() to get the key.
+ *   2. Determine the canonical SIZE_FIRST form for the value.
+ *   3. Add the entry below. No other files need to change — generateVehicleKey()
+ *      and generateVehicleKeyCandidates() will pick it up automatically.
  */
 const CANONICAL_SUBTYPE_ALIASES: Record<string, string> = {
   'open_14_ft': '14_ft_open',

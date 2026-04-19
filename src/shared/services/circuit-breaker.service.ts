@@ -29,7 +29,11 @@ import { metrics } from '../monitoring/metrics.service';
 // CONFIGURATION
 // =============================================================================
 
-const FF_CIRCUIT_BREAKER_ENABLED = process.env.FF_CIRCUIT_BREAKER_ENABLED === 'true';
+// Default: ENABLED. Opt-out by setting FF_CIRCUIT_BREAKER_ENABLED=false.
+// Rationale: Circuit breakers protect against cascading failures. Defaulting
+// to disabled means new deployments are unprotected until manually enabled.
+// Industry standard (Netflix, Uber): resilience features are ON by default.
+const FF_CIRCUIT_BREAKER_ENABLED = process.env.FF_CIRCUIT_BREAKER_ENABLED !== 'false';
 
 const DEFAULT_THRESHOLD = Math.max(
     1,
@@ -63,6 +67,8 @@ export interface CircuitBreakerOptions {
     windowMs?: number;
     /** How long circuit stays open before probing (ms) */
     openDurationMs?: number;
+    /** Called when circuit transitions from OPEN/HALF_OPEN to CLOSED (recovery) */
+    onRecovery?: () => void | Promise<void>;
 }
 
 // =============================================================================
@@ -74,6 +80,7 @@ export class CircuitBreaker {
     private readonly threshold: number;
     private readonly windowSeconds: number;
     private readonly openDurationSeconds: number;
+    private readonly onRecovery?: () => void | Promise<void>;
 
     // Redis keys
     private readonly failureKey: string;
@@ -100,6 +107,7 @@ export class CircuitBreaker {
         this.threshold = options.threshold ?? DEFAULT_THRESHOLD;
         this.windowSeconds = Math.ceil((options.windowMs ?? DEFAULT_WINDOW_MS) / 1000);
         this.openDurationSeconds = Math.ceil((options.openDurationMs ?? DEFAULT_OPEN_DURATION_MS) / 1000);
+        this.onRecovery = options.onRecovery;
 
         this.failureKey = `circuit:${name}:failures`;
         this.openKey = `circuit:${name}:open`;
@@ -192,6 +200,22 @@ export class CircuitBreaker {
     }
 
     /**
+     * Synchronous local-only open check. Use in synchronous code paths
+     * (e.g., emitToUser) where an async Redis check is impractical.
+     */
+    isLocallyOpen(): boolean {
+        return this.getLocalState() === CircuitState.OPEN;
+    }
+
+    /**
+     * Fire-and-forget failure recording for synchronous callers.
+     * Records to both local + Redis (async, errors swallowed).
+     */
+    reportFailure(): void {
+        this.recordFailure().catch(() => {});
+    }
+
+    /**
      * Atomically try to acquire the probe lock.
      * Returns true if this caller is the probe owner, false otherwise.
      * Lock auto-expires after 10s to prevent deadlocks.
@@ -280,6 +304,17 @@ export class CircuitBreaker {
             // Redis down — local state already reset above
             logger.warn(`[CircuitBreaker] Redis unavailable, local state reset for ${this.name}`);
         }
+
+        // Fire recovery callback (e.g., drain notification outbox)
+        // Wrapped in try/catch — drain failures must never crash the circuit breaker
+        if (this.onRecovery) {
+            try {
+                await Promise.resolve(this.onRecovery());
+            } catch (err: unknown) {
+                const msg = err instanceof Error ? err.message : String(err);
+                logger.warn(`[CircuitBreaker] onRecovery callback failed for ${this.name}: ${msg}`);
+            }
+        }
     }
 }
 
@@ -296,5 +331,23 @@ export const directionsCircuit = new CircuitBreaker('directions_api');
 /** Queue service (Redis-backed) → fallback to synchronous emit */
 export const queueCircuit = new CircuitBreaker('queue_service');
 
+/** Lazy-loaded outbox drain to avoid circular imports */
+function drainOutboxOnRecovery(): void {
+    // Fire-and-forget: import + drain. Errors caught inside drainAllOutboxes.
+    import('./notification-outbox.service')
+        .then(m => m.drainAllOutboxes())
+        .catch(() => {});
+}
+
 /** FCM delivery → fallback to socket-only */
-export const fcmCircuit = new CircuitBreaker('fcm_delivery');
+export const fcmCircuit = new CircuitBreaker('fcm_delivery', {
+    onRecovery: drainOutboxOnRecovery,
+});
+
+/** Socket.IO emit → fallback to FCM-only (Issue #13) */
+export const socketCircuit = new CircuitBreaker('socket_emit', {
+    threshold: 5,
+    windowMs: 30000,
+    openDurationMs: 30000,
+    onRecovery: drainOutboxOnRecovery,
+});

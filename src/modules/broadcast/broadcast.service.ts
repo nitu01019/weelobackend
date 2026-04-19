@@ -10,14 +10,15 @@
  */
 
 import { v4 as uuidv4 } from 'uuid';
-import { Prisma } from '@prisma/client';
+import { Prisma, AssignmentStatus } from '@prisma/client';
 import { db, BookingRecord, AssignmentRecord } from '../../shared/database/db';
 import { AppError } from '../../shared/types/error.types';
 import { logger } from '../../shared/services/logger.service';
 import { emitToUser, emitToUsers, emitToRoom, emitToAllTransporters, emitToAll, SocketEvent } from '../../shared/services/socket.service';
 import { sendPushNotification } from '../../shared/services/fcm.service';
 import { redisService } from '../../shared/services/redis.service';
-import { prismaClient, withDbTimeout } from '../../shared/database/prisma.service';
+import { prismaClient, withDbTimeout, VehicleStatus } from '../../shared/database/prisma.service';
+import { safeJsonParse } from '../../shared/utils/safe-json.utils';
 
 // =============================================================================
 // BROADCAST EXPIRY EVENTS - For real-time timeout handling
@@ -29,25 +30,23 @@ import { prismaClient, withDbTimeout } from '../../shared/database/prisma.servic
 
 /**
  * Socket events for broadcast lifecycle
- * These MUST match the events in captain app's SocketIOService.kt
+ * Fix E1: BroadcastEvents now references SocketEvent where string values match.
+ * All string values remain IDENTICAL to before -- only the source of truth changes.
  */
 export const BroadcastEvents = {
-  // Broadcast expired (timeout) - remove from all transporters
-  BROADCAST_EXPIRED: 'broadcast_expired',
-  // Broadcast fully filled - no more trucks needed
-  BROADCAST_FULLY_FILLED: 'booking_fully_filled',
-  // Broadcast cancelled by customer
-  BROADCAST_CANCELLED: 'order_cancelled',
-  // Real-time truck count update
-  TRUCKS_REMAINING_UPDATE: 'trucks_remaining_update',
-  // New broadcast notification
-  NEW_BROADCAST: 'new_broadcast',
+  BROADCAST_EXPIRED: SocketEvent.BROADCAST_EXPIRED,             // 'broadcast_expired'
+  BROADCAST_FULLY_FILLED: SocketEvent.BOOKING_FULLY_FILLED,     // 'booking_fully_filled'
+  BROADCAST_CANCELLED: SocketEvent.BROADCAST_CANCELLED,         // 'order_cancelled'
+  TRUCKS_REMAINING_UPDATE: SocketEvent.TRUCKS_REMAINING_UPDATE, // 'trucks_remaining_update'
+  NEW_BROADCAST: SocketEvent.NEW_BROADCAST,                     // 'new_broadcast'
 };
 
 interface GetActiveBroadcastsParams {
   actorId: string;
   vehicleType?: string;
   maxDistance?: number;
+  limit?: number;      // F-M6 FIX: Pagination support (0 = all, backward compat)
+  offset?: number;     // F-M6 FIX: Pagination offset
 }
 
 interface AcceptBroadcastParams {
@@ -162,8 +161,11 @@ class BroadcastService {
     try {
       const cached = await redisService.get(cacheKey) as string | null;
       if (cached) {
-        logger.debug(`[BroadcastCompat] Cache HIT for transporter ${transporterId}`);
-        return JSON.parse(cached);
+        const parsed = safeJsonParse<unknown[]>(cached, []);
+        if (parsed.length > 0) {
+          logger.debug(`[BroadcastCompat] Cache HIT for transporter ${transporterId}`);
+          return parsed;
+        }
       }
     } catch {
       // Redis down — fall through to DB query (graceful degradation)
@@ -296,7 +298,7 @@ class BroadcastService {
         broadcastId: order.id,
         customerId: order.customerId,
         customerName: order.customerName || 'Customer',
-        customerMobile: order.customerPhone || '',
+        customerMobile: '',  // FIX F-4-6: PII redacted — phone revealed only after accept (OWASP API3:2023)
         pickupLocation: {
           latitude: order.pickup.latitude,
           longitude: order.pickup.longitude,
@@ -336,11 +338,20 @@ class BroadcastService {
 
     logger.info(`Found ${activeBroadcasts.length} active broadcasts for transporter ${transporterId}`);
 
-    // ============== FIX 4: Store in Redis cache (5s TTL) ==============
+    // ============== FIX 4: Store in Redis cache (2s TTL) ==============
+    // M-15 FIX: Reduced from 5s to 2s — shorter TTL ensures truck counts
+    // are closer to real-time after accepts, while still protecting DB from polling storms.
     try {
-      await redisService.set(cacheKey, JSON.stringify(activeBroadcasts), 5);
+      await redisService.set(cacheKey, JSON.stringify(activeBroadcasts), 2);
     } catch {
       // Non-critical — next request will just re-query DB
+    }
+
+    // F-M6 FIX: Apply pagination if limit > 0 (0 = return all for backward compat)
+    const paginationLimit = params.limit || 0;
+    const paginationOffset = params.offset || 0;
+    if (paginationLimit > 0) {
+      return activeBroadcasts.slice(paginationOffset, paginationOffset + paginationLimit);
     }
 
     return activeBroadcasts;
@@ -374,6 +385,8 @@ class BroadcastService {
    * - Idempotent - safe to retry
    * - Transaction-safe with database
   */
+  // DEAD CODE — replaced by broadcast-accept.service.ts which has 7 safety mechanisms.
+  // See WEELO-FINAL-INDEX.md F-C1. DO NOT DELETE — kept for reference.
   async acceptBroadcast(broadcastId: string, params: AcceptBroadcastParams): Promise<AcceptBroadcastResult> {
     const { driverId, vehicleId, idempotencyKey, actorUserId, actorRole, metadata } = params;
     const lockKey = `broadcast-accept:${broadcastId}`;
@@ -411,12 +424,13 @@ class BroadcastService {
             replayed: true
           };
         }
-      } catch (error: any) {
+      } catch (error: unknown) {
+        const msg = error instanceof Error ? error.message : String(error);
         logger.warn('[BroadcastAccept] Idempotency cache read failed', {
           broadcastId,
           vehicleId,
           driverId,
-          error: error.message
+          error: msg
         });
       }
     }
@@ -438,20 +452,45 @@ class BroadcastService {
         throw new AppError(429, 'LOCK_CONTENTION',
           'Another accept is being processed for this broadcast. Please retry in 2 seconds.');
       }
-    } catch (error: any) {
+    } catch (error: unknown) {
       if (error instanceof AppError) throw error;  // Re-throw intentional 429
+      const lockMsg = error instanceof Error ? error.message : String(error);
       logger.warn('[BroadcastAccept] Lock acquisition failed, proceeding with transactional safety', {
         broadcastId,
         vehicleId,
         driverId,
-        error: error.message
+        error: lockMsg
       });
     }
 
     try {
-      const activeStatuses = ['pending', 'driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit'] as const;
+      const activeStatuses: AssignmentStatus[] = ['pending', 'driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit'];
       const maxTransactionAttempts = 3;
-      let txResult: any = null;
+      let txResult: {
+        replayed: boolean;
+        assignmentId: string;
+        tripId: string;
+        trucksConfirmed: number;
+        totalTrucksNeeded: number;
+        isFullyFilled: boolean;
+        booking: {
+          customerId: string;
+          trucksNeeded: number;
+          trucksFilled: number;
+          status: string;
+          pricePerTruck: number;
+          distanceKm: number;
+          customerName: string;
+          customerPhone: string;
+          vehicleType: string;
+          vehicleSubtype?: string;
+          pickup?: unknown;
+          drop?: unknown;
+        };
+        driver: { name?: string; phone?: string; transporterId?: string };
+        vehicle: { vehicleNumber?: string; vehicleType?: string; vehicleSubtype?: string };
+        transporter: { name?: string; businessName?: string; phone?: string };
+      } | null = null;
 
       for (let attempt = 1; attempt <= maxTransactionAttempts; attempt += 1) {
         try {
@@ -507,7 +546,7 @@ class BroadcastService {
                 bookingId: broadcastId,
                 driverId,
                 vehicleId,
-                status: { in: activeStatuses as any }
+                status: { in: activeStatuses }
               },
               orderBy: { assignedAt: 'desc' }
             });
@@ -540,7 +579,7 @@ class BroadcastService {
             const activeAssignment = await tx.assignment.findFirst({
               where: {
                 driverId,
-                status: { in: activeStatuses as any }
+                status: { in: activeStatuses }
               },
               orderBy: { assignedAt: 'desc' }
             });
@@ -550,6 +589,18 @@ class BroadcastService {
                 'DRIVER_BUSY',
                 'Driver already has an active trip. Assign a different driver.'
               );
+            }
+
+            // FIX P9: Atomically lock vehicle to on_hold inside Serializable TX.
+            // Prevents two concurrent accepts from assigning the same vehicle.
+            // Uses updateMany with status='available' precondition (CAS pattern).
+            // If the vehicle was already taken, the accept fails cleanly with 409.
+            const vehicleLock = await tx.vehicle.updateMany({
+              where: { id: vehicleId, status: VehicleStatus.available },
+              data: { status: VehicleStatus.on_hold }
+            });
+            if (vehicleLock.count === 0) {
+              throw new AppError(409, 'VEHICLE_UNAVAILABLE', 'Vehicle is no longer available');
             }
 
             const bookingUpdate = await tx.booking.updateMany({
@@ -634,8 +685,11 @@ class BroadcastService {
             };
           }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable, timeoutMs: 8000 });
           break;
-        } catch (transactionError: any) {
-          const isRetryableContention = transactionError?.code === 'P2034' || transactionError?.code === '40001';
+        } catch (transactionError: unknown) {
+          const txCode = transactionError instanceof Error && 'code' in transactionError
+            ? (transactionError as { code?: string }).code
+            : undefined;
+          const isRetryableContention = txCode === 'P2034' || txCode === '40001';
           if (!isRetryableContention || attempt >= maxTransactionAttempts) {
             throw transactionError;
           }
@@ -646,7 +700,7 @@ class BroadcastService {
             driverId,
             attempt,
             maxAttempts: maxTransactionAttempts,
-            code: transactionError.code
+            code: txCode
           });
         }
       }
@@ -676,13 +730,21 @@ class BroadcastService {
         });
       } else {
         this.incrementAcceptMetric('success');
-        const booking = txResult.booking as any;
-        const driver = txResult.driver as any;
-        const vehicle = txResult.vehicle as any;
-        const transporter = txResult.transporter as any;
+        const booking = txResult.booking;
+        const driver = txResult.driver;
+        const vehicle = txResult.vehicle;
+        const transporter = txResult.transporter;
         const now = new Date().toISOString();
-        const pickup = (booking.pickup || {}) as any;
-        const drop = (booking.drop || {}) as any;
+        const pickup = (booking.pickup || {}) as Record<string, unknown>;
+        const drop = (booking.drop || {}) as Record<string, unknown>;
+
+        // FIX F-5-7: Manual cache invalidation — $use middleware doesn't fire inside $transaction
+        // Pattern matches order.service.ts:4162 (proven fix)
+        if (driver?.transporterId) {
+          redisService.del(`cache:vehicles:transporter:${driver.transporterId}`).catch(() => {});
+          // M-15 FIX: Invalidate broadcast list cache so next poll reflects the new truck count.
+          redisService.del(`cache:broadcasts:${driver.transporterId}`).catch(() => {});
+        }
 
         logger.info('[BroadcastAccept] Success', {
           broadcastId,
@@ -696,7 +758,7 @@ class BroadcastService {
         });
 
         const driverNotification = {
-          type: 'trip_assignment',
+          type: 'trip_assigned',
           assignmentId: result.assignmentId,
           tripId: result.tripId,
           bookingId: broadcastId,
@@ -706,6 +768,8 @@ class BroadcastService {
           farePerTruck: booking.pricePerTruck,
           distanceKm: booking.distanceKm,
           customerName: booking.customerName,
+          // F-L8: INTENTIONAL — B2B trucking requires driver to contact customer directly.
+          // Phone exposure is a business requirement, not a bug. See WEELO-FINAL-INDEX.md F-L8.
           customerPhone: booking.customerPhone,
           assignedAt: now,
           message: `New trip assigned! ${pickup.address || 'Pickup'} → ${drop.address || 'Drop'}`
@@ -713,17 +777,21 @@ class BroadcastService {
 
         emitToUser(driverId, SocketEvent.TRIP_ASSIGNED, driverNotification);
 
+        // F-H7/M8 NOTE: This sendPushNotification call would be replaced with
+        // queueService.queuePushNotification for retry + DLQ, but acceptBroadcast
+        // is dead code (replaced by broadcast-accept.service.ts — see F-C1).
         sendPushNotification(driverId, {
           title: '🚛 New Trip Assigned!',
           body: `${pickup.city || pickup.address || 'Pickup'} → ${drop.city || drop.address || 'Drop'}`,
           data: {
-            type: 'trip_assignment',
+            type: 'trip_assigned',
             tripId: result.tripId,
             assignmentId: result.assignmentId,
             bookingId: broadcastId
           }
-        }).catch(err => {
-          logger.warn(`FCM to driver ${driverId} failed: ${err.message}`);
+        }).catch((err: unknown) => {
+          const fcmMsg = err instanceof Error ? err.message : String(err);
+          logger.warn(`FCM to driver ${driverId} failed: ${fcmMsg}`);
         });
 
         const customerNotification = {
@@ -759,6 +827,9 @@ class BroadcastService {
           trucksNeeded: booking.trucksNeeded
         });
 
+        // F-H7/M8 NOTE: This sendPushNotification call would be replaced with
+        // queueService.queuePushNotification for retry + DLQ, but acceptBroadcast
+        // is dead code (replaced by broadcast-accept.service.ts — see F-C1).
         sendPushNotification(booking.customerId, {
           title: `🚛 Truck ${result.trucksConfirmed}/${booking.trucksNeeded} Confirmed!`,
           body: `${vehicle?.vehicleNumber || 'Vehicle'} (${driver?.name || 'Driver'}) assigned to your booking`,
@@ -768,8 +839,9 @@ class BroadcastService {
             trucksConfirmed: result.trucksConfirmed,
             totalTrucks: booking.trucksNeeded
           }
-        }).catch(err => {
-          logger.warn(`FCM to customer ${booking.customerId} failed: ${err.message}`);
+        }).catch((err: unknown) => {
+          const custFcmMsg = err instanceof Error ? err.message : String(err);
+          logger.warn(`FCM to customer ${booking.customerId} failed: ${custFcmMsg}`);
         });
       }
 
@@ -783,39 +855,44 @@ class BroadcastService {
             totalTrucksNeeded: result.totalTrucksNeeded,
             isFullyFilled: result.isFullyFilled
           };
-          await redisService.setJSON(idempotencyCacheKey, cachePayload, 24 * 60 * 60);
-        } catch (error: any) {
+          // L-14 FIX: Accept idempotency cache — 1hr is sufficient (retries happen in seconds, not hours)
+          const ACCEPT_IDEMPOTENCY_TTL = parseInt(process.env.ACCEPT_IDEMPOTENCY_TTL || '3600', 10);
+          await redisService.setJSON(idempotencyCacheKey, cachePayload, ACCEPT_IDEMPOTENCY_TTL);
+        } catch (error: unknown) {
+          const cacheMsg = error instanceof Error ? error.message : String(error);
           logger.warn('[BroadcastAccept] Idempotency cache write failed', {
             broadcastId,
             vehicleId,
             driverId,
-            error: error.message
+            error: cacheMsg
           });
         }
       }
 
       return result;
-    } catch (error: any) {
+    } catch (error: unknown) {
       const code = error instanceof AppError ? error.code : 'INVALID_ASSIGNMENT_STATE';
       this.incrementAcceptFailureMetric(code);
+      const failMsg = error instanceof Error ? error.message : 'Unknown error';
       logger.warn('[BroadcastAccept] Failed', {
         broadcastId,
         vehicleId,
         driverId,
         resultCode: code,
-        message: error?.message || 'Unknown error'
+        message: failMsg
       });
       throw error;
     } finally {
       if (lockAcquired) {
         try {
           await redisService.releaseLock(lockKey, lockHolder);
-        } catch (error: any) {
+        } catch (error: unknown) {
+          const releaseMsg = error instanceof Error ? error.message : String(error);
           logger.warn('[BroadcastAccept] Lock release failed', {
             broadcastId,
             vehicleId,
             driverId,
-            error: error.message
+            error: releaseMsg
           });
         }
       }
@@ -831,17 +908,70 @@ class BroadcastService {
     // FIX #7: Track decline in Redis SET for analytics + re-broadcast prevention
     // TTL = 1 hour (matches booking max lifetime)
     const declineKey = `broadcast:declined:${broadcastId}`;
-    await redisService.sAdd(declineKey, actorId).catch((err: any) => {
-      logger.warn('[declineBroadcast] Redis sAdd failed', { broadcastId, actorId, error: err.message });
-    });
+    let isReplay = false;
+    try {
+      const added = await redisService.sAdd(declineKey, actorId);
+      isReplay = added === 0; // 0 means already a member (duplicate decline)
+    } catch (err: unknown) {
+      const declineMsg = err instanceof Error ? err.message : String(err);
+      logger.warn('[declineBroadcast] Redis sAdd failed', { broadcastId, actorId, error: declineMsg });
+    }
     await redisService.expire(declineKey, 3600).catch(() => {});
+
+    // M-4 FIX: Persist decline to DB for durability (Redis is cache, DB is truth)
+    // Booking model does not have a dedicated declinedTransporters column.
+    // Use notifiedTransporters as the source of "who was notified" and store
+    // declines in a separate Redis hash keyed by booking for durable cross-restart
+    // analytics. Full DB persistence requires a schema migration (tracked below).
+    // TODO: Add `declinedTransporters String[] @default([])` to Booking model
+    //       via direct SQL: ALTER TABLE "Booking" ADD COLUMN "declinedTransporters" TEXT[] DEFAULT '{}';
+    //       Then replace the Redis hash below with:
+    //       prismaClient.booking.update({ where: { id: bookingId }, data: { declinedTransporters: { push: actorId } } });
+    try {
+      const declineHashKey = `broadcast:decline_log:${broadcastId}`;
+      const declineEntry = JSON.stringify({
+        transporterId: actorId,
+        reason,
+        notes: notes || null,
+        declinedAt: new Date().toISOString(),
+      });
+      await redisService.hSet(declineHashKey, actorId, declineEntry);
+      // 24h TTL — longer than booking lifetime for post-mortem analytics
+      await redisService.expire(declineHashKey, 86400);
+    } catch (dbErr: unknown) {
+      // Non-fatal: Redis SET has the decline, hash is best-effort durability layer
+      const dbMsg = dbErr instanceof Error ? dbErr.message : String(dbErr);
+      logger.warn('[Broadcast] Decline durable persist failed', { broadcastId, transporterId: actorId, error: dbMsg });
+    }
+
+    // H-37 FIX: Fire-and-forget DB persistence for broadcast declines.
+    // Redis is volatile; DB is the source of truth. The BroadcastDecline table
+    // may not exist yet (requires direct SQL migration). The try/catch ensures
+    // this is completely non-blocking and non-fatal.
+    prismaClient.$queryRawUnsafe(
+      `INSERT INTO "BroadcastDecline" (id, "broadcastId", "transporterId", reason, "declinedAt")
+       VALUES (gen_random_uuid(), $1, $2, $3, NOW())
+       ON CONFLICT ("broadcastId", "transporterId") DO NOTHING`,
+      broadcastId,
+      actorId,
+      reason || null
+    ).catch((persistErr: unknown) => {
+      const persistMsg = persistErr instanceof Error ? persistErr.message : String(persistErr);
+      // Silently handle missing table or other DB errors — Redis has the data
+      logger.warn('[Broadcast] Decline DB persist failed (non-fatal)', {
+        broadcastId,
+        transporterId: actorId,
+        error: persistMsg
+      });
+    });
 
     logger.info(`Broadcast ${broadcastId} declined by ${actorId}. Reason: ${reason}`, {
       notes,
-      declineTracked: true
+      declineTracked: true,
+      replayed: isReplay
     });
 
-    return { success: true };
+    return { success: true, replayed: isReplay };
   }
 
   /**
@@ -897,7 +1027,7 @@ class BroadcastService {
       id: broadcastId,
       customerId: params.customerId,
       customerName: customer?.name || 'Customer',
-      customerPhone: customer?.phone || '',
+      customerPhone: '',  // FIX F-4-6: PII redacted — phone revealed only after accept
       pickup: {
         latitude: params.pickupLocation.latitude,
         longitude: params.pickupLocation.longitude,
@@ -982,7 +1112,8 @@ class BroadcastService {
         const expiresAt = new Date(order.expiresAt);
         if (expiresAt < now) {
           // Distributed lock: prevent duplicate processing across ECS instances
-          const lockKey = `lock:broadcast-order-expiry:${order.id}`;
+          // Standardized: lock: prefix added by acquireLock automatically
+          const lockKey = `broadcast-order-expiry:${order.id}`;
           const lock = await redisService.acquireLock(lockKey, 'broadcast-expiry-checker', 15);
 
           if (!lock.acquired) {
@@ -1001,10 +1132,11 @@ class BroadcastService {
 
             expiredCount++;
             logger.info(`⏰ Order ${order.id} expired - notified all transporters`);
-          } catch (error: any) {
+          } catch (error: unknown) {
+            const expiryMsg = error instanceof Error ? error.message : String(error);
             logger.error('Failed to process expired order broadcast', {
               orderId: order.id,
-              error: error.message
+              error: expiryMsg
             });
           } finally {
             await redisService.releaseLock(lockKey, 'broadcast-expiry-checker').catch(() => { });
@@ -1057,9 +1189,10 @@ class BroadcastService {
       logger.info(`📢 Targeted expiry event: ${broadcastId} (${reason}) → ${targets.length} transporters`);
       emitToUsers(targets, BroadcastEvents.BROADCAST_EXPIRED, payload);
     } else {
-      // Fallback: no targets found (order record missing) → broadcast to all
-      logger.warn(`📢 Fallback expiry event: ${broadcastId} (${reason}) → ALL transporters (no notified list found)`);
-      emitToAllTransporters(BroadcastEvents.BROADCAST_EXPIRED, payload);
+      // Fix E2: Degrade gracefully -- do NOT fan-out to ALL transporters
+      logger.warn('[Broadcast] No target transporters found for expiry notification, skipping emit', {
+        broadcastId, reason
+      });
     }
 
     // Also emit to the specific booking/order room (for any listeners)
@@ -1112,8 +1245,10 @@ class BroadcastService {
       logger.info(`📢 Targeted trucks update: ${broadcastId} - ${remaining}/${total} (${vehicleType}) → ${targets.length} transporters`);
       emitToUsers(targets, BroadcastEvents.TRUCKS_REMAINING_UPDATE, payload);
     } else {
-      logger.warn(`📢 Fallback trucks update: ${broadcastId} - ${remaining}/${total} → ALL transporters`);
-      emitToAllTransporters(BroadcastEvents.TRUCKS_REMAINING_UPDATE, payload);
+      // Fix E2: Degrade gracefully -- do NOT fan-out to ALL transporters
+      logger.warn('[Broadcast] No target transporters found for trucks-remaining update, skipping emit', {
+        broadcastId, remaining, total
+      });
     }
 
     // Also emit to booking/order room
@@ -1124,36 +1259,6 @@ class BroadcastService {
     if (remaining === 0) {
       await this.emitBroadcastExpired(broadcastId, 'fully_filled');
     }
-  }
-
-  /**
-   * Notify customer that their broadcast expired without being filled
-   */
-  private notifyCustomerBroadcastExpired(booking: BookingRecord): void {
-    const payload = {
-      type: 'booking_expired',
-      bookingId: booking.id,
-      trucksNeeded: booking.trucksNeeded,
-      trucksFilled: booking.trucksFilled,
-      message: booking.trucksFilled > 0
-        ? `Your booking expired with ${booking.trucksFilled}/${booking.trucksNeeded} trucks assigned`
-        : 'Your booking expired. No transporters accepted in time.'
-    };
-
-    // WebSocket to customer
-    emitToUser(booking.customerId, 'booking_expired', payload);
-
-    // Push notification
-    sendPushNotification(booking.customerId, {
-      title: '⏰ Booking Expired',
-      body: payload.message,
-      data: {
-        type: 'booking_expired',
-        bookingId: booking.id
-      }
-    }).catch(err => {
-      logger.warn(`FCM to customer ${booking.customerId} failed: ${err.message}`);
-    });
   }
 
   /**
@@ -1170,8 +1275,9 @@ class BroadcastService {
     this.expiryCheckerInterval = setInterval(async () => {
       try {
         await this.checkAndExpireBroadcasts();
-      } catch (error: any) {
-        logger.error(`Expiry checker error: ${error.message}`);
+      } catch (error: unknown) {
+        const checkerMsg = error instanceof Error ? error.message : String(error);
+        logger.error(`Expiry checker error: ${checkerMsg}`);
       }
     }, 5000);
 
@@ -1212,7 +1318,7 @@ class BroadcastService {
       broadcastId: booking.id,
       customerId: booking.customerId,
       customerName: booking.customerName || 'Customer',
-      customerMobile: booking.customerPhone || '',
+      customerMobile: '',  // FIX F-4-6: PII redacted — phone revealed only after accept (OWASP API3:2023)
       pickupLocation: booking.pickup,
       dropLocation: booking.drop,
       distance: booking.distanceKm || 0,

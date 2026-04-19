@@ -28,6 +28,8 @@ export function errorHandler(
   res: Response,
   _next: NextFunction
 ): void {
+  const requestId = (req.headers['x-request-id'] as string) || undefined;
+
   // Log the full error server-side
   logger.error('Request error', {
     error: error.message,
@@ -35,17 +37,29 @@ export function errorHandler(
     path: req.path,
     method: req.method,
     ip: req.ip,
-    userId: (req as any).userId || 'anonymous'
+    userId: req.userId || 'anonymous',
+    requestId
   });
 
   // Determine if this is a known operational error
   if (error instanceof AppError) {
+    // Fix G3: Sanitize error details outside development to prevent leaking internal state
+    // M8: Allow details for 4xx errors (field-level validation, rate-limit info) — only strip for 5xx
+    const safeDetails = error.details && (config.isDevelopment || error.statusCode < 500)
+      ? error.details
+      : undefined;
+    // M7: RFC 6585 — 429 responses SHOULD include Retry-After header
+    if (error.statusCode === 429) {
+      const retryAfter = error.details?.retryAfter ?? error.details?.retryAfterSeconds ?? '30';
+      res.setHeader('Retry-After', String(retryAfter));
+    }
     res.status(error.statusCode).json({
       success: false,
       error: {
         code: error.code,
         message: error.message,
-        ...(error.details && { details: error.details })
+        ...(safeDetails && { details: safeDetails }),
+        ...(requestId && { requestId })
       }
     });
     return;
@@ -57,9 +71,10 @@ export function errorHandler(
     success: false,
     error: {
       code: 'INTERNAL_ERROR',
-      message: config.isProduction 
-        ? 'An unexpected error occurred. Please try again later.'
-        : error.message // Show details only in development
+      message: config.isDevelopment
+        ? error.message // Show details only in development
+        : 'An unexpected error occurred. Please try again later.',
+      ...(requestId && { requestId })
     }
   });
 }

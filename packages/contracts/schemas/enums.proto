@@ -1,0 +1,75 @@
+// F-C-78 · Weelo canonical enums (mirrors prisma/schema.prisma exactly)
+//
+// Source of truth for enum surfaces shared across backend + captain + customer.
+// Codegen emits TypeScript (`enums.generated.ts`) and is designed to also emit
+// Kotlin sealed classes for downstream consumers (P10).
+//
+// Naming convention:
+//   - Proto constants are UPPER_SNAKE (proto convention); codegen preserves
+//     wire-level string values exactly as Prisma writes them (lowercase for
+//     VehicleStatus/AssignmentStatus/BookingStatus, UPPERCASE for HoldPhase).
+//   - Each enum has a sentinel `*_UNKNOWN = 0` for forward-compat wire drift.
+//     `fromBackendString(raw)` at consumer side returns `'UNKNOWN'` on miss.
+//
+// DO NOT edit enum values without a matching Prisma migration. Downstream
+// sealed-class exhaustiveness (Kotlin) will break compilation on drift.
+
+syntax = "proto3";
+
+package weelo.contracts;
+
+// ----------------------------------------------------------------------------
+// HoldPhase — prisma/schema.prisma:118-123 (UPPERCASE wire values)
+// ----------------------------------------------------------------------------
+enum HoldPhase {
+  HOLD_PHASE_UNKNOWN = 0;
+  HOLD_PHASE_FLEX = 1;       // Phase 1: 90s base, +30s per assignment, 130s cap
+  HOLD_PHASE_CONFIRMED = 2;  // Phase 2: trucks locked, 180s cap
+  HOLD_PHASE_EXPIRED = 3;    // Hold expired
+  HOLD_PHASE_RELEASED = 4;   // Hold released by transporter
+}
+
+// ----------------------------------------------------------------------------
+// VehicleStatus — prisma/schema.prisma:44-50 (lowercase wire values)
+// ----------------------------------------------------------------------------
+enum VehicleStatus {
+  VEHICLE_STATUS_UNKNOWN = 0;
+  VEHICLE_STATUS_AVAILABLE = 1;   // "available"
+  VEHICLE_STATUS_ON_HOLD = 2;     // "on_hold"
+  VEHICLE_STATUS_IN_TRANSIT = 3;  // "in_transit"
+  VEHICLE_STATUS_MAINTENANCE = 4; // "maintenance"
+  VEHICLE_STATUS_INACTIVE = 5;    // "inactive"
+}
+
+// ----------------------------------------------------------------------------
+// BookingStatus — prisma/schema.prisma:53-63 (lowercase wire values)
+// ----------------------------------------------------------------------------
+enum BookingStatus {
+  BOOKING_STATUS_UNKNOWN = 0;
+  BOOKING_STATUS_CREATED = 1;
+  BOOKING_STATUS_BROADCASTING = 2;
+  BOOKING_STATUS_ACTIVE = 3;
+  BOOKING_STATUS_PARTIALLY_FILLED = 4;
+  BOOKING_STATUS_FULLY_FILLED = 5;
+  BOOKING_STATUS_IN_PROGRESS = 6;
+  BOOKING_STATUS_COMPLETED = 7;
+  BOOKING_STATUS_CANCELLED = 8;
+  BOOKING_STATUS_EXPIRED = 9;
+}
+
+// ----------------------------------------------------------------------------
+// AssignmentStatus — prisma/schema.prisma:93-104 (lowercase wire values)
+// ----------------------------------------------------------------------------
+enum AssignmentStatus {
+  ASSIGNMENT_STATUS_UNKNOWN = 0;
+  ASSIGNMENT_STATUS_PENDING = 1;
+  ASSIGNMENT_STATUS_DRIVER_ACCEPTED = 2;
+  ASSIGNMENT_STATUS_DRIVER_DECLINED = 3;
+  ASSIGNMENT_STATUS_EN_ROUTE_PICKUP = 4;
+  ASSIGNMENT_STATUS_AT_PICKUP = 5;
+  ASSIGNMENT_STATUS_IN_TRANSIT = 6;
+  ASSIGNMENT_STATUS_ARRIVED_AT_DROP = 7;
+  ASSIGNMENT_STATUS_COMPLETED = 8;
+  ASSIGNMENT_STATUS_PARTIAL_DELIVERY = 9;
+  ASSIGNMENT_STATUS_CANCELLED = 10;
+}

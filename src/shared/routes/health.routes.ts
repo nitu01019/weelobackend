@@ -19,13 +19,15 @@
  * =============================================================================
  */
 
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import os from 'os';
 import { metrics, metricsHandler } from '../monitoring/metrics.service';
-import { circuitBreakerRegistry } from '../resilience/circuit-breaker';
+import { circuitBreakerRegistry, databaseCircuitBreaker } from '../resilience/circuit-breaker';
+import { prismaClient } from '../database/prisma.service';
 import { defaultQueue, bookingQueue, trackingQueue, authQueue } from '../resilience/request-queue';
 import { cacheService } from '../services/cache.service';
 import { redisService } from '../services/redis.service';
+import { redisCoordination } from '../services/redis-coordination.service';
 import { logger } from '../services/logger.service';
 import { getConnectionStats, getIO, getRedisAdapterStatus } from '../services/socket.service';
 import { smsService } from '../../modules/auth/sms.service';
@@ -41,13 +43,31 @@ const STARTUP_GRACE_MS = 15_000;
 
 // Phase 10: Import shutdown flag from server.ts
 // Uses lazy require to avoid circular dependency
+// Handles both variable (boolean) and function (() => boolean) exports
 function getIsShuttingDown(): boolean {
   try {
-    return require('../../server').isShuttingDown === true;
+    const val = require('../../server').isShuttingDown;
+    return typeof val === 'function' ? val() : val === true;
   } catch {
     return false;
   }
 }
+
+/**
+ * Token-based auth for sensitive health endpoints.
+ * Requires HEALTH_ADMIN_TOKEN env var to be set.
+ */
+const healthAuthCheck = (req: Request, res: Response, next: NextFunction) => {
+  const expected = process.env.HEALTH_ADMIN_TOKEN;
+  if (!expected) {
+    return res.status(503).json({ error: 'Health auth not configured' });
+  }
+  const token = req.headers['x-health-token'];
+  if (!token || token !== expected) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+};
 
 /**
  * Basic health check - for load balancers
@@ -64,7 +84,8 @@ router.get('/health', (_req: Request, res: Response) => {
 
   res.status(200).json({
     status: 'healthy',
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    redis: redisService.isDegraded ? 'degraded' : 'connected'
   });
 });
 
@@ -98,9 +119,12 @@ router.get('/health/ready', async (_req: Request, res: Response) => {
       checks.cache = false;
     }
 
-    // Check Redis connectivity (real Redis vs in-memory fallback)
+    // Check Redis connectivity (real Redis vs in-memory fallback).
+    // F-B-06: also honor redisCoordination.isReady() — when
+    // FF_REDIS_FAIL_CLOSED=true and coordination has been marked lost, this
+    // returns false so ALB drains the task.
     try {
-      checks.redis = redisService.isConnected();
+      checks.redis = redisService.isConnected() && redisCoordination.isReady();
       // If using real Redis, do a PING to verify it's responsive
       if (redisService.isRedisEnabled()) {
         const pingStart = Date.now();
@@ -115,6 +139,23 @@ router.get('/health/ready', async (_req: Request, res: Response) => {
       }
     } catch {
       checks.redis = false;
+    }
+
+    // Check database connectivity (C-3 fix: was missing entirely)
+    // Wrapped in databaseCircuitBreaker for fail-fast when DB is down (H-27 fix)
+    try {
+      const DB_TIMEOUT_MS = 3000;
+      await databaseCircuitBreaker.execute(() =>
+        Promise.race([
+          prismaClient.$queryRaw`SELECT 1`,
+          new Promise((_resolve, reject) =>
+            setTimeout(() => reject(new Error('DB health ping timeout')), DB_TIMEOUT_MS)
+          ),
+        ])
+      );
+      checks.database = true;
+    } catch {
+      checks.database = false;
     }
 
     // Check circuit breakers
@@ -187,7 +228,7 @@ router.get('/health/slo', (req: Request, res: Response) => {
  * Detailed health - full system status
  * Internal use only, provides comprehensive diagnostics
  */
-router.get('/health/detailed', async (_req: Request, res: Response) => {
+router.get('/health/detailed', healthAuthCheck, async (_req: Request, res: Response) => {
   const memUsage = process.memoryUsage();
   const cpuUsage = process.cpuUsage();
 
@@ -266,7 +307,7 @@ router.get('/health/detailed', async (_req: Request, res: Response) => {
 /**
  * Prometheus metrics endpoint
  */
-router.get('/metrics', metricsHandler);
+router.get('/metrics', healthAuthCheck, metricsHandler);
 
 /**
  * Version endpoint
@@ -286,7 +327,7 @@ router.get('/version', (_req: Request, res: Response) => {
  * WebSocket debug endpoint - shows connected users
  * CRITICAL for debugging broadcast issues!
  */
-router.get('/health/websocket', (_req: Request, res: Response) => {
+router.get('/health/websocket', healthAuthCheck, (_req: Request, res: Response) => {
   const io = getIO();
   const stats = getConnectionStats();
   const adapterStatus = getRedisAdapterStatus();
@@ -299,7 +340,7 @@ router.get('/health/websocket', (_req: Request, res: Response) => {
         socketId: socket.id,
         userId: socket.data.userId || 'unknown',
         role: socket.data.role || 'unknown',
-        phone: socket.data.phone || 'unknown',
+        phone: socket.data.phone ? '***' + String(socket.data.phone).slice(-4) : 'unknown',
         rooms: [...socket.rooms],
         connected: socket.connected
       });

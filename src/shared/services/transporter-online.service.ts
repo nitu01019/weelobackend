@@ -45,6 +45,8 @@ import { redisService } from './redis.service';
 import { logger } from './logger.service';
 import { db } from '../database/db';
 import { prismaClient } from '../database/prisma.service';
+import { h3GeoIndexService } from './h3-geo-index.service';
+import { TRANSPORTER_PRESENCE_TTL_SECONDS } from '../config/presence.config';
 
 // =============================================================================
 // REDIS KEY CONSTANTS (shared with transporter.routes.ts)
@@ -56,14 +58,32 @@ export const ONLINE_TRANSPORTERS_SET = 'online:transporters';
 /** Redis presence key pattern — TTL-based auto-offline on app crash */
 export const TRANSPORTER_PRESENCE_KEY = (id: string) => `transporter:presence:${id}`;
 
-/** Presence key TTL in seconds (must match transporter.routes.ts) */
-export const PRESENCE_TTL_SECONDS = 60; // 6× normal heartbeat interval — generous buffer for 2G/EDGE networks
+/**
+ * Presence key TTL in seconds — sourced from the canonical presence config
+ * (F-B-05 SSOT). Transporter TTL is 5× heartbeat (vs 3× for drivers) as a
+ * documented exception: transporter apps spend more time backgrounded so
+ * cellular-suspension tolerance per Discord gateway docs applies.
+ */
+export const PRESENCE_TTL_SECONDS = TRANSPORTER_PRESENCE_TTL_SECONDS;
 
 // =============================================================================
 // SERVICE CLASS
 // =============================================================================
 
 class TransporterOnlineService {
+
+  /** Grace period: skip stale cleanup while Redis reconnects to avoid mass-offlining */
+  private reconnectGraceUntil: number = 0;
+
+  /**
+   * Set a reconnect grace period during which stale cleanup is skipped.
+   * Call this when Redis reconnects so heartbeats have time to repopulate.
+   * @param ms Grace period in milliseconds (default 60s)
+   */
+  setReconnectGracePeriod(ms: number = 60000): void {
+    this.reconnectGraceUntil = Date.now() + ms;
+    logger.info(`[TransporterOnline] Reconnect grace period set for ${ms}ms`);
+  }
 
   // =========================================================================
   // CORE API — Used by broadcast services
@@ -188,7 +208,13 @@ class TransporterOnlineService {
    * @returns Number of stale transporters removed
    */
   async cleanStaleTransporters(): Promise<number> {
-    const lockKey = 'lock:clean-stale-transporters';
+    if (Date.now() < this.reconnectGraceUntil) {
+      logger.info('[TransporterOnline] Skipping stale cleanup during reconnect grace');
+      return 0;
+    }
+
+    // Standardized: lock: prefix for all distributed locks (added by acquireLock automatically)
+    const lockKey = 'clean-stale-transporters';
     let staleCount = 0;
 
     // Acquire distributed lock (prevents duplicate processing across ECS instances)
@@ -206,7 +232,19 @@ class TransporterOnlineService {
     }
 
     try {
-      const onlineIds = await redisService.sMembers(ONLINE_TRANSPORTERS_SET);
+      // FIX #13: Use SSCAN instead of SMEMBERS to avoid blocking Redis on large sets.
+      // SMEMBERS is O(N) and blocks Redis for the entire duration. At 10K+ transporters,
+      // this causes 100-500ms blocking every 30s. SSCAN iterates incrementally.
+      // Pattern: Sidekiq issue #3848. Already proven at getOnlineSet() (line 319).
+      const onlineIds: string[] = [];
+      let scanCursor = '0';
+      do {
+        const [nextCursor, batch] = await redisService.sScan(
+          ONLINE_TRANSPORTERS_SET, scanCursor, 200
+        );
+        scanCursor = nextCursor;
+        onlineIds.push(...batch);
+      } while (scanCursor !== '0');
 
       if (onlineIds.length === 0) {
         return 0;
@@ -224,6 +262,30 @@ class TransporterOnlineService {
             // Presence key expired — transporter is stale
             await redisService.sRem(ONLINE_TRANSPORTERS_SET, transporterId);
 
+            // FIX #2: Also clean geo + H3 indexes for stale transporters.
+            // Previously only removed from online SET, leaving stale entries in
+            // GEORADIUS and H3 cell sets for up to 90s (until TTL expiry).
+            try {
+              // Retrieve vehicle keys before they expire
+              const vehicleKeys = await redisService.sMembers(
+                `transporter:vehicle:keys:${transporterId}`
+              ).catch(() => [] as string[]);
+              const singleKey = await redisService.get(
+                `transporter:vehicle:${transporterId}`
+              ).catch(() => null);
+              const allKeys = new Set([...vehicleKeys, ...(singleKey ? [singleKey] : [])]);
+              for (const vk of allKeys) {
+                if (vk) {
+                  await redisService.geoRemove(`geo:transporters:${vk}`, transporterId);
+                }
+              }
+              // Clean H3 index (fire-and-forget)
+              h3GeoIndexService.removeTransporter(transporterId).catch(() => {});
+            } catch (geoCleanupErr: any) {
+              // Non-critical: geo entries will self-expire via TTL
+              logger.warn(`[TransporterOnline] Geo cleanup failed for stale ${transporterId}: ${geoCleanupErr.message}`);
+            }
+
             // Update DB to reflect offline state
             try {
               // Uses top-level import (line 46) — no runtime require()
@@ -237,7 +299,7 @@ class TransporterOnlineService {
             }
 
             staleCount++;
-            logger.info(`🧹 [TransporterOnline] Auto-offline stale transporter ${transporterId.substring(0, 8)}...`);
+            logger.info(`[TransporterOnline] Auto-offline stale transporter ${transporterId.substring(0, 8)}...`);
           }
         } catch (error: any) {
           // Individual transporter check failed — skip and continue
@@ -301,15 +363,49 @@ class TransporterOnlineService {
         select: { id: true }
       });
 
-      const onlineSet = new Set(onlineUsers.map(u => u.id));
-      const filtered = transporterIds.filter(id => onlineSet.has(id));
+      const dbCandidates = onlineUsers.map(u => u.id);
 
-      const offlineCount = transporterIds.length - filtered.length;
-      if (offlineCount > 0) {
-        logger.info(`📡 [TransporterOnline] Filtered ${offlineCount} offline transporters (${filtered.length}/${transporterIds.length} online) [DB fallback - batched]`);
+      // Fix #23: Recency check via presence key.
+      // At 3am or after Redis restart, DB isAvailable=true may be stale (transporters
+      // who went offline without updating DB). Check transporter:presence:{id} key
+      // existence as a recency signal. Only return transporters with active presence.
+      // If Redis is unreachable, skip recency check (we're already in fallback).
+      let filtered: string[];
+      try {
+        const presenceChecks = await Promise.all(
+          dbCandidates.map(async (id) => {
+            const hasPresence = await redisService.exists(
+              TRANSPORTER_PRESENCE_KEY(id)
+            );
+            return { id, hasPresence };
+          })
+        );
+        filtered = presenceChecks.filter(c => c.hasPresence).map(c => c.id);
+
+        if (filtered.length === 0 && dbCandidates.length > 0) {
+          logger.warn('[TransporterOnline] DB fallback found 0 transporters with recent presence. ' +
+            'This may indicate Redis data loss or low-activity period (e.g. 3am).', {
+            inputCount: transporterIds.length,
+            dbCandidateCount: dbCandidates.length
+          });
+        }
+      } catch {
+        // Redis presence check failed -- fall through to DB-only result
+        filtered = transporterIds.filter(id =>
+          new Set(dbCandidates).has(id)
+        );
       }
 
-      return filtered;
+      // Preserve original input order
+      const resultSet = new Set(filtered);
+      const result = transporterIds.filter(id => resultSet.has(id));
+
+      const offlineCount = transporterIds.length - result.length;
+      if (offlineCount > 0) {
+        logger.info(`📡 [TransporterOnline] Filtered ${offlineCount} offline transporters (${result.length}/${transporterIds.length} online) [DB fallback - batched + presence check]`);
+      }
+
+      return result;
     } catch (error: any) {
       logger.error(`[TransporterOnline] DB fallback filter failed: ${error.message}`);
       // Last resort: return all (don't block broadcasts)
@@ -345,8 +441,10 @@ export function startStaleTransporterCleanup(): void {
       logger.error(`[TransporterOnline] Stale cleanup error: ${error.message}`);
     }
   }, CLEANUP_INTERVAL_MS);
+  // L1 FIX: unref() so this non-critical timer doesn't block process exit
+  staleCleanupInterval.unref();
 
-  logger.info('🧹 [TransporterOnline] Stale transporter cleanup started (every 30s, cluster-safe)');
+  logger.info('[TransporterOnline] Stale transporter cleanup started (every 30s, cluster-safe)');
 }
 
 export function stopStaleTransporterCleanup(): void {
@@ -356,5 +454,6 @@ export function stopStaleTransporterCleanup(): void {
   }
 }
 
-// Auto-start when module is imported
-startStaleTransporterCleanup();
+// M12 FIX: Removed auto-start side effect — caller must invoke startStaleTransporterCleanup()
+// explicitly (e.g., from server.ts bootstrap). This prevents timers from firing on import
+// during tests or when the module is imported for type-only purposes.

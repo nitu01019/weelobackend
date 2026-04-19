@@ -10,15 +10,18 @@
 
 import { Router, Request, Response, NextFunction } from 'express';
 import { assignmentService } from './assignment.service';
+import { HOLD_CONFIG } from '../../core/config/hold-config';
 import { authMiddleware, roleGuard } from '../../shared/middleware/auth.middleware';
 import { transporterRateLimit } from '../../shared/middleware/transporter-rate-limit.middleware';
 import { validateRequest } from '../../shared/utils/validation.utils';
 import {
   createAssignmentSchema,
   updateStatusSchema,
-  getAssignmentsQuerySchema
+  getAssignmentsQuerySchema,
+  declineAssignmentSchema
 } from './assignment.schema';
 import { prismaClient } from '../../shared/database/prisma.service';
+import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
 const router = Router();
 
 /**
@@ -164,11 +167,25 @@ router.get(
 
       for (const assignment of [...byBookingId, ...byOrderId]) {
         const tripKey = assignment.tripId;
+        // L-01 FIX: null/undefined tripId should never collapse — always include
+        if (!tripKey) { allAssignments.push({
+          ...(assignment as any),
+          order: (assignment as any).order ? {
+            ...(assignment as any).order,
+            customerPhone: maskPhoneForExternal((assignment as any).order.customerPhone)
+          } : (assignment as any).order,
+          system: assignment.bookingId ? 'legacy' : 'multi-truck'
+        }); continue; }
         if (seenTripIds.has(tripKey)) continue;
 
         seenTripIds.add(tripKey);
+        const raw = assignment as any;
         allAssignments.push({
-          ...assignment,
+          ...raw,
+          order: raw.order ? {
+            ...raw.order,
+            customerPhone: maskPhoneForExternal(raw.order.customerPhone)
+          } : raw.order,
           system: assignment.bookingId ? 'legacy' : 'multi-truck'
         });
       }
@@ -237,6 +254,7 @@ router.get(
           driverId: true,
           transporterId: true,
           bookingId: true,
+          orderId: true,
           driverName: true,
           vehicleNumber: true,
           assignedAt: true,
@@ -247,7 +265,7 @@ router.get(
       if (!assignment) {
         return res.status(404).json({
           success: false,
-          error: 'Assignment not found'
+          error: { code: 'ASSIGNMENT_NOT_FOUND', message: 'Assignment not found' }
         });
       }
 
@@ -256,32 +274,44 @@ router.get(
       if (req.user!.role === 'driver' && assignment.driverId !== req.user!.userId) {
         return res.status(403).json({
           success: false,
-          error: 'Access denied: Assignment not assigned to you'
+          error: { code: 'FORBIDDEN', message: 'Access denied: Assignment not assigned to you' }
         });
       }
       if (req.user!.role === 'transporter' && assignment.transporterId !== req.user!.userId) {
         return res.status(403).json({
           success: false,
-          error: 'Access denied: Assignment not under your transport'
+          error: { code: 'FORBIDDEN', message: 'Access denied: Assignment not under your transport' }
         });
       }
       if (req.user!.role === 'customer') {
-        const booking = await prismaClient.booking.findUnique({
-          where: { id: assignment.bookingId },
-          select: { customerId: true }
-        });
-        if (!booking || booking.customerId !== req.user!.userId) {
+        let isOwner = false;
+        // Check booking path (legacy single-truck)
+        if (assignment.bookingId) {
+          const booking = await prismaClient.booking.findUnique({
+            where: { id: assignment.bookingId },
+            select: { customerId: true }
+          });
+          isOwner = booking?.customerId === req.user!.userId;
+        }
+        // Fallback: check order path (multi-truck) when bookingId is null
+        if (!isOwner && assignment.orderId) {
+          const order = await prismaClient.order.findUnique({
+            where: { id: assignment.orderId },
+            select: { customerId: true }
+          });
+          isOwner = order?.customerId === req.user!.userId;
+        }
+        if (!isOwner) {
           return res.status(403).json({
             success: false,
-            error: 'Access denied'
+            error: { code: 'FORBIDDEN', message: 'Access denied' }
           });
         }
       }
 
-      // Calculate timeout using the centralized config (ASSIGNMENT_TIMEOUT_MS, default 30s)
-      const ASSIGNMENT_TIMEOUT_MS = parseInt(process.env.ASSIGNMENT_TIMEOUT_MS || '30000', 10);
+      // Fix H-X1: Use centralized HOLD_CONFIG instead of local parseInt
       const assignedAt = new Date(assignment.assignedAt);
-      const timeoutAt = new Date(assignedAt.getTime() + ASSIGNMENT_TIMEOUT_MS).toISOString();
+      const timeoutAt = new Date(assignedAt.getTime() + HOLD_CONFIG.driverAcceptTimeoutMs).toISOString();
 
       res.json({
         success: true,
@@ -333,15 +363,22 @@ router.patch(
   authMiddleware,
   roleGuard(['driver']),
   transporterRateLimit('driverAcceptDecline'),
+  validateRequest(declineAssignmentSchema),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       // Driver explicitly declines → notify transporter for reassignment
       // Uses declineAssignment (not cancelAssignment) for proper status + notifications
+      // Body is validated by Zod middleware (reason: string<=500, reasonType: enum)
+      const { reason, reasonType } = req.body;
       await assignmentService.declineAssignment(
         req.params.id,
-        req.user!.userId
+        req.user!.userId,
+        {
+          reason,
+          type: reasonType,
+        }
       );
-      
+
       res.json({
         success: true,
         message: 'Assignment declined'
@@ -374,6 +411,46 @@ router.patch(
         success: true,
         data: assignment
       });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
+ * @route   PATCH /assignments/:id/transporter-override
+ * @desc    Transporter overrides assignment status on behalf of their driver
+ * @access  Transporter only (own assignments)
+ *
+ * H-35 FIX: Transporters need to update trip status when drivers can't
+ * (e.g., driver's phone died, driver called transporter to update).
+ * Uses the same updateStatus logic but authenticates via transporter ownership
+ * and passes the actual driver's ID so business rules remain consistent.
+ */
+router.patch(
+  '/:id/transporter-override',
+  authMiddleware,
+  roleGuard(['transporter']),
+  validateRequest(updateStatusSchema),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const assignment = await prismaClient.assignment.findUnique({
+        where: { id: req.params.id },
+        select: { transporterId: true, driverId: true }
+      });
+      if (!assignment) {
+        return res.status(404).json({ success: false, error: { code: 'ASSIGNMENT_NOT_FOUND', message: 'Assignment not found' } });
+      }
+      if (assignment.transporterId !== req.user!.userId) {
+        return res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Not your assignment' } });
+      }
+      // Use existing updateStatus but pass the assigned driverId (not the transporter's)
+      const result = await assignmentService.updateStatus(
+        req.params.id,
+        assignment.driverId,
+        { ...req.body, notes: `[Transporter Override] ${req.body.notes || ''}` }
+      );
+      res.json({ success: true, data: result });
     } catch (error) {
       next(error);
     }

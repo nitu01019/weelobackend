@@ -28,6 +28,7 @@
  * - Stateless service - horizontal scaling ready
  * 
  * @author Weelo Team
+ * @see src/core/state-machines.ts for canonical terminal statuses
  * @version 2.0.0 (Redis-powered for production scale)
  * =============================================================================
  */
@@ -39,7 +40,15 @@ import { redisService } from '../../shared/services/redis.service';
 import { queueService } from '../../shared/services/queue.service';
 import { liveAvailabilityService } from '../../shared/services/live-availability.service';
 import { generateVehicleKey } from '../../shared/services/vehicle-key.service';
+import { releaseVehicle } from '../../shared/services/vehicle-lifecycle.service';
+import { completeTrip } from '../assignment/completion-orchestrator';
+import { TERMINAL_ASSIGNMENT_STATUSES, ASSIGNMENT_VALID_TRANSITIONS } from '../../core/state-machines';
+
+// Feature flag: when true, use the unified completion orchestrator instead of inline logic.
+// Default ON for new code. Set FF_COMPLETION_ORCHESTRATOR=false to roll back.
+const FF_COMPLETION_ORCHESTRATOR = process.env.FF_COMPLETION_ORCHESTRATOR !== 'false';
 import { haversineDistanceMeters } from '../../shared/utils/geospatial.utils';
+import { safeJsonParse } from '../../shared/utils/safe-json.utils';
 import { prismaClient } from '../../shared/database/prisma.service';
 import { googleMapsService } from '../../shared/services/google-maps.service';
 import {
@@ -93,6 +102,10 @@ const REDIS_KEYS = {
   /** Driver online status: driver:status:{driverId}
    *  Values: ONLINE | OFFLINE | UNKNOWN */
   DRIVER_STATUS: (driverId: string) => `driver:status:${driverId}`,
+
+  /** History persist state per trip: tracking:persist-state:{tripId}
+   *  Stores last persisted point info to avoid redundant history writes */
+  HISTORY_PERSIST_STATE: (tripId: string) => `tracking:persist-state:${tripId}`,
 };
 
 // TTL values (in seconds)
@@ -124,6 +137,8 @@ interface LocationData {
   speed: number;
   bearing: number;
   accuracy?: number;
+  /** Whether a real GPS fix has been received. Old data without this field is treated as true. */
+  locationAvailable?: boolean;
   status: string;
   lastUpdated: string;  // ISO string for Redis
 }
@@ -156,6 +171,8 @@ export interface FleetTrackingResponse {
 }
 
 class TrackingService {
+  // L1 cache — Redis is primary store (lines 1562-1606). In-memory Map is read-through fallback only.
+  // KNOWN_ISSUE(H2): history persist state resets on restart; harmless (next GPS update re-seeds it)
   private readonly historyPersistStateByTrip = new Map<string, HistoryPersistState>();
 
   /**
@@ -196,6 +213,7 @@ class TrackingService {
       // Redis flag tracks mock usage per trip for post-trip review.
       // Broadcast includes isMockLocation so customer app can show "⚠️ GPS accuracy low".
       // =====================================================================
+      // TODO(L-15): Add admin review queue for flagged mock-GPS trips. Current: per-trip counter + point-dropping (H-24). Missing: admin dashboard, alert, manual review endpoint.
       if (data.isMockLocation === true) {
         logger.warn('🚨 [SPOOF] Mock GPS location detected', {
           tripId: data.tripId, driverId,
@@ -204,6 +222,55 @@ class TrackingService {
         });
         // Flag the trip in Redis (expires with trip data — 24h)
         redisService.set(`mock_gps:${data.tripId}`, 'true', TTL.TRIP).catch(() => {});
+
+        // H-24 FIX: Tiered spoof enforcement — drop points after 5+ mock detections per trip
+        const mockCountKey = `spoof:trip_count:${data.tripId}`;
+        const mockCount = await redisService.incr(mockCountKey);
+        if (mockCount === 1) await redisService.expire(mockCountKey, 86400);
+
+        if (mockCount >= 5) {
+          logger.warn('[SPOOF] Throttling mock GPS — count exceeded threshold', {
+            tripId: data.tripId, driverId, mockCount
+          });
+          return; // Drop the point after 5+ mock detections
+        }
+      }
+
+      // =====================================================================
+      // C-13 FIX: Coordinate validation (Grab-Posisi pattern)
+      // Reject null island (0,0) and out-of-range coordinates.
+      // Zod schema already enforces [-90,90] / [-180,180], but this guards
+      // against exactly (0,0) which is valid in Zod but not a real GPS fix.
+      // =====================================================================
+      if (data.latitude === 0 && data.longitude === 0) {
+        logger.warn('[TRACKING] Rejected null island (0,0) coordinates', {
+          tripId: data.tripId, driverId
+        });
+        return; // Silently drop — do not update Redis with (0,0)
+      }
+      if (
+        data.latitude < -90 || data.latitude > 90 ||
+        data.longitude < -180 || data.longitude > 180
+      ) {
+        logger.warn('[TRACKING] Rejected out-of-range coordinates', {
+          tripId: data.tripId, driverId, lat: data.latitude, lng: data.longitude
+        });
+        return;
+      }
+
+      // H-22 FIX: Speed-jump filter for single GPS updates (matching batch path logic)
+      // F-M18 FIX: Now uses shared isSpeedJumpUnrealistic method (DRY)
+      if (existing && existing.lastUpdated) {
+        if (this.isSpeedJumpUnrealistic(
+          existing.latitude, existing.longitude, existing.lastUpdated,
+          data.latitude, data.longitude, new Date().toISOString(),
+          TRACKING_CONFIG.MAX_REALISTIC_SPEED_MS
+        )) {
+          logger.warn('[TRACKING] Unrealistic jump rejected (single-point)', {
+            tripId: data.tripId, driverId,
+          });
+          return; // Drop the point
+        }
       }
 
       // 2. Create location data
@@ -220,6 +287,7 @@ class TrackingService {
         speed: data.speed || 0,
         bearing: data.bearing || 0,
         accuracy: data.accuracy,
+        locationAvailable: true,  // C-13 FIX: Real GPS fix received
         status: existing?.status || 'in_transit',
         lastUpdated: now
       };
@@ -238,10 +306,14 @@ class TrackingService {
 
         // Driver's current location (for fleet tracking)
         redisService.setJSON(REDIS_KEYS.DRIVER_LOCATION(driverId), locationData, TTL.LOCATION),
+
+        // F-H12 FIX: Refresh driver presence heartbeat — prevents false offline alerts
+        // Matches batch path at line ~576 which already does this
+        redisService.expire(`driver:presence:${driverId}`, 35).catch(() => {}),
       ]);
 
       // 4. Add to history (fire-and-forget), but sample to reduce hot-path write load.
-      if (this.shouldPersistHistoryPoint(data.tripId, historyEntry, locationData.status)) {
+      if (await this.shouldPersistHistoryPoint(data.tripId, historyEntry, locationData.status)) {
         this.addToHistory(data.tripId, historyEntry);
       }
 
@@ -293,6 +365,28 @@ class TrackingService {
       });
 
       logger.debug('📍 Location updated', { tripId: data.tripId, driverId, lat: data.latitude, lng: data.longitude });
+
+      // ==================================================================
+      // C-17 FIX: Real-time ETA push to customer (throttled: 1 per 60s per trip)
+      // Non-blocking — ETA failure must NEVER break location updates.
+      // Uses Google Maps getETA for road-distance estimate to dropoff.
+      // ==================================================================
+      if (
+        existing &&
+        existing.bookingId &&
+        (existing.status === 'in_transit' || existing.status === 'en_route_pickup' || existing.status === 'heading_to_pickup')
+      ) {
+        this.computeAndEmitETA(
+          data.tripId,
+          data.latitude,
+          data.longitude,
+          existing
+        ).catch(err => {
+          logger.debug('[TRACKING] ETA calculation failed (non-fatal)', {
+            tripId: data.tripId, error: err?.message
+          });
+        });
+      }
 
       // ==================================================================
       // Phase 7: 2km Proximity Notification — "Your driver is about to arrive"
@@ -476,10 +570,13 @@ class TrackingService {
         };
 
         // Update Redis
+        // H-25: Extend driver:presence (35s heartbeat) as authoritative source.
+        // Keep driver:status write for backward compat during transition.
         await Promise.all([
           redisService.setJSON(REDIS_KEYS.TRIP_LOCATION(tripId), locationData, TTL.TRIP),
           redisService.setJSON(REDIS_KEYS.DRIVER_LOCATION(driverId), locationData, TTL.LOCATION),
           redisService.set(REDIS_KEYS.DRIVER_LAST_TS(driverId), newestValidPoint.timestamp, TTL.LOCATION),
+          redisService.expire(`driver:presence:${driverId}`, 35).catch(() => {}),
           redisService.set(REDIS_KEYS.DRIVER_STATUS(driverId), 'ONLINE', TTL.LOCATION),
         ]);
 
@@ -503,7 +600,7 @@ class TrackingService {
           emitToUser(existing.transporterId, SocketEvent.LOCATION_UPDATED, broadcastPayload);
         }
 
-        this.rememberHistoryPersistState(tripId, {
+        await this.setHistoryPersistState(tripId, {
           latitude: newestValidPoint.latitude,
           longitude: newestValidPoint.longitude,
           timestampMs: new Date(newestValidPoint.timestamp).getTime(),
@@ -536,45 +633,64 @@ class TrackingService {
 
   /**
    * Check if jump between two points is unrealistic (impossibly fast)
-   * 
+   *
    * FORMULA: distance / time > MAX_REALISTIC_SPEED
-   * 
+   *
    * This catches:
    * - GPS glitches (sudden teleportation)
    * - Wrong device clock
    * - Spoofed locations
    */
   private isUnrealisticJump(from: BatchLocationPoint, to: BatchLocationPoint): boolean {
-    const timeDiffMs = new Date(to.timestamp).getTime() - new Date(from.timestamp).getTime();
-
-    // If time difference is too small, can't reliably calculate speed
-    if (timeDiffMs < TRACKING_CONFIG.MIN_INTERVAL_MS) {
-      return false; // Accept but don't flag
-    }
-
-    const distanceMeters = haversineDistanceMeters(
-      from.latitude, from.longitude,
-      to.latitude, to.longitude
+    // F-M18 FIX: Delegate to shared speed-jump detection method (DRY)
+    return this.isSpeedJumpUnrealistic(
+      from.latitude, from.longitude, from.timestamp,
+      to.latitude, to.longitude, to.timestamp,
+      TRACKING_CONFIG.MAX_REALISTIC_SPEED_MS
     );
+  }
 
-    const speedMs = distanceMeters / (timeDiffMs / 1000);
-
-    return speedMs > TRACKING_CONFIG.MAX_REALISTIC_SPEED_MS;
+  // F-M18 FIX: DRY — shared speed-jump detection used by both single-point and batch paths
+  private isSpeedJumpUnrealistic(
+    prevLat: number, prevLng: number, prevTime: string,
+    newLat: number, newLng: number, newTime: string,
+    maxSpeedMs: number = 55
+  ): boolean {
+    const timeDelta = (new Date(newTime).getTime() - new Date(prevTime).getTime()) / 1000;
+    if (timeDelta <= 0) return false;
+    const distance = haversineDistanceMeters(prevLat, prevLng, newLat, newLng);
+    const impliedSpeed = distance / timeDelta;
+    return impliedSpeed > maxSpeedMs;
   }
 
   /**
    * Get driver's online status
-   * 
+   *
+   * H-25: Consolidated presence check — reads driver:presence (35s heartbeat)
+   * first as the authoritative source, then falls back to driver:status (300s TTL)
+   * for backward compatibility during transition.
+   *
    * STATUS LOGIC:
-   * - ONLINE: Updated within OFFLINE_THRESHOLD
-   * - OFFLINE: Explicitly set (app backgrounded, etc)
+   * - ONLINE: driver:presence key exists (active heartbeat) OR driver:status = ONLINE
+   * - OFFLINE: Explicitly set OR no presence/status/location data
    * - UNKNOWN: No update for > OFFLINE_THRESHOLD (network issue?)
    */
   async getDriverStatus(driverId: string): Promise<DriverOnlineStatus> {
-    const status = await redisService.get(REDIS_KEYS.DRIVER_STATUS(driverId));
+    // H-25: Check the real presence key first (35s TTL heartbeat — authoritative)
+    try {
+      const presenceExists = await redisService.exists(`driver:presence:${driverId}`);
+      if (presenceExists) {
+        return 'ONLINE';
+      }
+    } catch {
+      // Non-critical — fall through to legacy check
+    }
 
-    if (status === 'ONLINE' || status === 'OFFLINE') {
-      return status;
+    // Backward compat: check legacy driver:status key
+    const rawStatus = await redisService.get(REDIS_KEYS.DRIVER_STATUS(driverId));
+
+    if (rawStatus === 'ONLINE' || rawStatus === 'OFFLINE') {
+      return rawStatus;
     }
 
     // Check if we have recent location data
@@ -596,9 +712,20 @@ class TrackingService {
 
   /**
    * Set driver status explicitly (called by app when going background/foreground)
+   *
+   * H-25: Now manages both driver:status AND driver:presence for consistency.
+   * When ONLINE: extends presence TTL. When OFFLINE: deletes presence key.
    */
   async setDriverStatus(driverId: string, status: DriverOnlineStatus): Promise<void> {
     await redisService.set(REDIS_KEYS.DRIVER_STATUS(driverId), status, TTL.LOCATION);
+
+    // H-25: Keep presence key in sync
+    if (status === 'ONLINE') {
+      await redisService.expire(`driver:presence:${driverId}`, 35).catch(() => {});
+    } else if (status === 'OFFLINE') {
+      await redisService.del(`driver:presence:${driverId}`).catch(() => {});
+    }
+
     logger.debug(`Driver ${driverId} status: ${status}`);
   }
 
@@ -610,8 +737,8 @@ class TrackingService {
       const key = REDIS_KEYS.TRIP_HISTORY(tripId);
       // Use Redis list ops: O(1) append, atomic, no read-modify-write race
       await redisService.rPush(key, JSON.stringify(entry));
-      // Cap at last 1000 points (lTrim keeps indices -1000 to -1)
-      await redisService.lTrim(key, -1000, -1);
+      // Cap at last 5000 points (H-30: supports ~7-14h trips at 10s intervals)
+      await redisService.lTrim(key, -5000, -1);
       await redisService.expire(key, TTL.HISTORY);
     } catch (error: any) {
       if (String(error?.message || error).includes('WRONGTYPE')) {
@@ -621,7 +748,7 @@ class TrackingService {
         try {
           await redisService.del(key);
           await redisService.rPush(key, JSON.stringify(entry));
-          await redisService.lTrim(key, -1000, -1);
+          await redisService.lTrim(key, -5000, -1);
           await redisService.expire(key, TTL.HISTORY);
           return;
         } catch (retryError) {
@@ -659,6 +786,7 @@ class TrackingService {
       longitude: 0,
       speed: 0,
       bearing: 0,
+      locationAvailable: false,  // C-13 FIX: No real GPS fix yet — prevents null island on customer map
       status: 'pending',
       lastUpdated: now
     };
@@ -679,7 +807,7 @@ class TrackingService {
 
     // Initialize empty history
     await redisService.del(REDIS_KEYS.TRIP_HISTORY(tripId));
-    this.historyPersistStateByTrip.delete(tripId);
+    await this.deleteHistoryPersistState(tripId);
 
     logger.info('🚀 Tracking initialized', { tripId, driverId, bookingId });
   }
@@ -741,6 +869,7 @@ class TrackingService {
    * 
    * @param tripId    - Trip ID (unique on Assignment table)
    * @param driverId  - Driver making the update (from JWT)
+   * @deprecated Use tracking-trip.service.ts TrackingTripService.updateTripStatus() instead. DO NOT REMOVE. See F-H16.
    * @param data      - { status: 'at_pickup' | 'loading_complete' | 'in_transit' | 'completed' | ... }
    */
   async updateTripStatus(
@@ -777,39 +906,23 @@ class TrackingService {
       //     e.g. driver can't go from in_transit → at_pickup
       //     Already-completed trips are immutable
       // ------------------------------------------------------------------
-      const STATUS_ORDER: Record<string, number> = {
-        'pending': 0,
-        'driver_accepted': 1,
-        'heading_to_pickup': 2,
-        'en_route_pickup': 2,
-        'at_pickup': 3,
-        'loading_complete': 4,
-        'in_transit': 5,
-        'arrived_at_drop': 6,
-        'completed': 7,
-        'cancelled': -1,
-        'driver_declined': -1
-      };
-
-      const currentOrder = STATUS_ORDER[assignment.status] ?? 0;
-      const newOrder = STATUS_ORDER[status] ?? 0;
-
-      if (assignment.status === 'completed') {
-        throw new AppError(400, 'TRIP_ALREADY_COMPLETED', 'This trip is already completed');
-      }
-
-      if (assignment.status === 'cancelled' || assignment.status === 'driver_declined') {
+      const TERMINAL = new Set<string>(TERMINAL_ASSIGNMENT_STATUSES);
+      if (TERMINAL.has(assignment.status)) {
+        if (assignment.status === 'completed') {
+          throw new AppError(400, 'TRIP_ALREADY_COMPLETED', 'This trip is already completed');
+        }
         throw new AppError(400, 'TRIP_NOT_ACTIVE', 'This trip is no longer active');
       }
 
-      if (newOrder <= currentOrder && newOrder > 0) {
-        // Same status = idempotent (return success, don't re-process)
-        if (newOrder === currentOrder) {
-          logger.info('[TRACKING] Idempotent status update — already at this status', { tripId, status });
-          return;
-        }
+      if (assignment.status === status) {
+        logger.info('[TRACKING] Idempotent status update — already at this status', { tripId, status });
+        return;
+      }
+
+      const allowedNext = ASSIGNMENT_VALID_TRANSITIONS[assignment.status] ?? [];
+      if (!allowedNext.includes(status)) {
         throw new AppError(400, 'INVALID_STATUS_TRANSITION',
-          `Cannot go from ${assignment.status} to ${status}. Status can only move forward.`);
+          `Cannot transition from ${assignment.status} to ${status}. Allowed: [${allowedNext.join(', ')}]`);
       }
 
       // ------------------------------------------------------------------
@@ -824,9 +937,9 @@ class TrackingService {
         );
         if (driverLocation?.latitude && driverLocation?.longitude) {
           const pickupSource = assignment.order?.pickup || assignment.booking?.pickup;
-          const pickupData = typeof pickupSource === 'string'
-            ? JSON.parse(pickupSource as string)
-            : pickupSource;
+          const pickupData = (typeof pickupSource === 'string'
+            ? safeJsonParse<Record<string, unknown>>(pickupSource, {})
+            : pickupSource) as Record<string, unknown> | undefined;
           const pickupLat = pickupData?.latitude || pickupData?.lat;
           const pickupLng = pickupData?.longitude || pickupData?.lng;
           if (pickupLat && pickupLng) {
@@ -899,6 +1012,36 @@ class TrackingService {
           data: updates
         });
 
+        // M6 FIX: Wire parent Order/Booking to in_progress when first assignment
+        // hits in_transit (mirrors H-36 fix in assignment.service.ts).
+        // CAS pattern: only transitions from pre-transit states. Non-fatal.
+        if (prismaStatus === 'in_transit') {
+          try {
+            if (assignment.orderId || assignment.order?.id) {
+              await prismaClient.order.updateMany({
+                where: {
+                  id: (assignment.orderId || assignment.order?.id)!,
+                  status: { in: ['fully_filled', 'partially_filled'] },
+                },
+                data: { status: 'in_progress' },
+              });
+            }
+            if (assignment.bookingId || assignment.booking?.id) {
+              await prismaClient.booking.updateMany({
+                where: {
+                  id: (assignment.bookingId || assignment.booking?.id)!,
+                  status: { in: ['fully_filled', 'partially_filled'] },
+                },
+                data: { status: 'in_progress' },
+              });
+            }
+          } catch (err) {
+            logger.warn('[TRACKING] Failed to transition parent to in_progress (non-fatal)', {
+              tripId, error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+
         // Phase 7 (7E): Populate Order timestamps for cancel policy stage detection
         const targetOrderId = assignment.orderId || assignment.order?.id;
         if (targetOrderId) {
@@ -945,82 +1088,56 @@ class TrackingService {
       //    so we skip the duplicate broadcast below for 'completed'
       // ------------------------------------------------------------------
       if (status === 'completed') {
-        // Phase 9A: Double-tap guard — Redis lock prevents race condition
-        // Scenario: Two rapid "Complete" taps → both pass Postgres idempotent check
-        //           before first one commits → duplicate completion events.
-        // Solution: SETNX lock with 10s TTL. Second tap gets lock-failed → returns silently.
-        const tripCompleteLock = `lock:trip-complete:${tripId}`;
-        const completeLock = await redisService.acquireLock(tripCompleteLock, 'trip-completion', 10);
-        if (!completeLock.acquired) {
-          logger.info('[TRACKING] Trip completion already in progress (double-tap guard)', { tripId });
-          return; // Idempotent — first request will handle everything
-        }
-
-        try {
-          try {
-            await this.completeTracking(tripId);
-          } catch (completeErr: any) {
-            logger.warn('[TRACKING] completeTracking cleanup failed (non-fatal)', {
-              tripId, error: completeErr.message
-            });
+        if (FF_COMPLETION_ORCHESTRATOR) {
+          // C1 FIX: Unified completion orchestrator — all side-effects in one place
+          const result = await completeTrip(assignment.id, 'driver', 'completed');
+          if (result.alreadyCompleted) {
+            logger.info('[TRACKING] Trip already completed (orchestrator idempotency)', { tripId });
+            return;
+          }
+        } else {
+          // Legacy inline path — kept behind feature flag for rollback safety
+          const tripCompleteLock = `lock:trip-complete:${tripId}`;
+          const completeLock = await redisService.acquireLock(tripCompleteLock, 'trip-completion', 10);
+          if (!completeLock.acquired) {
+            logger.info('[TRACKING] Trip completion already in progress (double-tap guard)', { tripId });
+            return;
           }
 
-          // =================================================================
-          // FIX 7.6: Release vehicle back to 'available' on completion
-          // =================================================================
-          // BEFORE: Only cancelAssignment and declineAssignment released the
-          //   vehicle. Completion path skipped this entirely.
-          //   → vehicle stays as 'busy' forever in transporter's fleet view.
-          // NOW: Same db.updateVehicle() call as cancel/decline uses.
-          // Non-fatal: if this fails, the trip is still complete.
-          // Uber/Grab pattern: vehicle status is always updated atomically
-          // with the trip terminal state (completed/cancelled).
-          // =================================================================
-          if (assignment.vehicleId) {
+          try {
             try {
-              const { db: dbService } = await import('../../shared/database/db');
-              await dbService.updateVehicle(assignment.vehicleId, {
-                status: 'available',
-                currentTripId: undefined,
-                assignedDriverId: undefined,
-                lastStatusChange: new Date().toISOString()
-              });
-              logger.info('[TRACKING] Vehicle released on completion', {
-                vehicleId: assignment.vehicleId, tripId
-              });
-
-              // Update Redis availability so DB and Redis stay in sync
-              const vehicleKey = generateVehicleKey(
-                assignment.vehicleType || '',
-                assignment.vehicleSubtype || ''
-              );
-              if (vehicleKey && assignment.transporterId) {
-                await liveAvailabilityService.onVehicleStatusChange(
-                  assignment.transporterId,
-                  vehicleKey,
-                  'in_transit',    // Vehicle was in transit
-                  'available'       // Now available again after trip completion
-                ).catch(err => logger.warn('[TRACKING] Redis update failed', err));
-              }
-            } catch (vehErr: any) {
-              logger.warn('[TRACKING] Vehicle release failed on completion (non-fatal)', {
-                vehicleId: assignment.vehicleId, tripId, error: vehErr.message
+              await this.completeTracking(tripId);
+            } catch (completeErr: any) {
+              logger.warn('[TRACKING] completeTracking cleanup failed (non-fatal)', {
+                tripId, error: completeErr.message
               });
             }
-          }
 
-          // Phase 5: Check if ALL trucks for this booking are now completed
-          // If yes → update booking status + notify customer
-          const completedBookingId = assignment.booking?.id || assignment.bookingId;
-          if (completedBookingId) {
-            this.checkBookingCompletion(completedBookingId).catch(err => {
-              logger.warn('[TRACKING] Booking completion check failed (non-fatal)', {
-                bookingId: completedBookingId, error: err.message
+            if (assignment.vehicleId) {
+              try {
+                await releaseVehicle(assignment.vehicleId, 'tripCompletion');
+              } catch (vehErr: any) {
+                logger.error('[TRACKING] releaseVehicle failed, enqueueing retry', {
+                  vehicleId: assignment.vehicleId, tripId, error: vehErr.message
+                });
+                queueService.enqueue('vehicle-release', {
+                  vehicleId: assignment.vehicleId,
+                  context: 'tripCompletion'
+                }).catch(() => {});
+              }
+            }
+
+            const completedBookingId = assignment.booking?.id || assignment.bookingId;
+            if (completedBookingId) {
+              this.checkBookingCompletion(completedBookingId).catch(err => {
+                logger.warn('[TRACKING] Booking completion check failed (non-fatal)', {
+                  bookingId: completedBookingId, error: err.message
+                });
               });
-            });
+            }
+          } finally {
+            await redisService.releaseLock(tripCompleteLock, 'trip-completion').catch(() => { });
           }
-        } finally {
-          await redisService.releaseLock(tripCompleteLock, 'trip-completion').catch(() => { });
         }
       }
 
@@ -1129,6 +1246,7 @@ class TrackingService {
   /**
    * Get current location for a trip
    * Used by: Customer app to track their truck
+   * @deprecated Use trackingQueryService.getTripTracking() instead. DO NOT REMOVE — see F-L16.
    */
   async getTripTracking(
     tripId: string,
@@ -1150,6 +1268,8 @@ class TrackingService {
       longitude: location.longitude,
       speed: location.speed,
       bearing: location.bearing,
+      // C-13: Backward compat — old data without the field is treated as true (real GPS)
+      locationAvailable: location.locationAvailable !== false,
       status: location.status,
       lastUpdated: location.lastUpdated
     };
@@ -1157,6 +1277,7 @@ class TrackingService {
 
   /**
    * Get current location - alias for getTripTracking
+   * @deprecated Use trackingQueryService.getCurrentLocation() instead. DO NOT REMOVE — see F-L16.
    */
   async getCurrentLocation(
     tripId: string,
@@ -1169,6 +1290,7 @@ class TrackingService {
   /**
    * Get all truck locations for a booking (multi-truck view)
    * Used by: Customer app to see all their trucks on map
+   * @deprecated Use trackingQueryService.getBookingTracking() instead. DO NOT REMOVE — see F-L16.
    */
   async getBookingTracking(
     bookingId: string,
@@ -1202,6 +1324,8 @@ class TrackingService {
           longitude: location.longitude,
           speed: location.speed,
           bearing: location.bearing,
+          // C-13: Backward compat — old data without the field is treated as true
+          locationAvailable: location.locationAvailable !== false,
           status: location.status,
           lastUpdated: location.lastUpdated
         });
@@ -1218,14 +1342,10 @@ class TrackingService {
    * ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
    * ┃  GET FLEET TRACKING - For Transporter to See All Their Trucks         ┃
    * ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
-   * 
+   *
    * Returns all active driver locations for a transporter's fleet.
    * Used by: Captain app to show fleet map view
-   * 
-   * FRONTEND SHOULD:
-   * - Show all drivers on map
-   * - Interpolate movement for each driver
-   * - Use different colors for different statuses
+   * @deprecated Use trackingQueryService.getFleetTracking() instead. DO NOT REMOVE — see F-L16.
    */
   async getFleetTracking(transporterId: string): Promise<FleetTrackingResponse> {
     // Get all active driver IDs for this transporter
@@ -1265,6 +1385,7 @@ class TrackingService {
 
   /**
    * Get location history for a trip (route replay)
+   * @deprecated Use trackingQueryService.getTripHistory() instead. DO NOT REMOVE — see F-L16.
    */
   async getTripHistory(
     tripId: string,
@@ -1275,13 +1396,9 @@ class TrackingService {
     await assertTripTrackingAccess(tripId, userId, userRole);
     const historyKey = REDIS_KEYS.TRIP_HISTORY(tripId);
     const rawHistory = await redisService.lRange(historyKey, 0, -1);
-    let history: LocationHistoryEntry[] = rawHistory.map((entry) => {
-      try {
-        return JSON.parse(entry) as LocationHistoryEntry;
-      } catch {
-        return null;
-      }
-    }).filter((entry): entry is LocationHistoryEntry => entry !== null);
+    let history: LocationHistoryEntry[] = rawHistory
+      .map((entry) => safeJsonParse<LocationHistoryEntry | null>(entry, null))
+      .filter((entry): entry is LocationHistoryEntry => entry !== null);
 
     // Backward compatibility for pre-list history keys.
     if (history.length === 0) {
@@ -1307,6 +1424,7 @@ class TrackingService {
 
   /**
    * Get location history - alias for getTripHistory
+   * @deprecated Use trackingQueryService.getLocationHistory() instead. DO NOT REMOVE — see F-L16.
    */
   async getLocationHistory(
     tripId: string,
@@ -1319,6 +1437,7 @@ class TrackingService {
 
   /**
    * Clean up tracking when trip completes
+   * @deprecated Use tracking-trip.service.ts TrackingTripService.completeTracking() instead. DO NOT REMOVE. See F-H16.
    */
   async completeTracking(tripId: string): Promise<void> {
     const location = await redisService.getJSON<LocationData>(REDIS_KEYS.TRIP_LOCATION(tripId));
@@ -1345,7 +1464,7 @@ class TrackingService {
       });
     }
 
-    this.historyPersistStateByTrip.delete(tripId);
+    await this.deleteHistoryPersistState(tripId);
 
     logger.info('✅ Tracking completed', { tripId });
   }
@@ -1418,8 +1537,8 @@ class TrackingService {
 
     const pickupSource = assignment.order?.pickup || assignment.booking?.pickup;
     const pickupData = typeof pickupSource === 'string'
-      ? JSON.parse(pickupSource as string)
-      : pickupSource as any;
+      ? safeJsonParse<Record<string, unknown>>(pickupSource, {})
+      : pickupSource as Record<string, unknown> | undefined;
 
     pickupLat = Number(pickupData?.latitude || pickupData?.lat);
     pickupLng = Number(pickupData?.longitude || pickupData?.lng);
@@ -1488,13 +1607,103 @@ class TrackingService {
     });
   }
 
-  private shouldPersistHistoryPoint(tripId: string, entry: LocationHistoryEntry, status: string): boolean {
+  /**
+   * ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+   * ┃  C-17 FIX: Real-Time ETA Push to Customer                              ┃
+   * ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+   *
+   * Calculates ETA from driver's current position to the dropoff location
+   * and emits it to the customer via the booking room.
+   *
+   * THROTTLE: Redis key with 60s TTL ensures max 1 Google Maps API call
+   *   per minute per trip. This limits cost while keeping ETA reasonably fresh.
+   *
+   * NON-BLOCKING: Entire method is wrapped in try/catch and called with
+   *   .catch() from updateLocation — failures never break GPS updates.
+   *
+   * INDUSTRY PATTERN (Uber/Grab): Push ETA updates periodically during trip,
+   *   not just on-demand via GET endpoint.
+   */
+  private async computeAndEmitETA(
+    tripId: string,
+    driverLat: number,
+    driverLng: number,
+    existing: LocationData
+  ): Promise<void> {
+    try {
+      const throttleKey = `eta:last_calc:${tripId}`;
+
+      // Throttle check: only calculate if key doesn't exist (max 1 per 60s)
+      const alreadyCalculated = await redisService.exists(throttleKey);
+      if (alreadyCalculated) return;
+
+      // Set throttle key with 60s TTL (fire-and-forget, non-critical)
+      await redisService.set(throttleKey, '1', 60);
+
+      // Look up dropoff location from order or booking
+      const entityId = existing.orderId || existing.bookingId;
+      if (!entityId) return;
+
+      const assignment = await prismaClient.assignment.findFirst({
+        where: { tripId },
+        select: {
+          order: { select: { drop: true } },
+          booking: { select: { drop: true } }
+        }
+      });
+
+      if (!assignment) return;
+
+      const dropSource = assignment.order?.drop || assignment.booking?.drop;
+      const dropData = typeof dropSource === 'string'
+        ? safeJsonParse<Record<string, unknown>>(dropSource, {})
+        : dropSource as Record<string, unknown> | undefined;
+
+      const dropLat = Number(dropData?.latitude || dropData?.lat);
+      const dropLng = Number(dropData?.longitude || dropData?.lng);
+
+      if (!dropLat || !dropLng) return;
+
+      // Calculate ETA via Google Maps (road distance)
+      const eta = await googleMapsService.getETA(
+        { lat: driverLat, lng: driverLng },
+        { lat: dropLat, lng: dropLng }
+      );
+
+      if (!eta) return;
+
+      // Emit to customer via booking room
+      const etaPayload = {
+        tripId,
+        estimatedMinutes: eta.durationMinutes,
+        distanceKm: eta.distanceKm,
+        durationText: eta.durationText,
+        updatedAt: new Date().toISOString()
+      };
+
+      emitToBooking(existing.bookingId, 'eta_updated', etaPayload);
+
+      logger.debug('[TRACKING] ETA pushed to customer', {
+        tripId,
+        bookingId: existing.bookingId,
+        estimatedMinutes: eta.durationMinutes,
+        distanceKm: eta.distanceKm.toFixed(1)
+      });
+    } catch (err: any) {
+      // Non-fatal — ETA is optional, GPS updates are critical
+      logger.debug('[TRACKING] computeAndEmitETA error (non-fatal)', {
+        tripId, error: err?.message
+      });
+    }
+  }
+
+  private async shouldPersistHistoryPoint(tripId: string, entry: LocationHistoryEntry, status: string): Promise<boolean> {
     const timestampMs = new Date(entry.timestamp).getTime();
     if (!Number.isFinite(timestampMs)) return false;
 
-    const previous = this.historyPersistStateByTrip.get(tripId);
+    const previous = await this.getHistoryPersistState(tripId);
     if (!previous) {
-      this.rememberHistoryPersistState(tripId, {
+      await this.setHistoryPersistState(tripId, {
         latitude: entry.latitude,
         longitude: entry.longitude,
         timestampMs,
@@ -1520,7 +1729,7 @@ class TrackingService {
       movedMeters >= HISTORY_PERSIST_MIN_MOVEMENT_METERS;
 
     if (shouldPersist) {
-      this.rememberHistoryPersistState(tripId, {
+      await this.setHistoryPersistState(tripId, {
         latitude: entry.latitude,
         longitude: entry.longitude,
         timestampMs,
@@ -1540,6 +1749,53 @@ class TrackingService {
       if (oldestKey) {
         this.historyPersistStateByTrip.delete(oldestKey);
       }
+    }
+  }
+
+  // ===========================================================================
+  // REDIS-BACKED HISTORY PERSIST STATE (FIX A4#20)
+  // ===========================================================================
+  // Replaces in-memory-only Map with Redis-backed storage (48h TTL).
+  // In-memory Map kept as fallback if Redis read/write fails.
+  // ===========================================================================
+
+  private async getHistoryPersistState(tripId: string): Promise<HistoryPersistState | null> {
+    try {
+      const redisState = await redisService.getJSON<HistoryPersistState>(REDIS_KEYS.HISTORY_PERSIST_STATE(tripId));
+      if (redisState) {
+        // Sync in-memory fallback
+        this.historyPersistStateByTrip.set(tripId, redisState);
+        return redisState;
+      }
+    } catch (err: any) {
+      logger.debug('[TRACKING] Redis persist state read failed, using in-memory fallback', {
+        tripId, error: err?.message
+      });
+    }
+    // Fallback to in-memory Map
+    return this.historyPersistStateByTrip.get(tripId) || null;
+  }
+
+  private async setHistoryPersistState(tripId: string, state: HistoryPersistState): Promise<void> {
+    // Always update in-memory fallback
+    this.rememberHistoryPersistState(tripId, state);
+    // Write to Redis with 48h TTL (fire-and-forget — non-critical)
+    const TTL_48H = 48 * 60 * 60; // 172800 seconds
+    try {
+      await redisService.setJSON(REDIS_KEYS.HISTORY_PERSIST_STATE(tripId), state, TTL_48H);
+    } catch (err: any) {
+      logger.debug('[TRACKING] Redis persist state write failed (in-memory fallback active)', {
+        tripId, error: err?.message
+      });
+    }
+  }
+
+  private async deleteHistoryPersistState(tripId: string): Promise<void> {
+    this.historyPersistStateByTrip.delete(tripId);
+    try {
+      await redisService.del(REDIS_KEYS.HISTORY_PERSIST_STATE(tripId));
+    } catch {
+      // Non-critical — key will expire via TTL
     }
   }
 
@@ -1653,8 +1909,10 @@ class TrackingService {
         logger.warn('[OFFLINE CHECKER] Error (non-fatal)', { error: error.message });
       }
     }, 30_000); // Every 30 seconds
+    // L1 FIX: unref() so this non-critical timer doesn't block process exit
+    this.offlineCheckerInterval.unref();
 
-    logger.info('🔍 Driver offline checker started (30s interval, 2min threshold)');
+    logger.info('Driver offline checker started (30s interval, 2min threshold)');
   }
 
   stopDriverOfflineChecker(): void {
@@ -1733,7 +1991,7 @@ class TrackingService {
 
           await redisService.set(cooldownKey, '1', 300);
 
-          emitToUser(transporterId, 'driver_may_be_offline', {
+          emitToUser(transporterId, SocketEvent.DRIVER_MAY_BE_OFFLINE, {
             driverId,
             driverName: location.vehicleNumber,
             vehicleNumber: location.vehicleNumber,
@@ -1815,6 +2073,9 @@ class TrackingService {
   // If yes → updates booking status and sends customer notification.
   // ===========================================================================
 
+  /**
+   * @deprecated Use tracking-fleet.service.ts trackingFleetService.checkBookingCompletion() instead. DO NOT REMOVE. See F-H16.
+   */
   async checkBookingCompletion(bookingId: string): Promise<void> {
     try {
       // =====================================================================
@@ -1847,10 +2108,11 @@ class TrackingService {
 
         if (assignments.length === 0) return;
 
-        const allCompleted = assignments.every(a => a.status === 'completed');
+        const TERMINAL_BOOKING_STATUSES = new Set(['completed', 'cancelled', 'partial_delivery']);
+        const allTerminal = assignments.every(a => TERMINAL_BOOKING_STATUSES.has(a.status));
 
-        if (allCompleted) {
-          logger.info(`[BOOKING COMPLETION] All ${assignments.length} trucks completed for booking ${bookingId}`);
+        if (allTerminal) {
+          logger.info(`[BOOKING COMPLETION] All ${assignments.length} trucks terminal for booking ${bookingId}`);
 
           // Update booking status + notify customer
           // Uses db.ts (which wraps Prisma or JSON — handles both)
@@ -1858,36 +2120,51 @@ class TrackingService {
           const booking = await dbService.getBookingById(bookingId);
 
           if (booking) {
-            // Only update if not already completed (idempotent)
-            if (booking.status !== 'completed') {
+            // Only update if not already completed or cancelled (idempotent)
+            if (booking.status !== 'completed' && booking.status !== 'cancelled') {
               await dbService.updateBooking(bookingId, { status: 'completed' });
-            }
 
-            if (booking.customerId) {
-              // WebSocket
-              emitToUser(booking.customerId, 'booking_completed', {
-                bookingId,
-                totalTrucks: assignments.length,
-                message: `All ${assignments.length} deliveries complete!`
-              });
-
-              // FCM push
-              queueService.queuePushNotification(booking.customerId, {
-                title: '✅ All Deliveries Complete!',
-                body: `All ${assignments.length} truck(s) have completed delivery. Rate your experience!`,
-                data: {
-                  type: 'booking_completed',
+              // Notifications inside guard to prevent duplicates (QA-4 fix)
+              if (booking.customerId) {
+                emitToUser(booking.customerId, SocketEvent.BOOKING_UPDATED, {
                   bookingId,
-                  totalTrucks: String(assignments.length)
-                }
-              }).catch(err => {
-                logger.warn('[BOOKING COMPLETION] FCM push failed', { error: err.message });
+                  status: 'completed',
+                  totalTrucks: assignments.length,
+                  message: `All ${assignments.length} deliveries complete!`
+                });
+
+                queueService.queuePushNotification(booking.customerId, {
+                  title: 'All Deliveries Complete!',
+                  body: `All ${assignments.length} truck(s) have completed delivery.`,
+                  data: {
+                    type: 'booking_status_changed',
+                    bookingId,
+                    status: 'completed',
+                    totalTrucks: String(assignments.length)
+                  }
+                }).catch(err => {
+                  logger.warn('[BOOKING COMPLETION] FCM push failed', { error: err.message });
+                });
+              }
+
+              // Cascade: check if parent order is fully completed
+              // Booking model has no orderId — look it up via assignment (QA-4 CRITICAL fix)
+              const orderAssignment = await prismaClient.assignment.findFirst({
+                where: { bookingId, orderId: { not: null } },
+                select: { orderId: true }
               });
+              if (orderAssignment?.orderId) {
+                this.checkOrderCompletion(orderAssignment.orderId).catch(err =>
+                  logger.warn('[ORDER COMPLETION] Check failed (non-fatal)', { orderId: orderAssignment.orderId, error: err.message })
+                );
+              }
+            } else if (booking.status === 'cancelled') {
+              logger.info('[BOOKING COMPLETION] Booking already cancelled, skipping completion', { bookingId });
             }
           }
         } else {
-          const completedCount = assignments.filter(a => a.status === 'completed').length;
-          logger.info(`[BOOKING COMPLETION] ${completedCount}/${assignments.length} trucks completed for booking ${bookingId}`);
+          const terminalCount = assignments.filter(a => TERMINAL_BOOKING_STATUSES.has(a.status)).length;
+          logger.info(`[BOOKING COMPLETION] ${terminalCount}/${assignments.length} trucks terminal for booking ${bookingId}`);
         }
       } finally {
         await redisService.releaseLock(lockKey, 'completion-checker');
@@ -1897,9 +2174,134 @@ class TrackingService {
       logger.warn('[BOOKING COMPLETION] Check failed (non-fatal)', { bookingId, error: error.message });
     }
   }
+
+  // ===========================================================================
+  // ORDER COMPLETION CHECK (FIX A4#33)
+  // ===========================================================================
+  //
+  // When a booking completes, check if ALL bookings/assignments for the parent
+  // order are now terminal. If all completed (or mix of completed+cancelled
+  // with at least one completed) → mark order 'completed'.
+  // If ALL cancelled → mark order 'cancelled'.
+  // Uses distributed lock to prevent duplicate updates across ECS instances.
+  // ===========================================================================
+
+  async checkOrderCompletion(orderId: string): Promise<void> {
+    const lockKey = `order-completion:${orderId}`;
+    const holderId = `order-completion:${process.pid}:${Date.now()}`;
+    const lock = await redisService.acquireLock(lockKey, holderId, 10);
+    if (!lock.acquired) {
+      logger.debug('[ORDER COMPLETION] Lock not acquired (another instance handling)', { orderId });
+      return;
+    }
+
+    try {
+      // Get all assignments for this order
+      const assignments = await prismaClient.assignment.findMany({
+        where: { orderId },
+        select: { id: true, status: true }
+      });
+
+      if (assignments.length === 0) return;
+
+      const terminalStatuses = new Set<string>(TERMINAL_ASSIGNMENT_STATUSES);
+      const allTerminal = assignments.every(a => terminalStatuses.has(a.status));
+
+      if (!allTerminal) {
+        const completedCount = assignments.filter(a => a.status === 'completed').length;
+        const cancelledCount = assignments.filter(a => a.status === 'cancelled').length;
+        logger.info(`[ORDER COMPLETION] Not all terminal: ${completedCount} completed, ${cancelledCount} cancelled, ${assignments.length} total`, { orderId });
+        return;
+      }
+
+      const hasCompleted = assignments.some(a => a.status === 'completed');
+      const allCancelled = assignments.every(a => a.status === 'cancelled');
+
+      let newOrderStatus: 'completed' | 'cancelled';
+      if (allCancelled) {
+        newOrderStatus = 'cancelled';
+      } else if (hasCompleted) {
+        newOrderStatus = 'completed';
+      } else {
+        return; // Should not happen, but guard
+      }
+
+      // Fetch current order to check idempotency and get customerId
+      const order = await prismaClient.order.findUnique({
+        where: { id: orderId },
+        select: { id: true, status: true, customerId: true }
+      });
+
+      if (!order) {
+        logger.warn('[ORDER COMPLETION] Order not found', { orderId });
+        return;
+      }
+
+      if (order.status === 'completed' || order.status === 'cancelled') {
+        logger.info('[ORDER COMPLETION] Order already terminal, skipping', { orderId, status: order.status });
+        return;
+      }
+
+      // CAS: only update if order is still active (prevents duplicate notifications)
+      const updateResult = await prismaClient.order.updateMany({
+        where: { id: orderId, status: { notIn: ['completed', 'cancelled'] } },
+        data: { status: newOrderStatus }
+      });
+
+      if (updateResult.count === 0) {
+        logger.info('[ORDER COMPLETION] Order already updated by concurrent process', { orderId });
+        return;
+      }
+
+      logger.info(`[ORDER COMPLETION] Order marked as ${newOrderStatus}`, {
+        orderId,
+        totalAssignments: assignments.length,
+        completedCount: assignments.filter(a => a.status === 'completed').length,
+        cancelledCount: assignments.filter(a => a.status === 'cancelled').length
+      });
+
+      // Notify customer
+      if (order.customerId) {
+        if (newOrderStatus === 'completed') {
+          emitToUser(order.customerId, SocketEvent.ORDER_STATUS_UPDATE, {
+            orderId,
+            totalAssignments: assignments.length,
+            message: `All deliveries for your order are complete!`
+          });
+          // Backward compat: Customer app listens for 'booking_completed' for rating trigger
+          emitToUser(order.customerId, 'booking_completed', {
+            orderId,
+            bookingId: orderId,
+            completedAt: new Date().toISOString()
+          });
+
+          queueService.queuePushNotification(order.customerId, {
+            title: '✅ Order Complete!',
+            body: `All ${assignments.length} delivery(ies) for your order are done. Rate your experience!`,
+            data: {
+              type: 'order_completed',
+              orderId,
+              totalAssignments: String(assignments.length)
+            }
+          }).catch(err => {
+            logger.warn('[ORDER COMPLETION] FCM push failed', { orderId, error: err.message });
+          });
+        } else {
+          emitToUser(order.customerId, SocketEvent.ORDER_STATUS_UPDATE, {
+            orderId,
+            totalAssignments: assignments.length,
+            message: `Your order has been cancelled.`
+          });
+        }
+      }
+    } finally {
+      await redisService.releaseLock(lockKey, holderId).catch(() => {});
+    }
+  }
 }
 
 export const trackingService = new TrackingService();
 
-// Start driver offline checker when module loads
-trackingService.startDriverOfflineChecker();
+// M12 FIX: Removed auto-start side effect — caller must invoke
+// trackingService.startDriverOfflineChecker() explicitly (e.g., from server.ts bootstrap).
+// This prevents timers from firing on import during tests or type-only imports.

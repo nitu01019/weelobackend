@@ -1,7 +1,15 @@
 /**
  * =============================================================================
- * DISTANCE MATRIX SERVICE — Pickup Distance & ETA via Google Distance Matrix
+ * DISTANCE MATRIX SERVICE — Batch ETA Lookups via Google Distance Matrix API
  * =============================================================================
+ *
+ * Google Distance Matrix API — batch ETA lookups (up to 25 origins per request).
+ * Used for: transporter RANKING during matching (need ETAs for many candidates).
+ * Cache: 5 minutes per origin-destination pair.
+ *
+ * NOTE: directions-api.service.ts handles single ROUTE calculation (turn-by-turn
+ * polyline, duration_in_traffic). These are separate Google APIs with different
+ * pricing and use cases. Do NOT consolidate — they serve different purposes.
  *
  * PURPOSE:
  * Dedicated service for computing pickup distance and ETA between transporters
@@ -39,6 +47,7 @@
 import { redisService } from './redis.service';
 import { logger } from './logger.service';
 import { config } from '../../config/environment';
+import { CIRCUITY_FACTORS } from '../utils/geospatial.utils';
 
 // =============================================================================
 // CONSTANTS
@@ -331,8 +340,13 @@ class DistanceMatrixService {
         destLng: number
     ): DistanceMatrixResult {
         const distanceKm = this.haversineKm(originLat, originLng, destLat, destLng);
-        const roadDistanceKm = distanceKm * 1.4; // 1.4x road factor (city average)
-        const durationSeconds = (roadDistanceKm / 30) * 3600; // 30 km/h avg truck speed
+        // FIX #34: Env-configurable speed and road factor (shared with candidate-scorer).
+        // Defaults match Indian urban truck patterns (Ballou et al. 2002).
+        // Now uses shared CIRCUITY_FACTORS for single source of truth.
+        const roadFactor = CIRCUITY_FACTORS.ETA_RANKING;
+        const avgSpeedKmh = Math.max(1, parseInt(process.env.HAVERSINE_AVG_SPEED_KMH || '30', 10) || 30);
+        const roadDistanceKm = distanceKm * roadFactor;
+        const durationSeconds = (roadDistanceKm / avgSpeedKmh) * 3600;
 
         return {
             durationSeconds: Math.round(durationSeconds),

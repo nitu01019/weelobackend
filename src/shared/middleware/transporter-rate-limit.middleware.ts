@@ -145,15 +145,22 @@ export function transporterRateLimit(action: keyof typeof RATE_LIMITS) {
       const remaining = Math.max(0, limit.max - current);
       res.setHeader('X-RateLimit-Limit', limit.max.toString());
       res.setHeader('X-RateLimit-Remaining', remaining.toString());
-      res.setHeader('X-RateLimit-Reset', await redisService.ttl(counterKey).toString());
+      res.setHeader('X-RateLimit-Reset', (await redisService.ttl(counterKey)).toString());
 
       // Proceed with request
       next();
 
-    } catch (error: any) {
-      // If Redis fails, allow the request (fail open)
-      logger.error(`[RateLimit] Redis error, allowing request:`, error);
-      next();
+    } catch (error: unknown) {
+      // If Redis fails, reject the request (fail closed) to prevent abuse
+      logger.error(`[RateLimit] Redis error, denying request for safety`, {
+        action,
+        transporterId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return res.status(503).json({
+        success: false,
+        error: 'Rate limiting unavailable',
+      });
     }
   };
 }
@@ -195,8 +202,8 @@ export async function getRateLimitStatus(
       isBlocked: !!blocked,
       blockTimeRemaining: blocked ? await redisService.ttl(blockKey) : null
     };
-  } catch (error: any) {
-    logger.error('[RateLimit] Error checking status:', error);
+  } catch (error: unknown) {
+    logger.error('[RateLimit] Error checking status:', { error: error instanceof Error ? error.message : String(error) });
     return {
       current: 0,
       max: limit.max,

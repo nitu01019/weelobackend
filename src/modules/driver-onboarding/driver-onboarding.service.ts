@@ -351,9 +351,8 @@ class DriverOnboardingService {
       logger.error('[DRIVER ONBOARD] Failed to resend OTP', { error });
     }
 
-    // Dev console
     if (config.isDevelopment) {
-      console.log(`\n🔄 RESENT OTP for driver ${maskForLogging(driverPhone, 2, 4)}: ${otp}\n`);
+      logger.debug('[DRIVER ONBOARD] OTP resent', { phoneLast4: driverPhone.slice(-4) });
     }
 
     return {

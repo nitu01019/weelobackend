@@ -9,6 +9,7 @@
  */
 
 import { Request, Response, NextFunction } from 'express';
+import jwt from 'jsonwebtoken';
 import { authService } from './auth.service';
 import { sendOtpSchema, verifyOtpSchema, refreshTokenSchema } from './auth.schema';
 import { validateSchema } from '../../shared/utils/validation.utils';
@@ -39,7 +40,7 @@ class AuthController {
     
     const data = validateSchema(verifyOtpSchema, req.body);
     
-    const result = await authService.verifyOtp(data.phone, data.otp, data.role || 'customer');
+    const result = await authService.verifyOtp(data.phone, data.otp, data.role || 'customer', data.deviceId || undefined);
     
     res.status(200).json(successResponse({
       user: result.user,
@@ -62,6 +63,7 @@ class AuthController {
     
     res.status(200).json(successResponse({
       accessToken: result.accessToken,
+      refreshToken: result.refreshToken,
       expiresIn: result.expiresIn
     }));
   });
@@ -71,9 +73,20 @@ class AuthController {
    */
   logout = asyncHandler(async (req: Request, res: Response, _next: NextFunction) => {
     const userId = req.userId!;
-    
-    await authService.logout(userId);
-    
+
+    // Extract JTI and exp from the access token for blacklisting
+    const authHeader = req.headers.authorization;
+    let jti: string | undefined;
+    let exp: number | undefined;
+    if (authHeader?.startsWith('Bearer ')) {
+      const token = authHeader.substring(7);
+      const decoded = jwt.decode(token) as { jti?: string; exp?: number } | null;
+      jti = decoded?.jti;
+      exp = decoded?.exp;
+    }
+
+    await authService.logout(userId, jti, exp);
+
     res.status(200).json(successResponse({
       message: 'Logged out successfully'
     }));

@@ -24,6 +24,7 @@ import { authMiddleware, roleGuard } from '../../shared/middleware/auth.middlewa
 import { logger } from '../../shared/services/logger.service';
 import { redisService } from '../../shared/services/redis.service';
 import { transporterRateLimit } from '../../shared/middleware/transporter-rate-limit.middleware';
+import { prismaClient } from '../../shared/database/prisma.service';
 
 const router = Router();
 
@@ -60,6 +61,28 @@ function mapReleaseErrorToHttpStatus(code?: string): number {
       return 500;
     default:
       return 400;
+  }
+}
+
+async function isOrderParticipant(orderId: string, userId: string, role: string): Promise<boolean> {
+  try {
+    const order = await prismaClient.order.findUnique({
+      where: { id: orderId },
+      select: { customerId: true },
+    });
+    if (!order) return false;
+    if (order.customerId === userId) return true;
+    if (role === 'transporter') {
+      const truckRequest = await prismaClient.truckRequest.findFirst({
+        where: { orderId, assignedTransporterId: userId },
+        select: { id: true },
+      });
+      return !!truckRequest;
+    }
+    return false;
+  } catch (err) {
+    logger.warn('[isOrderParticipant] Check failed, denying access', { orderId, userId, error: err instanceof Error ? err.message : String(err) });
+    return false;
   }
 }
 
@@ -156,37 +179,14 @@ router.post(
   '/confirm',
   authMiddleware,
   roleGuard(['transporter']),
-  async (req: Request, res: Response, next: NextFunction) => {
-    try {
-      const transporterId = req.user!.userId;
-      const { holdId } = req.body;
-      
-      if (!holdId) {
-        return res.status(400).json({
-          success: false,
-          error: { code: 'VALIDATION_ERROR', message: 'holdId is required' }
-        });
+  async (_req: Request, res: Response, _next: NextFunction) => {
+    res.status(410).json({
+      success: false,
+      error: {
+        code: 'DEPRECATED',
+        message: 'This endpoint is deprecated. Use POST /truck-hold/confirm-with-assignments instead'
       }
-      
-      logger.info(`[TruckHoldRoutes] Simple confirm request: ${holdId} by ${transporterId}`);
-      
-      const result = await truckHoldService.confirmHold(holdId, transporterId);
-      
-      if (result.success) {
-        res.json({
-          success: true,
-          data: { assignedTrucks: result.assignedTrucks },
-          message: result.message
-        });
-      } else {
-        res.status(400).json({
-          success: false,
-          error: { code: 'CONFIRM_FAILED', message: result.message }
-        });
-      }
-    } catch (error) {
-      next(error);
-    }
+    });
   }
 );
 
@@ -423,7 +423,12 @@ router.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { orderId } = req.params;
-      
+
+      const authorized = await isOrderParticipant(orderId, req.user!.userId, req.user!.role);
+      if (!authorized) {
+        return res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Not authorized to view this order' } });
+      }
+
       const availability = await truckHoldService.getOrderAvailability(orderId);
       
       if (!availability) {
@@ -522,6 +527,11 @@ router.post(
         });
       }
 
+      const holdState = await flexHoldService.getFlexHoldState(holdId);
+      if (!holdState || holdState.transporterId !== req.user!.userId) {
+        return res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Not authorized to extend this hold' } });
+      }
+
       const result = await flexHoldService.extendFlexHold({
         holdId,
         reason: reason || 'Driver assignment',
@@ -576,6 +586,13 @@ router.get(
         });
       }
 
+      if (state.transporterId !== req.user!.userId) {
+        return res.status(403).json({
+          success: false,
+          error: { code: 'FORBIDDEN', message: 'Not authorized to view this hold' }
+        });
+      }
+
       res.json({
         success: true,
         data: state
@@ -614,7 +631,7 @@ router.post(
         });
       }
 
-      const result = await confirmedHoldService.initializeConfirmedHold(holdId, assignments);
+      const result = await confirmedHoldService.initializeConfirmedHold(holdId, transporterId, assignments);
 
       if (result.success) {
         res.json({
@@ -660,6 +677,13 @@ router.get(
         });
       }
 
+      if (state.transporterId !== req.user!.userId) {
+        return res.status(403).json({
+          success: false,
+          error: { code: 'FORBIDDEN', message: 'Not authorized to view this hold' }
+        });
+      }
+
       res.json({
         success: true,
         data: state
@@ -687,17 +711,32 @@ router.put(
       const driverId = req.user!.userId;
       const { assignmentId } = req.params;
 
-      const result = await confirmedHoldService.handleDriverAcceptance(assignmentId);
+      const result = await confirmedHoldService.handleDriverAcceptance(assignmentId, driverId);
 
-      res.status(result.success ? 200 : 400).json({
-        success: result.success,
-        data: {
-          accepted: result.accepted,
-          declined: result.declined,
-          timeout: result.timeout
-        },
-        message: result.message
-      });
+      if (result.success) {
+        res.status(200).json({
+          success: true,
+          data: {
+            accepted: result.accepted,
+            declined: result.declined,
+            timeout: result.timeout
+          },
+          message: result.message
+        });
+      } else {
+        res.status(400).json({
+          success: false,
+          error: {
+            code: result.errorCode || 'DRIVER_ACTION_FAILED',
+            message: result.message
+          },
+          data: {
+            accepted: result.accepted,
+            declined: result.declined,
+            timeout: result.timeout
+          }
+        });
+      }
     } catch (error) {
       next(error);
     }
@@ -723,17 +762,32 @@ router.put(
       const { assignmentId } = req.params;
       const { reason } = req.body;
 
-      const result = await confirmedHoldService.handleDriverDecline(assignmentId, reason);
+      const result = await confirmedHoldService.handleDriverDecline(assignmentId, driverId, reason);
 
-      res.status(result.success ? 200 : 400).json({
-        success: result.success,
-        data: {
-          accepted: result.accepted,
-          declined: result.declined,
-          timeout: result.timeout
-        },
-        message: result.message
-      });
+      if (result.success) {
+        res.status(200).json({
+          success: true,
+          data: {
+            accepted: result.accepted,
+            declined: result.declined,
+            timeout: result.timeout
+          },
+          message: result.message
+        });
+      } else {
+        res.status(400).json({
+          success: false,
+          error: {
+            code: result.errorCode || 'DRIVER_ACTION_FAILED',
+            message: result.message
+          },
+          data: {
+            accepted: result.accepted,
+            declined: result.declined,
+            timeout: result.timeout
+          }
+        });
+      }
     } catch (error) {
       next(error);
     }
@@ -754,6 +808,8 @@ router.put(
  */
 router.post(
   '/order-timeout/initialize',
+  authMiddleware,
+  roleGuard(['transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { orderId, totalTrucks } = req.body;
@@ -762,6 +818,13 @@ router.post(
         return res.status(400).json({
           success: false,
           error: { code: 'VALIDATION_ERROR', message: 'orderId and totalTrucks are required' }
+        });
+      }
+
+      if (!(await isOrderParticipant(orderId, req.user!.userId, req.user!.role))) {
+        return res.status(403).json({
+          success: false,
+          error: { code: 'FORBIDDEN', message: 'Not authorized for this order' }
         });
       }
 
@@ -796,6 +859,8 @@ router.post(
  */
 router.post(
   '/order-timeout/extend',
+  authMiddleware,
+  roleGuard(['transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { orderId, driverId, driverName, assignmentId, truckRequestId, isFirstDriver, reason } = req.body;
@@ -804,6 +869,13 @@ router.post(
         return res.status(400).json({
           success: false,
           error: { code: 'VALIDATION_ERROR', message: 'orderId, driverId, driverName, and assignmentId are required' }
+        });
+      }
+
+      if (!(await isOrderParticipant(orderId, req.user!.userId, req.user!.role))) {
+        return res.status(403).json({
+          success: false,
+          error: { code: 'FORBIDDEN', message: 'Not authorized for this order' }
         });
       }
 
@@ -849,6 +921,13 @@ router.get(
     try {
       const { orderId } = req.params;
 
+      if (!(await isOrderParticipant(orderId, req.user!.userId, req.user!.role))) {
+        return res.status(403).json({
+          success: false,
+          error: { code: 'FORBIDDEN', message: 'Not authorized for this order' }
+        });
+      }
+
       const state = await smartTimeoutService.getOrderTimeout(orderId);
 
       if (!state) {
@@ -883,6 +962,13 @@ router.get(
     try {
       const { orderId } = req.params;
 
+      if (!(await isOrderParticipant(orderId, req.user!.userId, req.user!.role))) {
+        return res.status(403).json({
+          success: false,
+          error: { code: 'FORBIDDEN', message: 'Not authorized for this order' }
+        });
+      }
+
       const progress = await smartTimeoutService.getOrderProgress(orderId);
 
       if (!progress) {
@@ -916,6 +1002,13 @@ router.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { orderId } = req.params;
+
+      if (!(await isOrderParticipant(orderId, req.user!.userId, req.user!.role))) {
+        return res.status(403).json({
+          success: false,
+          error: { code: 'FORBIDDEN', message: 'Not authorized for this order' }
+        });
+      }
 
       const assignments = await progressTrackingService.getOrderAssignments(orderId);
 

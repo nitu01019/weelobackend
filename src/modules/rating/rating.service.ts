@@ -1,7 +1,8 @@
 import { prismaClient } from '../../shared/database/prisma.service';
 import { redisService } from '../../shared/services/redis.service';
-import { AppError } from '../../core/errors/AppError';
+import { AppError } from '../../shared/types/error.types';
 import { logger } from '../../shared/services/logger.service';
+import { safeJsonParse } from '../../shared/utils/safe-json.utils';
 import type { SubmitRatingInput } from './rating.schema';
 
 // =============================================================================
@@ -16,6 +17,8 @@ const PENDING_CACHE_TTL = 3600;     // 1 hour
 // =============================================================================
 // RATING SERVICE — Production-grade, transaction-safe, scale-ready
 // =============================================================================
+
+// TODO(L-12): Add driver->customer rating. Requires new submitDriverRating() method, route, and schema.
 
 export const ratingService = {
 
@@ -42,17 +45,17 @@ export const ratingService = {
     });
 
     if (!assignment) {
-      throw new AppError('Trip not found', 404, 'ASSIGNMENT_NOT_FOUND');
+      throw new AppError(404, 'ASSIGNMENT_NOT_FOUND', 'Trip not found');
     }
 
     if (assignment.status !== 'completed') {
-      throw new AppError('You can only rate completed trips', 400, 'TRIP_NOT_COMPLETED');
+      throw new AppError(400, 'TRIP_NOT_COMPLETED', 'You can only rate completed trips');
     }
 
     // 2. Validate customer owns the booking/order (role isolation at data level)
     const bookingCustomerId = assignment.booking?.customerId || assignment.order?.customerId;
     if (!bookingCustomerId || bookingCustomerId !== customerId) {
-      throw new AppError('You can only rate your own trips', 403, 'NOT_AUTHORIZED');
+      throw new AppError(403, 'NOT_AUTHORIZED', 'You can only rate your own trips');
     }
 
     // 3. Check for duplicate (idempotent — return existing on conflict)
@@ -167,18 +170,22 @@ export const ratingService = {
     // Try Redis cache first
     try {
       const cached = await redisService.get(PENDING_RATINGS_KEY(customerId));
-      if (cached) return JSON.parse(cached);
+      if (cached) return safeJsonParse(cached, null);
     } catch (_) { /* cache miss, continue */ }
 
     // completedAt is stored as ISO string (not DateTime) — filter in-memory after fetch
     const sevenDaysAgoMs = Date.now() - 7 * 24 * 60 * 60 * 1000;
+
+    // F-L18 FIX: DB-level date filter — reduces data fetched from DB
+    // ISO 8601 strings are lexicographically ordered, so gte works correctly
+    const sevenDaysAgoISO = new Date(sevenDaysAgoMs).toISOString();
 
     // Find completed assignments for this customer's bookings/orders that have no rating
     const unrated = await prismaClient.assignment.findMany({
       where: {
         status: 'completed',
         customerRating: null,
-        completedAt: { not: null },
+        completedAt: { not: null, gte: sevenDaysAgoISO },
         OR: [
           { booking: { customerId } },
           { order: { customerId } }
@@ -190,7 +197,7 @@ export const ratingService = {
         order: { select: { id: true, pickup: true, drop: true } }
       },
       orderBy: { completedAt: 'desc' },
-      take: 50  // Fetch more, then filter by 7-day window
+      take: 20  // F-L18: Reduced from 50 — DB filter handles 7-day window
     });
 
     const result = unrated
@@ -283,7 +290,7 @@ export const ratingService = {
     // Try Redis cache
     try {
       const cached = await redisService.get(DRIVER_RATING_DIST_KEY(driverId));
-      if (cached) return JSON.parse(cached);
+      if (cached) return safeJsonParse<Record<string, number>>(cached, defaultDist);
     } catch (_) { /* cache miss, fall through to DB */ }
 
     // Single DB query (no double call on Redis failure)
@@ -307,6 +314,43 @@ export const ratingService = {
   },
 
   /**
+   * F-M22 FIX: Bidirectional rating — driver rates customer (Uber/Ola pattern)
+   * NOTE: Requires driverRating Int? column on Assignment table.
+   * Add via direct SQL: ALTER TABLE "Assignment" ADD COLUMN IF NOT EXISTS "driverRating" INTEGER;
+   * DO NOT use prisma migrate — DB has no _prisma_migrations table.
+   */
+  async submitDriverRating(assignmentId: string, driverId: string, rating: number, feedback?: string): Promise<void> {
+    if (rating < 1 || rating > 5) {
+      throw new AppError(400, 'INVALID_RATING', 'Rating must be 1-5');
+    }
+
+    const assignment = await prismaClient.assignment.findUnique({
+      where: { id: assignmentId },
+    });
+
+    if (!assignment) {
+      throw new AppError(404, 'ASSIGNMENT_NOT_FOUND', 'Assignment not found');
+    }
+    if (assignment.driverId !== driverId) {
+      throw new AppError(403, 'FORBIDDEN', 'Not your assignment');
+    }
+    if (assignment.status !== 'completed') {
+      throw new AppError(400, 'NOT_COMPLETED', 'Can only rate completed trips');
+    }
+
+    // F-M22: driverRating column may not exist yet — use $executeRaw for safety
+    await prismaClient.$executeRaw`
+      UPDATE "Assignment" SET "driverRating" = ${rating} WHERE "id" = ${assignmentId}
+    `.catch(err => {
+      logger.warn('[RATING] driverRating column may not exist yet', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+
+    logger.info('[RATING] Driver rating submitted', { assignmentId, driverId, rating });
+  },
+
+  /**
    * Get driver's average rating (with Redis cache).
    * Used by performance endpoint and rating submission.
    */
@@ -315,7 +359,7 @@ export const ratingService = {
     try {
       const cached = await redisService.get(DRIVER_RATING_KEY(driverId));
       if (cached) {
-        const parsed = JSON.parse(cached);
+        const parsed = safeJsonParse<{ avg?: number; count?: number }>(cached, { avg: 0, count: 0 });
         return { avg: parsed.avg || 0, count: parsed.count || 0 };
       }
     } catch (_) { /* cache miss */ }

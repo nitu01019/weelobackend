@@ -42,8 +42,17 @@ import { logger } from './logger.service';
 // CONSTANTS
 // =============================================================================
 
-/** H3 resolution — configurable via H3_RESOLUTION env var (default 8: ~461m edge).
- *  Use 9 for dense urban (Mumbai/Delhi), 7 for suburban/rural. */
+/**
+ * H3 resolution 8 (~461m edge length, ~0.74 km² per cell).
+ * Good default for inter-city truck logistics in India.
+ *
+ * Configurable via H3_RESOLUTION env var (clamped to valid range 0-15).
+ *
+ * FUTURE: Consider adaptive resolution per city:
+ *   - Resolution 7 (~5.16 km²) for suburban/rural areas
+ *   - Resolution 9 (~0.105 km²) for dense urban areas (Mumbai, Delhi)
+ *   - Could be driven by a city_config table or geofence polygon
+ */
 const H3_RESOLUTION = Math.min(15, Math.max(0,
     parseInt(process.env.H3_RESOLUTION || '8', 10) || 8
 ));
@@ -55,8 +64,13 @@ const H3_CELL_KEY_PREFIX = `h3:${H3_RESOLUTION}`;
 const H3_POS_PREFIX = 'h3:pos';
 
 /** TTL for position keys — generous buffer for low-network transporters.
- *  90s = 36× REST heartbeat interval (2.5s), survives 2G network delays. */
+ *  90s = 36x REST heartbeat interval (2.5s), survives 2G network delays. */
 const H3_POS_TTL_SECONDS = 90;
+
+/** Fix D5/F-3-4: Cell TTL aligned with position TTL + small buffer for clock skew.
+ *  Previously was 2x (180s) which left a 90s ghost window where cells could
+ *  contain stale member references. Now 100s = only 10s ghost window. */
+const H3_CELL_TTL_SECONDS = H3_POS_TTL_SECONDS + 10;
 
 /** Feature flag — when false, index is shadow-built but not used for dispatch */
 export const FF_H3_INDEX_ENABLED = process.env.FF_H3_INDEX_ENABLED === 'true';
@@ -66,6 +80,12 @@ export const FF_H3_INDEX_ENABLED = process.env.FF_H3_INDEX_ENABLED === 'true';
 // =============================================================================
 
 function cellKey(cellId: string, vehicleKey: string): string {
+    // Fix D6/F-3-7: Dev-mode guard — colons in components would corrupt the key structure
+    if (process.env.NODE_ENV !== 'production') {
+        if (cellId.includes(':') || vehicleKey.includes(':')) {
+            logger.warn(`[H3Index] cellKey components must not contain colons`, { cellId, vehicleKey });
+        }
+    }
     return `${H3_CELL_KEY_PREFIX}:${cellId}:${vehicleKey}`;
 }
 
@@ -140,15 +160,11 @@ class H3GeoIndexService {
             const cell = this.latLngToCell(lat, lng);
             const key = cellKey(cell, vehicleKey);
 
-            // Add to cell set + store position for reverse lookup
+            // H-P3 FIX: Atomic SADD+EXPIRE via Lua script to prevent orphaned sets without TTL
             await Promise.all([
-                redisService.sAdd(key, transporterId),
+                redisService.sAddWithExpire(key, H3_CELL_TTL_SECONDS, transporterId),
                 redisService.set(posKey(transporterId), `${cell}:${vehicleKey}`, H3_POS_TTL_SECONDS)
             ]);
-
-            // Set TTL on cell key to auto-clean if all members go offline
-            // Use longer TTL — individual members are cleaned by removeTransporter
-            await redisService.expire(key, H3_POS_TTL_SECONDS * 2).catch(() => { });
 
         } catch (error: any) {
             // Non-critical — GEORADIUS path still works
@@ -171,11 +187,11 @@ class H3GeoIndexService {
         try {
             const cell = this.latLngToCell(lat, lng);
 
+            // H-P3 FIX: Atomic SADD+EXPIRE via Lua script for each vehicle key
             const ops: Promise<any>[] = [];
             for (const vk of vehicleKeys) {
                 const key = cellKey(cell, vk);
-                ops.push(redisService.sAdd(key, transporterId));
-                ops.push(redisService.expire(key, H3_POS_TTL_SECONDS * 2).catch(() => { }));
+                ops.push(redisService.sAddWithExpire(key, H3_CELL_TTL_SECONDS, transporterId));
             }
             // Store position with primary vehicle key for reverse lookup
             ops.push(
@@ -252,7 +268,7 @@ class H3GeoIndexService {
                     ];
                     for (const vk of vehicleKeys) {
                         refreshOps.push(
-                            redisService.expire(cellKey(newCell, vk), H3_POS_TTL_SECONDS * 2).catch(() => { })
+                            redisService.expire(cellKey(newCell, vk), H3_CELL_TTL_SECONDS).catch(() => { })
                         );
                     }
                     await Promise.all(refreshOps);
@@ -322,8 +338,19 @@ class H3GeoIndexService {
             let members: string[];
             if (keys.length === 1) {
                 members = await redisService.sMembers(keys[0]).catch(() => []);
-            } else {
+            } else if (keys.length <= 500) {
                 members = await redisService.sUnion(...keys).catch(() => []);
+            } else {
+                // FIX F-3-12: Chunk SUNION to prevent Redis event loop blocking
+                const CHUNK_SIZE = 500;
+                const chunks: string[][] = [];
+                for (let i = 0; i < keys.length; i += CHUNK_SIZE) {
+                    chunks.push(keys.slice(i, i + CHUNK_SIZE));
+                }
+                const chunkResults = await Promise.all(
+                    chunks.map(chunk => redisService.sUnion(...chunk).catch(() => [] as string[]))
+                );
+                members = [...new Set(chunkResults.flat())];
             }
 
             // Filter out already-notified transporters

@@ -33,6 +33,9 @@ import { Request, Response } from 'express';
 import { config } from '../../config/environment';
 import { redisService } from '../services/redis.service';
 import { logger } from '../services/logger.service';
+import { FLAGS, isEnabled } from '../config/feature-flags';
+import { isInCidrList } from '../utils/net.utils';
+import { metrics } from '../monitoring/metrics.service';
 
 // =============================================================================
 // REDIS RATE LIMIT STORE (Distributed across all ECS instances)
@@ -124,11 +127,10 @@ class RedisRateLimitStore {
     const windowSeconds = Math.ceil(this.windowMs / 1000);
 
     try {
-      const totalHits = await redisService.incrementWithTTL(redisKey, windowSeconds);
-      const ttl = await redisService.ttl(redisKey);
+      const { count, ttl } = await redisService.incrementWithTTLAndRemaining(redisKey, windowSeconds);
       const resetTime = new Date(Date.now() + (ttl > 0 ? ttl * 1000 : this.windowMs));
 
-      return { totalHits, resetTime };
+      return { totalHits: count, resetTime };
     } catch (error: any) {
       // Phase 10: FAIL-CLOSED with in-memory backup (Netflix pattern)
       // - NOT throw (causes 500 errors for ALL users)
@@ -231,16 +233,104 @@ function throttleHandler(code: string, message: string, fallbackWindowMs: number
 }
 
 // =============================================================================
+// F-A-11: LAYERED KEY GENERATOR
+// =============================================================================
+//
+// Replaces the legacy (userId || req.ip) composite with an explicit prefix
+// scheme. Provides correct bucket isolation:
+//
+//   u:<userId>           authenticated — bucket is user-unique (IP-agnostic)
+//   d:<deviceId>         unauthenticated but known device — per-device bucket
+//   ip:<ip>              IP originates inside our trusted proxy CIDRs
+//   spoof-slow:<ip>      IP originates outside our trust zone — slow bucket
+//
+// The trusted-proxy CIDR check leans on F-A-08 (isInCidrList +
+// config.trustedProxyCidrs). Device-id matches /^[a-zA-Z0-9-_]{8,64}$/ so
+// untrusted body/header content cannot be used as a pseudo-random key.
+//
+// When FF_LAYERED_RATE_LIMIT_KEY is OFF the legacy behavior is preserved:
+//   - userId → "user:<id>", otherwise req.ip — a single IP-wide bucket.
+//
+// Exported for unit testing so the key-selection rule can be asserted
+// deterministically without spinning up Express.
+// =============================================================================
+
+const DEVICE_ID_REGEX = /^[a-zA-Z0-9-_]{8,64}$/;
+
+function incrementKeySource(source: 'user' | 'dev' | 'ip' | 'spoof-slow' | 'legacy'): void {
+  try {
+    metrics.incrementCounter('rate_limit_key_source_total', { source });
+  } catch {
+    // Never fail the request on metric write.
+  }
+}
+
+export function layeredKeyGenerator(req: Request): string {
+  // Legacy (flag OFF): preserve the old (userId || req.ip) shape.
+  if (!isEnabled(FLAGS.LAYERED_RATE_LIMIT_KEY)) {
+    const legacyUserId = (req as any).user?.userId ?? (req as any).user?.id;
+    const legacyIp = req.ip ?? 'unknown';
+    incrementKeySource('legacy');
+    return legacyUserId ? `user:${legacyUserId}` : legacyIp;
+  }
+
+  // Layered (flag ON).
+  const userId = (req as any).user?.id ?? (req as any).user?.userId;
+  if (userId) {
+    incrementKeySource('user');
+    return `u:${userId}`;
+  }
+
+  const rawDeviceId = req.headers?.['x-device-id'];
+  const deviceId = Array.isArray(rawDeviceId) ? rawDeviceId[0] : rawDeviceId;
+  if (typeof deviceId === 'string' && DEVICE_ID_REGEX.test(deviceId)) {
+    incrementKeySource('dev');
+    return `d:${deviceId}`;
+  }
+
+  const ip = req.ip ?? 'unknown';
+  if (isInCidrList(ip, config.trustedProxyCidrs)) {
+    incrementKeySource('ip');
+    return `ip:${ip}`;
+  }
+
+  incrementKeySource('spoof-slow');
+  return `spoof-slow:${ip}`;
+}
+
+// =============================================================================
+// ROLE-BASED RATE LIMITS
+// =============================================================================
+// Different roles have different usage patterns:
+//   - driver: GPS pings every 500ms + status updates → moderate limit
+//   - transporter: fleet management, multiple drivers → higher limit
+//   - customer: booking + tracking → standard limit
+//   - admin: dashboard + bulk ops → highest limit
+// Unauthenticated requests fall back to config.rateLimit.maxRequests.
+// =============================================================================
+const ROLE_RATE_LIMITS: Record<string, number> = {
+  driver: 200,
+  transporter: 500,
+  customer: 300,
+  admin: 2000,
+};
+
+// =============================================================================
 // RATE LIMITERS
 // =============================================================================
 
 /**
  * Default rate limiter for all routes
- * 1000 requests per minute per IP (production-ready)
+ * Role-aware: authenticated users get role-specific limits,
+ * unauthenticated requests get config.rateLimit.maxRequests per IP.
  */
 export const rateLimiter = rateLimit({
   windowMs: config.rateLimit.windowMs,
-  max: config.rateLimit.maxRequests,
+  max: ((req: Request) => {
+    const role = (req as any).user?.role;
+    return ROLE_RATE_LIMITS[role] || config.rateLimit.maxRequests;
+  }) as any,
+  keyGenerator: (req: Request) => layeredKeyGenerator(req),
   handler: throttleHandler(
     'RATE_LIMIT_EXCEEDED',
     'Too many requests. Please try again later.',
@@ -331,6 +421,32 @@ export const otpRateLimiter = rateLimit({
 });
 
 /**
+ * Verify-OTP rate limiter - PHONE-BASED brute force protection
+ * 5 verification attempts per 10 minutes per phone+role
+ *
+ * WHY separate from authRateLimiter:
+ *   - authRateLimiter is IP-based — doesn't stop distributed attacks from many IPs
+ *   - This limiter keys by phone+role — 5 wrong guesses per phone = locked for 10 min
+ *   - Combined: IP limit + phone limit = defense in depth
+ *
+ * SECURITY: 6-digit OTP = 1M combinations. 5 attempts in 10 min = 0.0005% chance.
+ *   Even across 10-minute windows, brute force is infeasible within OTP's 5-min TTL.
+ */
+export const verifyOtpRateLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000, // 10 minutes
+  max: 5,
+  keyGenerator: (req: Request) => `verify:${req.body?.phone}:${req.body?.role || 'customer'}`,
+  handler: throttleHandler(
+    'TOO_MANY_ATTEMPTS',
+    'Too many verification attempts. Please try again later.',
+    10 * 60 * 1000
+  ),
+  standardHeaders: true,
+  legacyHeaders: false,
+  store: createStore(10 * 60 * 1000, 'verify-otp'),
+});
+
+/**
  * Profile update rate limiter
  * 30 requests per minute per user (allows rapid saves)
  */
@@ -339,7 +455,7 @@ export const profileRateLimiter = rateLimit({
   max: 30,
   keyGenerator: (req) => {
     // Rate limit by user ID for authenticated requests
-    return `profile:${(req as any).user?.userId || req.ip || 'unknown'}`;
+    return `profile:${req.user?.userId || req.ip || 'unknown'}`;
   },
   handler: throttleHandler(
     'PROFILE_RATE_LIMIT_EXCEEDED',
@@ -361,7 +477,7 @@ export const trackingRateLimiter = rateLimit({
   max: 120, // 2 per second
   keyGenerator: (req) => {
     // Rate limit by user ID for authenticated requests
-    return `tracking:${(req as any).user?.userId || req.ip || 'unknown'}`;
+    return `tracking:${req.user?.userId || req.ip || 'unknown'}`;
   },
   handler: throttleHandler(
     'TRACKING_RATE_LIMIT_EXCEEDED',

@@ -26,7 +26,7 @@
  * - Rate limiting enforced at route level
  * - Access tokens signed with JWT_SECRET
  * - Refresh tokens signed with JWT_REFRESH_SECRET (separate key!)
- * - OTPs logged to console ONLY in development mode
+ * - Dev details logged via logger.debug (never to console)
  * 
  * SCALABILITY:
  * - Redis-powered OTP storage (same as customer auth)
@@ -34,12 +34,13 @@
  * - Horizontal scaling ready
  * 
  * FOR BACKEND DEVELOPERS:
- * - To test driver login in dev: Check server console for OTP
+ * - To test driver login in dev: Check logger debug output for OTP delivery status
  * - In production: OTP is sent to transporter via SMS
  * - OTPs are stored in Redis with key pattern: driver-otp:{driverPhone}
  * =============================================================================
  */
 
+import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
 import { config } from '../../config/environment';
 import { logger } from '../../shared/services/logger.service';
@@ -48,6 +49,7 @@ import { db, UserRecord } from '../../shared/database/db';
 import { generateSecureOTP, maskForLogging } from '../../shared/utils/crypto.utils';
 import { smsService } from '../auth/sms.service';
 import { otpChallengeService } from '../auth/otp-challenge.service';
+import { redisService } from '../../shared/services/redis.service';
 
 // =============================================================================
 // REDIS KEY PATTERNS (consistent with auth.service.ts)
@@ -143,7 +145,32 @@ class DriverAuthService {
       arePhonesSame: driverPhone === transporter.phone
     });
 
-    // 3. Generate cryptographically secure OTP
+    // 3. Per-transporter SMS rate limit (max 20 OTPs per hour)
+    const smsRateKey = `sms_rate:transporter:${transporter.id}`;
+    try {
+      const count = await redisService.incr(smsRateKey);
+      if (count === 1) {
+        await redisService.expire(smsRateKey, 3600);
+      }
+      if (count > 20) {
+        logger.warn('[DRIVER AUTH] Transporter SMS rate limit exceeded', {
+          transporterId: transporter.id,
+          count
+        });
+        throw new AppError(
+          429,
+          'SMS_RATE_LIMIT_EXCEEDED',
+          'Too many OTP requests for this transporter. Please try again later.'
+        );
+      }
+    } catch (err: unknown) {
+      if (err instanceof AppError) throw err;
+      logger.warn('[DRIVER AUTH] SMS rate limit check failed, proceeding', {
+        error: err instanceof Error ? err.message : String(err)
+      });
+    }
+
+    // 4. Generate cryptographically secure OTP
     const otp = generateSecureOTP(config.otp.length);
 
     // 4. Store OTP challenge (Redis + PostgreSQL backup, shared OTP core)
@@ -289,7 +316,7 @@ class DriverAuthService {
 
     // 7. Generate JWT tokens
     const accessToken = this.generateAccessToken(driver);
-    const refreshToken = this.generateRefreshToken(driver);
+    const refreshToken = await this.generateRefreshToken(driver);
 
     // Log successful authentication (safe for production)
     logger.info('[DRIVER AUTH] Driver authenticated successfully', { 
@@ -300,16 +327,13 @@ class DriverAuthService {
 
     // Development only: Show login details
     if (config.isDevelopment) {
-      console.log('\n');
-      console.log('╔══════════════════════════════════════════════════════════════╗');
-      console.log('║                ✅ DRIVER LOGIN SUCCESSFUL                    ║');
-      console.log('╠══════════════════════════════════════════════════════════════╣');
-      console.log(`║  Driver ID:   ${driver.id.substring(0, 36).padEnd(46)}║`);
-      console.log(`║  Driver:      ${(driver.name || 'Driver').padEnd(46)}║`);
-      console.log(`║  Phone:       ${maskForLogging(driverPhone, 2, 4).padEnd(46)}║`);
-      console.log(`║  Transporter: ${(transporter.name || transporter.businessName || 'Transporter').padEnd(46)}║`);
-      console.log('╚══════════════════════════════════════════════════════════════╝');
-      console.log('\n');
+      logger.debug('Driver login successful (dev)', {
+        driverId: driver.id,
+        driverName: driver.name || 'Driver',
+        phoneLast4: driverPhone.slice(-4),
+        transporterName: transporter.name || transporter.businessName || 'Transporter',
+        transporterId: transporter.id,
+      });
     }
 
     // 8. Return tokens and driver data
@@ -377,6 +401,7 @@ class DriverAuthService {
         phone: driver.phone,
         role: 'driver',
         transporterId: driver.transporterId,
+        jti: crypto.randomUUID()
       },
       config.jwt.secret,
       { expiresIn: config.jwt.expiresIn } as jwt.SignOptions
@@ -390,8 +415,8 @@ class DriverAuthService {
    * This ensures that even if access token secret is compromised,
    * refresh tokens remain secure.
    */
-  private generateRefreshToken(driver: UserRecord): string {
-    return jwt.sign(
+  private async generateRefreshToken(driver: UserRecord): Promise<string> {
+    const token = jwt.sign(
       {
         userId: driver.id,
         type: 'refresh',
@@ -400,12 +425,42 @@ class DriverAuthService {
       config.jwt.refreshSecret,
       { expiresIn: config.jwt.refreshExpiresIn } as jwt.SignOptions
     );
+
+    // Store refresh token in Redis so POST /auth/refresh can find it
+    // MUST use same key pattern as auth.service.ts: refresh:{tokenHash}
+    const ttlSeconds = this.getExpirySeconds(config.jwt.refreshExpiresIn);
+    const expiresAt = new Date(Date.now() + ttlSeconds * 1000);
+    const tokenId = this.hashToken(token);
+
+    const entry = {
+      userId: driver.id,
+      expiresAt: expiresAt.toISOString(),
+    };
+
+    try {
+      await redisService.setJSON(`refresh:${tokenId}`, entry, ttlSeconds);
+      await redisService.sAdd(`user:tokens:${driver.id}`, tokenId);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error('Failed to store driver refresh token in Redis', { error: msg });
+      throw new AppError(500, 'TOKEN_STORAGE_FAILED', 'Failed to store authentication token');
+    }
+
+    return token;
+  }
+
+  /**
+   * Hash token to create a safe key for Redis storage.
+   * Must match auth.service.ts hashToken() exactly.
+   */
+  private hashToken(token: string): string {
+    return crypto.createHash('sha256').update(token).digest('hex').substring(0, 32);
   }
 
   /**
    * Parse JWT expiry duration string to seconds
    * Supports: d (days), h (hours), m (minutes), s (seconds)
-   * 
+   *
    * @param duration - Duration string like "7d", "24h", "30m", "60s"
    * @returns Number of seconds
    */

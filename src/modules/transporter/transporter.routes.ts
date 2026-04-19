@@ -19,6 +19,7 @@
  */
 
 import { Router, Request, Response, NextFunction } from 'express';
+import { z } from 'zod';
 import { authMiddleware, roleGuard } from '../../shared/middleware/auth.middleware';
 import { db } from '../../shared/database/db';
 import { logger } from '../../shared/services/logger.service';
@@ -86,7 +87,7 @@ router.put(
   authMiddleware,
   roleGuard(['transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
-    const user = (req as any).user;
+    const user = req.user;
     const transporterId = user.userId;
     const { isAvailable } = req.body;
 
@@ -448,7 +449,7 @@ router.get(
   roleGuard(['transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const user = (req as any).user;
+      const user = req.user;
       const transporterId = user.userId;
 
       const transporter = await prismaClient.user.findUnique({
@@ -518,7 +519,7 @@ router.post(
   roleGuard(['transporter', 'driver']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const user = (req as any).user;
+      const user = req.user;
       const { latitude, longitude, vehicleId, isOnTrip } = req.body;
 
       // Validate coordinates
@@ -679,7 +680,7 @@ router.delete(
   roleGuard(['transporter', 'driver']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const user = (req as any).user;
+      const user = req.user;
 
       // Remove from availability service
       availabilityService.setOffline(user.userId);
@@ -708,9 +709,10 @@ router.delete(
 router.get(
   '/availability/stats',
   authMiddleware,
+  roleGuard(['transporter', 'admin']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const stats = availabilityService.getStats();
+      const stats = await availabilityService.getStatsAsync();
 
       res.json({
         success: true,
@@ -738,7 +740,7 @@ router.get(
   roleGuard(['transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const user = (req as any).user;
+      const user = req.user;
 
       const transporter = await db.getUserById(user.userId);
 
@@ -789,20 +791,55 @@ router.get(
  * PUT /api/v1/transporter/profile
  * Update transporter profile
  */
+// H-S5 FIX: Zod schema for profile updates — prevents unbounded/malicious input
+const updateProfileSchema = z.object({
+  name: z.string().trim().min(2).max(100).optional(),
+  businessName: z.string().trim().min(2).max(200).optional(),
+  email: z.string().trim().email().max(254).optional(),
+  gstNumber: z.string().trim().toUpperCase()
+    .regex(/^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/, 'Invalid GST number format')
+    .optional()
+}).strict();
+
 router.put(
   '/profile',
   authMiddleware,
   roleGuard(['transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const user = (req as any).user;
-      const { name, businessName, email, gstNumber } = req.body;
+      const user = req.user;
 
-      const updates: any = {};
+      // H-S5 FIX: Validate input with Zod schema
+      const parseResult = updateProfileSchema.safeParse(req.body);
+      if (!parseResult.success) {
+        return res.status(400).json({
+          success: false,
+          error: {
+            code: 'VALIDATION_ERROR',
+            message: 'Invalid profile data',
+            details: parseResult.error.errors
+          }
+        });
+      }
+
+      const { name, businessName, email, gstNumber } = parseResult.data;
+
+      const updates: Record<string, string> = {};
       if (name) updates.name = name;
       if (businessName) updates.businessName = businessName;
       if (email) updates.email = email;
       if (gstNumber) updates.gstNumber = gstNumber;
+
+      // H-S5 FIX: Reject empty updates
+      if (Object.keys(updates).length === 0) {
+        return res.status(400).json({
+          success: false,
+          error: {
+            code: 'VALIDATION_ERROR',
+            message: 'No valid fields to update'
+          }
+        });
+      }
 
       await db.updateUser(user.userId, updates);
 
@@ -848,7 +885,7 @@ router.get(
   roleGuard(['transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const user = (req as any).user;
+      const user = req.user;
       const transporterId = user.userId;
 
       // =====================================================================
@@ -957,7 +994,7 @@ router.get(
   roleGuard(['transporter']),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const user = (req as any).user;
+      const user = req.user;
       const transporterId: string = user.userId;
 
       // ─── Rate limit: max 1 call per 3s per transporter ─────────────────

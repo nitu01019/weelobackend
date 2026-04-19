@@ -1,0 +1,57 @@
+-- =============================================================================
+-- M-002 — F-A-54 customer TOCTOU: unique-active-order guard (MEDIUM RISK)
+-- =============================================================================
+--
+-- Purpose: enforce "one active Order per customer" at the database layer via
+-- a partial unique index. The F-A-54 application-level check is racy under
+-- concurrent requests — two parallel POST /order calls can both pass the
+-- existence probe and then both insert. This partial unique index turns the
+-- second insert into a constraint violation, closing the TOCTOU window.
+--
+-- RISK: MEDIUM (SCHEMA-ADD with data pre-check).
+--   - CREATE UNIQUE INDEX CONCURRENTLY fails if duplicates exist. If even
+--     one customer already has > 1 active Order row, the CREATE aborts and
+--     the index is marked INVALID.
+--   - MUST run the pre-check query below BEFORE executing CREATE. If the
+--     pre-check returns any rows, product must remediate first (decide:
+--     UPDATE ... SET status='cancelled' for all but the newest, OR merge,
+--     OR manual triage) — do not blindly delete.
+--
+-- PRE-CODE SAFE once the pre-check is clean: existing code continues to work;
+-- the F-A-54 P4 consumer (the retry-on-constraint-violation handler) may
+-- land before or after this migration.
+--
+-- ---------------------------------------------------------------------------
+-- MANDATORY PRE-CHECK — RUN BEFORE `CREATE UNIQUE INDEX`:
+-- ---------------------------------------------------------------------------
+--   SELECT "customerId", count(*) AS active_count
+--   FROM "Order"
+--   WHERE status IN ('created','broadcasting','active','partially_filled')
+--   GROUP BY "customerId"
+--   HAVING count(*) > 1;
+--
+-- EXPECTED: 0 rows. If non-zero: STOP. Do not proceed to CREATE INDEX.
+-- Product/ops decides remediation (e.g. `UPDATE "Order" SET status='cancelled'
+-- WHERE id IN (...)` keeping newest per customer) before retry.
+-- ---------------------------------------------------------------------------
+--
+-- EXECUTION ORDER:
+--   1. Land this file in source control (PR merged — this PR).
+--   2. Operator runs pre-check query above; confirms 0 rows.
+--   3. Operator runs CREATE INDEX CONCURRENTLY on prod via direct psql,
+--      OUTSIDE any BEGIN/COMMIT block.
+--   4. Verify: `\d "Order"` shows `uniq_customer_active_order`, marked VALID.
+--      If INVALID: pre-check missed duplicates; investigate and rebuild.
+--   5. F-A-54 P4 consumer catches `unique_violation` (23505 on this index
+--      name) and returns a friendly 409 Conflict.
+--
+-- DO NOT EXECUTE AS PART OF THIS PR. Per CLAUDE.md, the production DB has no
+-- `_prisma_migrations` table — never use `prisma migrate deploy`.
+--
+-- ROLLBACK:
+--   DROP INDEX CONCURRENTLY IF EXISTS uniq_customer_active_order;
+-- =============================================================================
+
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS uniq_customer_active_order
+  ON "Order" ("customerId")
+  WHERE status IN ('created','broadcasting','active','partially_filled');

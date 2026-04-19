@@ -21,8 +21,9 @@
  */
 
 import { Router, Request, Response, NextFunction } from 'express';
-import { authMiddleware } from '../../shared/middleware/auth.middleware';
+import { authMiddleware, roleGuard } from '../../shared/middleware/auth.middleware';
 import { otpRateLimiter } from '../../shared/middleware/rate-limiter.middleware';
+import { validateRequest } from '../../shared/utils/validation.utils';
 import { redisService } from '../../shared/services/redis.service';
 import { queueService } from '../../shared/services/queue.service';
 import { customBookingService } from './customBooking.service';
@@ -47,7 +48,9 @@ const router = Router();
 router.post(
     '/',
     authMiddleware,
+    roleGuard(['customer']),
     otpRateLimiter,  // Rate limit: 10 req/min per IP
+    validateRequest(createCustomBookingSchema.shape.body),
     async (req: Request, res: Response, next: NextFunction) => {
         try {
             // === IDEMPOTENCY CHECK ===
@@ -126,6 +129,7 @@ router.post(
 router.get(
     '/',
     authMiddleware,
+    roleGuard(['customer']),
     async (req: Request, res: Response, next: NextFunction) => {
         try {
             const query = getRequestsQuerySchema.parse(req.query);
@@ -153,6 +157,7 @@ router.get(
 router.get(
     '/:id',
     authMiddleware,
+    roleGuard(['customer']),
     async (req: Request, res: Response, next: NextFunction) => {
         try {
             const request = await customBookingService.getRequestById(
@@ -178,6 +183,8 @@ router.get(
 router.post(
     '/:id/cancel',
     authMiddleware,
+    roleGuard(['customer']),
+    otpRateLimiter,  // F-L7 FIX: rate limit cancel endpoint (10 req/min per IP)
     async (req: Request, res: Response, next: NextFunction) => {
         try {
             const request = await customBookingService.cancelRequest(

@@ -16,7 +16,10 @@
  * FEATURE FLAGS:
  * - FF_H3_INDEX_ENABLED=true  → H3 primary, GEORADIUS fallback
  * - FF_H3_INDEX_ENABLED=false → GEORADIUS only (current production behavior)
- * - FF_H3_RADIUS_STEPS_7=true → 7-step expansion (5→10→15→30→60→100km)
+ *
+ * RADIUS STEPS (H-X2 unified):
+ * - 6-step expansion: 5→10→15→30→60→100 km
+ * - Total window: 80s (fits within 90% of 120s booking timeout)
  *
  * =============================================================================
  */
@@ -25,7 +28,10 @@ import { availabilityService } from '../../shared/services/availability.service'
 import { generateVehicleKey, generateVehicleKeyCandidates } from '../../shared/services/vehicle-key.service';
 import { h3GeoIndexService, FF_H3_INDEX_ENABLED } from '../../shared/services/h3-geo-index.service';
 import { distanceMatrixService } from '../../shared/services/distance-matrix.service';
+import { redisService } from '../../shared/services/redis.service';
 import { logger } from '../../shared/services/logger.service';
+// Fix F2: Import shared haversine instead of local duplicate
+import { haversineDistanceKm } from '../../shared/utils/geospatial.utils';
 
 export interface RadiusStep {
   radiusKm: number;
@@ -56,48 +62,25 @@ export interface CandidateTransporter {
 // PROGRESSIVE RADIUS STEPS
 // ============================================================================
 
-/** Original 3-step progression (default) — with H3 ring mappings */
-export const PROGRESSIVE_RADIUS_STEPS: RadiusStep[] = [
-  { radiusKm: 10, windowMs: 20_000, h3RingK: 15 },
-  { radiusKm: 25, windowMs: 20_000, h3RingK: 38 },
-  { radiusKm: 30, windowMs: 20_000, h3RingK: 44 }
-];
-
 /**
- * Extended 7-step progression with H3 ring mappings.
- * Feature-flagged: FF_H3_RADIUS_STEPS_7=true
- *
- * Ring K → approximate radius: ringK × 0.461km (H3 res 8 edge length)
+ * Fix H-X2: Unified 6-step progressive radius expansion with H3 ring mappings.
+ * Ring K -> approximate radius: ringK x 0.461km (H3 res 8 edge length)
+ * Total: 10+10+15+15+15+15 = 80s < 108s (passes booking.service startup validation)
  */
-const FF_H3_RADIUS_STEPS_7 = process.env.FF_H3_RADIUS_STEPS_7 === 'true';
-
-export const PROGRESSIVE_RADIUS_STEPS_7: RadiusStep[] = [
-  { radiusKm: 5, windowMs: 0, h3RingK: 8 },          // ~5 km, immediate
-  { radiusKm: 10, windowMs: 10_000, h3RingK: 15 },    // ~10 km at +10s
-  { radiusKm: 15, windowMs: 20_000, h3RingK: 22 },    // ~15 km
-  { radiusKm: 30, windowMs: 25_000, h3RingK: 44 },    // ~30 km
-  { radiusKm: 60, windowMs: 30_000, h3RingK: 88 },    // ~60 km
-  { radiusKm: 100, windowMs: 40_000, h3RingK: 150 }   // ~100 km
+export const PROGRESSIVE_RADIUS_STEPS: RadiusStep[] = [
+  { radiusKm: 5,   windowMs: 10_000, h3RingK: 8 },
+  { radiusKm: 10,  windowMs: 10_000, h3RingK: 15 },
+  { radiusKm: 15,  windowMs: 15_000, h3RingK: 22 },
+  { radiusKm: 30,  windowMs: 15_000, h3RingK: 44 },
+  { radiusKm: 60,  windowMs: 15_000, h3RingK: 88 },
+  { radiusKm: 100, windowMs: 15_000, h3RingK: 150 }
 ];
 
 function getActiveSteps(): RadiusStep[] {
-  return FF_H3_RADIUS_STEPS_7 ? PROGRESSIVE_RADIUS_STEPS_7 : PROGRESSIVE_RADIUS_STEPS;
+  return PROGRESSIVE_RADIUS_STEPS;
 }
 
-function toRadians(value: number): number {
-  return value * (Math.PI / 180);
-}
-
-function haversineDistanceKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
-  const earthRadiusKm = 6371;
-  const dLat = toRadians(lat2 - lat1);
-  const dLon = toRadians(lon2 - lon1);
-  const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(toRadians(lat1)) * Math.cos(toRadians(lat2)) *
-    Math.sin(dLon / 2) * Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return earthRadiusKm * c;
-}
+// Fix F2: Local haversineDistanceKm removed -- now imported from geospatial.utils
 
 class ProgressiveRadiusMatcher {
   getStep(stepIndex: number): RadiusStep | undefined {
@@ -253,10 +236,32 @@ class ProgressiveRadiusMatcher {
       // FIX #2: H3 lookup across ALL vehicleKey variants (parallel)
       const candidateArrays = await Promise.all(
         vehicleKeys.map(key =>
-          h3GeoIndexService.getCandidates(pickupLat, pickupLng, key, ringK, alreadyNotified)
+          h3GeoIndexService.getCandidatesNewRing(pickupLat, pickupLng, key, ringK, alreadyNotified)
         )
       );
-      const candidateIds = [...new Set(candidateArrays.flat())];
+      const rawCandidateIds = [...new Set(candidateArrays.flat())];
+
+      // FIX #3/#14: Filter out candidates whose h3:pos:{id} key has expired.
+      // H3 cell TTL (180s) > position key TTL (90s), creating a 90s ghost window.
+      // Query-time filtering catches stale entries before they reach dispatch.
+      // Industry pattern: Grab Pharos -- query-time staleness filtering.
+      let candidateIds: string[];
+      try {
+        const liveChecks = await Promise.all(
+          rawCandidateIds.map(async (id) => {
+            const posExists = await redisService.exists(`h3:pos:${id}`);
+            if (!posExists) {
+              logger.debug(`[H3] Stale candidate ${id} -- posKey expired, skipping`);
+            }
+            return { id, live: posExists };
+          })
+        );
+        candidateIds = liveChecks.filter(c => c.live).map(c => c.id);
+      } catch (err: any) {
+        // If existence check fails, use all candidates (safe fallback)
+        logger.warn(`[H3] posKey existence check failed, using all candidates: ${err.message}`);
+        candidateIds = rawCandidateIds;
+      }
 
       if (candidateIds.length === 0) {
         logger.info('[RadiusMatcher] H3 returned 0 candidates, falling back to GEORADIUS', {
@@ -268,9 +273,29 @@ class ProgressiveRadiusMatcher {
       // Load transporter:details Redis hash directly — NO GEORADIUS
       const detailsMap = await availabilityService.loadTransporterDetailsMap(candidateIds);
 
+      // =====================================================================
+      // FIX M-5: Double-check online status via the authoritative presence SET.
+      // The details hash can be stale by up to 90s. The online:transporters SET
+      // is updated on every heartbeat (4s interval).
+      // =====================================================================
+      const onlineFlags = await redisService.smIsMembers(
+        'online:transporters', candidateIds
+      ).catch((err) => {
+        logger.warn('[RadiusMatcher] smIsMembers failed, fail-open applied', {
+          error: err instanceof Error ? err.message : String(err),
+          candidateCount: candidateIds.length
+        });
+        return candidateIds.map(() => true);
+      });
+
       // Filter: online + not on trip + within radius
       const results: CandidateTransporter[] = [];
-      for (const transporterId of candidateIds) {
+      for (let i = 0; i < candidateIds.length; i++) {
+        const transporterId = candidateIds[i];
+
+        // M-5: Skip transporters not in the authoritative online set
+        if (!onlineFlags[i]) continue;
+
         const details = detailsMap.get(transporterId);
 
         // No details = TTL expired = transporter offline → skip
@@ -304,7 +329,9 @@ class ProgressiveRadiusMatcher {
         vehicleKeys,
         ringK,
         radiusKm,
-        h3Candidates: candidateIds.length,
+        h3RawCandidates: rawCandidateIds.length,
+        h3LiveCandidates: candidateIds.length,
+        h3StaleFiltered: rawCandidateIds.length - candidateIds.length,
         filteredOnline: results.length
       });
 

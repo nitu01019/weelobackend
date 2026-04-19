@@ -16,6 +16,15 @@ import { redisService } from '../services/redis.service';
 import { liveAvailabilityService } from '../services/live-availability.service';
 
 // =============================================================================
+// DB ERROR SANITIZER — Prevents leaking hostnames/credentials in logs
+// =============================================================================
+function sanitizeDbError(msg: string): string {
+  return msg
+    .replace(/(?:postgresql|mysql|mongodb):\/\/[^\s]+/gi, '[DB_URL_REDACTED]')
+    .replace(/\.rds\.amazonaws\.com\S*/g, '.[RDS_REDACTED]');
+}
+
+// =============================================================================
 // PAGINATION SAFETY — Prevents unbounded queries from exhausting memory
 // =============================================================================
 // All list queries use this as a default limit when no explicit limit is provided.
@@ -60,20 +69,22 @@ export interface UserRecord {
   phone: string;
   role: 'customer' | 'transporter' | 'driver';
   name: string;
-  email?: string | null;
-  profilePhoto?: string | null;
-  company?: string | null;
-  gstNumber?: string | null;
-  businessName?: string | null;
-  businessAddress?: string | null;
-  panNumber?: string | null;
-  transporterId?: string | null;
-  licenseNumber?: string | null;
-  licenseExpiry?: string | null;
-  aadharNumber?: string | null;
+  email?: string;
+  profilePhoto?: string;
+  company?: string;
+  gstNumber?: string;
+  businessName?: string;
+  businessAddress?: string;
+  panNumber?: string;
+  transporterId?: string;
+  licenseNumber?: string;
+  licenseExpiry?: string;
+  aadharNumber?: string;
   isVerified: boolean;
   isActive: boolean;
-  isAvailable?: boolean | null;
+  isAvailable?: boolean;
+  preferredLanguage?: string;
+  isProfileCompleted?: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -81,29 +92,29 @@ export interface UserRecord {
 export interface VehicleRecord {
   id: string;
   transporterId: string;
-  assignedDriverId?: string | null;
+  assignedDriverId?: string;
   vehicleNumber: string;
   vehicleType: string;
   vehicleSubtype: string;
-  vehicleKey?: string | null;
+  vehicleKey?: string;
   capacity: string;
-  model?: string | null;
-  year?: number | null;
+  model?: string;
+  year?: number;
   status: 'available' | 'on_hold' | 'in_transit' | 'maintenance' | 'inactive';
-  currentTripId?: string | null;
-  maintenanceReason?: string | null;
-  maintenanceEndDate?: string | null;
-  lastStatusChange?: string | null;
-  rcNumber?: string | null;
-  rcExpiry?: string | null;
-  insuranceNumber?: string | null;
-  insuranceExpiry?: string | null;
-  permitNumber?: string | null;
-  permitExpiry?: string | null;
-  fitnessExpiry?: string | null;
+  currentTripId?: string;
+  maintenanceReason?: string;
+  maintenanceEndDate?: string;
+  lastStatusChange?: string;
+  rcNumber?: string;
+  rcExpiry?: string;
+  insuranceNumber?: string;
+  insuranceExpiry?: string;
+  permitNumber?: string;
+  permitExpiry?: string;
+  fitnessExpiry?: string;
   vehiclePhotos?: string[];
-  rcPhoto?: string | null;
-  insurancePhoto?: string | null;
+  rcPhoto?: string;
+  insurancePhoto?: string;
   isVerified: boolean;
   isActive: boolean;
   createdAt: string;
@@ -124,11 +135,12 @@ export interface BookingRecord {
   distanceKm: number;
   pricePerTruck: number;
   totalAmount: number;
-  goodsType?: string | null;
-  weight?: string | null;
-  status: 'active' | 'partially_filled' | 'fully_filled' | 'in_progress' | 'completed' | 'cancelled' | 'expired';
+  goodsType?: string;
+  weight?: string;
+  status: 'created' | 'broadcasting' | 'active' | 'partially_filled' | 'fully_filled' | 'in_progress' | 'completed' | 'cancelled' | 'expired';
+  stateChangedAt?: Date | string;
   notifiedTransporters: string[];
-  scheduledAt?: string | null;
+  scheduledAt?: string;
   expiresAt: string;
   createdAt: string;
   updatedAt: string;
@@ -148,22 +160,23 @@ export interface OrderRecord {
   totalTrucks: number;
   trucksFilled: number;
   totalAmount: number;
-  goodsType?: string | null;
-  weight?: string | null;
-  cargoWeightKg?: number | null;
-  status: 'active' | 'partially_filled' | 'fully_filled' | 'in_progress' | 'completed' | 'cancelled' | 'expired';
+  goodsType?: string;
+  weight?: string;
+  cargoWeightKg?: number;
+  status: 'created' | 'broadcasting' | 'active' | 'partially_filled' | 'fully_filled' | 'in_progress' | 'completed' | 'cancelled' | 'expired';
+  stateChangedAt?: Date | string;
   dispatchState?: 'queued' | 'dispatching' | 'dispatched' | 'dispatch_failed';
   dispatchAttempts?: number;
   dispatchReasonCode?: string | null;
   onlineCandidatesCount?: number;
   notifiedCount?: number;
-  lastDispatchAt?: string | null;
-  loadingStartedAt?: string | null;
-  unloadingStartedAt?: string | null;
+  lastDispatchAt?: Date | string | null;
+  loadingStartedAt?: Date | string | null;
+  unloadingStartedAt?: Date | string | null;
   lifecycleEventVersion?: number;
-  cancelledAt?: string | null;
-  cancellationReason?: string | null;
-  scheduledAt?: string | null;
+  cancelledAt?: string;
+  cancellationReason?: string;
+  scheduledAt?: string;
   expiresAt: string;
   createdAt: string;
   updatedAt: string;
@@ -177,19 +190,19 @@ export interface TruckRequestRecord {
   vehicleSubtype: string;
   pricePerTruck: number;
   status: 'searching' | 'held' | 'assigned' | 'accepted' | 'in_progress' | 'completed' | 'cancelled' | 'expired';
-  heldBy?: string | null;
-  heldAt?: string | null;
-  assignedTo?: string | null;
-  assignedTransporterId?: string | null;
-  assignedTransporterName?: string | null;
-  assignedVehicleId?: string | null;
-  assignedVehicleNumber?: string | null;
-  assignedDriverId?: string | null;
-  assignedDriverName?: string | null;
-  assignedDriverPhone?: string | null;
-  tripId?: string | null;
+  heldBy?: string;
+  heldAt?: string;
+  assignedTo?: string;
+  assignedTransporterId?: string;
+  assignedTransporterName?: string;
+  assignedVehicleId?: string;
+  assignedVehicleNumber?: string;
+  assignedDriverId?: string;
+  assignedDriverName?: string;
+  assignedDriverPhone?: string;
+  tripId?: string;
   notifiedTransporters: string[];
-  assignedAt?: string | null;
+  assignedAt?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -197,8 +210,8 @@ export interface TruckRequestRecord {
 export interface AssignmentRecord {
   id: string;
   bookingId: string;
-  truckRequestId?: string | null;
-  orderId?: string | null;
+  truckRequestId?: string;
+  orderId?: string;
   transporterId: string;
   transporterName: string;
   vehicleId: string;
@@ -209,11 +222,11 @@ export interface AssignmentRecord {
   driverName: string;
   driverPhone: string;
   tripId: string;
-  status: 'pending' | 'driver_accepted' | 'driver_declined' | 'en_route_pickup' | 'at_pickup' | 'in_transit' | 'arrived_at_drop' | 'completed' | 'cancelled';
+  status: 'pending' | 'driver_accepted' | 'driver_declined' | 'en_route_pickup' | 'at_pickup' | 'in_transit' | 'arrived_at_drop' | 'completed' | 'partial_delivery' | 'cancelled';
   assignedAt: string;
-  driverAcceptedAt?: string | null;
-  startedAt?: string | null;
-  completedAt?: string | null;
+  driverAcceptedAt?: string;
+  startedAt?: string;
+  completedAt?: string;
 }
 
 export interface TrackingRecord {
@@ -258,7 +271,11 @@ export interface TrackingRecord {
 // =============================================================================
 
 const DB_POOL_CONFIG = {
-  connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT || '10', 10),
+  // Connection budget math (db.t4g.micro, 1GB RAM, max_connections ~87):
+  //   2 ECS tasks x 20 = 40 connections (46% utilization — safe headroom)
+  //   Reserve ~7 for RDS internals + admin = 80 available → 40/80 = 50%
+  // For scale-up (db.r6g.large): 4 tasks x 20 = 80 of ~1600 = 5% (excellent)
+  connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT || '20', 10),
   // Phase 10: Reduced from 10s to 5s — fail fast for user-facing APIs
   // 10s wait = user already abandoned. 5s returns meaningful 503 quickly.
   poolTimeout: parseInt(process.env.DB_POOL_TIMEOUT || '5', 10),
@@ -269,10 +286,18 @@ let prisma: PrismaClient;
 
 function getPrismaClient(): PrismaClient {
   if (!prisma) {
-    // Build pooled DATABASE_URL with connection limits
+    // Build pooled DATABASE_URL with connection limits and RDS failover timeouts
     const databaseUrl = process.env.DATABASE_URL || '';
     const separator = databaseUrl.includes('?') ? '&' : '?';
-    const pooledUrl = `${databaseUrl}${separator}connection_limit=${DB_POOL_CONFIG.connectionLimit}&pool_timeout=${DB_POOL_CONFIG.poolTimeout}`;
+    // connect_timeout=5: Fail fast if RDS is unreachable after failover (default 0 = wait forever)
+    // socket_timeout=10: Kill queries stuck on a dead socket during failover
+    const hasConnectTimeout = databaseUrl.includes('connect_timeout');
+    const hasSocketTimeout = databaseUrl.includes('socket_timeout');
+    const timeoutParams = [
+      ...(hasConnectTimeout ? [] : ['connect_timeout=5']),
+      ...(hasSocketTimeout ? [] : ['socket_timeout=10']),
+    ].join('&');
+    const pooledUrl = `${databaseUrl}${separator}connection_limit=${DB_POOL_CONFIG.connectionLimit}&pool_timeout=${DB_POOL_CONFIG.poolTimeout}${timeoutParams ? '&' + timeoutParams : ''}`;
 
     prisma = new PrismaClient({
       log: process.env.NODE_ENV === 'development'
@@ -311,16 +336,61 @@ function getPrismaClient(): PrismaClient {
       return result;
     });
 
+    // =========================================================================
+    // CACHE INVALIDATION MIDDLEWARE — Auto-invalidate Redis on writes
+    // =========================================================================
+    // Ensures Redis caches stay consistent with DB writes without requiring
+    // every service to manually call redisService.del(). Covers User profile
+    // cache and Vehicle transporter-list cache. Non-fatal: cache misses on
+    // invalidation failure are acceptable (stale data expires via TTL).
+    //
+    // SAFETY: Calls next(params) FIRST, then invalidates — no infinite loop
+    // risk because findUnique in the invalidation path is a read (not a write),
+    // so it won't re-trigger this middleware's write-op guard.
+    //
+    // NOTE: Prisma $use middleware does NOT fire for operations inside $transaction().
+    // For cache-critical writes inside transactions (e.g., order cancel vehicle release),
+    // manual cache invalidation must be added in the post-commit section.
+    // See: https://github.com/prisma/prisma/issues/3740
+    // =========================================================================
+    prisma.$use(async (params, next) => {
+      const result = await next(params);
+      const writeOps = ['update', 'upsert', 'delete', 'updateMany', 'create', 'createMany'];
+      if (writeOps.includes(params.action)) {
+        try {
+          if (params.model === 'User') {
+            const id = params.args?.where?.id;
+            if (id && typeof id === 'string') {
+              await redisService.del(`user:profile:${id}`).catch(() => {});
+            }
+          }
+          if (params.model === 'Vehicle') {
+            // FIX-29: Eliminate N+1 findUnique query for cache invalidation.
+            // Extract transporterId from available sources without an extra DB round-trip:
+            //   1. result.transporterId — available for single create/update/upsert/delete
+            //   2. params.args.data.transporterId — available when transporterId is being set
+            //   3. params.args.where.transporterId — available when filtering by transporter
+            // For updateMany where result is { count: N }, we fall back to args.
+            // If none are available, skip invalidation — the 5-min TTL safety net handles it.
+            const transporterId =
+              result?.transporterId
+              || params.args?.data?.transporterId
+              || params.args?.where?.transporterId;
+            if (transporterId && typeof transporterId === 'string') {
+              await redisService.del(`cache:vehicles:transporter:${transporterId}`).catch(() => {});
+            }
+            // No extra findUnique fallback — TTL (300s) handles the rare miss
+          }
+        } catch { /* cache invalidation is non-fatal */ }
+      }
+      return result;
+    });
+
     logger.info(`🗄️ Prisma connection pool configured: limit=${DB_POOL_CONFIG.connectionLimit}, timeout=${DB_POOL_CONFIG.poolTimeout}s`);
     logger.info(`🐢 Slow query logging enabled: threshold=${SLOW_QUERY_THRESHOLD_MS}ms`);
+    logger.info(`🔄 Cache invalidation middleware enabled for User and Vehicle writes`);
 
-    // SCALABILITY: Graceful shutdown - properly close DB connections
-    const shutdown = async () => {
-      logger.info('Disconnecting Prisma client...');
-      await prisma.$disconnect();
-    };
-    process.on('SIGTERM', shutdown);
-    process.on('SIGINT', shutdown);
+    // Shutdown handled by server.ts gracefulShutdown() — see A5#28
   }
   return prisma;
 }
@@ -373,6 +443,11 @@ export async function withDbTimeout<T>(
 
   for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
     try {
+      // Guard against SQL injection via timeoutMs — must be a safe positive integer
+      if (typeof timeoutMs !== 'number' || timeoutMs <= 0 || !Number.isInteger(timeoutMs)) {
+        throw new Error('Invalid timeout value');
+      }
+
       return await prismaClient.$transaction(
         async (tx) => {
           // SET LOCAL — applies only within this transaction, zero global impact
@@ -385,8 +460,8 @@ export async function withDbTimeout<T>(
           timeout: timeoutMs + 2000
         }
       );
-    } catch (error: any) {
-      const prismaCode = error?.code || '';
+    } catch (error: unknown) {
+      const prismaCode = error instanceof Error && 'code' in error ? (error as { code?: string }).code ?? '' : '';
       const isRetryable = RETRYABLE_CODES.has(prismaCode);
 
       if (isRetryable && attempt <= maxRetries) {
@@ -399,12 +474,31 @@ export async function withDbTimeout<T>(
 
       // All retries exhausted OR non-retryable error — throw friendly error
       if (isRetryable) {
-        logger.error(`[withDbTimeout] Serializable conflict persisted after ${maxRetries} retries`);
-        const { AppError } = require('../../shared/errors/app-error');
+        logger.error(`[withDbTimeout] Serializable conflict persisted after ${maxRetries} retries`, {
+          error: error instanceof Error ? sanitizeDbError(error.message) : String(error),
+        });
+        const { AppError } = require('../types/error.types');
         throw new AppError(
           409,
           'TRANSACTION_CONFLICT',
           'This action conflicted with another request. Please try again in a moment.'
+        );
+      }
+
+      // PostgreSQL statement_timeout (code 57014) — Prisma wraps it as a generic error.
+      // Surface a 503 so callers can distinguish a timed-out query from other failures.
+      const isStatementTimeout =
+        prismaCode === '57014' ||
+        (error instanceof Error && error.message?.includes('statement timeout'));
+      if (isStatementTimeout) {
+        logger.warn('[withDbTimeout] PostgreSQL statement_timeout hit', {
+          error: error instanceof Error ? sanitizeDbError(error.message) : String(error),
+        });
+        const { AppError } = require('../types/error.types');
+        throw new AppError(
+          503,
+          'DB_TIMEOUT',
+          'Database operation timed out. Please retry.'
         );
       }
 
@@ -423,7 +517,9 @@ export async function withDbTimeout<T>(
 // =============================================================================
 
 class PrismaDatabaseService {
-  private prisma: PrismaClient;
+  /** Exposed for raw queries ($executeRawUnsafe, $transaction, $queryRawUnsafe).
+   *  Prefer the typed methods on this class for standard CRUD operations. */
+  readonly prisma: PrismaClient;
 
   constructor() {
     this.prisma = getPrismaClient();
@@ -435,7 +531,19 @@ class PrismaDatabaseService {
       await this.prisma.$connect();
       logger.info('✅ PostgreSQL connected via Prisma');
     } catch (error) {
-      logger.error('❌ PostgreSQL connection failed:', error);
+      const code = error instanceof Error && 'code' in error ? (error as { code?: string }).code : undefined;
+      const msg = sanitizeDbError(error instanceof Error ? error.message : String(error));
+      logger.error('❌ PostgreSQL connection failed:', msg);
+
+      // FIX-12: After RDS failover, stale pool connections are dead.
+      // $disconnect() drains the pool so the next query auto-reconnects
+      // to the new primary. Without this, all queries fail until pool_timeout
+      // naturally evicts the stale sockets.
+      if (code === 'P1001' || code === 'P2024') {
+        logger.warn('[Prisma] Connection issue detected, draining pool for reconnect...', { code });
+        await this.prisma.$disconnect().catch(() => {});
+        // Next query will auto-reconnect via Prisma's lazy connect
+      }
     }
   }
 
@@ -587,8 +695,14 @@ class PrismaDatabaseService {
       const { redisService } = require('../services/redis.service');
       const cacheKey = `user:profile:${id}`;
       const cached = await redisService.get(cacheKey);
-      if (cached) return JSON.parse(cached);
-    } catch (_) { /* cache miss or Redis down — fall through to DB */ }
+      if (cached) {
+        const { safeJsonParse } = require('../utils/safe-json.utils');
+        const parsed = safeJsonParse(cached, null, 'user-profile-cache');
+        if (parsed) return parsed;
+      }
+    } catch (error) {
+      logger.warn('User profile cache read failed', { error: error instanceof Error ? error.message : String(error) });
+    }
 
     const user = await this.prisma.user.findUnique({ where: { id } });
     const record = user ? this.toUserRecord(user) : undefined;
@@ -598,7 +712,9 @@ class PrismaDatabaseService {
       try {
         const { redisService } = require('../services/redis.service');
         redisService.set(`user:profile:${id}`, JSON.stringify(record), 60).catch(() => {});
-      } catch (_) { /* graceful degradation */ }
+      } catch (error) {
+        logger.warn('User profile cache write failed', { error: error instanceof Error ? error.message : String(error) });
+      }
     }
     return record;
   }
@@ -632,10 +748,13 @@ class PrismaDatabaseService {
       try {
         const { redisService } = require('../services/redis.service');
         await redisService.del(`user:profile:${id}`);
-      } catch (_) { /* cache invalidation failure is non-fatal */ }
+      } catch (error) {
+        logger.warn('User profile cache invalidation failed', { error: error instanceof Error ? error.message : String(error) });
+      }
 
       return this.toUserRecord(updated);
-    } catch {
+    } catch (error) {
+      logger.error('DB operation failed', { error: error instanceof Error ? sanitizeDbError(error.message) : String(error) });
       return undefined;
     }
   }
@@ -666,14 +785,13 @@ class PrismaDatabaseService {
       if (existing.transporterId && existing.transporterId !== vehicle.transporterId) {
         redisService.del(this.vehiclesCacheKey(existing.transporterId)).catch(() => { });
       }
-      // Live availability: handle status change on re-registration
+      // Live availability + fleet cache: handle status change on re-registration
       if (existing.status !== (vehicle.status || 'available')) {
-        liveAvailabilityService.onVehicleStatusChange(
-          updated.transporterId,
-          updated.vehicleKey || vehicle.vehicleKey || '',
-          existing.status || 'available',
-          (vehicle.status || 'available') as string
-        ).catch(err => logger.warn('[LiveAvail] createVehicle re-reg hook failed:', (err as Error).message));
+        const { onVehicleTransition } = require('../services/vehicle-lifecycle.service');
+        onVehicleTransition(
+          updated.transporterId, updated.id, updated.vehicleKey || vehicle.vehicleKey || '',
+          existing.status || 'available', (vehicle.status || 'available') as string, 'vehicleReReg'
+        ).catch((err: any) => logger.warn('[vehicleReReg] Vehicle transition failed:', err?.message));
       }
       return this.toVehicleRecord(updated);
     }
@@ -724,14 +842,20 @@ class PrismaDatabaseService {
     try {
       const cached = await redisService.get(cacheKey);
       if (cached) {
-        return JSON.parse(cached) as VehicleRecord[];
+        const { safeJsonParse } = require('../utils/safe-json.utils');
+        const parsed = safeJsonParse(cached, null, 'vehicle-cache') as VehicleRecord[] | null;
+        if (parsed) return parsed;
       }
-    } catch {
+    } catch (error) {
       // Redis unavailable — fall through to DB (graceful degradation)
+      logger.warn('Vehicle cache read failed', { error: error instanceof Error ? error.message : String(error) });
     }
 
     // Cache miss — fetch from DB
-    const vehicles = await this.prisma.vehicle.findMany({ where: { transporterId } });
+    // FIX-15: Bound query to prevent unbounded result sets if a transporter
+    // has an anomalous number of vehicles (e.g., data import bug). 500 is the
+    // MAX_PAGE_SIZE constant used throughout this service.
+    const vehicles = await this.prisma.vehicle.findMany({ where: { transporterId }, take: MAX_PAGE_SIZE });
     const records = vehicles.map(v => this.toVehicleRecord(v));
 
     // Write to cache (fire-and-forget — don't block the caller)
@@ -740,9 +864,13 @@ class PrismaDatabaseService {
     return records;
   }
 
-  async getVehiclesByType(vehicleType: string): Promise<VehicleRecord[]> {
+  // H-D1 FIX: Add limit parameter with default 500 to prevent unbounded queries
+  async getVehiclesByType(vehicleType: string, limit = 500): Promise<VehicleRecord[]> {
+    const safeLimit = Math.min(Math.max(1, limit), 1000);
     const vehicles = await this.prisma.vehicle.findMany({
-      where: { vehicleType, isActive: true }
+      where: { vehicleType, isActive: true },
+      take: safeLimit,
+      orderBy: { createdAt: 'desc' }
     });
     return vehicles.map(v => this.toVehicleRecord(v));
   }
@@ -836,7 +964,7 @@ class PrismaDatabaseService {
     return [...new Set(vehicles.map(vehicle => vehicle.transporterId))];
   }
 
-  async updateVehicle(id: string, updates: Partial<VehicleRecord>): Promise<VehicleRecord | undefined> {
+  async updateVehicle(id: string, updates: Partial<VehicleRecord>): Promise<VehicleRecord> {
     try {
       // Fetch old vehicle state BEFORE update for:
       // 1. Cache invalidation when transporterId changes
@@ -865,18 +993,18 @@ class PrismaDatabaseService {
       if (oldVehicle?.transporterId && oldVehicle.transporterId !== updated.transporterId) {
         redisService.del(this.vehiclesCacheKey(oldVehicle.transporterId)).catch(() => { });
       }
-      // Live availability: update Redis set + count when status changes
+      // Live availability + fleet cache: update when status changes
       if (oldVehicle && (updates as any).status && oldVehicle.status !== (updates as any).status) {
-        liveAvailabilityService.onVehicleStatusChange(
-          updated.transporterId,
-          updated.vehicleKey || oldVehicle.vehicleKey || '',
-          oldVehicle.status || 'available',
-          (updates as any).status
-        ).catch(err => logger.warn('[LiveAvail] updateVehicle hook failed:', (err as Error).message));
+        const { onVehicleTransition } = require('../services/vehicle-lifecycle.service');
+        onVehicleTransition(
+          updated.transporterId, id, updated.vehicleKey || oldVehicle.vehicleKey || '',
+          oldVehicle.status || 'available', (updates as any).status, 'prismaUpdateVehicle'
+        ).catch((err: any) => logger.warn('[prismaUpdateVehicle] Vehicle transition failed:', err?.message));
       }
       return this.toVehicleRecord(updated);
-    } catch {
-      return undefined;
+    } catch (error) {
+      logger.error('DB operation failed', { operation: 'updateVehicle', id, error: error instanceof Error ? sanitizeDbError(error.message) : String(error) });
+      throw error;
     }
   }
 
@@ -897,7 +1025,8 @@ class PrismaDatabaseService {
           .catch(err => logger.warn('[LiveAvail] deleteVehicle hook failed:', (err as Error).message));
       }
       return true;
-    } catch {
+    } catch (error) {
+      logger.error('DB operation failed', { error: error instanceof Error ? sanitizeDbError(error.message) : String(error) });
       return false;
     }
   }
@@ -976,7 +1105,7 @@ class PrismaDatabaseService {
       .map(b => this.toBookingRecord(b));
   }
 
-  async updateBooking(id: string, updates: Partial<BookingRecord>): Promise<BookingRecord | undefined> {
+  async updateBooking(id: string, updates: Partial<BookingRecord>): Promise<BookingRecord> {
     try {
       const { createdAt, updatedAt, ...data } = updates as any;
       const updated = await this.prisma.booking.update({
@@ -989,8 +1118,9 @@ class PrismaDatabaseService {
         }
       });
       return this.toBookingRecord(updated);
-    } catch {
-      return undefined;
+    } catch (error) {
+      logger.error('DB operation failed', { operation: 'updateBooking', id, error: error instanceof Error ? sanitizeDbError(error.message) : String(error) });
+      throw error;
     }
   }
 
@@ -1102,7 +1232,7 @@ class PrismaDatabaseService {
     return this.toOrderRecord(activeOrder);
   }
 
-  async updateOrder(id: string, updates: Partial<OrderRecord>): Promise<OrderRecord | undefined> {
+  async updateOrder(id: string, updates: Partial<OrderRecord>): Promise<OrderRecord> {
     try {
       const { createdAt, updatedAt, ...data } = updates as any;
       const updated = await this.prisma.order.update({
@@ -1117,18 +1247,28 @@ class PrismaDatabaseService {
         }
       });
       return this.toOrderRecord(updated);
-    } catch {
-      return undefined;
+    } catch (error) {
+      logger.error('DB operation failed', { operation: 'updateOrder', id, error: error instanceof Error ? sanitizeDbError(error.message) : String(error) });
+      throw error;
     }
   }
 
-  async getActiveOrders(): Promise<OrderRecord[]> {
+  // M-10 FIX: Cursor-based pagination replaces hard 1000 cap.
+  // Old: take:1000 made orders invisible at 1001+.
+  // New: Optional cursor+limit for pagination; default behavior unchanged
+  // for backward compatibility (existing callers get all results up to cap).
+  async getActiveOrders(options?: { cursor?: string; limit?: number }): Promise<OrderRecord[]> {
     const now = new Date();
+    const limit = Math.min(Math.max(1, options?.limit || 1000), 2000);
+
     const orders = await this.prisma.order.findMany({
       where: {
         status: { notIn: ['fully_filled', 'completed', 'cancelled'] },
         expiresAt: { gt: now.toISOString() }
-      }
+      },
+      take: limit,
+      ...(options?.cursor ? { cursor: { id: options.cursor }, skip: 1 } : {}),
+      orderBy: { createdAt: 'desc' }
     });
 
     return orders
@@ -1254,10 +1394,10 @@ class PrismaDatabaseService {
         transporterId,
         activeVehiclePairs
       );
-    } catch (error: any) {
+    } catch (error: unknown) {
       logger.warn('[DB] Indexed transporter request query failed, falling back to in-memory filter', {
         transporterId,
-        error: error?.message || 'unknown'
+        error: error instanceof Error ? error.message : 'unknown'
       });
     }
 
@@ -1273,6 +1413,17 @@ class PrismaDatabaseService {
       orderBy: { createdAt: 'desc' },
       take: 500
     });
+
+    // F-5-19: Monitor notifiedTransporters array growth
+    const maxArrayLen = requests.reduce(
+      (max, r) => Math.max(max, (r.notifiedTransporters as string[])?.length ?? 0), 0
+    );
+    if (maxArrayLen > 50) {
+      logger.warn('[DB] notifiedTransporters array exceeding 50 elements', {
+        maxArrayLen, transporterId, requestCount: requests.length,
+        hint: 'Consider migrating to TruckRequestNotification junction table'
+      });
+    }
 
     return requests
       .filter(request => {
@@ -1310,13 +1461,33 @@ class PrismaDatabaseService {
   }
 
   async getTruckRequestsByVehicleType(vehicleType: string, vehicleSubtype?: string): Promise<TruckRequestRecord[]> {
+    // H-5 FIX: Bound query to prevent OOM at 100k+ searching requests.
+    // Previously loaded ALL searching requests with no limit, then filtered
+    // in JS. At scale this could exhaust memory and crash the ECS task.
+    // Now: cap at MAX_RESULTS (most recent first) + push vehicleType filter
+    // into the WHERE clause for index efficiency.
+    const MAX_RESULTS = parseInt(process.env.MAX_TRUCK_REQUESTS_QUERY || '500', 10);
+
     const requests = await this.prisma.truckRequest.findMany({
-      where: { status: 'searching' }
+      where: {
+        status: 'searching',
+        vehicleType: { equals: vehicleType, mode: 'insensitive' as const },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: MAX_RESULTS,
     });
 
+    if (requests.length >= MAX_RESULTS) {
+      logger.warn('[DB] getTruckRequestsByVehicleType hit cap', {
+        vehicleType,
+        vehicleSubtype: vehicleSubtype || '(any)',
+        cap: MAX_RESULTS,
+      });
+    }
+
+    // Still need in-memory filter for vehicleSubtype (uses fuzzy matching)
     return requests
       .filter(r => {
-        if (!this.vehicleStringsMatch(r.vehicleType, vehicleType)) return false;
         if (vehicleSubtype && !this.vehicleStringsMatch(r.vehicleSubtype, vehicleSubtype)) return false;
         return true;
       })
@@ -1336,7 +1507,8 @@ class PrismaDatabaseService {
         }
       });
       return this.toTruckRequestRecord(updated);
-    } catch {
+    } catch (error) {
+      logger.error('DB operation failed', { error: error instanceof Error ? sanitizeDbError(error.message) : String(error) });
       return undefined;
     }
   }
@@ -1398,6 +1570,11 @@ class PrismaDatabaseService {
     return assignments.map(a => this.toAssignmentRecord(a));
   }
 
+  async getAssignmentsByOrder(orderId: string): Promise<AssignmentRecord[]> {
+    const assignments = await this.prisma.assignment.findMany({ where: { orderId } });
+    return assignments.map(a => this.toAssignmentRecord(a));
+  }
+
   async getAssignmentsByDriver(driverId: string, limit: number = DEFAULT_PAGE_SIZE): Promise<AssignmentRecord[]> {
     const assignments = await this.prisma.assignment.findMany({
       where: { driverId },
@@ -1427,7 +1604,7 @@ class PrismaDatabaseService {
     return assignment ? this.toAssignmentRecord(assignment) : undefined;
   }
 
-  async updateAssignment(id: string, updates: Partial<AssignmentRecord>): Promise<AssignmentRecord | undefined> {
+  async updateAssignment(id: string, updates: Partial<AssignmentRecord>): Promise<AssignmentRecord> {
     try {
       const updated = await this.prisma.assignment.update({
         where: { id },
@@ -1437,8 +1614,9 @@ class PrismaDatabaseService {
         }
       });
       return this.toAssignmentRecord(updated);
-    } catch {
-      return undefined;
+    } catch (error) {
+      logger.error('DB operation failed', { operation: 'updateAssignment', id, error: error instanceof Error ? sanitizeDbError(error.message) : String(error) });
+      throw error;
     }
   }
 
@@ -1537,7 +1715,9 @@ class PrismaDatabaseService {
         logger.debug(`[AvailSnapshot] Live Redis: ${redisResult.length} transporters for ${vehicleKey}`);
         return redisResult;
       }
-    } catch { /* Redis down — fall through to DB */ }
+    } catch (error) {
+      logger.warn('Redis availability snapshot failed, falling back to DB', { error: error instanceof Error ? error.message : String(error) });
+    }
 
     // Fallback: DB queries (unchanged)
 
@@ -1665,14 +1845,18 @@ class PrismaDatabaseService {
   }
 
   async getRawData() {
+    // C4 FIX: Hard limit on all findMany() calls to prevent unbounded memory usage.
+    // At scale (millions of rows), an unbounded findMany() can OOM the ECS task.
+    const HARD_LIMIT = 1000;
+
     const [users, vehicles, bookings, orders, truckRequests, assignments, tracking] = await Promise.all([
-      this.prisma.user.findMany(),
-      this.prisma.vehicle.findMany(),
-      this.prisma.booking.findMany(),
-      this.prisma.order.findMany(),
-      this.prisma.truckRequest.findMany(),
-      this.prisma.assignment.findMany(),
-      this.prisma.tracking.findMany(),
+      this.prisma.user.findMany({ take: HARD_LIMIT, orderBy: { createdAt: 'desc' } }),
+      this.prisma.vehicle.findMany({ take: HARD_LIMIT, orderBy: { createdAt: 'desc' } }),
+      this.prisma.booking.findMany({ take: HARD_LIMIT, orderBy: { createdAt: 'desc' } }),
+      this.prisma.order.findMany({ take: HARD_LIMIT, orderBy: { createdAt: 'desc' } }),
+      this.prisma.truckRequest.findMany({ take: HARD_LIMIT, orderBy: { createdAt: 'desc' } }),
+      this.prisma.assignment.findMany({ take: HARD_LIMIT, orderBy: { assignedAt: 'desc' } }),
+      this.prisma.tracking.findMany({ take: HARD_LIMIT, orderBy: { lastUpdated: 'desc' } }),
     ]);
 
     return {
@@ -1686,6 +1870,8 @@ class PrismaDatabaseService {
       _meta: {
         version: '2.0.0',
         lastUpdated: new Date().toISOString(),
+        truncated: true,
+        limit: HARD_LIMIT,
       }
     };
   }
@@ -1762,20 +1948,15 @@ function getReadReplicaClient(): PrismaClient {
     return result;
   });
 
-  // Graceful shutdown for replica connection
-  const shutdownReplica = async () => {
-    if (prismaRead) {
-      logger.info('Disconnecting Prisma read replica client...');
-      await prismaRead.$disconnect();
-    }
-  };
-  process.on('SIGTERM', shutdownReplica);
-  process.on('SIGINT', shutdownReplica);
+  // Shutdown handled by server.ts gracefulShutdown() — see A5#28
 
   logger.info(`📖 [Prisma] Read replica configured: pool_limit=${readPoolLimit}, timeout=${DB_POOL_CONFIG.poolTimeout}s`);
 
   return prismaRead;
 }
+
+// Export the class type so db.ts can type the singleton without `any`
+export type { PrismaDatabaseService };
 
 // Export singleton instance
 export const prismaDb = new PrismaDatabaseService();

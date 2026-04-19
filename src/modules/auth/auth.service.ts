@@ -69,6 +69,7 @@ const REDIS_KEYS = {
 interface RefreshTokenEntry {
   userId: string;
   expiresAt: string; // ISO string for JSON serialization
+  deviceId?: string; // Device binding: preserved across token refresh
 }
 
 // =============================================================================
@@ -116,6 +117,19 @@ class AuthService {
    * @returns Object with expiry time and message
    */
   async sendOtp(phone: string, role: UserRole): Promise<{ expiresIn: number; message: string }> {
+    // 30-second per-phone cooldown to prevent OTP spam
+    const cooldownKey = `otp:cooldown:${phone}:${role}`;
+    let cooldownActive = false;
+    try {
+      cooldownActive = await redisService.exists(cooldownKey);
+    } catch (err: unknown) {
+      // Fail-open: if Redis is down, allow the OTP send rather than blocking all users
+      logger.warn('[OTP] Cooldown check failed-open', { phone: maskForLogging(phone, 2, 4), role });
+    }
+    if (cooldownActive) {
+      throw new AppError(429, 'OTP_COOLDOWN', 'Please wait 30 seconds before requesting another OTP');
+    }
+
     // Generate cryptographically secure 6-digit OTP
     const otp = generateSecureOTP(config.otp.length);
 
@@ -135,6 +149,16 @@ class AuthService {
     });
 
     const expiresAt = issueResult.expiresAt;
+
+    // Set 30-second cooldown after OTP is generated and stored
+    try {
+      await redisService.set(cooldownKey, '1', 30); // 30 second TTL
+    } catch (err) {
+      logger.warn('[OTP] Cooldown write failed, OTP still valid', {
+        phone: maskForLogging(phone, 2, 4),
+        error: (err as Error).message
+      });
+    }
 
     if (!issueResult.storedInRedis && !issueResult.storedInDb) {
       logger.error('❌ CRITICAL: OTP could not be stored in Redis OR PostgreSQL', {
@@ -159,10 +183,12 @@ class AuthService {
     // Fire-and-forget: don't await SMS delivery
     smsService.sendOtp(phone, otp).then(() => {
       logger.info('OTP SMS sent successfully', { phone: maskedPhone, role });
-    }).catch(async (smsError: any) => {
-      logger.error('❌ Failed to send OTP SMS', {
-        error: smsError.message,
-        errorCode: smsError.code || 'UNKNOWN',
+    }).catch(async (smsError: unknown) => {
+      const smsErrMsg = smsError instanceof Error ? smsError.message : String(smsError);
+      const smsErrCode = smsError instanceof Error && 'code' in smsError ? (smsError as { code?: string }).code : 'UNKNOWN';
+      logger.error('Failed to send OTP SMS', {
+        error: smsErrMsg,
+        errorCode: smsErrCode || 'UNKNOWN',
         phone: maskedPhone,
         role,
         otpStored: true,
@@ -173,8 +199,9 @@ class AuthService {
           redisKey: key,
           dbKey: { phone, role },
           logContext: { phone: maskedPhone, role, reason: 'sms_send_failed' }
-        }).catch((cleanupErr: any) => {
-          logger.error('Failed to clean up OTP after SMS failure', { error: cleanupErr.message });
+        }).catch((cleanupErr: unknown) => {
+          const cleanupMsg = cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr);
+          logger.error('Failed to clean up OTP after SMS failure', { error: cleanupMsg });
         });
       }
     });
@@ -205,9 +232,10 @@ class AuthService {
    * @param phone - Phone number that received OTP
    * @param otp - OTP entered by user
    * @param role - User role
+   * @param deviceId - Optional device identifier for device binding
    * @returns User data and JWT tokens
    */
-  async verifyOtp(phone: string, otp: string, role: UserRole): Promise<{
+  async verifyOtp(phone: string, otp: string, role: UserRole, deviceId?: string): Promise<{
     user: AuthUser;
     accessToken: string;
     refreshToken: string;
@@ -253,8 +281,9 @@ class AuthService {
 
     try {
       dbUser = await db.getUserByPhone(phone, role);
-    } catch (err: any) {
-      logger.warn('Error fetching user, will create new', { error: err.message });
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      logger.warn('Error fetching user, will create new', { error: errMsg });
     }
 
     if (!dbUser) {
@@ -267,23 +296,14 @@ class AuthService {
           isVerified: false,
           isActive: true
         });
-      } catch (err: any) {
-        logger.warn('Error creating user in DB, using fallback', { error: err.message });
+      } catch (err: unknown) {
+        const createErrMsg = err instanceof Error ? err.message : String(err);
+        logger.error('Error creating user in DB', { error: createErrMsg });
+        throw new AppError(503, 'DB_UNAVAILABLE', 'Unable to create user account. Please try again.');
       }
 
-      // If dbUser is still null/undefined, create a fallback object
       if (!dbUser || !dbUser.id) {
-        dbUser = {
-          id: newUserId,
-          phone: phone,
-          role: role,
-          name: '',
-          email: null,
-          isVerified: false,
-          isActive: true,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString()
-        };
+        throw new AppError(503, 'DB_UNAVAILABLE', 'Unable to create user account. Please try again.');
       }
       isNewUser = true;
 
@@ -295,15 +315,11 @@ class AuthService {
 
       // Development only: Show user creation details
       if (config.isDevelopment) {
-        console.log('\n');
-        console.log('╔══════════════════════════════════════════════════════════════╗');
-        console.log('║                  👤 NEW USER CREATED                         ║');
-        console.log('╠══════════════════════════════════════════════════════════════╣');
-        console.log(`║  User ID: ${dbUser.id.padEnd(50)}║`);
-        console.log(`║  Phone:   ${maskForLogging(phone, 2, 4).padEnd(50)}║`);
-        console.log(`║  Role:    ${role.padEnd(50)}║`);
-        console.log('╚══════════════════════════════════════════════════════════════╝');
-        console.log('\n');
+        logger.debug('New user created (dev)', {
+          userId: dbUser.id,
+          phone: maskForLogging(phone, 2, 4),
+          role
+        });
       }
     }
 
@@ -318,30 +334,27 @@ class AuthService {
       updatedAt: dbUser?.updatedAt ? new Date(dbUser.updatedAt) : new Date()
     };
 
-    // Generate tokens
-    const accessToken = this.generateAccessToken(user);
-    const refreshToken = this.generateRefreshToken(user);
+    // Generate tokens (deviceId is embedded in JWT for device binding)
+    const accessToken = this.generateAccessToken(user, deviceId);
+    const refreshToken = await this.generateRefreshToken(user, deviceId);
 
     // Log successful authentication (safe for production)
     logger.info('User authenticated successfully', {
       userId: user.id,
       phone: maskForLogging(phone, 2, 4),
       role,
-      isNewUser
+      isNewUser,
+      deviceBound: !!deviceId
     });
 
     // Development only: Show login details
     if (config.isDevelopment) {
-      console.log('\n');
-      console.log('╔══════════════════════════════════════════════════════════════╗');
-      console.log('║                  ✅ LOGIN SUCCESSFUL                         ║');
-      console.log('╠══════════════════════════════════════════════════════════════╣');
-      console.log(`║  User ID:  ${user.id.substring(0, 36).padEnd(49)}║`);
-      console.log(`║  Phone:    ${maskForLogging(phone, 2, 4).padEnd(49)}║`);
-      console.log(`║  Role:     ${role.padEnd(49)}║`);
-      console.log(`║  New User: ${(isNewUser ? 'Yes' : 'No').padEnd(49)}║`);
-      console.log('╚══════════════════════════════════════════════════════════════╝');
-      console.log('\n');
+      logger.debug('Login successful (dev)', {
+        userId: user.id,
+        phone: maskForLogging(phone, 2, 4),
+        role,
+        isNewUser
+      });
     }
 
     return {
@@ -361,12 +374,13 @@ class AuthService {
    */
   async refreshToken(refreshToken: string): Promise<{
     accessToken: string;
+    refreshToken: string;
     expiresIn: number;
   }> {
     // Verify refresh token
     let decoded: any;
     try {
-      decoded = jwt.verify(refreshToken, config.jwt.refreshSecret);
+      decoded = jwt.verify(refreshToken, config.jwt.refreshSecret, { algorithms: ['HS256'] });
     } catch {
       throw new AppError(401, 'INVALID_REFRESH_TOKEN', 'Invalid or expired refresh token');
     }
@@ -397,11 +411,24 @@ class AuthService {
       updatedAt: new Date(dbUser.updatedAt)
     };
 
-    // Generate new access token
-    const accessToken = this.generateAccessToken(user);
+    // Preserve deviceId from the original refresh token for device binding continuity
+    const refreshDeviceId: string | undefined = decoded.deviceId || stored.deviceId || undefined;
+
+    // Generate new access token (carries same deviceId as original)
+    const accessToken = this.generateAccessToken(user, refreshDeviceId);
+
+    // Rotate refresh token: invalidate old, issue new
+    // Grace period: keep old token valid for 30s instead of immediate delete.
+    // If the client crashes or loses network after sending the refresh request
+    // but before saving the new token, the old token still works briefly.
+    // This follows the Auth0 "Rotation Overlap Period" / Okta 30-second grace window pattern.
+    await redisService.expire(REDIS_KEYS.REFRESH_TOKEN(tokenId), 30);
+    await redisService.sRem(REDIS_KEYS.USER_TOKENS(user.id), tokenId);
+    const newRefreshToken = await this.generateRefreshToken(user, refreshDeviceId);
 
     return {
       accessToken,
+      refreshToken: newRefreshToken,
       expiresIn: this.getExpirySeconds(config.jwt.expiresIn)
     };
   }
@@ -409,7 +436,17 @@ class AuthService {
   /**
    * Logout user - invalidate refresh token
    */
-  async logout(userId: string): Promise<void> {
+  async logout(userId: string, jti?: string, exp?: number): Promise<void> {
+    // Blacklist the access token JTI so it cannot be reused
+    if (jti && exp) {
+      const remainingTTL = exp - Math.floor(Date.now() / 1000);
+      if (remainingTTL > 0) {
+        try {
+          await redisService.set(`blacklist:${jti}`, 'revoked', remainingTTL);
+        } catch { /* non-critical — token will expire naturally */ }
+      }
+    }
+
     // Get all token IDs for this user from Redis
     const userTokensKey = REDIS_KEYS.USER_TOKENS(userId);
     const tokenIds = await redisService.sMembers(userTokensKey);
@@ -472,44 +509,46 @@ class AuthService {
   // The getPendingOtp() method has been REMOVED for security reasons
   // Plain OTPs are never stored - only hashed versions are kept
 
-  private generateAccessToken(user: AuthUser): string {
+  private generateAccessToken(user: AuthUser, deviceId?: string): string {
     return jwt.sign(
       {
         userId: user.id,
         role: user.role,
-        phone: user.phone
+        phone: user.phone,
+        jti: crypto.randomUUID(),
+        ...(deviceId ? { deviceId } : {})
       },
       config.jwt.secret,
       { expiresIn: config.jwt.expiresIn } as jwt.SignOptions
     );
   }
 
-  private generateRefreshToken(user: AuthUser): string {
+  private async generateRefreshToken(user: AuthUser, deviceId?: string): Promise<string> {
     const token = jwt.sign(
-      { userId: user.id },
+      { userId: user.id, ...(deviceId ? { deviceId } : {}) },
       config.jwt.refreshSecret,
       { expiresIn: config.jwt.refreshExpiresIn } as jwt.SignOptions
     );
 
-    // Store refresh token in Redis (fire and forget)
     const expiresAt = new Date(Date.now() + this.getExpirySeconds(config.jwt.refreshExpiresIn) * 1000);
     const tokenId = this.hashToken(token);
     const ttlSeconds = this.getExpirySeconds(config.jwt.refreshExpiresIn);
 
-    // Store token entry with TTL
+    // Store token entry with TTL (deviceId preserved for refresh flow)
     const entry: RefreshTokenEntry = {
       userId: user.id,
-      expiresAt: expiresAt.toISOString()
+      expiresAt: expiresAt.toISOString(),
+      ...(deviceId ? { deviceId } : {})
     };
 
-    redisService.setJSON(REDIS_KEYS.REFRESH_TOKEN(tokenId), entry, ttlSeconds).catch(err => {
-      logger.error(`Failed to store refresh token: ${err.message}`);
-    });
-
-    // Track token ID for user (for logout all devices)
-    redisService.sAdd(REDIS_KEYS.USER_TOKENS(user.id), tokenId).catch(err => {
-      logger.error(`Failed to track user token: ${err.message}`);
-    });
+    try {
+      await redisService.setJSON(REDIS_KEYS.REFRESH_TOKEN(tokenId), entry, ttlSeconds);
+      await redisService.sAdd(REDIS_KEYS.USER_TOKENS(user.id), tokenId);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error('Failed to store refresh token in Redis', { error: msg });
+      throw new AppError(500, 'TOKEN_STORAGE_FAILED', 'Failed to store authentication token');
+    }
 
     return token;
   }

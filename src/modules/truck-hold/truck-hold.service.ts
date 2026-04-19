@@ -1,8 +1,22 @@
 /**
+ * TRUCK HOLD SERVICE — Single-phase hold system (LEGACY)
+ *
+ * Hold duration: 180 seconds (configurable via HOLD_CONFIG)
+ * Used by: Booking path (POST /hold)
+ *
+ * NOTE: A newer two-phase hold system exists:
+ *   - flex-hold.service.ts (Phase 1: 90s flex hold)
+ *   - confirmed-hold.service.ts (Phase 2: 180s confirmed hold)
+ *
+ * TODO: Migrate booking path to the two-phase hold system
+ * and deprecate single-phase holds.
+ */
+
+/**
  * =============================================================================
  * TRUCK HOLD SERVICE - Race Condition Prevention for Million-User Scale
  * =============================================================================
- * 
+ *
  * Handles the "BookMyShow-style" truck holding system for broadcast orders.
  * 
  * ⭐ GOLDEN RULE (NEVER FORGET):
@@ -72,11 +86,16 @@
  * =============================================================================
  */
 
+// SCALE NOTE: TruckHoldLedger rows are never deleted (audit trail).
+// At 100k+ holds, add a scheduled job to archive rows older than 90 days
+// to a separate TruckHoldLedgerArchive table or cold storage (S3/Glacier).
+// The idempotency purge job (7 days) already exists — extend pattern for holds.
+
 import { v4 as uuidv4 } from 'uuid';
 import crypto from 'crypto';
 import { Prisma } from '@prisma/client';
 import { db } from '../../shared/database/db';
-import { prismaClient, withDbTimeout, AssignmentStatus, OrderStatus, TruckRequestStatus, VehicleStatus } from '../../shared/database/prisma.service';
+import { prismaClient, withDbTimeout, AssignmentStatus, OrderStatus, TruckRequestStatus, VehicleStatus, HoldPhase } from '../../shared/database/prisma.service';
 import { logger } from '../../shared/services/logger.service';
 import { socketService, SocketEvent } from '../../shared/services/socket.service';
 import { redisService } from '../../shared/services/redis.service';
@@ -85,6 +104,16 @@ import { queueService } from '../../shared/services/queue.service';
 import { metrics } from '../../shared/monitoring/metrics.service';
 import { fcmService } from '../../shared/services/fcm.service';
 import { driverService } from '../driver/driver.service';
+import { HOLD_CONFIG } from '../../core/config/hold-config';
+import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
+import { holdExpiryCleanupService } from '../hold-expiry/hold-expiry-cleanup.service';
+// F-A-75: KYC SECOND-GATE — row-locked eligibility re-check inside hold TX.
+// Helper + error class live in a dedicated module so test files that
+// jest.mock('./truck-hold.service') cannot accidentally erase them from
+// cross-module imports in flex-hold.service / confirmed-hold.service.
+// See `./hold-eligibility.ts` for the rationale (KYC FSM, Ola, Uber Rider Identity).
+import { validateActorEligibility, HoldEligibilityError } from './hold-eligibility';
+export { validateActorEligibility, HoldEligibilityError } from './hold-eligibility';
 
 // =============================================================================
 // TYPES & INTERFACES
@@ -185,7 +214,11 @@ export interface OrderAvailability {
 const CONFIG = {
   // Keep enough time for transporter to map vehicles + drivers before confirm.
   HOLD_DURATION_SECONDS: 180,      // 3 minutes hold window
-  CLEANUP_INTERVAL_MS: 5000,       // How often to clean expired holds
+  // F-A-77: Downgraded from 5s to 60s — per-hold durable HOLD_EXPIRY jobs are
+  // the primary expiry mechanism; this setInterval is now a belt-and-braces
+  // reconciler for (a) jobs whose enqueue failed, (b) Redis clock skew.
+  // Pattern: BullMQ delayed jobs + Uber Cadence durable timers.
+  CLEANUP_INTERVAL_MS: 60000,      // Safety-net reconciler cadence (60s)
   MAX_HOLD_QUANTITY: 50,           // Max trucks one transporter can hold at once
   MIN_HOLD_QUANTITY: 1,            // Minimum trucks to hold
 };
@@ -195,6 +228,9 @@ const TERMINAL_ORDER_STATUSES = new Set(['cancelled', 'expired', 'completed', 'f
 const HOLD_EVENT_VERSION = 1;
 
 const FF_HOLD_DB_ATOMIC_CLAIM = process.env.FF_HOLD_DB_ATOMIC_CLAIM !== 'false';
+if (!FF_HOLD_DB_ATOMIC_CLAIM) {
+  logger.error('[SAFETY] FF_HOLD_DB_ATOMIC_CLAIM is DISABLED — row locking is OFF. Double-claims possible. Set to true or remove the env var.');
+}
 const FF_HOLD_STRICT_IDEMPOTENCY = process.env.FF_HOLD_STRICT_IDEMPOTENCY !== 'false';
 const FF_HOLD_RECONCILE_RECOVERY = process.env.FF_HOLD_RECONCILE_RECOVERY !== 'false';
 const FF_HOLD_SAFE_RELEASE_GUARD = process.env.FF_HOLD_SAFE_RELEASE_GUARD !== 'false';
@@ -203,6 +239,7 @@ const HOLD_IDEMPOTENCY_PURGE_INTERVAL_MS = Math.max(
   60_000,
   parseInt(process.env.HOLD_IDEMPOTENCY_PURGE_INTERVAL_MS || String(30 * 60 * 1000), 10) || (30 * 60 * 1000)
 );
+const HOLD_CLEANUP_BATCH_SIZE = parseInt(process.env.HOLD_CLEANUP_BATCH_SIZE || '500', 10);
 
 // =============================================================================
 // REDIS KEYS - Distributed Locking for Truck Holds
@@ -221,13 +258,14 @@ const HOLD_IDEMPOTENCY_PURGE_INTERVAL_MS = Math.max(
  * - hold:{holdId}                    → Hold data (JSON, TTL: 180s / 3 min)
  * - hold:order:{orderId}             → Set of holdIds for this order
  * - hold:transporter:{transporterId} → Set of holdIds for this transporter
- * - lock:truck:{truckRequestId}      → Lock for specific truck (SETNX)
+ * - lock:truck:{truckRequestId}      → Lock for specific truck (lock: prefix added by acquireLock)
  */
 const REDIS_KEYS = {
   HOLD: (holdId: string) => `hold:${holdId}`,
   HOLDS_BY_ORDER: (orderId: string) => `hold:order:${orderId}`,
   HOLDS_BY_TRANSPORTER: (transporterId: string) => `hold:transporter:${transporterId}`,
-  TRUCK_LOCK: (truckRequestId: string) => `lock:truck:${truckRequestId}`,
+  // Standardized: lock: prefix for all distributed locks (added by acquireLock automatically)
+  TRUCK_LOCK: (truckRequestId: string) => `truck:${truckRequestId}`,
 };
 
 // =============================================================================
@@ -259,7 +297,7 @@ class HoldStore {
       for (const truckId of sortedTruckIds) {
         const lockKey = REDIS_KEYS.TRUCK_LOCK(truckId);
         const lockResult = await redisService.acquireLock(
-          lockKey.replace('lock:', ''), // acquireLock adds 'lock:' prefix
+          lockKey, // Standardized: lock: prefix for all distributed locks
           hold.transporterId,
           CONFIG.HOLD_DURATION_SECONDS
         );
@@ -270,7 +308,7 @@ class HoldStore {
           for (let i = 0; i < lockResults.length - 1; i++) {
             if (lockResults[i]) {
               await redisService.releaseLock(
-                REDIS_KEYS.TRUCK_LOCK(sortedTruckIds[i]).replace('lock:', ''),
+                REDIS_KEYS.TRUCK_LOCK(sortedTruckIds[i]),
                 hold.transporterId
               );
             }
@@ -306,8 +344,9 @@ class HoldStore {
       logger.info(`[HoldStore] ✅ Hold ${hold.holdId} stored with ${hold.truckRequestIds.length} truck locks`);
       return true;
 
-    } catch (error: any) {
-      logger.error(`[HoldStore] Failed to add hold: ${error.message}`);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error(`[HoldStore] Failed to add hold: ${message}`);
       return false;
     }
   }
@@ -350,8 +389,9 @@ class HoldStore {
       const ttl = await redisService.ttl(REDIS_KEYS.HOLD(holdId));
       await redisService.setJSON(REDIS_KEYS.HOLD(holdId), holdData, ttl > 0 ? ttl : 60);
 
-    } catch (error: any) {
-      logger.error(`[HoldStore] Failed to update status: ${error.message}`);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error(`[HoldStore] Failed to update status: ${message}`);
     }
   }
 
@@ -366,7 +406,7 @@ class HoldStore {
       // Release all truck locks
       for (const truckId of hold.truckRequestIds) {
         await redisService.releaseLock(
-          REDIS_KEYS.TRUCK_LOCK(truckId).replace('lock:', ''),
+          REDIS_KEYS.TRUCK_LOCK(truckId),
           hold.transporterId
         );
       }
@@ -380,8 +420,9 @@ class HoldStore {
 
       logger.info(`[HoldStore] Hold ${holdId} removed, locks released`);
 
-    } catch (error: any) {
-      logger.error(`[HoldStore] Failed to remove hold: ${error.message}`);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error(`[HoldStore] Failed to remove hold: ${message}`);
     }
   }
 
@@ -404,16 +445,6 @@ class HoldStore {
     } catch (error) {
       return [];
     }
-  }
-
-  /**
-   * Get all expired holds (for cleanup)
-   * Note: With Redis TTL, this is mostly for manual cleanup
-   */
-  async getExpiredHolds(): Promise<TruckHold[]> {
-    // Redis TTL handles expiration automatically
-    // This method is kept for compatibility but returns empty
-    return [];
   }
 
   /**
@@ -466,7 +497,8 @@ const holdStore = new HoldStore();
 
 class TruckHoldService {
   private cleanupInterval: NodeJS.Timeout | null = null;
-  private lastIdempotencyPurgeAtMs = 0;
+  // FIX-38: Removed private lastIdempotencyPurgeAtMs field.
+  // Purge timestamp is now stored in Redis for distributed-safe coordination.
 
   constructor() {
     this.startCleanupJob();
@@ -570,22 +602,22 @@ class TruckHoldService {
 
   private recordHoldOutcomeMetrics(result: HoldTrucksResponse, startedAtMs: number, replay: boolean = false): void {
     const durationMs = Math.max(0, Date.now() - startedAtMs);
-    metrics.observeHistogram('hold.latency_ms', durationMs, {
+    metrics.observeHistogram('hold_latency_ms', durationMs, {
       replay: replay ? 'true' : 'false',
       result: result.success ? 'success' : 'failed'
     });
     if (replay) {
-      metrics.incrementCounter('hold.idempotent_replay.total', {
+      metrics.incrementCounter('hold_idempotent_replay_total', {
         result: result.success ? 'success' : 'failed',
         reason: (result.error || 'none').toLowerCase()
       });
       return;
     }
     if (result.success) {
-      metrics.incrementCounter('hold.success.total');
+      metrics.incrementCounter('hold_success_total');
     } else {
       const reason = (result.error || 'unknown').toLowerCase();
-      metrics.incrementCounter('hold.conflict.total', { reason });
+      metrics.incrementCounter('hold_conflict_total', { reason });
     }
   }
 
@@ -609,7 +641,7 @@ class TruckHoldService {
    */
   async holdTrucks(request: HoldTrucksRequest): Promise<HoldTrucksResponse> {
     const holdStartedAtMs = Date.now();
-    metrics.incrementCounter('hold.request.total');
+    metrics.incrementCounter('hold_request_total');
 
     const transporterId = request.transporterId;
     const orderId = (request.orderId || '').trim();
@@ -696,22 +728,97 @@ class TruckHoldService {
         }
       }
 
+      // C-08 fix: Check for existing FLEX hold before creating a legacy hold.
+      // Prevents two parallel hold systems from creating overlapping holds
+      // for the same order + transporter combination.
+      // (Mirrors guard in truck-hold-create.service.ts:262-281)
+      const existingFlexHold = await prismaClient.truckHoldLedger.findFirst({
+        where: {
+          orderId,
+          transporterId,
+          status: 'active',
+          phase: HoldPhase.FLEX,
+        },
+      });
+      if (existingFlexHold) {
+        response = {
+          success: false,
+          message: 'Active flex hold already exists. Use the flex hold API to manage it.',
+          error: 'FLEX_HOLD_CONFLICT',
+        };
+        this.recordHoldOutcomeMetrics(response, holdStartedAtMs);
+        return response;
+      }
+
+      // AB-2 fix: Reject hold creation if the parent broadcast/order has expired.
+      // Prevents stale broadcasts from locking trucks after expiry.
+      const parentOrder = await prismaClient.order.findUnique({
+        where: { id: orderId },
+        select: { expiresAt: true, status: true },
+      });
+      if (!parentOrder) {
+        response = {
+          success: false,
+          message: 'Order not found. Cannot create hold for a non-existent order.',
+          error: 'ORDER_NOT_FOUND',
+        };
+        this.recordHoldOutcomeMetrics(response, holdStartedAtMs);
+        return response;
+      }
+      if (new Date(parentOrder.expiresAt).getTime() < Date.now()) {
+        response = {
+          success: false,
+          message: 'Cannot create hold — broadcast has expired.',
+          error: 'BROADCAST_EXPIRED',
+        };
+        statusCode = 409;
+        await this.saveIdempotentOperationResponse(transporterId, 'hold', idempotencyKey, payloadHash, statusCode, response);
+        this.recordHoldOutcomeMetrics(response, holdStartedAtMs);
+        return response;
+      }
+      if (parentOrder.status === 'cancelled' || parentOrder.status === 'expired' || parentOrder.status === 'completed') {
+        response = {
+          success: false,
+          message: `Cannot create hold — order is ${parentOrder.status}.`,
+          error: 'ORDER_TERMINAL',
+        };
+        statusCode = 409;
+        await this.saveIdempotentOperationResponse(transporterId, 'hold', idempotencyKey, payloadHash, statusCode, response);
+        this.recordHoldOutcomeMetrics(response, holdStartedAtMs);
+        return response;
+      }
+
       const holdId = `HOLD_${uuidv4().substring(0, 8).toUpperCase()}`;
       const now = new Date();
-      const expiresAt = new Date(now.getTime() + CONFIG.HOLD_DURATION_SECONDS * 1000);
+      const holdDurationMs = CONFIG.HOLD_DURATION_SECONDS * 1000;
+      let expiresAt = new Date(now.getTime() + holdDurationMs);
       let heldCount = 0;
 
       await withDbTimeout(async (tx) => {
+        // F-A-75: Second-gate KYC + isActive re-check inside the same transaction as
+        // the hold mutation, with SELECT ... FOR UPDATE row-lock to serialize against
+        // concurrent admin revocations. Errors propagate and roll back the TX.
+        await validateActorEligibility(tx, transporterId, 'legacy_hold');
+
         const order = await tx.order.findUnique({
           where: { id: orderId },
-          select: { id: true, status: true }
+          select: { id: true, status: true, expiresAt: true }
         });
 
         if (!order) throw new Error('ORDER_NOT_FOUND');
         if (TERMINAL_ORDER_STATUSES.has(order.status)) throw new Error('ORDER_INACTIVE');
 
-        const claimedRows = FF_HOLD_DB_ATOMIC_CLAIM
-          ? await tx.$queryRaw<Array<{ id: string }>>`
+        // AB3: Cap hold lifetime to broadcast/order remaining time.
+        // A hold must never outlive its parent broadcast.
+        const broadcastRemainingMs = new Date(order.expiresAt).getTime() - now.getTime();
+        if (broadcastRemainingMs > 0) {
+          const cappedDurationMs = Math.min(holdDurationMs, broadcastRemainingMs);
+          expiresAt = new Date(now.getTime() + cappedDurationMs);
+        }
+
+        // H-08 FIX: Always use FOR UPDATE SKIP LOCKED — the findMany fallback
+        // had no row locking, allowing double-claims under concurrent requests.
+        const claimedRows = await tx.$queryRaw<Array<{ id: string }>>`
               SELECT id
               FROM "TruckRequest"
               WHERE "orderId" = ${orderId}
@@ -721,18 +828,7 @@ class TruckHoldService {
               ORDER BY "requestNumber" ASC, "createdAt" ASC
               FOR UPDATE SKIP LOCKED
               LIMIT ${quantity}
-            `
-          : await tx.truckRequest.findMany({
-            where: {
-              orderId,
-              vehicleType: { equals: vehicleType, mode: 'insensitive' },
-              vehicleSubtype: { equals: vehicleSubtype, mode: 'insensitive' },
-              status: TruckRequestStatus.searching
-            },
-            orderBy: [{ requestNumber: 'asc' }, { createdAt: 'asc' }],
-            take: quantity,
-            select: { id: true }
-          });
+            `;
 
         const selectedIds = claimedRows.map((row) => row.id);
         if (selectedIds.length < quantity) {
@@ -791,8 +887,37 @@ class TruckHoldService {
 
       this.broadcastAvailabilityUpdate(orderId);
       logger.info(`[TruckHold] ✅ Held ${heldCount} trucks. Hold ID: ${holdId}, Expires: ${expiresAt.toISOString()}`);
-    } catch (error: any) {
-      const message = String(error?.message || 'HOLD_FAILED');
+
+      // F-A-77: Enqueue a per-hold durable expiry job. Legacy holds default to FLEX phase
+      // (schema default) so scheduleFlexHoldCleanup is the correct routing. This moves the
+      // primary expiry responsibility from the in-process setInterval to a Redis-backed
+      // delayed job that survives container restarts. The setInterval reconciler (60s)
+      // remains as belt-and-braces for failed enqueues and Redis clock skew.
+      try {
+        await holdExpiryCleanupService.scheduleFlexHoldCleanup(holdId, expiresAt);
+      } catch (scheduleErr: unknown) {
+        const errMsg = scheduleErr instanceof Error ? scheduleErr.message : String(scheduleErr);
+        logger.warn(`[TruckHold] Failed to schedule durable HOLD_EXPIRY job — reconciler will catch within 60s`, {
+          holdId,
+          orderId,
+          error: errMsg,
+        });
+      }
+    } catch (error: unknown) {
+      // F-A-75: surface KYC / isActive eligibility failures with a distinct code so
+      // the API layer can return 403 FORBIDDEN_INELIGIBLE instead of a generic 500.
+      if (error instanceof HoldEligibilityError) {
+        statusCode = 403;
+        response = {
+          success: false,
+          message: error.message,
+          error: error.code,
+        };
+        await this.saveIdempotentOperationResponse(transporterId, 'hold', idempotencyKey, payloadHash, statusCode, response);
+        this.recordHoldOutcomeMetrics(response, holdStartedAtMs);
+        return response;
+      }
+      const message = error instanceof Error ? error.message : 'HOLD_FAILED';
       if (message.startsWith('NOT_ENOUGH_AVAILABLE')) {
         const available = parseInt(message.split(':')[1] || '0', 10);
         response = {
@@ -912,6 +1037,8 @@ class TruckHoldService {
         await tx.truckHoldLedger.update({
           where: { holdId },
           data: {
+            phase: HoldPhase.CONFIRMED,
+            phaseChangedAt: new Date(),
             status: 'confirmed',
             confirmedAt: new Date(),
             terminalReason: null
@@ -935,17 +1062,18 @@ class TruckHoldService {
         assignedTrucks: hold.truckRequestIds
       };
 
-    } catch (error: any) {
-      if (String(error?.message || '') === 'ORDER_INACTIVE') {
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message === 'ORDER_INACTIVE') {
         return { success: false, message: 'This request is no longer active.' };
       }
-      if (String(error?.message || '') === 'TRUCK_STATE_CHANGED') {
+      if (message === 'TRUCK_STATE_CHANGED') {
         return { success: false, message: 'Some held trucks changed state. Please retry.' };
       }
-      logger.error(`[TruckHold] Error confirming hold: ${error.message}`, error);
+      logger.error(`[TruckHold] Error confirming hold: ${message}`, error);
       return { success: false, message: 'Failed to confirm. Please try again.' };
     } finally {
-      metrics.observeHistogram('confirm.latency_ms', Math.max(0, Date.now() - confirmStartedAtMs));
+      metrics.observeHistogram('confirm_latency_ms', Math.max(0, Date.now() - confirmStartedAtMs));
     }
   }
 
@@ -976,6 +1104,13 @@ class TruckHoldService {
    * @param transporterId - The transporter confirming
    * @param assignments - Array of { vehicleId, driverId } for each truck
    * @returns Success/failure with assignment details
+   */
+  /**
+   * ⚠ PRE-SHIP CHECKLIST (F-A-76 strangler-fig meta-parent)
+   * This monolith (confirmHoldWithAssignments, ~673 LOC) will be extracted in P5.
+   * All hold-saga fixes (F-A-78/79/80/82/84) must preserve single-entry semantics.
+   * Routes `truck-hold-crud.routes.ts:171` + `truck-hold.routes.ts:226` pin here.
+   * DO NOT add new call-sites. See .planning/phase4/INDEX.md § F-A-76.
    */
   async confirmHoldWithAssignments(
     holdId: string,
@@ -1226,6 +1361,11 @@ class TruckHoldService {
       const transporter = await db.getUserById(transporterId);
       const now = new Date().toISOString();
       const confirmedAssignments = await withDbTimeout(async (tx) => {
+        // F-A-75: Second-gate KYC + isActive re-check inside the same transaction as
+        // the assignment writes. Row-locked so a concurrent admin revocation cannot
+        // race between our read and the truckRequest/assignment mutations below.
+        await validateActorEligibility(tx, transporterId, 'legacy_accept');
+
         const txAssignments: Array<{
           assignmentId: string;
           tripId: string;
@@ -1395,6 +1535,8 @@ class TruckHoldService {
           });
         }
 
+        // F-L12: Increment inside interactive TX is safe — Prisma holds row lock for TX duration.
+        // CAS is unnecessary here. See WEELO-FINAL-INDEX.md F-L12.
         const updatedOrder = await tx.order.update({
           where: { id: hold.orderId },
           data: { trucksFilled: { increment: txAssignments.length } },
@@ -1437,8 +1579,8 @@ class TruckHoldService {
         );
       }
 
-      // Driver response timeout — matches assignment.service.ts config
-      const DRIVER_TIMEOUT_MS = parseInt(process.env.ASSIGNMENT_TIMEOUT_MS || '30000', 10);
+      // Driver response timeout — Fix H-X1: centralized via HOLD_CONFIG
+      const DRIVER_TIMEOUT_MS = HOLD_CONFIG.driverAcceptTimeoutMs;
 
       // OPTIMIZATION 1: Single room broadcast to all drivers
       // All drivers receive their assignment in one message and filter by driverId
@@ -1457,7 +1599,7 @@ class TruckHoldService {
         farePerTruck: assignment.farePerTruck,
         distanceKm: order.distanceKm,
         customerName: order.customerName,
-        customerPhone: order.customerPhone,
+        customerPhone: maskPhoneForExternal(order.customerPhone),
         assignedAt: now,
         expiresAt: new Date(Date.now() + DRIVER_TIMEOUT_MS).toISOString(),
         message: `New trip assigned! ${order.pickup.address} → ${order.drop.address}`
@@ -1481,7 +1623,7 @@ class TruckHoldService {
           farePerTruck: assignment.farePerTruck,
           distanceKm: order.distanceKm,
           customerName: order.customerName,
-          customerPhone: order.customerPhone,
+          customerPhone: maskPhoneForExternal(order.customerPhone),
           assignedAt: now,
           expiresAt: new Date(Date.now() + DRIVER_TIMEOUT_MS).toISOString(),
           message: `New trip assigned! ${order.pickup.address} → ${order.drop.address}`
@@ -1521,7 +1663,7 @@ class TruckHoldService {
           fare: String(assignment.farePerTruck ?? 0),
           distanceKm: String(order.distanceKm ?? 0),
           customerName: order.customerName || '',
-          customerPhone: order.customerPhone || '',
+          customerPhone: maskPhoneForExternal(order.customerPhone),
           assignedAt: now,
           expiresAt: new Date(Date.now() + DRIVER_TIMEOUT_MS).toISOString()
         };
@@ -1579,6 +1721,8 @@ class TruckHoldService {
       await prismaClient.truckHoldLedger.update({
         where: { holdId },
         data: {
+          phase: HoldPhase.CONFIRMED,
+          phaseChangedAt: new Date(),
           status: 'confirmed',
           confirmedAt: new Date(),
           terminalReason: null
@@ -1601,13 +1745,19 @@ class TruckHoldService {
         tripIds
       };
 
-    } catch (error: any) {
-      const msg = String(error?.message || '');
+    } catch (error: unknown) {
+      // F-A-75: surface KYC / isActive ineligibility as a distinct rejection so the API
+      // caller can render the correct 403 error instead of a generic transaction failure.
+      if (error instanceof HoldEligibilityError) {
+        return { success: false, message: error.message };
+      }
+      const msg = error instanceof Error ? error.message : String(error);
+      const prismaError = error as { code?: string; meta?: { target?: string[] } };
       logger.error(`[TruckHold] Error confirming with assignments: ${msg}`, error);
 
       // Prisma unique constraint violation (P2002) — driver already has an active assignment
-      if (error?.code === 'P2002') {
-        const target = Array.isArray(error?.meta?.target) ? error.meta.target.join(', ') : '';
+      if (prismaError?.code === 'P2002') {
+        const target = Array.isArray(prismaError?.meta?.target) ? prismaError.meta.target.join(', ') : '';
         if (target.includes('driverId')) {
           return { success: false, message: 'This driver already has an active assignment. Please choose a different driver.' };
         }
@@ -1615,7 +1765,7 @@ class TruckHoldService {
       }
 
       // Prisma serialization failure (P2034) — concurrent transaction conflict
-      if (error?.code === 'P2034') {
+      if (prismaError?.code === 'P2034') {
         return { success: false, message: 'Another transaction is in progress. Please try again in a moment.' };
       }
 
@@ -1761,15 +1911,16 @@ class TruckHoldService {
 
       logger.info(`[TruckHold] ✅ Released hold ${normalizedHoldId}. ${hold.quantity} trucks reconciled.`);
       if (releaseSource !== 'cleanup') {
-        metrics.incrementCounter('hold.release.total', { source: releaseSource });
+        metrics.incrementCounter('hold_release_total', { source: releaseSource });
       }
 
       response = { success: true, message: 'Hold released successfully.' };
       statusCode = 200;
       return response;
 
-    } catch (error: any) {
-      logger.error(`[TruckHold] Error releasing hold: ${error.message}`, error);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error(`[TruckHold] Error releasing hold: ${message}`, error);
       response = { success: false, message: 'Failed to release hold', error: 'INTERNAL_ERROR' };
       return response;
     } finally {
@@ -1851,7 +2002,7 @@ class TruckHoldService {
       return {
         orderId,
         customerName: order.customerName || 'Customer',
-        customerPhone: order.customerPhone || '',
+        customerPhone: maskPhoneForExternal(order.customerPhone),
         pickup: order.pickup,
         drop: order.drop,
         distanceKm: order.distanceKm || 0,
@@ -1861,8 +2012,9 @@ class TruckHoldService {
         isFullyAssigned
       };
 
-    } catch (error: any) {
-      logger.error(`[TruckHold] Error getting availability: ${error.message}`, error);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error(`[TruckHold] Error getting availability: ${message}`, error);
       return null;
     }
   }
@@ -2037,6 +2189,17 @@ class TruckHoldService {
         }
       }
 
+      // H-19 FIX: Cap notified transporters to prevent latency spikes on availability updates
+      const MAX_BROADCAST_TRANSPORTERS_HOLD = parseInt(process.env.MAX_BROADCAST_TRANSPORTERS || '100', 10);
+      if (notifiedTransporterIds.size > MAX_BROADCAST_TRANSPORTERS_HOLD) {
+        const allIds = Array.from(notifiedTransporterIds);
+        logger.info(`[TruckHold] Capping availability update ${notifiedTransporterIds.size} -> ${MAX_BROADCAST_TRANSPORTERS_HOLD} transporters`);
+        notifiedTransporterIds.clear();
+        for (let i = 0; i < MAX_BROADCAST_TRANSPORTERS_HOLD; i++) {
+          notifiedTransporterIds.add(allIds[i]);
+        }
+      }
+
       // For each vehicle type in the order, calculate personalized updates
       for (const truckType of availability.trucks) {
         const { vehicleType, vehicleSubtype, available: trucksStillSearching } = truckType;
@@ -2146,19 +2309,37 @@ class TruckHoldService {
    * and to clean up database state for trucks that were held but lock expired.
    */
   private startCleanupJob(): void {
-    this.cleanupInterval = setInterval(async () => {
-      try {
-        // Distributed lock: only ONE instance runs cleanup per interval
-        const cleanupLock = await redisService.acquireLock(
-          'hold-cleanup-job',
-          `cleanup-${process.pid}`,
-          60  // 60s lock TTL — cleanup should complete well within this
-        );
-        if (!cleanupLock.acquired) {
-          return; // Another instance is handling cleanup
-        }
+    // FIX #8: Immediate catch-up on startup — process anything expired during downtime.
+    // Fire-and-forget so it never blocks server startup.
+    this.processExpiredHoldsOnce().catch(err =>
+      logger.warn('[HOLD-CLEANUP] Startup catch-up failed', { error: err instanceof Error ? err.message : String(err) })
+    );
 
-        try {
+    // Then start the regular interval
+    this.cleanupInterval = setInterval(async () => {
+      await this.processExpiredHoldsOnce();
+    }, CONFIG.CLEANUP_INTERVAL_MS);
+
+    logger.info(`[TruckHold] Cleanup reconciler started (every ${CONFIG.CLEANUP_INTERVAL_MS / 1000}s — safety net; primary path is durable HOLD_EXPIRY queue)`);
+  }
+
+  /**
+   * FIX #8: Extracted cleanup logic into a named method so it can be called
+   * both on startup (immediate catch-up) and on each interval tick.
+   */
+  private async processExpiredHoldsOnce(): Promise<void> {
+    try {
+      // FIX-22: Unified cleanup lock key — all cleanup systems share this lock to prevent conflicts
+      const cleanupLock = await redisService.acquireLock(
+        'hold:cleanup:unified',
+        `cleanup-${process.pid}`,
+        60  // 60s lock TTL — cleanup should complete well within this
+      );
+      if (!cleanupLock.acquired) {
+        return; // Another instance is handling cleanup
+      }
+
+      try {
         const now = new Date();
         let cleanupReleasedCount = 0;
         const expiredHolds = await prismaClient.truckHoldLedger.findMany({
@@ -2166,7 +2347,7 @@ class TruckHoldService {
             status: 'active',
             expiresAt: { lte: now }
           },
-          take: 200,
+          take: HOLD_CLEANUP_BATCH_SIZE,
           orderBy: { expiresAt: 'asc' },
           select: { holdId: true, orderId: true }
         });
@@ -2177,8 +2358,13 @@ class TruckHoldService {
           if (releaseResult.success) {
             cleanupReleasedCount++;
           }
-          await prismaClient.truckHoldLedger.update({
-            where: { holdId: hold.holdId },
+          // FIX #29: Guard against overwriting terminal states.
+          // Only mark as expired if hold is still in a non-terminal state.
+          await prismaClient.truckHoldLedger.updateMany({
+            where: {
+              holdId: hold.holdId,
+              status: { notIn: ['completed', 'cancelled', 'released', 'expired'] },
+            },
             data: {
               status: 'expired',
               terminalReason: 'HOLD_TTL_EXPIRED',
@@ -2190,11 +2376,17 @@ class TruckHoldService {
         if (expiredHolds.length > 0) {
           logger.info(`[TruckHold] Cleanup: Reconciled ${expiredHolds.length} expired holds`);
           // Emit explicit cleanup metric at job level for release-gate visibility.
-          metrics.incrementCounter('hold.cleanup.released_total', { source: 'cleanup_job' }, cleanupReleasedCount);
+          metrics.incrementCounter('hold_cleanup_released_total', { source: 'cleanup_job' }, cleanupReleasedCount);
         }
 
+        // FIX-38: Use Redis for distributed-safe purge timestamp instead of in-memory field.
+        // This ensures all instances share the same "last purge at" value and prevents
+        // redundant purges across horizontally scaled servers.
+        const PURGE_KEY = 'hold:idempotency:lastPurgeAt';
+        const lastPurgeRaw = await redisService.get(PURGE_KEY);
+        const lastPurgeMs = lastPurgeRaw ? parseInt(lastPurgeRaw, 10) : 0;
         const nowMs = Date.now();
-        if (nowMs - this.lastIdempotencyPurgeAtMs >= HOLD_IDEMPOTENCY_PURGE_INTERVAL_MS) {
+        if (nowMs - lastPurgeMs >= HOLD_IDEMPOTENCY_PURGE_INTERVAL_MS) {
           // Distributed lock: only ONE instance runs purge per interval
           const purgeLock = await redisService.acquireLock(
             'hold-idempotency-purge',
@@ -2205,7 +2397,8 @@ class TruckHoldService {
             // Another instance is handling purge — skip
           } else {
             try {
-              this.lastIdempotencyPurgeAtMs = nowMs;
+              // FIX-38: Write purge timestamp to Redis with 1hr TTL
+              await redisService.set(PURGE_KEY, String(nowMs), 3600);
               const cutoff = new Date(nowMs - (HOLD_IDEMPOTENCY_RETENTION_HOURS * 60 * 60 * 1000));
               const purged = await prismaClient.truckHoldIdempotency.deleteMany({
                 where: {
@@ -2214,23 +2407,21 @@ class TruckHoldService {
               });
               if (purged.count > 0) {
                 logger.info(`[TruckHold] Purged ${purged.count} old hold idempotency row(s)`);
-                metrics.incrementCounter('hold.idempotency.purged_total', {}, purged.count);
+                metrics.incrementCounter('hold_idempotency_purged_total', {}, purged.count);
               }
             } finally {
               await redisService.releaseLock('hold-idempotency-purge', `purge-${process.pid}`).catch(() => {});
             }
           }
         }
-        } finally {
-          // Release the cleanup lock (auto-expires after 60s if we crash)
-          await redisService.releaseLock('hold-cleanup-job', `cleanup-${process.pid}`).catch(() => {});
-        }
-      } catch (error: any) {
-        logger.error(`[TruckHold] Cleanup job error: ${error.message}`);
+      } finally {
+        // FIX-22: Release the unified cleanup lock (auto-expires after 60s if we crash)
+        await redisService.releaseLock('hold:cleanup:unified', `cleanup-${process.pid}`).catch(() => {});
       }
-    }, CONFIG.CLEANUP_INTERVAL_MS);
-
-    logger.info(`[TruckHold] Cleanup job started (every ${CONFIG.CLEANUP_INTERVAL_MS / 1000}s)`);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error(`[TruckHold] Cleanup job error: ${message}`);
+    }
   }
 
   /**

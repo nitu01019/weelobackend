@@ -47,6 +47,31 @@
  */
 
 import { logger } from './logger.service';
+import { config } from '../../config/environment';
+
+// =============================================================================
+// UTILITIES
+// =============================================================================
+
+/** Safe JSON.stringify that handles circular references */
+function safeStringify(obj: unknown): string {
+  try {
+    return JSON.stringify(obj);
+  } catch {
+    const seen = new WeakSet();
+    try {
+      return JSON.stringify(obj, (_key, value) => {
+        if (typeof value === 'object' && value !== null) {
+          if (seen.has(value)) return '[Circular]';
+          seen.add(value);
+        }
+        return value;
+      });
+    } catch {
+      return String(obj);
+    }
+  }
+}
 
 // =============================================================================
 // TYPES
@@ -114,6 +139,8 @@ interface IRedisClient {
   sMembers(key: string): Promise<string[]>;
   sScan(key: string, cursor: string, count?: number): Promise<[string, string[]]>;
   sIsMember(key: string, member: string): Promise<boolean>;
+  /** H-P4: Batch SISMEMBER — checks multiple members in a single round-trip */
+  smIsMembers(key: string, members: string[]): Promise<boolean[]>;
   sCard(key: string): Promise<number>;
   sUnion(...keys: string[]): Promise<string[]>;
 
@@ -149,6 +176,12 @@ interface IRedisClient {
   // Lua scripts (for atomic operations)
   eval(script: string, keys: string[], args: string[]): Promise<any>;
 
+  /**
+   * Atomic SADD + EXPIRE via Lua script (LINE Engineering pattern).
+   * Prevents orphaned sets without TTL if crash occurs between separate calls.
+   */
+  sAddWithExpire(key: string, ttlSeconds: number, ...members: string[]): Promise<void>;
+
   // Raw client access (for Socket.IO Redis Streams adapter)
   getRawClient(): any;
 }
@@ -170,12 +203,34 @@ class InMemoryRedisClient implements IRedisClient {
   private store = new Map<string, { value: any; expiresAt?: number; type: string }>();
   private subscribers = new Map<string, Set<(message: string) => void>>();
   private cleanupInterval: NodeJS.Timeout | null = null;
+  private evalWarned = false;
+  // Fix G2: Cap in-memory store to prevent unbounded growth in dev/fallback
+  private readonly MAX_KEYS = 10000;
 
   constructor() {
     // Cleanup expired keys every 10 seconds
     this.cleanupInterval = setInterval(() => this.cleanup(), 10000);
     this.cleanupInterval.unref();
     logger.info('📦 [Redis] In-memory fallback initialized (development mode)');
+  }
+
+  /** Fix G2: Evict oldest entries without TTL when store exceeds MAX_KEYS */
+  private enforceMaxKeys(): void {
+    if (this.store.size <= this.MAX_KEYS) return;
+    const entries = [...this.store.entries()];
+    const toRemove = entries
+      .filter(([, v]) => !v.expiresAt)
+      .slice(0, this.store.size - this.MAX_KEYS);
+    for (const [key] of toRemove) {
+      this.store.delete(key);
+    }
+    // If still over limit, evict the oldest with TTL
+    if (this.store.size > this.MAX_KEYS) {
+      const remaining = [...this.store.keys()].slice(0, this.store.size - this.MAX_KEYS);
+      for (const key of remaining) {
+        this.store.delete(key);
+      }
+    }
   }
 
   getRawClient(): any {
@@ -238,6 +293,7 @@ class InMemoryRedisClient implements IRedisClient {
       entry.expiresAt = Date.now() + (ttlSeconds * 1000);
     }
     this.store.set(key, entry);
+    this.enforceMaxKeys(); // Fix G2: Prevent unbounded growth
   }
 
   async del(key: string): Promise<boolean> {
@@ -486,6 +542,13 @@ class InMemoryRedisClient implements IRedisClient {
     const entry = this.store.get(key);
     if (!entry || entry.type !== 'set') return false;
     return entry.value.has(member);
+  }
+
+  /** H-P4: Batch SISMEMBER for in-memory fallback */
+  async smIsMembers(key: string, members: string[]): Promise<boolean[]> {
+    const set = this.isExpired(key) ? null : this.store.get(key);
+    if (!set || set.type !== 'set') return members.map(() => false);
+    return members.map(m => set.value.has(m));
   }
 
   async sCard(key: string): Promise<number> {
@@ -737,8 +800,18 @@ class InMemoryRedisClient implements IRedisClient {
 
   async eval(script: string, keys: string[], args: string[]): Promise<any> {
     // Basic Lua script simulation for common patterns
-    logger.warn('[Redis] Lua scripts not fully supported in in-memory mode');
+    if (!this.evalWarned) {
+      logger.error('[Redis] Lua scripts NOT supported in in-memory mode — all atomic operations degraded');
+      this.evalWarned = true;
+    }
     return null;
+  }
+
+  async sAddWithExpire(key: string, ttlSeconds: number, ...members: string[]): Promise<void> {
+    if (members.length === 0) return;
+    // In-memory fallback: separate calls (no atomicity concern in single-process dev mode)
+    await this.sAdd(key, ...members);
+    await this.expire(key, ttlSeconds);
   }
 }
 
@@ -789,6 +862,7 @@ class InMemoryTransaction implements IRedisTransaction {
 class RealRedisClient implements IRedisClient {
   private client: any = null;
   private subscriber: any = null;
+  private blockingClient: any = null;  // Dedicated client for BRPOP/BLPOP (BullMQ pattern)
   private connected = false;
   private reconnecting = false;
   private subscriptions = new Map<string, (message: string) => void>();
@@ -817,6 +891,7 @@ class RealRedisClient implements IRedisClient {
       const isClusterMode = process.env.REDIS_CLUSTER === 'true';
       const clusterNodes = (process.env.REDIS_NODES || '').split(',').filter(Boolean);
       const useTls = this.config.url.startsWith('rediss://');
+      const rejectUnauthorized = process.env.REDIS_TLS_REJECT_UNAUTHORIZED !== 'false';
 
       if (isClusterMode && clusterNodes.length > 0) {
         // Parse cluster nodes: "host1:port1,host2:port2,..."
@@ -833,7 +908,7 @@ class RealRedisClient implements IRedisClient {
             commandTimeout: this.config.commandTimeoutMs,
             enableOfflineQueue: false,
             keepAlive: 1000,
-            tls: useTls ? { rejectUnauthorized: false } : undefined,
+            tls: useTls ? { rejectUnauthorized } : undefined,
             password: process.env.REDIS_PASSWORD || undefined,
           },
           clusterRetryStrategy: (times: number) => {
@@ -855,7 +930,7 @@ class RealRedisClient implements IRedisClient {
         // Subscriber in cluster mode — same cluster client works for pub/sub
         this.subscriber = new Redis.Cluster(nodes, {
           redisOptions: {
-            tls: useTls ? { rejectUnauthorized: false } : undefined,
+            tls: useTls ? { rejectUnauthorized } : undefined,
             password: process.env.REDIS_PASSWORD || undefined,
           },
         });
@@ -896,7 +971,7 @@ class RealRedisClient implements IRedisClient {
           // on ElastiCache Serverless which has a 20s idle connection timeout.
           keepAlive: 1000,
           // TLS required for ElastiCache Serverless
-          tls: useTls ? { rejectUnauthorized: false } : undefined,
+          tls: useTls ? { rejectUnauthorized } : undefined,
         });
 
         // Subscriber client for pub/sub (needs separate connection)
@@ -904,7 +979,26 @@ class RealRedisClient implements IRedisClient {
           maxRetriesPerRequest: this.config.maxRetries,
           connectTimeout: this.config.connectionTimeoutMs,
           // TLS required for ElastiCache Serverless
-          tls: useTls ? { rejectUnauthorized: false } : undefined,
+          tls: useTls ? { rejectUnauthorized } : undefined,
+        });
+
+        // Blocking client for BRPOP/BLPOP (BullMQ pattern)
+        // Separate ioredis instance with no commandTimeout so BRPOP can
+        // legitimately wait for seconds without being killed.
+        // maxRetriesPerRequest: null is required by ioredis for blocking commands.
+        this.blockingClient = new Redis(this.config.url, {
+          maxRetriesPerRequest: null,     // Required for blocking commands (BullMQ pattern)
+          connectTimeout: this.config.connectionTimeoutMs,
+          enableOfflineQueue: false,
+          enableReadyCheck: true,
+          lazyConnect: false,
+          keepAlive: 1000,
+          tls: useTls ? { rejectUnauthorized } : undefined,
+          // No commandTimeout — BRPOP legitimately waits for seconds
+        });
+
+        this.blockingClient.on('error', (err: Error) => {
+          logger.error(`[Redis] Blocking client error: ${err.message}`);
         });
       }
 
@@ -971,6 +1065,9 @@ class RealRedisClient implements IRedisClient {
   }
 
   async disconnect(): Promise<void> {
+    if (this.blockingClient) {
+      await this.blockingClient.quit().catch(() => {});
+    }
     if (this.subscriber) {
       await this.subscriber.quit();
     }
@@ -1092,13 +1189,31 @@ class RealRedisClient implements IRedisClient {
   }
 
   /**
-   * Pop from right of list (non-blocking)
-   * Uses RPOP instead of BRPOP to avoid ioredis commandTimeout conflicts.
-   * The caller (queue worker) handles the polling interval with sleep.
+   * Blocking pop from right of list with timeout.
+   * Uses a DEDICATED blocking client to avoid commandTimeout conflicts.
+   * BullMQ pattern: separate ioredis instance for BRPOP/BLPOP.
    */
-  async brPop(key: string, _timeoutSeconds: number): Promise<string | null> {
-    const result = await this.client.rpop(key);
-    return result ?? null;
+  async brPop(key: string, timeoutSeconds: number): Promise<string | null> {
+    if (!this.blockingClient) {
+      // Fallback: blocking client not initialized
+      const result = await this.client.rpop(key);
+      return result ?? null;
+    }
+
+    try {
+      const result = await this.blockingClient.brpop(key, timeoutSeconds);
+      // ioredis brpop returns [key, value] or null when timeout expires
+      return result ? result[1] : null;
+    } catch (err: any) {
+      // If blocking client dies, fall back to non-blocking rpop
+      logger.warn(`[Redis] BRPOP failed, falling back to RPOP: ${err.message}`);
+      const result = await this.client.rpop(key);
+      if (!result) {
+        // Prevent busy-spin: sleep for the blocking timeout duration since BRPOP failed
+        await new Promise(resolve => setTimeout(resolve, timeoutSeconds * 1000));
+      }
+      return result ?? null;
+    }
   }
 
   // =========== Sets ===========
@@ -1125,6 +1240,13 @@ class RealRedisClient implements IRedisClient {
   async sIsMember(key: string, member: string): Promise<boolean> {
     const result = await this.client.sismember(key, member);
     return result > 0;
+  }
+
+  /** H-P4: Batch SISMEMBER via Redis SMISMEMBER (Redis 6.2+) — single round-trip */
+  async smIsMembers(key: string, members: string[]): Promise<boolean[]> {
+    if (members.length === 0) return [];
+    const results = await this.client.smismember(key, ...members);
+    return results.map((r: number) => r === 1);
   }
 
   async sCard(key: string): Promise<number> {
@@ -1217,7 +1339,8 @@ class RealRedisClient implements IRedisClient {
     };
   }
 
-  async geoRadius(key: string, longitude: number, latitude: number, radius: number, unit: 'km' | 'm'): Promise<GeoMember[]> {
+  async geoRadius(key: string, longitude: number, latitude: number, radius: number, unit: 'km' | 'm', count: number = config.geoQueryMaxCandidates || 250): Promise<GeoMember[]> {
+    // Fix D1/F-3-1: Add COUNT limit to prevent unbounded result sets
     // Use GEOSEARCH (Redis 6.2+) or fallback to GEORADIUS
     try {
       const results = await this.client.geosearch(
@@ -1225,7 +1348,8 @@ class RealRedisClient implements IRedisClient {
         'FROMLONLAT', longitude, latitude,
         'BYRADIUS', radius, unit,
         'WITHDIST', 'WITHCOORD',
-        'ASC'
+        'ASC',
+        'COUNT', count
       );
 
       return this.parseGeoResults(results);
@@ -1233,7 +1357,8 @@ class RealRedisClient implements IRedisClient {
       // Fallback to GEORADIUS for older Redis
       const results = await this.client.georadius(
         key, longitude, latitude, radius, unit,
-        'WITHDIST', 'WITHCOORD', 'ASC'
+        'WITHDIST', 'WITHCOORD', 'ASC',
+        'COUNT', count
       );
 
       return this.parseGeoResults(results);
@@ -1295,6 +1420,18 @@ class RealRedisClient implements IRedisClient {
   async eval(script: string, keys: string[], args: string[]): Promise<any> {
     return this.client.eval(script, keys.length, ...keys, ...args);
   }
+
+  async sAddWithExpire(key: string, ttlSeconds: number, ...members: string[]): Promise<void> {
+    if (members.length === 0) return;
+    // Atomic SADD + EXPIRE via Lua (LINE Engineering pattern).
+    // Prevents orphaned sets without TTL if crash occurs between separate calls.
+    const luaScript = `
+      for i = 2, #ARGV do redis.call('SADD', KEYS[1], ARGV[i]) end
+      redis.call('EXPIRE', KEYS[1], ARGV[1])
+      return 1
+    `;
+    await this.eval(luaScript, [key], [String(ttlSeconds), ...members]);
+  }
 }
 
 // Real Redis transaction
@@ -1348,6 +1485,29 @@ class RedisService {
   private client: IRedisClient;
   private initialized = false;
   private useRedis = false;
+  public isDegraded: boolean = false;
+  private reconnectProbeTimer: ReturnType<typeof setInterval> | null = null;
+
+  // M-15 FIX: Environment-aware Redis key prefix.
+  // Prevents key collisions when dev/staging/prod share the same Redis instance.
+  // Existing keys already have semantic prefixes (geo:, transporter:, {avail:}:),
+  // so this is an opt-in utility — callers use prefixKey() for new or direct keys.
+  // Set REDIS_KEY_PREFIX env var per environment (e.g., "prod", "staging", "dev").
+  readonly keyPrefix: string = process.env.REDIS_KEY_PREFIX || '';
+
+  /**
+   * M-15: Prefix a key with the environment namespace.
+   * Idempotent — already-prefixed keys are returned unchanged.
+   * Use for new direct Redis calls to prevent cross-environment collisions.
+   *
+   * @example
+   * const key = redisService.prefixKey('order:lock:123'); // "prod:order:lock:123"
+   */
+  prefixKey(key: string): string {
+    if (!this.keyPrefix) return key;
+    if (key.startsWith(`${this.keyPrefix}:`)) return key;
+    return `${this.keyPrefix}:${key}`;
+  }
 
   constructor() {
     // Initialize with in-memory by default
@@ -1390,11 +1550,40 @@ class RedisService {
 
         this.client = realClient;
         this.useRedis = true;
+        this.isDegraded = false;
+
+        // FIX F-5-10b: Attach runtime event handlers to reset/set isDegraded
+        // on Redis disconnect/reconnect. Without this, isDegraded stays true
+        // forever after a transient Redis outage even if Redis recovers.
+        const rawClient = realClient.getRawClient();
+        if (rawClient && typeof rawClient.on === 'function') {
+          rawClient.on('ready', () => {
+            this.isDegraded = false;
+            this.stopReconnectProbe();
+            logger.info('[Redis] Connection recovered — isDegraded reset to false');
+          });
+
+          rawClient.on('close', () => {
+            this.isDegraded = true;
+            this.startReconnectProbe();
+            logger.warn('[Redis] Connection lost — isDegraded set to true');
+          });
+        }
 
         logger.info('✅ [Redis] Production Redis connected successfully');
 
       } catch (error: any) {
         logger.error(`[Redis] Failed to connect to Redis: ${error.message}`);
+
+        // F-B-06: notify coordination wrapper first. In production with
+        // FF_REDIS_FAIL_CLOSED=true, this flips readinessBlocked=true and
+        // schedules process.exit(1) after a 5s grace so ALB drains the task.
+        // Without the flag (default OFF), legacy fallback is preserved.
+        try {
+          // Lazy require to avoid a circular dependency at module load.
+          const { markCoordinationLost } = require('./redis-coordination.service');
+          markCoordinationLost(`connect_failed: ${error.message}`);
+        } catch { /* wrapper unavailable — treat as legacy path */ }
 
         // 4 PRINCIPLES: Allow graceful degradation in production
         // SCALABILITY: App continues running, OTP uses memory fallback
@@ -1406,7 +1595,8 @@ class RedisService {
         logger.warn('⚠️  [Redis] Fix Redis connectivity for full production functionality');
         this.client = new InMemoryRedisClient();
         this.useRedis = false;
-        // Don't throw - allow app to start with limited functionality
+        this.isDegraded = true;
+        this.startReconnectProbe();
       }
     } else {
       // Redis not enabled
@@ -1428,17 +1618,55 @@ class RedisService {
     return this.useRedis;
   }
 
-  /**
-   * Get the raw underlying ioredis client for Socket.IO Redis Streams adapter.
-   * Returns null if using in-memory mode (adapter won't be init'd without Redis).
-   */
+  private startReconnectProbe(): void {
+    if (this.reconnectProbeTimer) return;
+    const PROBE_INTERVAL_MS = 30_000;
+
+    this.reconnectProbeTimer = setInterval(async () => {
+      try {
+        const { metrics } = require('../monitoring/metrics.service');
+        metrics.incrementCounter('redis_degraded_total');
+      } catch { /* metrics not available */ }
+
+      const redisUrl = process.env.REDIS_URL;
+      if (!redisUrl) return;
+
+      try {
+        const probe = new RealRedisClient({
+          url: redisUrl,
+          maxRetries: 1,
+          retryDelayMs: 500,
+          maxConnections: 1,
+          connectionTimeoutMs: 3000,
+          commandTimeoutMs: 3000,
+        });
+        await probe.connect();
+        this.client = probe;
+        this.useRedis = true;
+        this.isDegraded = false;
+        this.stopReconnectProbe();
+        logger.info('[Redis] Reconnect probe succeeded -- restored real Redis');
+      } catch {
+        logger.debug('[Redis] Reconnect probe failed -- still degraded');
+      }
+    }, PROBE_INTERVAL_MS);
+
+    if (this.reconnectProbeTimer.unref) {
+      this.reconnectProbeTimer.unref();
+    }
+  }
+
+  private stopReconnectProbe(): void {
+    if (this.reconnectProbeTimer) {
+      clearInterval(this.reconnectProbeTimer);
+      this.reconnectProbeTimer = null;
+    }
+  }
+
   getClient(): any {
     return this.client.getRawClient();
   }
 
-  /**
-   * Check if connected
-   */
   isConnected(): boolean {
     return this.client.isConnected();
   }
@@ -1472,7 +1700,12 @@ class RedisService {
   }
 
   async keys(pattern: string): Promise<string[]> {
-    return this.client.keys(pattern);
+    // Use SCAN instead of KEYS to avoid blocking Redis on large datasets
+    const keys: string[] = [];
+    for await (const key of this.client.scanIterator(pattern)) {
+      keys.push(key);
+    }
+    return keys;
   }
 
   /**
@@ -1568,7 +1801,8 @@ class RedisService {
       logger.warn(`[Redis] setJSON called before initialization, waiting...`);
       await this.initialize();
     }
-    await this.client.set(key, JSON.stringify(value), ttlSeconds);
+    // #55 FIX: Use safeStringify to avoid crash on circular objects
+    await this.client.set(key, safeStringify(value), ttlSeconds);
   }
 
   // ===========================================================================
@@ -1652,6 +1886,25 @@ class RedisService {
   }
 
   /**
+   * Atomic INCR + EXPIRE via Lua script for rate limiting.
+   *
+   * Guarantees the key always has a TTL by executing INCR and conditional
+   * EXPIRE as a single atomic Redis operation. Prevents the race where
+   * INCR succeeds but a subsequent EXPIRE call fails (network blip, timeout),
+   * leaving a counter key with no TTL that blocks requests forever.
+   *
+   * Self-heals: if an existing key has no TTL (from old non-atomic code),
+   * the script detects TTL=-1 and forces one.
+   *
+   * @param key - Redis key to increment
+   * @param ttlSeconds - TTL to set on first increment or when missing
+   * @returns The new counter value after increment
+   */
+  async atomicIncr(key: string, ttlSeconds: number): Promise<number> {
+    return this.incrementWithTTL(key, ttlSeconds);
+  }
+
+  /**
    * Atomic increment with TTL guarantee (Lua script)
    *
    * PRODUCTION FIX: The old implementation used two separate commands:
@@ -1671,61 +1924,62 @@ class RedisService {
    * Lua-based atomic pattern for rate limiting.
    */
   async incrementWithTTL(key: string, ttlSeconds: number): Promise<number> {
+    const result = await this.incrementWithTTLAndRemaining(key, ttlSeconds);
+    return result.count;
+  }
+
+  async incrementWithTTLAndRemaining(key: string, ttlSeconds: number): Promise<{ count: number; ttl: number }> {
     try {
-      // Atomic Lua script: INCR + conditional EXPIRE in one operation
-      // Self-heals stuck keys (no TTL) from old non-atomic implementation
       const result = await this.client.eval(
         `
         local count = redis.call('INCR', KEYS[1])
         if count == 1 then
           redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
         else
-          -- Self-healing: if key exists but has no TTL (stuck from old bug), fix it
           local currentTtl = redis.call('TTL', KEYS[1])
           if currentTtl == -1 then
             redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
           end
         end
-        return count
+        local ttl = redis.call('TTL', KEYS[1])
+        return {count, ttl}
         `,
-        [key],                   // KEYS[1]
-        [String(ttlSeconds)]     // ARGV[1]
+        [key],
+        [String(ttlSeconds)]
       );
 
-      // InMemoryRedisClient.eval() returns null — fall through to fallback
       if (result === null || result === undefined) {
         throw new Error('eval returned null (in-memory mode)');
       }
 
-      return Number(result);
-    } catch (error: any) {
-      // Fallback for in-memory mode or if Lua eval fails
-      // Uses two-command approach with defensive TTL check
+      if (Array.isArray(result) && result.length >= 2) {
+        return { count: Number(result[0]), ttl: Number(result[1]) };
+      }
+
+      return { count: Number(result), ttl: ttlSeconds };
+    } catch (error: unknown) {
       const count = await this.client.incr(key);
+      let currentTtl = ttlSeconds;
       try {
-        const currentTtl = await this.client.ttl(key);
-        if (currentTtl < 0) {
-          // Key has no TTL — either first increment or stuck key. Fix it.
+        const redisTtl = await this.client.ttl(key);
+        if (redisTtl < 0) {
           await this.client.expire(key, ttlSeconds);
+        } else {
+          currentTtl = redisTtl;
         }
       } catch {
-        // Best effort — counter still incremented correctly
+        // Best effort
       }
-      return count;
+      return { count, ttl: currentTtl };
     }
   }
 
-  /**
-   * Check rate limit
-   * @returns { allowed: boolean, remaining: number, resetIn: number }
-   */
   async checkRateLimit(key: string, limit: number, windowSeconds: number): Promise<{
     allowed: boolean;
     remaining: number;
     resetIn: number;
   }> {
-    const count = await this.incrementWithTTL(key, windowSeconds);
-    const ttl = await this.client.ttl(key);
+    const { count, ttl } = await this.incrementWithTTLAndRemaining(key, windowSeconds);
 
     return {
       allowed: count <= limit,
@@ -1826,11 +2080,17 @@ class RedisService {
       createdAt: new Date().toISOString()
     };
 
-    await this.client.set(timerKey, JSON.stringify(timerData), ttlSeconds + 60); // Extra 60s buffer
+    // #55 FIX: Use safeStringify to avoid crash on circular objects
+    await this.client.set(timerKey, safeStringify(timerData), ttlSeconds + 60); // Extra 60s buffer
 
-    // Also add to sorted set for efficient scanning
+    // Fix C6/F-5-2: Lua script does ZADD + cap at 10000 entries + 30-day safety TTL
     await this.client.eval(
-      `redis.call('zadd', KEYS[1], ARGV[1], ARGV[2])`,
+      `redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
+       redis.call('ZREMRANGEBYRANK', KEYS[1], 0, -10001)
+       if redis.call('TTL', KEYS[1]) == -1 then
+         redis.call('EXPIRE', KEYS[1], 2592000)
+       end
+       return 1`,
       ['timers:pending'],
       [expiresAt.getTime().toString(), timerKey]
     ).catch(() => {
@@ -1850,9 +2110,9 @@ class RedisService {
     const expired: Array<{ key: string; data: T; expiresAt: string }> = [];
 
     try {
-      // Get all timers that have expired from sorted set
+      // Get expired timers from sorted set (capped at 100 per cycle to prevent runaway scans)
       const expiredKeys = await this.client.eval(
-        `return redis.call('zrangebyscore', KEYS[1], '-inf', ARGV[1])`,
+        `return redis.call('zrangebyscore', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, 100)`,
         ['timers:pending'],
         [now.toString()]
       ) as string[] | null;
@@ -1887,8 +2147,11 @@ class RedisService {
         }
       }
     } catch (e) {
-      // Fallback: scan keys matching prefix
-      const keys = await this.client.keys(`${timerPrefix}*`);
+      // Fallback: scan keys matching prefix (uses SCAN, not KEYS)
+      const keys: string[] = [];
+      for await (const k of this.client.scanIterator(`${timerPrefix}*`)) {
+        keys.push(k);
+      }
       for (const key of keys) {
         const timerJson = await this.client.get(key);
         if (timerJson) {
@@ -1960,6 +2223,11 @@ class RedisService {
     return this.client.sIsMember(key, member);
   }
 
+  /** H-P4: Batch SISMEMBER — checks multiple members in a single round-trip */
+  async smIsMembers(key: string, members: string[]): Promise<boolean[]> {
+    return this.client.smIsMembers(key, members);
+  }
+
   async sCard(key: string): Promise<number> {
     return this.client.sCard(key);
   }
@@ -2014,7 +2282,8 @@ class RedisService {
   }
 
   async hSetJSON<T>(key: string, field: string, value: T): Promise<void> {
-    await this.client.hSet(key, field, JSON.stringify(value));
+    // #55 FIX: Use safeStringify to avoid crash on circular objects
+    await this.client.hSet(key, field, safeStringify(value));
   }
 
   async hGetJSON<T>(key: string, field: string): Promise<T | null> {
@@ -2123,23 +2392,56 @@ class RedisService {
       [holderId, ttlSeconds.toString()]
     );
 
-    // Fallback for in-memory mode
-    if (result === null) {
-      const existing = await this.client.get(key);
-      if (!existing) {
-        await this.client.set(key, holderId, ttlSeconds);
-        return { acquired: true, ttl: ttlSeconds };
-      } else if (existing === holderId) {
-        await this.client.expire(key, ttlSeconds);
-        return { acquired: true, ttl: ttlSeconds };
-      }
-      return { acquired: false };
+    // FIX F-5-10: Tiered degradation — Redis Lua → PG advisory → reject
+    // Lua eval succeeded — use its result directly
+    if (result !== null) {
+      return {
+        acquired: result === 1,
+        ttl: result === 1 ? ttlSeconds : undefined
+      };
     }
 
-    return {
-      acquired: result === 1,
-      ttl: result === 1 ? ttlSeconds : undefined
-    };
+    // Fallback: Lua returned null (in-memory mode or eval failure)
+    try {
+      const { metrics } = require('../monitoring/metrics.service');
+      metrics.incrementCounter('redis_lock_fallback_total');
+    } catch { /* metrics not available */ }
+
+    if (this.isDegraded) {
+      // Tier 2: PostgreSQL advisory lock — ACID-backed distributed coordination
+      try {
+        const { prismaClient } = require('../database/prisma.service');
+        const pgResult = await prismaClient.$queryRaw<Array<{ locked: boolean }>>`
+          SELECT pg_try_advisory_xact_lock(hashtext(${key})) AS locked
+        `;
+        const acquired = pgResult?.[0]?.locked === true;
+        if (acquired) {
+          await this.client.set(key, holderId, ttlSeconds).catch(() => {});
+          logger.warn('[Redis] Lock acquired via PostgreSQL advisory lock (degraded mode)', {
+            lockKey: key, holderId
+          });
+        }
+        return { acquired, ttl: acquired ? ttlSeconds : undefined };
+      } catch (pgError: unknown) {
+        // Tier 3: Both Redis AND PostgreSQL unavailable — reject, never silently proceed
+        const pgMsg = pgError instanceof Error ? pgError.message : String(pgError);
+        logger.error('[Redis] PG advisory lock failed — rejecting lock request (Tier 3)', {
+          lockKey: key, holderId, error: pgMsg
+        });
+        return { acquired: false };
+      }
+    }
+
+    // Non-degraded in-memory mode (dev/test only, single process)
+    const existing = await this.client.get(key);
+    if (!existing) {
+      await this.client.set(key, holderId, ttlSeconds);
+      return { acquired: true, ttl: ttlSeconds };
+    } else if (existing === holderId) {
+      await this.client.expire(key, ttlSeconds);
+      return { acquired: true, ttl: ttlSeconds };
+    }
+    return { acquired: false };
   }
 
   /**
@@ -2164,6 +2466,13 @@ class RedisService {
 
     // Fallback for in-memory mode
     if (result === null) {
+      // FIX F-5-10: Release PG advisory lock if in degraded mode
+      if (this.isDegraded) {
+        try {
+          const { prismaClient } = require('../database/prisma.service');
+          await prismaClient.$queryRaw`SELECT pg_advisory_unlock(hashtext(${key}))`;
+        } catch { /* PG release failure — lock auto-released on connection close */ }
+      }
       const existing = await this.client.get(key);
       if (existing === holderId) {
         await this.client.del(key);
@@ -2201,7 +2510,8 @@ class RedisService {
   }
 
   async publishJSON<T>(channel: string, data: T): Promise<number> {
-    return this.client.publish(channel, JSON.stringify(data));
+    // #55 FIX: Use safeStringify to avoid crash on circular objects
+    return this.client.publish(channel, safeStringify(data));
   }
 
   async subscribe(channel: string, callback: (message: string) => void): Promise<void> {
@@ -2227,6 +2537,14 @@ class RedisService {
     return this.client.eval(script, keys, args);
   }
 
+  /**
+   * Atomic SADD + EXPIRE via Lua script (LINE Engineering pattern).
+   * Prevents orphaned sets without TTL if crash occurs between separate SADD/EXPIRE calls.
+   */
+  async sAddWithExpire(key: string, ttlSeconds: number, ...members: string[]): Promise<void> {
+    return this.client.sAddWithExpire(key, ttlSeconds, ...members);
+  }
+
   // ===========================================================================
   // TRANSACTIONS
   // ===========================================================================
@@ -2239,7 +2557,11 @@ class RedisService {
   // HEALTH CHECK
   // ===========================================================================
 
-  async healthCheck(): Promise<{ status: 'healthy' | 'unhealthy'; mode: string; latencyMs?: number }> {
+  async healthCheck(): Promise<{ status: 'healthy' | 'degraded' | 'unhealthy'; mode: string; latencyMs?: number }> {
+    if (this.isDegraded) {
+      return { status: 'degraded', mode: 'memory-fallback' };
+    }
+
     const start = Date.now();
 
     try {
@@ -2266,6 +2588,7 @@ class RedisService {
 
   async shutdown(): Promise<void> {
     logger.info('[Redis] Shutting down...');
+    this.stopReconnectProbe();
     await this.client.disconnect();
   }
 }

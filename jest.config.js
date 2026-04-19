@@ -63,11 +63,8 @@ module.exports = {
   // Verbose output for debugging
   verbose: true,
   
-  // Transform TypeScript files
+  // Transform TypeScript files (diagnostics disabled — type safety enforced by tsc in CI)
   transform: {
-    '^.+\\.ts$': 'ts-jest'
-  },
-  
-  // Transform configuration for ts-jest (modern syntax)
-  // CODING STANDARDS: Using latest ts-jest configuration pattern
+    '^.+\\.ts$': ['ts-jest', { diagnostics: false }]
+  }
 };

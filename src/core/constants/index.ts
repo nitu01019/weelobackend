@@ -47,17 +47,15 @@ export const ROLE_DISPLAY_NAMES: Record<UserRole, string> = {
  * Booking lifecycle states
  */
 export enum BookingStatus {
-  CREATED = 'created',           // Initial state before broadcasting
-  BROADCASTING = 'broadcasting', // Actively sending to transporters
-  PENDING = 'pending',           // Created, waiting for transporter
-  CONFIRMED = 'confirmed',       // Transporter accepted
-  ASSIGNED = 'assigned',         // Driver assigned
-  DRIVER_EN_ROUTE = 'driver_en_route', // Driver going to pickup
-  AT_PICKUP = 'at_pickup',       // Driver at pickup location
-  IN_TRANSIT = 'in_transit',     // Goods in transit
-  AT_DROPOFF = 'at_dropoff',     // Driver at dropoff location
-  COMPLETED = 'completed',       // Delivered successfully
-  CANCELLED = 'cancelled'        // Cancelled by any party
+  CREATED = 'created',
+  BROADCASTING = 'broadcasting',
+  ACTIVE = 'active',
+  PARTIALLY_FILLED = 'partially_filled',
+  FULLY_FILLED = 'fully_filled',
+  IN_PROGRESS = 'in_progress',
+  COMPLETED = 'completed',
+  CANCELLED = 'cancelled',
+  EXPIRED = 'expired'
 }
 
 /**
@@ -65,16 +63,14 @@ export enum BookingStatus {
  */
 export const BOOKING_STATUS_TRANSITIONS: Record<BookingStatus, BookingStatus[]> = {
   [BookingStatus.CREATED]: [BookingStatus.BROADCASTING, BookingStatus.CANCELLED],
-  [BookingStatus.BROADCASTING]: [BookingStatus.PENDING, BookingStatus.CANCELLED],
-  [BookingStatus.PENDING]: [BookingStatus.CONFIRMED, BookingStatus.CANCELLED],
-  [BookingStatus.CONFIRMED]: [BookingStatus.ASSIGNED, BookingStatus.CANCELLED],
-  [BookingStatus.ASSIGNED]: [BookingStatus.DRIVER_EN_ROUTE, BookingStatus.CANCELLED],
-  [BookingStatus.DRIVER_EN_ROUTE]: [BookingStatus.AT_PICKUP, BookingStatus.CANCELLED],
-  [BookingStatus.AT_PICKUP]: [BookingStatus.IN_TRANSIT, BookingStatus.CANCELLED],
-  [BookingStatus.IN_TRANSIT]: [BookingStatus.AT_DROPOFF, BookingStatus.CANCELLED],
-  [BookingStatus.AT_DROPOFF]: [BookingStatus.COMPLETED],
+  [BookingStatus.BROADCASTING]: [BookingStatus.ACTIVE, BookingStatus.CANCELLED, BookingStatus.EXPIRED],
+  [BookingStatus.ACTIVE]: [BookingStatus.PARTIALLY_FILLED, BookingStatus.FULLY_FILLED, BookingStatus.EXPIRED, BookingStatus.CANCELLED],
+  [BookingStatus.PARTIALLY_FILLED]: [BookingStatus.FULLY_FILLED, BookingStatus.EXPIRED, BookingStatus.CANCELLED],
+  [BookingStatus.FULLY_FILLED]: [BookingStatus.IN_PROGRESS, BookingStatus.CANCELLED],
+  [BookingStatus.IN_PROGRESS]: [BookingStatus.COMPLETED, BookingStatus.CANCELLED],
   [BookingStatus.COMPLETED]: [],
-  [BookingStatus.CANCELLED]: []
+  [BookingStatus.CANCELLED]: [],
+  [BookingStatus.EXPIRED]: []
 };
 
 // =============================================================================
@@ -86,6 +82,7 @@ export const BOOKING_STATUS_TRANSITIONS: Record<BookingStatus, BookingStatus[]> 
  */
 export enum VehicleStatus {
   AVAILABLE = 'available',       // Ready for assignments
+  ON_HOLD = 'on_hold',           // Reserved while driver decides
   IN_TRANSIT = 'in_transit',     // Currently on a trip
   MAINTENANCE = 'maintenance',   // Under maintenance
   INACTIVE = 'inactive'          // Deactivated/suspended
@@ -94,20 +91,8 @@ export enum VehicleStatus {
 // =============================================================================
 // ORDER STATUS (Multi-vehicle orders)
 // =============================================================================
-
-/**
- * Order lifecycle states
- */
-export enum OrderStatus {
-  DRAFT = 'draft',               // Customer creating order
-  PENDING = 'pending',           // Submitted, waiting for matches
-  BROADCASTING = 'broadcasting', // Actively finding transporters
-  PARTIAL = 'partial',           // Some trucks assigned
-  CONFIRMED = 'confirmed',       // All trucks assigned
-  IN_PROGRESS = 'in_progress',   // At least one truck started
-  COMPLETED = 'completed',       // All deliveries complete
-  CANCELLED = 'cancelled'        // Order cancelled
-}
+// REMOVED: OrderStatus enum — use OrderStatus from @prisma/client instead.
+// The Prisma-generated enum is the single source of truth for order statuses.
 
 // =============================================================================
 // ASSIGNMENT STATUS
@@ -117,12 +102,15 @@ export enum OrderStatus {
  * Assignment (driver-vehicle to booking) status
  */
 export enum AssignmentStatus {
-  PENDING = 'pending',           // Offered to driver
-  ACCEPTED = 'accepted',         // Driver accepted
-  REJECTED = 'rejected',         // Driver rejected
-  IN_TRANSIT = 'in_transit',     // Trip in progress
-  COMPLETED = 'completed',       // Delivery complete
-  CANCELLED = 'cancelled'        // Assignment cancelled
+  PENDING = 'pending',
+  DRIVER_ACCEPTED = 'driver_accepted',
+  DRIVER_DECLINED = 'driver_declined',
+  EN_ROUTE_PICKUP = 'en_route_pickup',
+  AT_PICKUP = 'at_pickup',
+  IN_TRANSIT = 'in_transit',
+  ARRIVED_AT_DROP = 'arrived_at_drop',
+  COMPLETED = 'completed',
+  CANCELLED = 'cancelled'
 }
 
 // =============================================================================
@@ -201,11 +189,11 @@ export const OTP_CONFIG = {
   EXPIRY_MINUTES: 5,
   MAX_ATTEMPTS: 3,
   RESEND_COOLDOWN_SECONDS: 30,
-  
-  // Development mode (bypass SMS)
-  DEV_OTP: '123456',
-  DEV_PHONES: ['9999999999', '8888888888', '7777777777']
-} as const;
+
+  // Development mode (bypass SMS) - only enabled in dev/test, never staging or production
+  DEV_OTP: (process.env.NODE_ENV === 'development' || process.env.NODE_ENV === 'test') ? '123456' : '',
+  DEV_PHONES: (process.env.NODE_ENV === 'development' || process.env.NODE_ENV === 'test') ? ['9999999999', '8888888888', '7777777777'] : [] as string[],
+};
 
 // =============================================================================
 // JWT CONFIGURATION
@@ -535,7 +523,13 @@ export const TIMEOUTS = {
 // =============================================================================
 
 export const CACHE = {
-  // Key prefixes
+  // M-15: Environment-aware key prefix for Redis.
+  // Set REDIS_KEY_PREFIX env var per environment (e.g., "prod", "staging", "dev").
+  // CacheService auto-prefixes with this. Direct redisService callers should
+  // use redisService.prefixKey() for new keys to prevent cross-env collisions.
+  ENV_PREFIX: process.env.REDIS_KEY_PREFIX || 'weelo',
+
+  // Key prefixes (within the env namespace)
   PREFIX: {
     USER: 'user:',
     VEHICLE: 'vehicle:',

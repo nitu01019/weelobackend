@@ -9,8 +9,8 @@
  * during broadcasts.
  *
  * DATA STRUCTURES:
- * - Redis Set  `avail_set:{vehicleKey}`   → members are transporterIds with ≥1 available truck
- * - Redis Hash `avail_count:{vehicleKey}` → field per transporterId, value = available count
+ * - Redis Set  `{avail:vehicleKey}:set`   → members are transporterIds with ≥1 available truck
+ * - Redis Hash `{avail:vehicleKey}:count` → field per transporterId, value = available count
  *
  * ATOMICITY:
  * Uses a Lua script to atomically HINCRBY + SADD/SREM in one Redis call.
@@ -31,22 +31,36 @@ import { logger } from './logger.service';
 // Lazy import of main PrismaClient singleton — avoids circular deps with prisma.service.ts
 // Reuses the managed connection pool (connection_limit=20, pool_timeout=5)
 // instead of creating a separate uncontrolled pool.
-let _prisma: any = null;
+// H18 FIX: Add type annotation to preserve type safety across lazy require()
+let _prisma: typeof import('../database/prisma.service')['prismaClient'] | null = null;
 function getLazyPrisma() {
   if (!_prisma) {
-    const { prismaClient } = require('../database/prisma.service');
-    _prisma = prismaClient;
+    const mod: typeof import('../database/prisma.service') = require('../database/prisma.service');
+    _prisma = mod.prismaClient;
   }
   return _prisma;
 }
 
 // =============================================================================
+// M-14 FIX: Safety-net TTL prevents orphaned avail keys from leaking memory.
+// Reconciliation rebuilds every 5 minutes, so 24hr TTL only catches edge cases
+// where reconciliation itself is failing or the vehicle key was deleted.
+// =============================================================================
+const AVAIL_KEY_TTL = parseInt(process.env.AVAIL_KEY_TTL_SECONDS || '86400', 10); // 24hr default
+
+// =============================================================================
 // LUA SCRIPT — Atomic count update + set membership management
 // =============================================================================
-// KEYS[1] = avail_count:{vehicleKey}  (Hash)
-// KEYS[2] = avail_set:{vehicleKey}    (Set)
+// KEYS[1] = {avail:vehicleKey}:count  (Hash)
+// KEYS[2] = {avail:vehicleKey}:set    (Set)
 // ARGV[1] = transporterId
 // ARGV[2] = increment (+1 or -1)
+// ARGV[3] = TTL in seconds (M-14: safety-net expiry)
+//
+// Redis Cluster requires all Lua script keys in the same hash slot.
+// The {avail:${vk}} hash tag ensures count and set keys co-locate.
+// Backward compatible: old keys (avail_count:X) expire via TTL,
+// reconciliation rebuilds with new format within 5 minutes.
 //
 // Returns the new count (or 0 if cleaned up)
 // =============================================================================
@@ -55,9 +69,15 @@ local newCount = redis.call('HINCRBY', KEYS[1], ARGV[1], tonumber(ARGV[2]))
 if newCount <= 0 then
   redis.call('SREM', KEYS[2], ARGV[1])
   redis.call('HDEL', KEYS[1], ARGV[1])
-  return 0
 else
   redis.call('SADD', KEYS[2], ARGV[1])
+end
+-- M-14: Safety-net TTL on both keys (refreshed on every write)
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
+redis.call('EXPIRE', KEYS[2], tonumber(ARGV[3]))
+if newCount <= 0 then
+  return 0
+else
   return newCount
 end
 `;
@@ -65,13 +85,19 @@ end
 // =============================================================================
 // KEY HELPERS
 // =============================================================================
+// H-11 FIX: Redis Cluster hash tags — ensures both keys land on same slot.
+// Old: avail_count:truck_14ft, avail_set:truck_14ft (different slots possible)
+// New: {avail:truck_14ft}:count, {avail:truck_14ft}:set (same slot guaranteed)
+// The {avail:${vehicleKey}} portion is the hash tag that Redis uses to compute
+// the slot, so both keys always co-locate in the same shard.
+// =============================================================================
 
 function countKey(vehicleKey: string): string {
-  return `avail_count:${vehicleKey}`;
+  return `{avail:${vehicleKey}}:count`;
 }
 
 function setKey(vehicleKey: string): string {
-  return `avail_set:${vehicleKey}`;
+  return `{avail:${vehicleKey}}:set`;
 }
 
 // =============================================================================
@@ -100,7 +126,7 @@ class LiveAvailabilityService {
       const result = await redisService.eval(
         LUA_UPDATE_AVAILABILITY,
         [countKey(vehicleKey), setKey(vehicleKey)],
-        [transporterId, String(increment)]
+        [transporterId, String(increment), String(AVAIL_KEY_TTL)]
       );
       const newCount = typeof result === 'number' ? result : parseInt(String(result), 10) || 0;
       logger.debug(`[LiveAvail] ${transporterId} ${vehicleKey}: ${increment > 0 ? '+' : ''}${increment} → count=${newCount}`);
@@ -212,31 +238,61 @@ class LiveAvailabilityService {
     }
   }
 
+  // ==========================================================================
+  // PRIVATE — Cursor-based pagination helper (FIX #19/#20)
+  // Replaces take:1000 with cursor-based iteration through ALL vehicles.
+  // Industry pattern: Netflix EVCache -- chunked iteration for cache warming.
+  // ==========================================================================
+
+  private async iterateVehicles(
+    where: Record<string, unknown>,
+    select: Record<string, boolean>,
+    callback: (batch: any[]) => Promise<void>
+  ): Promise<number> {
+    const prisma = getLazyPrisma();
+    const BATCH_SIZE = 500;
+    let cursor: string | undefined;
+    let total = 0;
+
+    while (true) {
+      const batch = await prisma.vehicle.findMany({
+        where,
+        select: { ...select, id: true },
+        take: BATCH_SIZE,
+        ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
+        orderBy: { id: 'asc' }
+      });
+      if (batch.length === 0) break;
+      await callback(batch);
+      total += batch.length;
+      cursor = batch[batch.length - 1].id;
+      if (batch.length < BATCH_SIZE) break;
+    }
+    return total;
+  }
+
   /**
    * Bootstrap: rebuild Redis sets from database.
    * Called once on server startup.
+   * FIX #19: Uses cursor-based pagination to process ALL vehicles (not capped at 1000).
    */
   async rebuildFromDatabase(): Promise<void> {
     try {
-      const prisma = getLazyPrisma();
-
-      const vehicles = await prisma.vehicle.findMany({
-        where: { isActive: true, status: 'available' },
-        select: { transporterId: true, vehicleKey: true },
-        take: 1000  // Safety limit — log warning if hit
-      });
-      if (vehicles.length >= 1000) {
-        logger.warn('[LiveAvail] Bootstrap hit 1000 vehicle limit — consider pagination');
-      }
-
       // Group by vehicleKey → transporterId → count
       const groups = new Map<string, Map<string, number>>();
-      for (const v of vehicles) {
-        if (!v.vehicleKey || !v.transporterId) continue;
-        if (!groups.has(v.vehicleKey)) groups.set(v.vehicleKey, new Map());
-        const tMap = groups.get(v.vehicleKey)!;
-        tMap.set(v.transporterId, (tMap.get(v.transporterId) || 0) + 1);
-      }
+
+      const total = await this.iterateVehicles(
+        { isActive: true, status: 'available' },
+        { transporterId: true, vehicleKey: true },
+        async (batch) => {
+          for (const v of batch) {
+            if (!v.vehicleKey || !v.transporterId) continue;
+            if (!groups.has(v.vehicleKey)) groups.set(v.vehicleKey, new Map());
+            const tMap = groups.get(v.vehicleKey)!;
+            tMap.set(v.transporterId, (tMap.get(v.transporterId) || 0) + 1);
+          }
+        }
+      );
 
       let totalKeys = 0;
       let totalTransporters = 0;
@@ -265,9 +321,13 @@ class LiveAvailabilityService {
         if (members.length > 0) {
           await redisService.sAdd(setKey(vKey), ...members);
         }
+
+        // M-14: Safety-net TTL on rebuilt keys
+        await redisService.expire(countKey(vKey), AVAIL_KEY_TTL).catch(() => {});
+        await redisService.expire(setKey(vKey), AVAIL_KEY_TTL).catch(() => {});
       }
 
-      logger.info(`[LiveAvail] ✅ Bootstrap complete: ${totalKeys} vehicle keys, ${totalTransporters} transporter entries`);
+      logger.info(`[LiveAvail] Bootstrap complete: ${totalKeys} vehicle keys, ${totalTransporters} transporter entries (${total} vehicles processed)`);
     } catch (err: any) {
       logger.error(`[LiveAvail] Bootstrap failed: ${err.message}`);
     }
@@ -276,6 +336,7 @@ class LiveAvailabilityService {
   /**
    * Periodic reconciliation: compare Redis with DB and fix any drift.
    * Called every 5 minutes as a safety net.
+   * FIX #20: Uses cursor-based pagination to process ALL vehicles (not capped at 1000).
    */
   async reconcile(): Promise<void> {
     // Distributed lock — only one ECS instance reconciles at a time
@@ -288,30 +349,26 @@ class LiveAvailabilityService {
     } catch (_) { /* Redis down — proceed without lock */ }
 
     try {
-      const prisma = getLazyPrisma();
-
-      const vehicles = await prisma.vehicle.findMany({
-        where: { isActive: true },
-        select: { transporterId: true, vehicleKey: true, status: true },
-        take: 1000  // Safety limit
-      });
-      if (vehicles.length >= 1000) {
-        logger.warn('[LiveAvail] Reconcile hit 1000 vehicle limit — consider pagination');
-      }
-
       // Build ground truth: vehicleKey → transporterId → available count
       const groundTruth = new Map<string, Map<string, number>>();
-      for (const v of vehicles) {
-        if (!v.vehicleKey || !v.transporterId) continue;
-        if (!groundTruth.has(v.vehicleKey)) groundTruth.set(v.vehicleKey, new Map());
-        const tMap = groundTruth.get(v.vehicleKey)!;
-        if (v.status === 'available') {
-          tMap.set(v.transporterId, (tMap.get(v.transporterId) || 0) + 1);
-        } else {
-          // Ensure entry exists even if 0
-          if (!tMap.has(v.transporterId)) tMap.set(v.transporterId, 0);
+
+      const total = await this.iterateVehicles(
+        { isActive: true },
+        { transporterId: true, vehicleKey: true, status: true },
+        async (batch) => {
+          for (const v of batch) {
+            if (!v.vehicleKey || !v.transporterId) continue;
+            if (!groundTruth.has(v.vehicleKey)) groundTruth.set(v.vehicleKey, new Map());
+            const tMap = groundTruth.get(v.vehicleKey)!;
+            if (v.status === 'available') {
+              tMap.set(v.transporterId, (tMap.get(v.transporterId) || 0) + 1);
+            } else {
+              // Ensure entry exists even if 0
+              if (!tMap.has(v.transporterId)) tMap.set(v.transporterId, 0);
+            }
+          }
         }
-      }
+      );
 
       let corrections = 0;
 
@@ -324,7 +381,7 @@ class LiveAvailabilityService {
 
           if (redisCount !== dbCount) {
             corrections++;
-            logger.warn(`[LiveAvail] DRIFT: ${vKey}/${tid} Redis=${redisCount} DB=${dbCount} — correcting`);
+            logger.warn(`[LiveAvail] DRIFT: ${vKey}/${tid} Redis=${redisCount} DB=${dbCount} -- correcting`);
 
             if (dbCount > 0) {
               await redisService.hSet(countKey(vKey), tid, String(dbCount));
@@ -333,6 +390,9 @@ class LiveAvailabilityService {
               await redisService.hDel(countKey(vKey), tid);
               await redisService.sRem(setKey(vKey), tid);
             }
+            // M-14: Refresh safety-net TTL on corrected keys
+            await redisService.expire(countKey(vKey), AVAIL_KEY_TTL).catch(() => {});
+            await redisService.expire(setKey(vKey), AVAIL_KEY_TTL).catch(() => {});
           }
         }
 
@@ -340,7 +400,7 @@ class LiveAvailabilityService {
         for (const redisTid of Object.keys(redisCounts)) {
           if (!tMap.has(redisTid)) {
             corrections++;
-            logger.warn(`[LiveAvail] STALE: ${vKey}/${redisTid} in Redis but not in DB — removing`);
+            logger.warn(`[LiveAvail] STALE: ${vKey}/${redisTid} in Redis but not in DB -- removing`);
             await redisService.hDel(countKey(vKey), redisTid);
             await redisService.sRem(setKey(vKey), redisTid);
           }
@@ -348,9 +408,9 @@ class LiveAvailabilityService {
       }
 
       if (corrections > 0) {
-        logger.info(`[LiveAvail] Reconciliation done: ${corrections} corrections applied`);
+        logger.info(`[LiveAvail] Reconciliation done: ${corrections} corrections applied (${total} vehicles processed)`);
       } else {
-        logger.debug(`[LiveAvail] Reconciliation done: 0 corrections (all in sync)`);
+        logger.debug(`[LiveAvail] Reconciliation done: 0 corrections (all in sync, ${total} vehicles processed)`);
       }
     } catch (err: any) {
       logger.warn(`[LiveAvail] Reconciliation failed: ${err.message}`);

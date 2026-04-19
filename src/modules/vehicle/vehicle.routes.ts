@@ -12,7 +12,7 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { vehicleService } from './vehicle.service';
 import { authMiddleware, roleGuard } from '../../shared/middleware/auth.middleware';
 import { db } from '../../shared/database/db';
-import { validateSchema } from '../../shared/utils/validation.utils';
+import { validateSchema, validateQuery } from '../../shared/utils/validation.utils';
 import {
   registerVehicleSchema,
   updateVehicleSchema,
@@ -23,6 +23,10 @@ import {
 } from './vehicle.schema';
 import { logger } from '../../shared/services/logger.service';
 import { fleetCacheService, onVehicleChange } from '../../shared/services/fleet-cache.service';
+import { pricingService } from '../pricing/pricing.service';
+import { z } from 'zod';
+import { releaseVehicle } from '../../shared/services/vehicle-lifecycle.service';
+import { prismaClient } from '../../shared/database/prisma.service';
 
 const router = Router();
 
@@ -51,6 +55,93 @@ router.get('/types', async (_req: Request, res: Response) => {
     });
   }
 });
+
+/**
+ * Zod schema for GET /vehicles/pricing query params.
+ * Query strings arrive as strings, so coerce numeric fields.
+ */
+const vehiclePricingQuerySchema = z.object({
+  vehicleType: z.string().min(1, 'vehicleType is required'),
+  vehicleSubtype: z.string().optional(),
+  distanceKm: z.coerce
+    .number({ invalid_type_error: 'distanceKm must be a number' })
+    .min(1, 'distanceKm must be at least 1')
+    .max(5000, 'distanceKm cannot exceed 5000'),
+  trucksNeeded: z.coerce
+    .number({ invalid_type_error: 'trucksNeeded must be a number' })
+    .int('trucksNeeded must be a whole number')
+    .min(1, 'trucksNeeded must be at least 1')
+    .max(50, 'trucksNeeded cannot exceed 50'),
+  cargoWeightKg: z.coerce
+    .number({ invalid_type_error: 'cargoWeightKg must be a number' })
+    .min(1, 'cargoWeightKg must be at least 1')
+    .max(100000, 'cargoWeightKg cannot exceed 100000')
+    .optional(),
+});
+
+/**
+ * @route   GET /vehicles/pricing
+ * @desc    Get price estimate for a vehicle type and distance
+ * @access  Public (customer app calls this without auth)
+ *
+ * Query params:
+ *   vehicleType   (required) - e.g. "tipper", "container"
+ *   vehicleSubtype (optional) - e.g. "20-24 Ton", "32 Feet"
+ *   distanceKm    (required) - distance in km
+ *   trucksNeeded  (required) - number of trucks
+ *   cargoWeightKg (optional) - cargo weight in kg
+ *
+ * Returns the same PriceEstimateResponse as POST /pricing/estimate.
+ */
+router.get(
+  '/pricing',
+  validateQuery(vehiclePricingQuerySchema),
+  async (req: Request, res: Response) => {
+    try {
+      const { vehicleType, vehicleSubtype, distanceKm, trucksNeeded, cargoWeightKg } = req.query as z.infer<typeof vehiclePricingQuerySchema>;
+
+      const estimate = pricingService.calculateEstimate({
+        vehicleType,
+        vehicleSubtype,
+        distanceKm,
+        trucksNeeded,
+        cargoWeightKg,
+      });
+
+      // Wrap response to match Android PricingResponse { data: { pricing: { ... } } }
+      res.json({
+        success: true,
+        data: {
+          pricing: {
+            vehicleType: estimate.breakdown.vehicleType,
+            vehicleSubtype: estimate.breakdown.vehicleSubtype,
+            distanceKm: estimate.breakdown.distanceKm,
+            trucksNeeded: estimate.trucksNeeded,
+            pricePerKm: estimate.breakdown.perKmRate,
+            pricePerTruck: estimate.pricePerTruck,
+            totalAmount: estimate.totalPrice,
+            basePrice: estimate.basePrice,
+            distanceCharge: estimate.distanceCharge,
+            tonnageCharge: estimate.tonnageCharge,
+            surgeMultiplier: estimate.surgeMultiplier,
+            surgeFactor: estimate.breakdown.surgeFactor,
+            distanceSlab: estimate.breakdown.distanceSlab,
+            estimatedDuration: `${Math.max(1, Math.round(estimate.breakdown.distanceKm / 40))} hrs`,
+            currency: estimate.currency,
+            validForMinutes: estimate.validForMinutes,
+            capacityInfo: estimate.capacityInfo,
+          },
+        },
+      });
+    } catch (error) {
+      logger.error('Error calculating vehicle pricing', error);
+      res.status(500).json({
+        success: false,
+        error: { code: 'SERVER_ERROR', message: 'Failed to calculate pricing' },
+      });
+    }
+  }
+);
 
 // =============================================================================
 // PROTECTED ROUTES (Auth required)
@@ -599,13 +690,95 @@ router.put(
       const transporterId = req.user!.userId;
       
       const vehicle = await vehicleService.setAvailable(vehicleId, transporterId);
-      
+
+      await onVehicleChange(transporterId, vehicleId);
+
       res.json({
         success: true,
         message: 'Vehicle is now available',
         data: { vehicle }
       });
     } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// =============================================================================
+// VEHICLE RELEASE ROUTE
+// =============================================================================
+
+/**
+ * @route   POST /vehicles/:vehicleId/release
+ * @desc    Force-release a vehicle back to 'available' status
+ * @access  Transporter only (own vehicles)
+ *
+ * USE CASE: Vehicle stuck in on_hold/in_transit due to failed cleanup.
+ * Cancels any active assignments and uses centralized releaseVehicle().
+ *
+ * AUTO-UPDATE CACHE: Invalidates on release
+ */
+router.post(
+  '/:vehicleId/release',
+  authMiddleware,
+  roleGuard(['transporter']),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { vehicleId } = req.params;
+      const transporterId = req.user!.userId;
+
+      // Verify vehicle exists and belongs to the transporter
+      const vehicle = await vehicleService.getVehicleById(vehicleId);
+      if (vehicle.transporterId !== transporterId) {
+        return res.status(403).json({
+          success: false,
+          error: { code: 'FORBIDDEN', message: 'This vehicle does not belong to you' }
+        });
+      }
+
+      const previousStatus = vehicle.status || 'unknown';
+
+      // Release vehicle FIRST (idempotent, uses centralized path with Redis sync)
+      // This ensures vehicle is freed even if assignment cancel fails (QA-8 fix)
+      await releaseVehicle(vehicleId, 'adminVehicleRelease');
+
+      // Then cancel any active assignments for this vehicle (best-effort)
+      try {
+        await prismaClient.assignment.updateMany({
+          where: {
+            vehicleId,
+            status: { in: ['pending', 'driver_accepted', 'en_route_pickup', 'at_pickup'] }
+          },
+          data: {
+            status: 'cancelled',
+            declinedAt: new Date(),
+            declineReason: 'Vehicle force-released by transporter'
+          }
+        });
+      } catch (cancelErr: any) {
+        logger.warn(`[Vehicles] Failed to cancel active assignments for ${vehicleId}`, { error: cancelErr.message });
+      }
+
+      // Invalidate cache
+      await onVehicleChange(transporterId, vehicleId);
+
+      logger.info(`[Vehicles] Vehicle ${vehicleId} force-released by transporter ${transporterId}: ${previousStatus} -> available`);
+
+      res.json({
+        success: true,
+        data: {
+          previousStatus,
+          newStatus: 'available'
+        },
+        message: `Vehicle released from ${previousStatus} to available`
+      });
+    } catch (error: any) {
+      if (error.code === 'VEHICLE_NOT_FOUND') {
+        return res.status(404).json({
+          success: false,
+          error: { code: 'NOT_FOUND', message: 'Vehicle not found' }
+        });
+      }
       next(error);
     }
   }
@@ -631,7 +804,12 @@ router.post(
       const data = validateSchema(assignDriverSchema, req.body);
       
       const vehicle = await vehicleService.assignDriver(vehicleId, transporterId, data.driverId);
-      
+
+      // Invalidate fleet cache so Redis reflects the new driver assignment
+      onVehicleChange(transporterId, vehicleId).catch(err => {
+        logger.warn('[assign-driver] Fleet cache invalidation failed', err);
+      });
+
       res.json({
         success: true,
         data: { vehicle },
@@ -658,7 +836,12 @@ router.post(
       const transporterId = req.user!.userId;
       
       const vehicle = await vehicleService.unassignDriver(vehicleId, transporterId);
-      
+
+      // Invalidate fleet cache so Redis reflects the removed driver assignment
+      onVehicleChange(transporterId, vehicleId).catch(err => {
+        logger.warn('[unassign-driver] Fleet cache invalidation failed', err);
+      });
+
       res.json({
         success: true,
         data: { vehicle },

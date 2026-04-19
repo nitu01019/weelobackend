@@ -36,7 +36,7 @@ export const productionConfig = {
   // CORS - Configure for your domains
   // ===========================================================================
   cors: {
-    origins: (process.env.CORS_ORIGINS || '').split(',').filter(Boolean),
+    origins: (process.env.CORS_ORIGIN || '').split(',').filter(Boolean),
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-ID'],
     credentials: true,

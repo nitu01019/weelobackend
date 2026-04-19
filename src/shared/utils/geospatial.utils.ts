@@ -80,10 +80,24 @@ function toRadians(degrees: number): number {
 }
 
 /**
+ * Circuity factors for haversine-to-road distance conversion.
+ * India avg: 1.31 (Ballou 2002). Different use cases need different factors.
+ */
+export const CIRCUITY_FACTORS = {
+  /** Routing: conservative (India avg 1.31 + buffer) */
+  ROUTING: 1.35,
+  /** ETA ranking: generous to avoid under-promising */
+  ETA_RANKING: Math.max(0.1, parseFloat(process.env.HAVERSINE_ROAD_FACTOR || '1.4') || 1.4),
+  /** Validation: pure haversine, no multiplier */
+  VALIDATION: 1.0,
+} as const;
+
+/**
  * Road distance multiplier (straight line to road estimate)
  * Industry standard: 1.3x for urban, 1.4x for rural
+ * @deprecated Use CIRCUITY_FACTORS.ROUTING instead
  */
-export const ROAD_DISTANCE_MULTIPLIER = 1.35;
+export const ROAD_DISTANCE_MULTIPLIER = CIRCUITY_FACTORS.ROUTING;
 
 /**
  * Calculate estimated road distance from straight-line distance

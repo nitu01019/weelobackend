@@ -142,8 +142,10 @@ class ProgressTrackingService {
       });
 
       // Emit real-time progress update
-      await socketService.emitToUser(event.orderId, 'order_progress_update', {
+      await socketService.emitToOrder(event.orderId, 'order_progress_update', {
         orderId: event.orderId,
+        driverName: event.driverName,
+        addedSeconds: event.addedSeconds,
         progress: {
           driverId: event.driverId,
           driverName: event.driverName,

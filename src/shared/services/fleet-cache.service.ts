@@ -15,20 +15,20 @@
  * - Driver assignment page needs fast response (<100ms)
  * - Millions of concurrent requests need shared cache across servers
  * 
- * CACHE STRUCTURE:
+ * CACHE STRUCTURE (F-B-03: FleetCache owns `fleetcache:*`; tracking owns `fleet:*`):
  * ─────────────────────────────────────────────────────────────────────────────
  * VEHICLES:
- *   fleet:vehicles:{transporterId}         → JSON array of all vehicles
- *   fleet:vehicles:{transporterId}:type:{vehicleType} → Filtered by type
- *   fleet:vehicles:available:{transporterId} → Only available vehicles
- * 
+ *   fleetcache:vehicles:{transporterId}         → JSON array of all vehicles
+ *   fleetcache:vehicles:{transporterId}:type:{vehicleType} → Filtered by type
+ *   fleetcache:vehicles:available:{transporterId} → Only available vehicles
+ *
  * DRIVERS:
- *   fleet:drivers:{transporterId}          → JSON array of all drivers
- *   fleet:drivers:available:{transporterId} → Only available drivers
- * 
+ *   fleetcache:drivers:{transporterId}          → JSON array of all drivers
+ *   fleetcache:drivers:available:{transporterId} → Only available drivers
+ *
  * INDEXES (for fast lookups):
- *   fleet:vehicle:{vehicleId}              → Single vehicle details
- *   fleet:driver:{driverId}                → Single driver details
+ *   fleetcache:vehicle:{vehicleId}              → Single vehicle details
+ *   fleetcache:driver:{driverId}                → Single driver details
  * 
  * TTL:
  *   - Vehicle list: 5 minutes (300 seconds)
@@ -78,85 +78,38 @@ import { logger } from './logger.service';
 import { db } from '../database/db';
 import { prismaClient } from '../database/prisma.service';
 import { redisService } from './redis.service';
+// F-B-02 Phase A: constants + shapes now live in fleet-cache-types.ts (single
+// source of truth). Local duplicates removed; the class below is marked
+// @deprecated — callers should migrate to the free-function module
+// (fleet-cache-read.service.ts / fleet-cache-write.service.ts) in Phase C.
+import {
+  FLEET_CACHE_PREFIX,
+  CACHE_KEYS,
+  CACHE_TTL,
+  CachedVehicle,
+  CachedDriver,
+  AvailabilitySnapshot,
+} from './fleet-cache-types';
 
 // =============================================================================
-// CACHE KEYS & CONFIG
+// FLEET CACHE SERVICE (@deprecated — see F-B-02 Phase C for deletion plan)
 // =============================================================================
 
-const CACHE_KEYS = {
-  // Vehicle caches
-  VEHICLES: (transporterId: string) => `fleet:vehicles:${transporterId}`,
-  VEHICLES_BY_TYPE: (transporterId: string, type: string, subtype?: string) =>
-    `fleet:vehicles:${transporterId}:type:${type.toLowerCase()}${subtype ? `:${subtype.toLowerCase()}` : ''}`,
-  VEHICLES_AVAILABLE: (transporterId: string) => `fleet:vehicles:available:${transporterId}`,
-  VEHICLE: (vehicleId: string) => `fleet:vehicle:${vehicleId}`,
-
-  // Driver caches
-  DRIVERS: (transporterId: string) => `fleet:drivers:${transporterId}`,
-  DRIVERS_AVAILABLE: (transporterId: string) => `fleet:drivers:available:${transporterId}`,
-  DRIVER: (driverId: string) => `fleet:driver:${driverId}`,
-
-  // Snapshot caches (for broadcasts)
-  AVAILABILITY_SNAPSHOT: (transporterId: string, vehicleType: string) =>
-    `fleet:snapshot:${transporterId}:${vehicleType.toLowerCase()}`
-};
-
-const CACHE_TTL = {
-  VEHICLE_LIST: 300,      // 5 minutes
-  DRIVER_LIST: 300,       // 5 minutes
-  INDIVIDUAL: 600,        // 10 minutes
-  SNAPSHOT: 60            // 1 minute (for broadcasts, needs fresher data)
-};
-
-// =============================================================================
-// INTERFACES
-// =============================================================================
-
-interface CachedVehicle {
-  id: string;
-  transporterId: string;
-  vehicleNumber: string;
-  vehicleType: string;
-  vehicleSubtype: string;
-  capacityTons: number;
-  status: 'available' | 'on_hold' | 'in_transit' | 'maintenance' | 'inactive';
-  currentTripId?: string;
-  assignedDriverId?: string;
-  isActive: boolean;
-  lastUpdated: string;
-}
-
-interface CachedDriver {
-  id: string;
-  transporterId: string;
-  name: string;
-  phone: string;
-  profilePhotoUrl?: string; // Driver profile photo (visible to transporter)
-  rating: number;
-  totalTrips: number;
-  status: 'active' | 'inactive' | 'suspended';
-  isAvailable: boolean;
-  isOnline: boolean;         // Real-time: DB isAvailable=true AND Redis presence exists
-  currentTripId?: string;
-  lastUpdated: string;
-}
-
-interface AvailabilitySnapshot {
-  transporterId: string;
-  transporterName: string;
-  vehicleType: string;
-  vehicleSubtype?: string;
-  totalOwned: number;
-  available: number;
-  inTransit: number;
-  lastUpdated: string;
-}
-
-// =============================================================================
-// FLEET CACHE SERVICE
-// =============================================================================
-
+/**
+ * @deprecated F-B-02: constants moved to `fleet-cache-types.ts`; split read
+ *   and write helpers live in `fleet-cache-read.service.ts` and
+ *   `fleet-cache-write.service.ts`. This class remains as a thin compatibility
+ *   wrapper for one release to avoid a disruptive change across the ~20 call
+ *   sites. Phase C (follow-up PR) replaces the wrapper with a re-export of
+ *   the free-function API and then removes this file.
+ */
 class FleetCacheService {
+
+  /**
+   * F-B-03: Prefixes owned by this service. Boot-time assertion in server.ts
+   * enumerates these across services and throws on overlap.
+   */
+  readonly registeredPrefixes: readonly string[] = [FLEET_CACHE_PREFIX];
 
   // ===========================================================================
   // VEHICLE CACHE METHODS
@@ -179,9 +132,13 @@ class FleetCacheService {
     if (!forceRefresh) {
       try {
         const cached = await cacheService.get<CachedVehicle[]>(cacheKey);
-        if (cached) {
+        if (cached && Array.isArray(cached)) {
           logger.debug(`[FleetCache] HIT: vehicles for ${transporterId.substring(0, 8)}`);
           return cached;
+        }
+        if (cached && !Array.isArray(cached)) {
+          logger.warn(`[FleetCache] Corrupted cache (not array) for vehicles:${transporterId.substring(0, 8)}, deleting`);
+          await cacheService.delete(cacheKey).catch(() => {});
         }
       } catch (error) {
         logger.warn(`[FleetCache] Cache read error: ${error}`);
@@ -245,9 +202,13 @@ class FleetCacheService {
     // Check cache first
     try {
       const cached = await cacheService.get<CachedVehicle[]>(cacheKey);
-      if (cached) {
+      if (cached && Array.isArray(cached)) {
         logger.debug(`[FleetCache] HIT: ${vehicleType} vehicles for ${transporterId.substring(0, 8)}`);
         return cached;
+      }
+      if (cached && !Array.isArray(cached)) {
+        logger.warn(`[FleetCache] Corrupted cache (not array) for vehiclesByType:${transporterId.substring(0, 8)}, deleting`);
+        await cacheService.delete(cacheKey).catch(() => {});
       }
     } catch (error) {
       logger.warn(`[FleetCache] Cache read error: ${error}`);
@@ -303,8 +264,12 @@ class FleetCacheService {
 
     try {
       const cached = await cacheService.get<CachedVehicle>(cacheKey);
-      if (cached) {
+      if (cached && typeof cached === 'object' && cached.id) {
         return cached;
+      }
+      if (cached && (typeof cached !== 'object' || !cached.id)) {
+        logger.warn(`[FleetCache] Corrupted cache for vehicle:${vehicleId.substring(0, 8)}, deleting`);
+        await cacheService.delete(cacheKey).catch(() => {});
       }
     } catch (error) {
       logger.warn(`[FleetCache] Cache read error: ${error}`);
@@ -354,9 +319,13 @@ class FleetCacheService {
     if (!forceRefresh) {
       try {
         const cached = await cacheService.get<CachedDriver[]>(cacheKey);
-        if (cached) {
+        if (cached && Array.isArray(cached)) {
           logger.debug(`[FleetCache] HIT: drivers for ${transporterId.substring(0, 8)}`);
           return cached;
+        }
+        if (cached && !Array.isArray(cached)) {
+          logger.warn(`[FleetCache] Corrupted cache (not array) for drivers:${transporterId.substring(0, 8)}, deleting`);
+          await cacheService.delete(cacheKey).catch(() => {});
         }
       } catch (error) {
         logger.warn(`[FleetCache] Cache read error: ${error}`);
@@ -499,8 +468,12 @@ class FleetCacheService {
 
     try {
       const cached = await cacheService.get<CachedDriver>(cacheKey);
-      if (cached) {
+      if (cached && typeof cached === 'object' && cached.id) {
         return cached;
+      }
+      if (cached && (typeof cached !== 'object' || !cached.id)) {
+        logger.warn(`[FleetCache] Corrupted cache for driver:${driverId.substring(0, 8)}, deleting`);
+        await cacheService.delete(cacheKey).catch(() => {});
       }
     } catch (error) {
       logger.warn(`[FleetCache] Cache read error: ${error}`);
@@ -560,8 +533,12 @@ class FleetCacheService {
 
     try {
       const cached = await cacheService.get<AvailabilitySnapshot>(cacheKey);
-      if (cached) {
+      if (cached && typeof cached === 'object' && cached.transporterId) {
         return cached;
+      }
+      if (cached && (typeof cached !== 'object' || !cached.transporterId)) {
+        logger.warn(`[FleetCache] Corrupted cache for snapshot:${transporterId.substring(0, 8)}, deleting`);
+        await cacheService.delete(cacheKey).catch(() => {});
       }
     } catch (error) {
       logger.warn(`[FleetCache] Cache read error: ${error}`);
@@ -614,7 +591,7 @@ class FleetCacheService {
 
     // Also delete type-specific caches (we don't know which types changed)
     try {
-      const iterator = cacheService.scanIterator(`fleet:vehicles:${transporterId}:type:*`);
+      const iterator = cacheService.scanIterator(`fleetcache:vehicles:${transporterId}:type:*`);
       for await (const key of iterator) {
         keysToDelete.push(key);
       }
@@ -624,7 +601,7 @@ class FleetCacheService {
 
     // Delete snapshot caches
     try {
-      const iterator = cacheService.scanIterator(`fleet:snapshot:${transporterId}:*`);
+      const iterator = cacheService.scanIterator(`fleetcache:snapshot:${transporterId}:*`);
       for await (const key of iterator) {
         keysToDelete.push(key);
       }
@@ -767,17 +744,17 @@ class FleetCacheService {
   }> {
     try {
       let vehicleCount = 0;
-      for await (const _ of cacheService.scanIterator('fleet:vehicle*')) {
+      for await (const _ of cacheService.scanIterator('fleetcache:vehicle*')) {
         vehicleCount++;
       }
 
       let driverCount = 0;
-      for await (const _ of cacheService.scanIterator('fleet:driver*')) {
+      for await (const _ of cacheService.scanIterator('fleetcache:driver*')) {
         driverCount++;
       }
 
       let snapshotCount = 0;
-      for await (const _ of cacheService.scanIterator('fleet:snapshot*')) {
+      for await (const _ of cacheService.scanIterator('fleetcache:snapshot*')) {
         snapshotCount++;
       }
 
@@ -793,24 +770,41 @@ class FleetCacheService {
   }
 
   /**
-   * Clear all fleet caches (use with caution)
+   * Clear all fleet caches (use with caution).
+   *
+   * F-B-03: Scan only the `fleetcache:*` prefix (FleetCache-owned) and additionally
+   * refuse to delete any key that resembles a tracking-owned `fleet:*` key
+   * (fleet:index:transporters or fleet:{uuid} active-driver sets). This is a
+   * fail-closed defense-in-depth against prefix-glob regressions.
    */
   async clearAll(): Promise<void> {
     logger.warn('[FleetCache] Clearing ALL fleet caches');
 
     try {
-      const iterator = cacheService.scanIterator('fleet:*');
+      const iterator = cacheService.scanIterator(`${FLEET_CACHE_PREFIX}*`);
       let count = 0;
+      let skipped = 0;
       for await (const key of iterator) {
+        if (TRACKING_KEY_DENYLIST.test(key)) {
+          // Fail-closed: refuse to delete tracking-owned keys even if a regression
+          // routes them under the fleetcache prefix.
+          logger.error(`[FleetCache] fleetcache_refuse_tracking_key: refused to delete tracking-shaped key under fleetcache scan: ${key}`);
+          skipped++;
+          continue;
+        }
         await cacheService.delete(key);
         count++;
       }
-      logger.info(`[FleetCache] Cleared ${count} cache entries`);
+      logger.info(`[FleetCache] Cleared ${count} cache entries (skipped=${skipped})`);
     } catch (error) {
       logger.error(`[FleetCache] Error clearing caches: ${error}`);
     }
   }
 }
+
+// F-B-03: Tracking-shape regex — matches `fleet:index:transporters` and
+// `fleet:{uuid}` active-driver sets. Used as defensive deny-list in clearAll.
+const TRACKING_KEY_DENYLIST = /^fleet:(index:transporters|[0-9a-f]{8}-[0-9a-f]{4}-)/i;
 
 // =============================================================================
 // EXPORT SINGLETON

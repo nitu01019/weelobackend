@@ -25,7 +25,8 @@ export const VALID_VEHICLE_TYPES = [
   'container',
   'trailer',
   'tanker',
-  'bulker'
+  'bulker',
+  'tractor'
 ] as const;
 
 // =============================================================================
@@ -35,23 +36,26 @@ export const VALID_VEHICLE_TYPES = [
 /**
  * Schema for price estimate request
  * Enhanced with optional cargo weight for tonnage-based pricing
+ *
+ * NOTE: Schema is FLAT (no `body:` wrapper) because `validateRequest` middleware
+ * at src/shared/utils/validation.utils.ts calls `schema.parse(req.body)` directly.
+ * Wrapping in `body:` would cause all well-formed calls to fail with 400
+ * VALIDATION_ERROR. See F-A-25 in WEELO-CRITICAL-SOLUTION.md.
  */
 export const priceEstimateSchema = z.object({
-  body: z.object({
-    vehicleType: z.string().min(1, 'Vehicle type is required'),
-    vehicleSubtype: z.string().optional(),
-    distanceKm: z.number({
-      required_error: 'Distance is required',
-      invalid_type_error: 'Distance must be a number'
-    }).min(1, 'Distance must be at least 1 km').max(5000, 'Distance cannot exceed 5000 km'),
-    trucksNeeded: z.number({
-      required_error: 'Number of trucks is required',
-      invalid_type_error: 'Trucks needed must be a number'
-    }).int('Must be a whole number').min(1, 'At least 1 truck required').max(50, 'Max 50 trucks per booking'),
-    cargoWeightKg: z.number({
-      invalid_type_error: 'Cargo weight must be a number'
-    }).min(1, 'Cargo weight must be at least 1 kg').max(100000, 'Cargo weight cannot exceed 100 tons').optional()
-  })
+  vehicleType: z.string().min(1, 'Vehicle type is required'),
+  vehicleSubtype: z.string().optional(),
+  distanceKm: z.number({
+    required_error: 'Distance is required',
+    invalid_type_error: 'Distance must be a number'
+  }).min(1, 'Distance must be at least 1 km').max(5000, 'Distance cannot exceed 5000 km'),
+  trucksNeeded: z.number({
+    required_error: 'Number of trucks is required',
+    invalid_type_error: 'Trucks needed must be a number'
+  }).int('Must be a whole number').min(1, 'At least 1 truck required').max(50, 'Max 50 trucks per booking'),
+  cargoWeightKg: z.number({
+    invalid_type_error: 'Cargo weight must be a number'
+  }).min(1, 'Cargo weight must be at least 1 kg').max(100000, 'Cargo weight cannot exceed 100 tons').optional()
 });
 
 /**
@@ -71,23 +75,23 @@ export const bulkPriceEstimateSchema = z.object({
 /**
  * Schema for vehicle suggestions request
  * Used to recommend the most cost-effective vehicle for cargo
+ *
+ * NOTE: Schema is FLAT (no `body:` wrapper) — see note on priceEstimateSchema.
  */
 export const suggestionsSchema = z.object({
-  body: z.object({
-    cargoWeightKg: z.number({
-      required_error: 'Cargo weight is required for suggestions',
-      invalid_type_error: 'Cargo weight must be a number'
-    }).min(100, 'Cargo weight must be at least 100 kg').max(100000, 'Cargo weight cannot exceed 100 tons'),
-    distanceKm: z.number({
-      required_error: 'Distance is required',
-      invalid_type_error: 'Distance must be a number'
-    }).min(1, 'Distance must be at least 1 km').max(5000, 'Distance cannot exceed 5000 km'),
-    trucksNeeded: z.number({
-      invalid_type_error: 'Trucks needed must be a number'
-    }).int('Must be a whole number').min(1, 'At least 1 truck required').max(50, 'Max 50 trucks').default(1),
-    currentVehicleType: z.string().optional(),
-    currentVehicleSubtype: z.string().optional()
-  })
+  cargoWeightKg: z.number({
+    required_error: 'Cargo weight is required for suggestions',
+    invalid_type_error: 'Cargo weight must be a number'
+  }).min(100, 'Cargo weight must be at least 100 kg').max(100000, 'Cargo weight cannot exceed 100 tons'),
+  distanceKm: z.number({
+    required_error: 'Distance is required',
+    invalid_type_error: 'Distance must be a number'
+  }).min(1, 'Distance must be at least 1 km').max(5000, 'Distance cannot exceed 5000 km'),
+  trucksNeeded: z.number({
+    invalid_type_error: 'Trucks needed must be a number'
+  }).int('Must be a whole number').min(1, 'At least 1 truck required').max(50, 'Max 50 trucks').default(1),
+  currentVehicleType: z.string().optional(),
+  currentVehicleSubtype: z.string().optional()
 });
 
 // =============================================================================
@@ -95,7 +99,13 @@ export const suggestionsSchema = z.object({
 // =============================================================================
 
 /**
- * Enhanced price estimate response structure
+ * Enhanced price estimate response structure.
+ *
+ * F-A-26: adds the surge determinism anchor (`surgeRuleId`, `surgeBucketStart`,
+ * `surgeBucketEnd`) plus an HMAC-signed `quoteToken`. Fields are optional to
+ * preserve backward compatibility with existing clients, but the pricing
+ * service now emits them on every estimate so the order-creation path can
+ * verify the quote without silently re-pricing.
  */
 export interface PriceEstimateResponse {
   basePrice: number;
@@ -122,6 +132,13 @@ export interface PriceEstimateResponse {
   currency: 'INR';
   validForMinutes: number;
   estimatedAt: string;
+  // F-A-26: signed price quote (Adyen/Stripe pattern) + deterministic surge
+  // anchor (Uber H3 × 5-min bucket). Optional so schemas from older code paths
+  // still compile; the canonical pricing.service.ts always populates them.
+  quoteToken?: string;
+  surgeRuleId?: string;
+  surgeBucketStart?: string;
+  surgeBucketEnd?: string;
 }
 
 /**
@@ -169,6 +186,6 @@ export interface VehiclePricingEntry {
 // TYPE EXPORTS
 // =============================================================================
 
-export type PriceEstimateInput = z.infer<typeof priceEstimateSchema>['body'];
+export type PriceEstimateInput = z.infer<typeof priceEstimateSchema>;
 export type BulkPriceEstimateInput = z.infer<typeof bulkPriceEstimateSchema>['body'];
-export type SuggestionsInput = z.infer<typeof suggestionsSchema>['body'];
+export type SuggestionsInput = z.infer<typeof suggestionsSchema>;

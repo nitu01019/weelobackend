@@ -45,11 +45,13 @@ function getRequired(key: string, devDefault?: string): string {
   // In development, use default or generate secure value
   if (process.env.NODE_ENV !== 'production') {
     if (devDefault) {
+      // console used intentionally — runs before logger initialization
       console.warn(`⚠️  [CONFIG] ${key} not set, using development default`);
       return devDefault;
     }
     // Auto-generate secure secret for development
     const generated = randomBytes(32).toString('hex');
+    // console used intentionally — runs before logger initialization
     console.warn(`⚠️  [CONFIG] ${key} not set, auto-generated for development`);
     return generated;
   }
@@ -96,6 +98,15 @@ function parseCorsOrigins(value: string): string | string[] {
   return value.split(',').map(origin => origin.trim()).filter(Boolean);
 }
 
+/**
+ * F-A-08: Parse trusted-proxy CIDR list from comma-separated string.
+ * Default covers AWS VPC CIDRs so ALB → task traffic is recognised as
+ * trusted without any ops override.
+ */
+function parseTrustedProxyCidrs(value: string): string[] {
+  return value.split(',').map(s => s.trim()).filter(Boolean);
+}
+
 // =============================================================================
 // CONFIGURATION OBJECT
 // =============================================================================
@@ -111,11 +122,11 @@ export const config = {
   host: getOptional('HOST', 'localhost'),
 
   // Database
-  databaseUrl: getOptional('DATABASE_URL', 'postgresql://localhost:5432/weelo_db'),
+  databaseUrl: getRequired('DATABASE_URL', 'postgresql://localhost:5432/weelo_db'),
 
   // Redis (Required for production scalability)
   redis: {
-    enabled: getBoolean('REDIS_ENABLED', false),
+    enabled: getBoolean('REDIS_ENABLED', process.env.NODE_ENV === 'production'),
     url: getOptional('REDIS_URL', 'redis://localhost:6379'),
   },
 
@@ -123,7 +134,7 @@ export const config = {
   // These are auto-generated in development, REQUIRED in production
   jwt: {
     secret: getRequired('JWT_SECRET'),
-    expiresIn: getOptional('JWT_EXPIRES_IN', '7d'),
+    expiresIn: getOptional('JWT_EXPIRES_IN', '5m'),
     refreshSecret: getRequired('JWT_REFRESH_SECRET'),
     refreshExpiresIn: getOptional('JWT_REFRESH_EXPIRES_IN', '30d'),
   },
@@ -161,6 +172,17 @@ export const config = {
     },
   },
 
+  // Firebase (for FCM push notifications)
+  // Option A: file path to service account JSON (local dev)
+  // Option B: inline credentials (production ECS — no file on disk)
+  // If none set, FCM runs in mock mode (notifications logged only)
+  firebase: {
+    serviceAccountPath: getOptional('FIREBASE_SERVICE_ACCOUNT_PATH', ''),
+    projectId: getOptional('FIREBASE_PROJECT_ID', ''),
+    privateKey: getOptional('FIREBASE_PRIVATE_KEY', ''),
+    clientEmail: getOptional('FIREBASE_CLIENT_EMAIL', ''),
+  },
+
   // Google Maps
   googleMaps: {
     apiKey: getOptional('GOOGLE_MAPS_API_KEY', ''),
@@ -180,6 +202,20 @@ export const config = {
   cors: {
     origin: parseCorsOrigins(getOptional('CORS_ORIGIN', '*')),
   },
+
+  // F-A-08: Trusted-proxy CIDRs for Express `trust proxy`.
+  // Numeric hop-count (e.g., `1`) lets attackers spoof X-Forwarded-For; a
+  // CIDR allowlist restricts XFF trust to ALB/VPC subnets only. Override via
+  // TRUSTED_PROXY_CIDRS=10.x/16,10.y/16 in production when subnets differ.
+  trustedProxyCidrs: parseTrustedProxyCidrs(
+    getOptional('TRUSTED_PROXY_CIDRS', '10.0.0.0/16,172.16.0.0/12')
+  ),
+
+  // Booking backpressure
+  bookingConcurrencyLimit: getNumber('BOOKING_CONCURRENCY_LIMIT', 200),
+
+  // Geo Query
+  geoQueryMaxCandidates: getNumber('GEO_QUERY_MAX_CANDIDATES', 250),
 
   // Helpers
   isProduction: getOptional('NODE_ENV', 'development') === 'production',
@@ -208,9 +244,9 @@ function validateConfig(): void {
 
   // Production-specific checks
   if (config.isProduction) {
-    // CORS should not be wildcard in production (warn, don't block — mobile API backend)
+    // CORS wildcard is unsafe in production — fail loudly so it gets fixed
     if (config.cors.origin === '*') {
-      warnings.push('CORS_ORIGIN is set to "*" — consider restricting in production. Set CORS_ORIGIN=https://yourdomain.com');
+      errors.push('CORS_ORIGIN is set to "*" in production. Set CORS_ORIGIN to specific origins (e.g., https://weelo.app,https://captain.weelo.app)');
     }
 
     // Google Maps should be configured for Places search
@@ -236,6 +272,7 @@ function validateConfig(): void {
 
   // Log warnings
   if (warnings.length > 0) {
+    // console used intentionally — runs before logger initialization
     console.warn('\n⚠️  Configuration Warnings:');
     warnings.forEach(w => console.warn(`   - ${w}`));
     console.warn('');
