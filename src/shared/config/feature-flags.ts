@@ -23,6 +23,7 @@
 //   - src/server.ts (1 inline check)
 
 import { logger } from '../services/logger.service';
+import express from 'express';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -567,3 +568,22 @@ export function logFlagStates(): void {
     `--- Numeric Flags ---\n${numericLines.join('\n')}`
   );
 }
+
+/**
+ * Boot-time validation entry point. Currently delegates to logFlagStates so
+ * every flag's env value is logged once at startup for deploy-time audit.
+ * Expand later to assert critical flags are set before accepting traffic.
+ */
+export function validateFeatureFlags(): void {
+  logFlagStates();
+}
+
+/**
+ * Minimal HTTP health endpoint for feature flag state. Mounted at '/' in
+ * server.ts so GET /flags/health returns the boolean + numeric flag snapshot
+ * for ops tooling.
+ */
+export const flagHealthRouter = express.Router();
+flagHealthRouter.get('/flags/health', (_req, res) => {
+  res.json({ flags: FLAGS, numericFlags: NUMERIC_FLAGS });
+});

@@ -28,24 +28,25 @@
 
 import { Request, Response, NextFunction } from 'express';
 import { logger } from '../services/logger.service';
+import { registerDefaultCounters, registerDefaultGauges, registerDefaultHistograms } from './metrics-definitions';
 
 // =============================================================================
 // METRIC TYPES
 // =============================================================================
 
-interface CounterMetric {
+export interface CounterMetric {
   name: string;
   help: string;
   labels: Record<string, number>;
 }
 
-interface GaugeMetric {
+export interface GaugeMetric {
   name: string;
   help: string;
   value: number;
 }
 
-interface HistogramMetric {
+export interface HistogramMetric {
   name: string;
   help: string;
   buckets: number[];
@@ -79,6 +80,9 @@ class MetricsService {
 
   constructor() {
     this.initializeDefaultMetrics();
+    registerDefaultCounters(this.counters);
+    registerDefaultGauges(this.gauges);
+    registerDefaultHistograms(this.histograms);
     this.startSystemMetricsCollection();
   }
 

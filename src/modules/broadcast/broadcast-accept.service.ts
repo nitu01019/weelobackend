@@ -465,7 +465,6 @@ export async function acceptBroadcast(broadcastId: string, params: AcceptBroadca
           await sendPushNotification(driverId, {
             title: 'New Trip Assigned!',
             body: `${pickup.city || pickup.address || 'Pickup'} → ${drop.city || drop.address || 'Drop'}`,
-            priority: 'high',
             data: { type: 'trip_assigned', tripId: result.tripId, assignmentId: result.assignmentId, bookingId: broadcastId, driverName: driver?.name || '', vehicleNumber: vehicle?.vehicleNumber || '', vehicleType: vehicle?.vehicleType || '', status: 'trip_assigned' }
           });
         }, 3, 500);
@@ -514,7 +513,6 @@ export async function acceptBroadcast(broadcastId: string, params: AcceptBroadca
           await sendPushNotification(booking.customerId, {
             title: `Truck ${result.trucksConfirmed}/${booking.trucksNeeded} Confirmed!`,
             body: `${vehicle?.vehicleNumber || 'Vehicle'} (${driver?.name || 'Driver'}) assigned to your booking`,
-            priority: 'high',
             data: { type: 'truck_confirmed', bookingId: broadcastId, trucksConfirmed: result.trucksConfirmed, totalTrucks: booking.trucksNeeded }
           });
         }, 3, 500);
