@@ -1381,7 +1381,17 @@ async function setupRedisAdapter(socketServer: Server): Promise<void> {
         throw new Error('Redis client not available — redisService may not be initialized yet');
       }
 
-      socketServer.adapter(createAdapter(client));
+      // H-16 (Phase 3): pass explicit adapter options. Defaults are
+      // streamCount:1 (single-partition hot spot) + maxLen:10_000 (~50s retention
+      // at peak). Widening to streamCount:4 horizontally shards the stream and
+      // maxLen:100_000 (~8 min retention) survives task pause/partition without
+      // silent cross-instance message loss. readCount:100 is the maximum
+      // per-read batch so lagging tasks catch up quickly.
+      socketServer.adapter(createAdapter(client, {
+        streamCount: parseInt(process.env.SOCKET_STREAM_COUNT || '16', 10),
+        maxLen: 100_000,
+        readCount: 100,
+      }));
 
       redisPubSubInitialized = true;
       redisAdapterMode = 'enabled';
@@ -1420,7 +1430,12 @@ async function setupRedisAdapter(socketServer: Server): Promise<void> {
     try {
       const client = redisService.getClient();
       if (!client || !io) return;
-      io.adapter(createAdapter(client));
+      // H-16 (Phase 3): same explicit adapter options on the retry path.
+      io.adapter(createAdapter(client, {
+        streamCount: parseInt(process.env.SOCKET_STREAM_COUNT || '16', 10),
+        maxLen: 100_000,
+        readCount: 100,
+      }));
       redisPubSubInitialized = true;
       redisAdapterMode = 'enabled';
       redisAdapterLastError = null;
