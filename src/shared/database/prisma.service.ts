@@ -337,6 +337,28 @@ function getPrismaClient(): PrismaClient {
     });
 
     // =========================================================================
+    // P1 F14.5 — Pool wait observability (proxy via total elapsed)
+    // =========================================================================
+    // Prisma's public API does not expose a direct "pool wait" event. We use
+    // total-elapsed as a proxy: when pool is saturated, elapsed climbs faster
+    // than actual DB work would explain. Dashboard panels compare
+    // pool_wait_seconds.p99 vs db_query_duration_ms.p99 — divergence indicates
+    // connection starvation.
+    prisma.$use(async (params, next) => {
+      const start = Date.now();
+      try {
+        return await next(params);
+      } finally {
+        const elapsedMs = Date.now() - start;
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-var-requires
+          const { metrics } = require('../monitoring/metrics.service');
+          metrics.observeHistogram?.('pool_wait_seconds', elapsedMs / 1000, { pool_name: 'primary' });
+        } catch { /* metrics unavailable — never break a query */ }
+      }
+    });
+
+    // =========================================================================
     // CACHE INVALIDATION MIDDLEWARE — Auto-invalidate Redis on writes
     // =========================================================================
     // Ensures Redis caches stay consistent with DB writes without requiring
@@ -1946,6 +1968,21 @@ function getReadReplicaClient(): PrismaClient {
     }
 
     return result;
+  });
+
+  // P1 F14.5 — Pool wait observability (replica)
+  prismaRead.$use(async (params, next) => {
+    const start = Date.now();
+    try {
+      return await next(params);
+    } finally {
+      const elapsedMs = Date.now() - start;
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const { metrics } = require('../monitoring/metrics.service');
+        metrics.observeHistogram?.('pool_wait_seconds', elapsedMs / 1000, { pool_name: 'replica' });
+      } catch { /* non-fatal */ }
+    }
   });
 
   // Shutdown handled by server.ts gracefulShutdown() — see A5#28
