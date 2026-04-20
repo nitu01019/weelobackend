@@ -152,3 +152,61 @@ describe('Phase 6: Prometheus Export', () => {
         expect(json).toHaveProperty('gauges');
     });
 });
+
+// ============================================================================
+// PHASE 1 (F-series): OBSERVABILITY BASELINE REGISTRATION
+// Asserts presence of all counters/gauges/histograms introduced by A1-A9 in
+// the Phase 1 observability baseline. Counter + histogram misses log a warn
+// via logger.warn("... ${name} not found"); gauges silently no-op, so we
+// verify their presence through getMetricsJSON() instead.
+// ============================================================================
+
+describe('Phase 1 (F-series): Observability Baseline Registration', () => {
+    const counters = [
+        'new_assignment_dispatch_total',
+        'new_assignment_socket_emit_total',
+        'new_assignment_outbox_insert_total',
+        'new_assignment_fcm_enqueue_total',
+        'fleetcache_read_total',
+        'dlq_pushed_total',
+        'hold_confirmed_committed_total',
+        'driver_accepted_total',
+        'driver_declined_total',
+        'driver_timeout_total',
+        'driver_reassign_issued_total',
+        'driver_overlay_rendered_total',
+        'fcm_quota_consumed_total',
+    ];
+
+    counters.forEach((name) => {
+        it(`${name} counter is registered`, () => {
+            const spy = jest.spyOn(console, 'warn').mockImplementation();
+            metrics.incrementCounter(name, { label: 'test' }, 1);
+            expect(spy).not.toHaveBeenCalledWith(
+                expect.stringContaining(`Counter ${name} not found`)
+            );
+            spy.mockRestore();
+        });
+    });
+
+    it('circuit_breaker_state_gauge gauge is registered', () => {
+        metrics.setGauge('circuit_breaker_state_gauge', 1);
+        const json = metrics.getMetricsJSON() as { gauges: Record<string, unknown> };
+        expect(json.gauges).toHaveProperty('circuit_breaker_state_gauge');
+    });
+
+    it('stream_depth gauge is registered', () => {
+        metrics.setGauge('stream_depth', 0);
+        const json = metrics.getMetricsJSON() as { gauges: Record<string, unknown> };
+        expect(json.gauges).toHaveProperty('stream_depth');
+    });
+
+    it('pool_wait_seconds histogram is registered', () => {
+        const spy = jest.spyOn(console, 'warn').mockImplementation();
+        metrics.observeHistogram('pool_wait_seconds', 0.05, { pool_name: 'primary' });
+        expect(spy).not.toHaveBeenCalledWith(
+            expect.stringContaining('Histogram pool_wait_seconds not found')
+        );
+        spy.mockRestore();
+    });
+});
