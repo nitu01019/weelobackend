@@ -32,7 +32,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { prismaClient, HoldPhase, AssignmentStatus } from '../../shared/database/prisma.service';
 import { logger } from '../../shared/services/logger.service';
 import { redisService } from '../../shared/services/redis.service';
-import { socketService } from '../../shared/services/socket.service';
+import { socketService, SocketEvent } from '../../shared/services/socket.service';
 import { queueService } from '../../shared/services/queue.service';
 import { holdExpiryCleanupService } from '../hold-expiry/hold-expiry-cleanup.service';
 import { releaseVehicle } from '../../shared/services/vehicle-lifecycle.service';
@@ -40,6 +40,8 @@ import { HOLD_CONFIG } from '../../core/config/hold-config';
 import { smartTimeoutService } from '../order-timeout/smart-timeout.service';
 import { tryAutoRedispatch } from '../assignment/auto-redispatch.service';
 import { validateActorEligibility, HoldEligibilityError } from './hold-eligibility';
+import { metrics } from '../../shared/monitoring/metrics.service';
+import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
 
 // =============================================================================
 // TYPES & INTERFACES
@@ -284,8 +286,10 @@ class ConfirmedHoldService {
           transporterId: true,
           vehicleId: true,
           vehicleNumber: true,
+          vehicleType: true,
           tripId: true,
           orderId: true,
+          bookingId: true,
           truckRequestId: true,
         }
       });
@@ -295,7 +299,28 @@ class ConfirmedHoldService {
         assignmentsData.map(a => [a.id, a])
       );
 
-      // Schedule driver acceptance timeouts with full data
+      // P2 F4.1: Fetch order/booking context for trip_assigned fanout.
+      // Mirrors truck-hold.service.ts:1612-1678 payload shape so the captain app
+      // receives the same data via socket + FCM as the legacy path.
+      const parentOrder = await prismaClient.order.findUnique({
+        where: { id: updated.orderId },
+        select: {
+          id: true,
+          pickup: true,
+          drop: true,
+          distanceKm: true,
+          customerName: true,
+          customerPhone: true,
+        },
+      });
+      const pickup = (parentOrder?.pickup as any) || {};
+      const drop = (parentOrder?.drop as any) || {};
+      const expiresAtIso = new Date(
+        now.getTime() + this.config.driverAcceptTimeoutSeconds * 1000
+      ).toISOString();
+
+      // Schedule driver acceptance timeouts with full data AND
+      // fan out per-driver socket emit + FCM enqueue (P2 F4.1).
       const missingIds: string[] = [];
       for (const assignment of assignments) {
         const fullData = assignmentMap.get(assignment.assignmentId);
@@ -312,6 +337,90 @@ class ConfirmedHoldService {
           this.config.driverAcceptTimeoutSeconds,
           now
         );
+
+        // P2 F4.1: per-driver try/catch so one failure never aborts the fanout.
+        try {
+          const driverNotification = {
+            type: 'trip_assigned',
+            assignmentId: fullData.id,
+            tripId: fullData.tripId,
+            orderId: fullData.orderId,
+            bookingId: fullData.bookingId,
+            truckRequestId: fullData.truckRequestId,
+            pickup,
+            drop,
+            vehicleNumber: fullData.vehicleNumber,
+            vehicleType: fullData.vehicleType,
+            distanceKm: parentOrder?.distanceKm,
+            customerName: parentOrder?.customerName || '',
+            customerPhone: maskPhoneForExternal(parentOrder?.customerPhone || ''),
+            assignedAt: now.toISOString(),
+            expiresAt: expiresAtIso,
+            message: `New trip assigned! ${pickup?.address ?? ''} → ${drop?.address ?? ''}`,
+          };
+
+          // Socket emit
+          try {
+            await socketService.emitToUser(
+              fullData.driverId,
+              SocketEvent.TRIP_ASSIGNED,
+              driverNotification
+            );
+            metrics.incrementCounter('new_assignment_socket_emit_total', { result: 'success' });
+          } catch (sockErr) {
+            metrics.incrementCounter('new_assignment_socket_emit_total', { result: 'fail' });
+            logger.warn('[CONFIRMED HOLD] socket emit trip_assigned failed', {
+              assignmentId: fullData.id,
+              driverId: fullData.driverId,
+              error: sockErr instanceof Error ? sockErr.message : String(sockErr),
+            });
+          }
+
+          // FCM enqueue — flatten payload for FCM data constraints (mirrors truck-hold.service.ts:1647-1678)
+          const fcmData = {
+            type: 'trip_assigned',
+            assignmentId: fullData.id,
+            tripId: fullData.tripId,
+            orderId: fullData.orderId,
+            truckRequestId: fullData.truckRequestId ?? '',
+            pickupAddress: pickup?.address ?? '',
+            pickupCity: pickup?.city ?? '',
+            pickupLat: String(pickup?.latitude ?? pickup?.lat ?? 0),
+            pickupLng: String(pickup?.longitude ?? pickup?.lng ?? 0),
+            dropAddress: drop?.address ?? '',
+            dropCity: drop?.city ?? '',
+            dropLat: String(drop?.latitude ?? drop?.lat ?? 0),
+            dropLng: String(drop?.longitude ?? drop?.lng ?? 0),
+            vehicleNumber: fullData.vehicleNumber ?? '',
+            distanceKm: String(parentOrder?.distanceKm ?? 0),
+            customerName: parentOrder?.customerName ?? '',
+            customerPhone: maskPhoneForExternal(parentOrder?.customerPhone || ''),
+            assignedAt: now.toISOString(),
+            expiresAt: expiresAtIso,
+          };
+
+          try {
+            await queueService.queuePushNotification(fullData.driverId, {
+              title: '🚛 New Trip Assigned!',
+              body: `${pickup?.address ?? 'Pickup'} → ${drop?.address ?? 'Drop'}`,
+              data: fcmData,
+            });
+            metrics.incrementCounter('new_assignment_fcm_enqueue_total', { result: 'success' });
+          } catch (fcmErr) {
+            metrics.incrementCounter('new_assignment_fcm_enqueue_total', { result: 'fail' });
+            logger.warn('[CONFIRMED HOLD] FCM enqueue trip_assigned failed', {
+              assignmentId: fullData.id,
+              driverId: fullData.driverId,
+              error: fcmErr instanceof Error ? fcmErr.message : String(fcmErr),
+            });
+          }
+        } catch (perDriverErr) {
+          logger.error('[CONFIRMED HOLD] per-driver dispatch failed', {
+            assignmentId: fullData?.id,
+            driverId: fullData?.driverId,
+            error: perDriverErr instanceof Error ? perDriverErr.message : String(perDriverErr),
+          });
+        }
       }
 
       if (missingIds.length > 0) {
@@ -322,6 +431,9 @@ class ConfirmedHoldService {
         holdId,
         confirmedExpiresAt,
       });
+
+      // P2 F2.6: counter for confirmed-hold post-commit commits.
+      metrics.incrementCounter('hold_confirmed_committed_total', { stage: 'post_commit' });
 
       return {
         success: true,
