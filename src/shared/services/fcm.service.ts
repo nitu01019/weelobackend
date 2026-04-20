@@ -544,14 +544,39 @@ class FCMService {
   }
 
   /**
+   * P2 F6.2: Parse Retry-After header from FCM quota/unavailable errors.
+   * Handles integer-seconds ("30") and HTTP-date formats. Capped at maxMs.
+   * Returns null when header is missing or unparseable (caller should fall
+   * back to exponential backoff).
+   */
+  private static parseRetryAfter(header: string | undefined, maxMs: number): number | null {
+    if (!header) return null;
+    const trimmed = header.trim();
+    const asInt = parseInt(trimmed, 10);
+    if (!Number.isNaN(asInt) && String(asInt) === trimmed) {
+      return Math.min(Math.max(0, asInt * 1000), maxMs);
+    }
+    const asDate = Date.parse(trimmed);
+    if (!Number.isNaN(asDate)) {
+      return Math.min(Math.max(0, asDate - Date.now()), maxMs);
+    }
+    return null;
+  }
+
+  /**
    * H-28 FIX: Generic retry wrapper with exponential backoff + jitter.
    * Non-retryable FCM errors (invalid token, credential mismatch) bail immediately.
    * All primary send paths now route through this to get automatic retries.
+   *
+   * P2 F6.2: On quota/unavailable errors (messaging/quota-exceeded,
+   * messaging/server-unavailable, HTTP 429/503) honor the server's
+   * Retry-After header when present instead of exponential backoff.
    */
   private async executeWithRetry(
     fn: () => Promise<void>,
     maxRetries: number = 2
   ): Promise<void> {
+    const MAX_BACKOFF_MS = 30000;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
         await fn();
@@ -569,19 +594,47 @@ class FCMService {
           throw err;
         }
 
-        // Exponential backoff with jitter (AWS pattern)
-        const baseDelay = 1000 * Math.pow(2, attempt); // 1s, 2s, 4s
-        const cappedDelay = Math.min(30000, baseDelay);
-        const jitteredDelay = Math.random() * cappedDelay;
+        // P2 F6.2: Prefer Retry-After header on quota/unavailable errors.
+        const httpStatus = err?.errorInfo?.httpResponse?.status;
+        const isQuotaOrUnavailable =
+          code === 'messaging/quota-exceeded' ||
+          code === 'messaging/server-unavailable' ||
+          httpStatus === 429 ||
+          httpStatus === 503;
+        const retryAfterHeader: string | undefined =
+          err?.errorInfo?.httpResponse?.headers?.['retry-after'] ??
+          err?.errorInfo?.httpResponse?.headers?.['Retry-After'];
+        const retryAfterMs = isQuotaOrUnavailable
+          ? FCMService.parseRetryAfter(retryAfterHeader, MAX_BACKOFF_MS)
+          : null;
+
+        let delayMs: number;
+        if (retryAfterMs !== null) {
+          delayMs = retryAfterMs;
+        } else {
+          // Exponential backoff with jitter (AWS pattern)
+          const baseDelay = 1000 * Math.pow(2, attempt); // 1s, 2s, 4s
+          const cappedDelay = Math.min(MAX_BACKOFF_MS, baseDelay);
+          delayMs = Math.random() * cappedDelay;
+        }
+
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-var-requires
+          const { metrics } = require('../monitoring/metrics.service');
+          metrics.incrementCounter('fcm_retry_backoff_source_total', {
+            source: retryAfterMs !== null ? 'retry_after_header' : 'exponential',
+          });
+        } catch { /* non-fatal */ }
 
         logger.info('[FCM] Retrying after transient error', {
           attempt: attempt + 1,
           maxRetries,
-          delayMs: Math.round(jitteredDelay),
+          delayMs: Math.round(delayMs),
           code,
+          backoffSource: retryAfterMs !== null ? 'retry_after_header' : 'exponential',
         });
 
-        await new Promise(resolve => setTimeout(resolve, jitteredDelay));
+        await new Promise(resolve => setTimeout(resolve, delayMs));
       }
     }
   }
@@ -757,6 +810,14 @@ class FCMService {
     const ttlSeconds = ttlMap[notification.type] ?? 600;
     const apnsExpiration = Math.floor(Date.now() / 1000) + ttlSeconds;
 
+    // P2 F6.3: Collapse retries/duplicates with the same business key into a
+    // single visible notification (one buzz per booking, not N).
+    const collapseKey =
+      (notification.data?.bookingId as string | undefined) ??
+      (notification.data?.orderId as string | undefined) ??
+      (notification.data?.assignmentId as string | undefined) ??
+      undefined;
+
     return {
       notification: {
         title: truncate(notification.title, 100) || '',
@@ -770,6 +831,7 @@ class FCMService {
       android: {
         priority: notification.priority === 'high' ? 'high' : 'normal',
         ttl: `${ttlSeconds}s`,
+        ...(collapseKey ? { collapseKey } : {}),
         notification: {
           channelId: this.getChannelId(notification.type),
           sound: 'default',
@@ -782,6 +844,7 @@ class FCMService {
         headers: {
           'apns-expiration': String(apnsExpiration),
           ...(notification.priority === 'high' ? { 'apns-priority': '10' } : { 'apns-priority': '5' }),
+          ...(collapseKey ? { 'apns-collapse-id': collapseKey } : {}),
         },
         payload: {
           aps: {
