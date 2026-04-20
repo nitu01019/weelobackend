@@ -337,6 +337,7 @@ export class InMemoryQueue extends EventEmitter {
             attempts: failedJob.attempts,
             failedAt: new Date().toISOString()
           });
+          try { metrics.incrementCounter('dlq_pushed_total', { queue: queueName }); } catch { /* never break */ }
           await redisService.lPush(dlqKey, dlqEntry);
           // M-6 FIX: Configurable DLQ cap (env: DLQ_MAX_SIZE, default 5000)
           await redisService.lTrim(dlqKey, 0, DLQ_MAX_SIZE - 1);
@@ -830,6 +831,7 @@ export class RedisQueue extends EventEmitter {
       if (failedJob.attempts >= failedJob.maxAttempts) {
         // Max retries reached - move to dead letter queue
         const dlqKey = this.getDeadLetterKey(queueName);
+        try { metrics.incrementCounter('dlq_pushed_total', { queue: queueName }); } catch { /* never break */ }
         await redisService.lPush(dlqKey, JSON.stringify(failedJob));
 
         this.emit('job:failed', { queueName, job: failedJob, error: error.message });
@@ -1858,6 +1860,7 @@ export class QueueService {
           transporterId, event, data,
           droppedAt: Date.now(), reason: 'queue_full'
         });
+        try { metrics.incrementCounter('dlq_pushed_total', { queue: 'broadcast_depth_cap' }); } catch { /* never break */ }
         await redisService.lPush('dlq:broadcasts', dlqEntry);
         // M-6 FIX: Configurable DLQ cap (env: DLQ_MAX_SIZE, default 5000)
         await redisService.lTrim('dlq:broadcasts', 0, DLQ_MAX_SIZE - 1);
