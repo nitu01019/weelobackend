@@ -252,6 +252,8 @@ export class CircuitBreaker {
 
                 logger.error(`[CircuitBreaker] OPEN: ${this.name} (${count} failures in ${this.windowSeconds}s window)`);
                 metrics.incrementCounter('circuit_breaker_open', { service: this.name });
+                // F15.3: reflect OPEN state on the per-circuit gauge (redis-source transition)
+                metrics.setGauge('circuit_breaker_state_gauge', 1);
             }
         } catch {
             // Redis down — local fallback already recorded above
@@ -279,6 +281,8 @@ export class CircuitBreaker {
             this.localOpenUntil = now + (this.openDurationSeconds * 1000);
             logger.error(`[CircuitBreaker] OPEN (local): ${this.name} (${this.localFailureTimestamps.length} failures in ${this.windowSeconds}s window)`);
             metrics.incrementCounter('circuit_breaker_open', { service: this.name, source: 'local' });
+            // F15.3: reflect OPEN state on the per-circuit gauge (local-source transition)
+            metrics.setGauge('circuit_breaker_state_gauge', 1);
         }
     }
 
@@ -300,6 +304,8 @@ export class CircuitBreaker {
 
             logger.info(`[CircuitBreaker] CLOSED: ${this.name} (probe success)`);
             metrics.incrementCounter('circuit_breaker_closed', { service: this.name });
+            // F15.3: reflect CLOSED state on the per-circuit gauge (both sources cleared)
+            metrics.setGauge('circuit_breaker_state_gauge', 0);
         } catch {
             // Redis down — local state already reset above
             logger.warn(`[CircuitBreaker] Redis unavailable, local state reset for ${this.name}`);
@@ -351,3 +357,10 @@ export const socketCircuit = new CircuitBreaker('socket_emit', {
     openDurationMs: 30000,
     onRecovery: drainOutboxOnRecovery,
 });
+
+/**
+ * F15.3: Circuits whose OPEN state must drain the ECS task via /health/ready → 503.
+ * ONLY critical-path circuits belong here — transient side-circuits like h3 or
+ * directions should not drain the whole task.
+ */
+export const CRITICAL_CIRCUITS: ReadonlyArray<CircuitBreaker> = [fcmCircuit, socketCircuit] as const;

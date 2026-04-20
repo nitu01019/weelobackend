@@ -31,6 +31,7 @@ import { redisCoordination } from '../services/redis-coordination.service';
 import { logger } from '../services/logger.service';
 import { getConnectionStats, getIO, getRedisAdapterStatus } from '../services/socket.service';
 import { smsService } from '../../modules/auth/sms.service';
+import { CRITICAL_CIRCUITS } from '../services/circuit-breaker.service';
 
 const router = Router();
 
@@ -157,6 +158,10 @@ router.get('/health/ready', async (_req: Request, res: Response) => {
     } catch {
       checks.database = false;
     }
+
+    // F15.3: Drain task if any critical service-level circuit breaker is OPEN.
+    // Uses sync local check (zero Redis I/O on health path).
+    checks.criticalCircuits = !CRITICAL_CIRCUITS.some(cb => cb.isLocallyOpen());
 
     // Check circuit breakers
     const circuitBreakers = circuitBreakerRegistry.getAllStats();
