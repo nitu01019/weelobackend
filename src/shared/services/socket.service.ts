@@ -1601,6 +1601,25 @@ async function durableEmit(userId: string, event: string, data: any): Promise<bo
     logger.warn('[durableEmit] Emit failed, circuit breaker recording', {
       userId, event, error: msg
     });
+    // P2 F5.2: Adapter-down fallback — buffer into notification-outbox so
+    // the payload survives cross-instance drop. Best-effort; never rethrows.
+    try {
+      const { bufferNotification } = require('./notification-outbox.service');
+      await bufferNotification(userId, { type: event, data });
+      const { metrics: m } = require('../monitoring/metrics.service') as {
+        metrics: {
+          incrementCounter: (
+            name: string,
+            labels?: Record<string, string>,
+            value?: number
+          ) => void;
+        };
+      };
+      m.incrementCounter('socket_emit_buffered_adapter_down_total', { event });
+    } catch (bufErr: unknown) {
+      const bufMsg = bufErr instanceof Error ? bufErr.message : String(bufErr);
+      logger.warn('[Socket] adapter-down buffer write failed', { userId, event, error: bufMsg });
+    }
     return false;
   }
   return true;
@@ -1725,6 +1744,28 @@ export function emitToUser(userId: string, event: string, data: any): boolean {
     } catch {
       // Metrics module unavailable (minimal test harness): observability is
       // opt-in and must never break the emit path.
+    }
+    // P2 F5.2: Adapter-down fallback — buffer payload into notification-outbox
+    // so cross-instance drop is no longer silent. Best-effort; never rethrows.
+    try {
+      const { bufferNotification } = require('./notification-outbox.service');
+      bufferNotification(userId, { type: event, data }).catch((bufErr: unknown) => {
+        const bufMsg = bufErr instanceof Error ? bufErr.message : String(bufErr);
+        logger.warn('[Socket] adapter-down buffer write failed', { userId, event, error: bufMsg });
+      });
+      const { metrics: m2 } = require('../monitoring/metrics.service') as {
+        metrics: {
+          incrementCounter: (
+            name: string,
+            labels?: Record<string, string>,
+            value?: number
+          ) => void;
+        };
+      };
+      m2.incrementCounter('socket_emit_buffered_adapter_down_total', { event });
+    } catch (bufImportErr: unknown) {
+      const bufMsg = bufImportErr instanceof Error ? bufImportErr.message : String(bufImportErr);
+      logger.warn('[Socket] adapter-down buffer module unavailable', { userId, event, error: bufMsg });
     }
   }
 

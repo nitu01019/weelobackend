@@ -155,6 +155,16 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
       'Socket emits processed while Redis adapter is down (local-instance only broadcast)'
     ),
 
+    // P2 F5.2: Adapter-down fallback — counts emits routed into notification-outbox
+    // when redisPubSubInitialized=false. Pair with socket_emit_while_adapter_down_total
+    // to see what fraction of adapter-down emits were rescued via the outbox.
+    //   Labels: event = <socket event name>
+    //   Call site: src/shared/services/socket.service.ts (emitToUser, durableEmit)
+    counter(
+      'socket_emit_buffered_adapter_down_total',
+      'Socket emits buffered in notification-outbox because Redis adapter was down (labels: event)'
+    ),
+
     // === Phase 2 (H-5): Missing idempotency key telemetry ===
     // Fires inside the ALLOW_MISSING_IDEMPOTENCY_KEY_UNTIL grace-window branch
     // at order.routes.ts when the server fabricates a UUID because the client
