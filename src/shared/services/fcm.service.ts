@@ -381,7 +381,8 @@ class FCMService {
     const notifType = notification.data?.type || 'general';
     // L-03 FIX: Expanded transactional types list to cover all driver/customer critical notifications.
     // These always send regardless of notification preferences (user cannot opt out of trip-critical comms).
-    const ALWAYS_SEND = ['trip_status', 'payment', 'security', 'assignment_update', 'trip_assigned', 'driver_timeout', 'driver_assigned', 'trip_update'];
+    // H-18 Fix B (Phase 1): broadcasts are revenue-gating — always send.
+    const ALWAYS_SEND = ['trip_status', 'payment', 'security', 'assignment_update', 'trip_assigned', 'driver_timeout', 'driver_assigned', 'trip_update', 'new_broadcast'];
     if (!ALWAYS_SEND.includes(notifType)) {
       try {
         const prefsStr = await redisService.get(`notification_prefs:${userId}`);
@@ -465,10 +466,34 @@ class FCMService {
           // NOT_FOUND, the app was uninstalled or token rotated — remove it.
           // Without cleanup, every future notification to this user fails silently.
           // =====================================================================
+          const sendLatencyStart = Date.now();
           const sendResult = await this.admin.messaging().sendEachForMulticast({
             ...message,
             tokens
           });
+          // M-16 (Phase 5): FCM observability — success/failure/latency
+          // counters + dead-token cleanup counter. `tokens_bucket` is a
+          // low-cardinality label (1|2-10|11-50|51-250|251-500).
+          try {
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            const { metrics } = require('../monitoring/metrics.service');
+            const bucket =
+              tokens.length === 1 ? '1' :
+              tokens.length <= 10 ? '2-10' :
+              tokens.length <= 50 ? '11-50' :
+              tokens.length <= 250 ? '51-250' : '251-500';
+            const latencyMs = Date.now() - sendLatencyStart;
+            metrics.observeHistogram?.('fcm_send_latency_ms', latencyMs, { type: notification.type });
+            const successes = sendResult.successCount || 0;
+            const failures = sendResult.failureCount || 0;
+            if (successes > 0) {
+              metrics.incrementCounter('fcm_send_success_total', { type: notification.type, tokens_bucket: bucket }, successes);
+              metrics.incrementCounter('fcm_quota_consumed_total', { type: notification.type, tokens_bucket: bucket }, successes);
+            }
+            if (failures > 0) {
+              metrics.incrementCounter('fcm_send_failure_total', { type: notification.type, error_code: 'multicast_partial' }, failures);
+            }
+          } catch { /* metrics unavailable — never break the send */ }
           // Clean up dead tokens
           if (sendResult.failureCount > 0 && userId) {
             const deadTokens: string[] = [];
@@ -483,6 +508,11 @@ class FCMService {
             });
             if (deadTokens.length > 0) {
               logger.info(`FCM: Cleaning ${deadTokens.length} dead token(s) for user ${userId}`);
+              try {
+                // eslint-disable-next-line @typescript-eslint/no-var-requires
+                const { metrics } = require('../monitoring/metrics.service');
+                metrics.incrementCounter('fcm_dead_token_cleanup_total', {}, deadTokens.length);
+              } catch { /* non-fatal */ }
               for (const deadToken of deadTokens) {
                 this.removeToken(userId, deadToken).catch((err) => logger.warn('[FCM] Token cleanup failed', { userId, error: err instanceof Error ? err.message : String(err) }));
               }
@@ -712,6 +742,21 @@ class FCMService {
       });
     } catch { /* metrics not available — never break a send over a counter */ }
 
+    // C-4 (Phase 2): Android + APNs TTL so stale broadcasts don't land after
+    // the booking TTL (108s) has already expired. FCM default is 4 weeks,
+    // which produced confusing UX and wasted quota. Pattern: Uber dispatch
+    // TTL=60s, Lyft=90s. Defaults to 600s for non-dispatch lifecycle types.
+    const ttlMap: Record<string, number> = {
+      new_broadcast: 90,
+      driver_timeout: 90,
+      assignment_update: 90,
+      trip_update: 600,
+      driver_assigned: 600,
+      trip_assigned: 600,
+    };
+    const ttlSeconds = ttlMap[notification.type] ?? 600;
+    const apnsExpiration = Math.floor(Date.now() / 1000) + ttlSeconds;
+
     return {
       notification: {
         title: truncate(notification.title, 100) || '',
@@ -724,6 +769,7 @@ class FCMService {
       },
       android: {
         priority: notification.priority === 'high' ? 'high' : 'normal',
+        ttl: `${ttlSeconds}s`,
         notification: {
           channelId: this.getChannelId(notification.type),
           sound: 'default',
@@ -733,6 +779,10 @@ class FCMService {
         }
       },
       apns: {
+        headers: {
+          'apns-expiration': String(apnsExpiration),
+          ...(notification.priority === 'high' ? { 'apns-priority': '10' } : { 'apns-priority': '5' }),
+        },
         payload: {
           aps: {
             sound: 'default',
