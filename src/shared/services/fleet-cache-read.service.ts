@@ -15,6 +15,7 @@ import { logger } from './logger.service';
 import { db } from '../database/db';
 import { prismaClient } from '../database/prisma.service';
 import { redisService } from './redis.service';
+import { metrics } from '../monitoring/metrics.service';
 import {
   CACHE_KEYS,
   CACHE_TTL,
@@ -38,18 +39,22 @@ export async function getTransporterVehicles(
       const cached = await cacheService.get<CachedVehicle[]>(cacheKey);
       if (cached && Array.isArray(cached)) {
         logger.debug(`[FleetCache] HIT: vehicles for ${transporterId.substring(0, 8)}`);
+        metrics.incrementCounter('fleetcache_read_total', { kind: 'vehicles', result: 'hit' });
         return cached;
       }
       if (cached && !Array.isArray(cached)) {
         logger.warn(`[FleetCache] Corrupted cache (not array) for vehicles:${transporterId.substring(0, 8)}, deleting`);
+        metrics.incrementCounter('fleetcache_read_total', { kind: 'vehicles', result: 'corrupted' });
         await cacheService.delete(cacheKey).catch(() => {});
       }
     } catch (error) {
       logger.warn(`[FleetCache] Cache read error: ${error}`);
+      metrics.incrementCounter('fleetcache_read_total', { kind: 'vehicles', result: 'error' });
     }
   }
 
   logger.debug(`[FleetCache] MISS: vehicles for ${transporterId.substring(0, 8)}, fetching from DB`);
+  metrics.incrementCounter('fleetcache_read_total', { kind: 'vehicles', result: 'miss' });
 
   const dbResult = await db.getVehiclesByTransporter(transporterId);
   const dbVehicles = Array.isArray(dbResult) ? dbResult : await dbResult;
@@ -94,16 +99,20 @@ export async function getTransporterVehiclesByType(
     const cached = await cacheService.get<CachedVehicle[]>(cacheKey);
     if (cached && Array.isArray(cached)) {
       logger.debug(`[FleetCache] HIT: ${vehicleType} vehicles for ${transporterId.substring(0, 8)}`);
+      metrics.incrementCounter('fleetcache_read_total', { kind: 'vehicles_by_type', result: 'hit' });
       return cached;
     }
     if (cached && !Array.isArray(cached)) {
       logger.warn(`[FleetCache] Corrupted cache (not array) for vehiclesByType:${transporterId.substring(0, 8)}, deleting`);
+      metrics.incrementCounter('fleetcache_read_total', { kind: 'vehicles_by_type', result: 'corrupted' });
       await cacheService.delete(cacheKey).catch(() => {});
     }
   } catch (error) {
     logger.warn(`[FleetCache] Cache read error: ${error}`);
+    metrics.incrementCounter('fleetcache_read_total', { kind: 'vehicles_by_type', result: 'error' });
   }
 
+  metrics.incrementCounter('fleetcache_read_total', { kind: 'vehicles_by_type', result: 'miss' });
   const allVehicles = await getTransporterVehicles(transporterId);
   const filtered = allVehicles.filter(v => {
     const typeMatch = v.vehicleType.toLowerCase() === vehicleType.toLowerCase();
@@ -138,19 +147,25 @@ export async function getVehicle(vehicleId: string): Promise<CachedVehicle | nul
 
   try {
     const cached = await cacheService.get<CachedVehicle>(cacheKey);
-    if (cached && typeof cached === 'object' && cached.id) return cached;
+    if (cached && typeof cached === 'object' && cached.id) {
+      metrics.incrementCounter('fleetcache_read_total', { kind: 'vehicle', result: 'hit' });
+      return cached;
+    }
     if (cached && (typeof cached !== 'object' || !cached.id)) {
       logger.warn(`[FleetCache] Corrupted cache for vehicle:${vehicleId.substring(0, 8)}, deleting`);
+      metrics.incrementCounter('fleetcache_read_total', { kind: 'vehicle', result: 'corrupted' });
       await cacheService.delete(cacheKey).catch(() => {});
     }
   } catch (error) {
     logger.warn(`[FleetCache] Cache read error: ${error}`);
+    metrics.incrementCounter('fleetcache_read_total', { kind: 'vehicle', result: 'error' });
   }
 
   const dbResult = await db.getVehicleById(vehicleId);
   const vehicle = dbResult && typeof dbResult.then === 'function' ? await dbResult : dbResult;
   if (!vehicle) return null;
 
+  metrics.incrementCounter('fleetcache_read_total', { kind: 'vehicle', result: 'miss' });
   const cachedVehicle: CachedVehicle = {
     id: vehicle.id,
     transporterId: vehicle.transporterId,
@@ -189,18 +204,22 @@ export async function getTransporterDrivers(
       const cached = await cacheService.get<CachedDriver[]>(cacheKey);
       if (cached && Array.isArray(cached)) {
         logger.debug(`[FleetCache] HIT: drivers for ${transporterId.substring(0, 8)}`);
+        metrics.incrementCounter('fleetcache_read_total', { kind: 'drivers', result: 'hit' });
         return cached;
       }
       if (cached && !Array.isArray(cached)) {
         logger.warn(`[FleetCache] Corrupted cache (not array) for drivers:${transporterId.substring(0, 8)}, deleting`);
+        metrics.incrementCounter('fleetcache_read_total', { kind: 'drivers', result: 'corrupted' });
         await cacheService.delete(cacheKey).catch(() => {});
       }
     } catch (error) {
       logger.warn(`[FleetCache] Cache read error: ${error}`);
+      metrics.incrementCounter('fleetcache_read_total', { kind: 'drivers', result: 'error' });
     }
   }
 
   logger.debug(`[FleetCache] MISS: drivers for ${transporterId.substring(0, 8)}, fetching from DB`);
+  metrics.incrementCounter('fleetcache_read_total', { kind: 'drivers', result: 'miss' });
 
   let dbDrivers: Array<{ id: string; transporterId?: string; name: string; phone: string; profilePhotoUrl?: string; profilePhoto?: string; rating?: number; totalTrips?: number; status?: string; isAvailable?: boolean; currentTripId?: string }> = [];
   if (db.getDriversByTransporter) {
@@ -299,19 +318,25 @@ export async function getDriver(driverId: string): Promise<CachedDriver | null> 
 
   try {
     const cached = await cacheService.get<CachedDriver>(cacheKey);
-    if (cached && typeof cached === 'object' && cached.id) return cached;
+    if (cached && typeof cached === 'object' && cached.id) {
+      metrics.incrementCounter('fleetcache_read_total', { kind: 'driver', result: 'hit' });
+      return cached;
+    }
     if (cached && (typeof cached !== 'object' || !cached.id)) {
       logger.warn(`[FleetCache] Corrupted cache for driver:${driverId.substring(0, 8)}, deleting`);
+      metrics.incrementCounter('fleetcache_read_total', { kind: 'driver', result: 'corrupted' });
       await cacheService.delete(cacheKey).catch(() => {});
     }
   } catch (error) {
     logger.warn(`[FleetCache] Cache read error: ${error}`);
+    metrics.incrementCounter('fleetcache_read_total', { kind: 'driver', result: 'error' });
   }
 
   const dbResult = await db.getUserById(driverId);
   const driver = dbResult && typeof dbResult.then === 'function' ? await dbResult : dbResult;
   if (!driver || driver.role !== 'driver') return null;
 
+  metrics.incrementCounter('fleetcache_read_total', { kind: 'driver', result: 'miss' });
   let isOnline = false;
   try {
     const presenceExists = await redisService.exists(`driver:presence:${driverId}`);
@@ -356,15 +381,21 @@ export async function getAvailabilitySnapshot(
 
   try {
     const cached = await cacheService.get<AvailabilitySnapshot>(cacheKey);
-    if (cached && typeof cached === 'object' && cached.transporterId) return cached;
+    if (cached && typeof cached === 'object' && cached.transporterId) {
+      metrics.incrementCounter('fleetcache_read_total', { kind: 'snapshot', result: 'hit' });
+      return cached;
+    }
     if (cached && (typeof cached !== 'object' || !cached.transporterId)) {
       logger.warn(`[FleetCache] Corrupted cache for snapshot:${transporterId.substring(0, 8)}, deleting`);
+      metrics.incrementCounter('fleetcache_read_total', { kind: 'snapshot', result: 'corrupted' });
       await cacheService.delete(cacheKey).catch(() => {});
     }
   } catch (error) {
     logger.warn(`[FleetCache] Cache read error: ${error}`);
+    metrics.incrementCounter('fleetcache_read_total', { kind: 'snapshot', result: 'error' });
   }
 
+  metrics.incrementCounter('fleetcache_read_total', { kind: 'snapshot', result: 'miss' });
   const vehicles = await getTransporterVehiclesByType(transporterId, vehicleType, vehicleSubtype);
   const transporterResult = await db.getUserById(transporterId);
   const transporter = transporterResult && typeof transporterResult.then === 'function'
