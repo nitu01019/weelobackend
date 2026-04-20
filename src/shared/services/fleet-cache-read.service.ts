@@ -16,6 +16,7 @@ import { db } from '../database/db';
 import { prismaClient } from '../database/prisma.service';
 import { redisService } from './redis.service';
 import { metrics } from '../monitoring/metrics.service';
+import { DRIVER_PRESENCE_TTL_SECONDS } from '../config/presence.config';
 import {
   CACHE_KEYS,
   CACHE_TTL,
@@ -335,7 +336,20 @@ export async function getDriver(driverId: string): Promise<CachedDriver | null> 
     const cached = await cacheService.get<CachedDriver>(cacheKey);
     if (cached && typeof cached === 'object' && cached.id) {
       metrics.incrementCounter('fleetcache_read_total', { kind: 'driver', result: 'hit' });
-      return cached;
+
+      // F3.NEW-2: Recompute isOnline from live presence on every HIT.
+      // Mirrors F3.1 list-path recompute — cache holds the driver shell;
+      // presence truth stays ephemeral in Redis.
+      try {
+        const presenceExists = await redisService.exists(`driver:presence:${driverId}`);
+        return {
+          ...cached,
+          isOnline: (cached.isAvailable !== false) && (presenceExists === true),
+        };
+      } catch (presenceErr: unknown) {
+        logger.warn('[FleetCache] F3.NEW-2 live presence recompute failed — returning cached isOnline as-is', { driverId, error: presenceErr instanceof Error ? presenceErr.message : String(presenceErr) });
+        return cached;
+      }
     }
     if (cached && (typeof cached !== 'object' || !cached.id)) {
       logger.warn(`[FleetCache] Corrupted cache for driver:${driverId.substring(0, 8)}, deleting`);
@@ -375,7 +389,10 @@ export async function getDriver(driverId: string): Promise<CachedDriver | null> 
   };
 
   try {
-    await cacheService.set(cacheKey, cached, CACHE_TTL.INDIVIDUAL);
+    // F3.NEW-2: Cap individual driver TTL at presence TTL so cached isOnline
+    // cannot outlive one presence heartbeat window.
+    const individualTtl = Math.min(CACHE_TTL.INDIVIDUAL, DRIVER_PRESENCE_TTL_SECONDS);
+    await cacheService.set(cacheKey, cached, individualTtl);
   } catch (error) {
     logger.warn(`[FleetCache] Cache write error: ${error}`);
   }
