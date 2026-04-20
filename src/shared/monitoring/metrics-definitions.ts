@@ -154,6 +154,208 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
       'socket_emit_while_adapter_down_total',
       'Socket emits processed while Redis adapter is down (local-instance only broadcast)'
     ),
+
+    // === Phase 2 (H-5): Missing idempotency key telemetry ===
+    // Fires inside the ALLOW_MISSING_IDEMPOTENCY_KEY_UNTIL grace-window branch
+    // at order.routes.ts when the server fabricates a UUID because the client
+    // did not send a valid x-idempotency-key header. SRE watches this counter
+    // for 7-14 days; once it approaches zero, flip the grace-window date and
+    // the server rejects missing keys outright (Stripe/Square pattern).
+    // Label `user_agent_prefix` is the first 32 chars of User-Agent so we know
+    // which client build is still missing the header.
+    counter(
+      'missing_idempotency_key_total',
+      'Order creates accepted only via the grace-window UUID fabrication path (no client-provided Idempotency-Key)',
+    ),
+
+    // === Phase 4 (M-6): Order create rejection reasons ===
+    // Low-cardinality 5-value reason label so dashboards can break down
+    // rejection mix at each 4xx exit in order.routes.ts.
+    // Reasons: validation_error | rate_limit | concurrent_request |
+    //          missing_idempotency_key | active_order_exists
+    counter(
+      'order_create_rejected_total',
+      'Order create rejections by reason label (validation, rate_limit, etc)',
+    ),
+
+    // === Phase 3 (H-9): Google Directions hard-timeout fallback ===
+    // Fires when the 2s Promise.race timeout beats the real Distance Matrix
+    // response. Non-zero means cold-cache Google responses are exceeding the
+    // 10s distributed lock TTL and we're correctly falling through to
+    // client_fallback route math.
+    counter(
+      'google_directions_timeout_total',
+      'Google Directions/Distance Matrix calls that hit the client-side Promise.race timeout',
+    ),
+
+    // === Phase 3 (H-13, M-12): Haversine / no-api-key fallback reasons ===
+    // Low-cardinality reason label so dashboards can separate "Google hit quota"
+    // from "no API key configured" from "zero results" etc.
+    // Reasons: no_api_key | rate_limit | api_error | zero_results | timeout
+    counter(
+      'distance_matrix_fallback_total',
+      'Distance Matrix calls that fell through to haversine ETA (by reason label)',
+    ),
+
+    // === Phase 3 (H-12): Redis-coordinated Distance Matrix EPS bucket ===
+    // Emitted per element on every token-bucket acquire attempt. Label
+    // `result` is `allowed|denied` — dashboards show deny-rate trending
+    // toward Google's 1000 EPS project quota ceiling so ops can scale the
+    // bucket (DISTANCE_MATRIX_REDIS_EPS) before Google starts returning
+    // OVER_QUERY_LIMIT.
+    counter(
+      'distance_matrix_rate_limit_total',
+      'Distance Matrix Redis-coordinated token bucket decisions (result: allowed|denied)',
+    ),
+
+    // === Phase 3 (M-9): Order create Redis-fallback ops breakdown ===
+    // Fires when Redis coord path degrades to per-instance in-memory limits.
+    // Label `op` identifies WHICH stage degraded so dashboards show a root
+    // cause instead of a generic "Redis flap" blur.
+    // Ops: lock | dedupe | active_broadcast | idempotency | backpressure | debounce
+    counter(
+      'order_create_redis_fallback_total',
+      'Order create paths that used the in-memory fallback after a Redis coord primitive failed (by op label)',
+    ),
+
+    // === Phase 5 (M-16): FCM observability trio ===
+    // Thin-counter fill: currently only `fcm_push_priority_total` and
+    // `fcm_mock_mode_drop_total` exist. These three add success/failure
+    // parity and per-type breakdown for dashboards + SLO math.
+    counter(
+      'fcm_send_success_total',
+      'FCM sendEachForMulticast successes, labelled by notification type and token-count bucket',
+    ),
+    counter(
+      'fcm_send_failure_total',
+      'FCM sendEachForMulticast failures, labelled by notification type and error code',
+    ),
+    counter(
+      'fcm_dead_token_cleanup_total',
+      'Dead device-token rows removed from DB after per-token FCM error (messaging/invalid-registration-token etc)',
+    ),
+
+    // === Phase 5 (M-19): Cross-channel dedup signal ===
+    // Fires when the FCM processor runs AND the user was already connected
+    // via socket (therefore the socket path should already have delivered).
+    // Non-zero is fine — dual-channel dedup is defensive. Sustained >5%
+    // suggests stale presence keys and warrants investigation.
+    counter(
+      'fcm_sent_while_online_total',
+      'FCM pushes sent even though presenceService flagged the user as socket-connected (by type)',
+    ),
+
+    // === Phase 5 (M-20): DeviceToken sweep observability ===
+    // Emitted by the daily cron at 03:00 IST that deletes rows older than
+    // 90 days (DeviceToken.lastSeenAt). Lets ops see row-count trends.
+    counter(
+      'device_token_swept_total',
+      'DeviceToken DB rows deleted by the 90-day lastSeenAt sweep cron',
+    ),
+
+    // === Phase 2 risk register: H3 ring-K rollback signal ===
+    // Dashboard panel asserts rate <10/min steady-state. Spike to 100+/min
+    // after C-1 deploy means the ring-K constant flip returned empty
+    // candidate sets — rollback via FF_H3_RING_K_FIX=false.
+    counter(
+      'no_candidates_total',
+      'Progressive radius matcher returned an empty candidate list (by progressive step)',
+    ),
+
+    // === Phase 2 (H-6): Idempotency replay counter ===
+    // Fires when the route-layer Redis GET returns a cached 201 envelope
+    // BEFORE active-order guard runs. Distinguishes "network-retry replay"
+    // from "new duplicate request" in the dashboards.
+    counter(
+      'order_idempotency_replay_total',
+      'Order create requests served directly from the route-layer idempotency cache (retry-after-lost-201 path)',
+    ),
+
+    // === Phase 3 (H-8 rule-1 compliant): Debounce Redis bypass ===
+    // Fires in the debounce catch block when the Redis debounce GET/SET errors
+    // and we fail-open (proceeding without debounce). Previously only emitted
+    // from the deprecated delegate path at `order-creation.service.ts:175`.
+    // Registering here ensures the live-path increment in `order.service.ts`
+    // (added for H-8) isn't silently dropped by incrementCounter's warn-and-
+    // return branch. Label `path: 'live' | 'delegate'` distinguishes the two
+    // code paths so ops dashboards converge on a single counter.
+    counter(
+      'order_debounce_redis_bypass_total',
+      'Order create debounce check skipped because Redis GET/SET failed (by path label: live | delegate)',
+    ),
+
+    // === Phase 3 (M-11): Async stale-geo cleanup queue ===
+    // Inline `geoRemove + sRem + h3GeoIndexService.removeTransporter` on the
+    // read path amplified writes on the hot shard (1% stale x 250 members x
+    // 1000 dispatches/sec = 2500 writes/sec). Cleanup is now deferred to a
+    // Redis list (`stale_geo_cleanup_queue`) drained by a single leader-gated
+    // background worker. `queued` fires on every read-path enqueue; `drained`
+    // fires when the worker completes a removal.
+    counter(
+      'stale_geo_cleanup_queued_total',
+      'Stale transporter cleanup envelopes RPUSHed onto stale_geo_cleanup_queue from a read path',
+    ),
+    counter(
+      'stale_geo_cleanup_drained_total',
+      'Stale transporter cleanup envelopes drained and executed by the background worker',
+    ),
+
+    // === Phase 1 (F-series) — observability baseline ===
+    // Register-only descriptors for the F-series broadcast-fix pipeline. Actual
+    // increment call sites land in Phase 1 tasks 4-11. Names match the Fix
+    // directions index at .planning/reviews/transporter_to_driver_INDEX.md.
+    counter(
+      'new_assignment_dispatch_total',
+      'New-assignment primary dispatch commit (F4.15) — labels: vehicle_type, stage',
+    ),
+    counter(
+      'new_assignment_socket_emit_total',
+      'New-assignment socket emit outcome (F4.15) — labels: result=success|fail|adapter_down',
+    ),
+    counter(
+      'new_assignment_outbox_insert_total',
+      'New-assignment notification outbox insert outcome (F4.15) — labels: result=success|fail',
+    ),
+    counter(
+      'new_assignment_fcm_enqueue_total',
+      'New-assignment FCM enqueue outcome (F4.15) — labels: result=success|fail',
+    ),
+    counter(
+      'fleetcache_read_total',
+      'Fleet cache reads (F3.6) — labels: kind=vehicles|vehicle|vehicles_by_type|drivers|driver|snapshot, result=hit|miss|corrupted|error',
+    ),
+    counter(
+      'dlq_pushed_total',
+      'Dead-letter queue pushes (F7.5) — labels: queue',
+    ),
+    counter(
+      'hold_confirmed_committed_total',
+      'Confirmed-hold commits after phase transition — labels: stage',
+    ),
+    counter(
+      'driver_accepted_total',
+      'Driver accepts committed — labels: source=rest|socket',
+    ),
+    counter(
+      'driver_declined_total',
+      'Driver declines committed — labels: source=rest|socket',
+    ),
+    counter(
+      'driver_timeout_total',
+      'Driver 45s timeout fired — labels: source=timer|reconcile',
+    ),
+    counter(
+      'driver_reassign_issued_total',
+      'Driver reassign issued after decline/timeout — labels: reason=decline|timeout|offline',
+    ),
+    counter(
+      'driver_overlay_rendered_total',
+      'Driver overlay actually rendered (F9.9) — labels: type, result=ok|fail',
+    ),
+    counter(
+      'fcm_quota_consumed_total',
+      'FCM quota consumed per send success (F14.5) — labels: type, tokens_bucket',
+    ),
   ];
 
   for (const def of defs) {
@@ -184,6 +386,16 @@ export function registerDefaultGauges(gauges: Map<string, GaugeMetric>): void {
     // whose `dispatchState='dispatching'` hasn't advanced past a threshold age.
     // Non-zero and growing = the outbox poller is lagging, worth paging oncall.
     gauge('order_stale_dispatching_state', 'Orders stuck in dispatchState=dispatching past the stale threshold (F-A-70)'),
+
+    // === Phase 1 (F-series) — observability baseline ===
+    gauge(
+      'circuit_breaker_state_gauge',
+      'Per-circuit state (1=OPEN, 0=CLOSED/HALF_OPEN) — labels: name, source=redis|local (F15.3)',
+    ),
+    gauge(
+      'stream_depth',
+      'Socket.IO Redis Streams adapter per-stream depth (F14.5) — labels: stream',
+    ),
   ];
 
   for (const def of defs) {
@@ -228,6 +440,20 @@ export function registerDefaultHistograms(histograms: Map<string, HistogramMetri
       'hold_reconciliation_cycle_duration_seconds',
       'Per-cycle duration of the hold reconciliation sweeper in seconds',
       [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30],
+    ),
+
+    // === Phase 5 (M-16): FCM send latency ===
+    hist(
+      'fcm_send_latency_ms',
+      'FCM sendEachForMulticast latency per notification type',
+      [50, 100, 250, 500, 1000, 2500, 5000, 10000],
+    ),
+
+    // === Phase 1 (F-series) — observability baseline ===
+    hist(
+      'pool_wait_seconds',
+      'Prisma connection pool wait time in seconds (F14.5) — labels: pool_name',
+      [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
     ),
   ];
 
