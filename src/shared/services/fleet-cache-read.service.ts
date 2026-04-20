@@ -205,7 +205,22 @@ export async function getTransporterDrivers(
       if (cached && Array.isArray(cached)) {
         logger.debug(`[FleetCache] HIT: drivers for ${transporterId.substring(0, 8)}`);
         metrics.incrementCounter('fleetcache_read_total', { kind: 'drivers', result: 'hit' });
-        return cached;
+
+        // F3.1: Recompute isOnline from live presence on every HIT.
+        // Cache holds the driver shell; presence truth stays ephemeral in Redis.
+        try {
+          const ids = cached.map(d => d.id);
+          const presenceValues = await Promise.all(
+            ids.map(id => redisService.exists(`driver:presence:${id}`))
+          );
+          return cached.map((d, i) => ({
+            ...d,
+            isOnline: (d.isAvailable !== false) && (presenceValues[i] === true),
+          }));
+        } catch (presenceErr) {
+          logger.warn('[FleetCache] F3.1 live presence recompute failed — returning cached isOnline as-is', { error: presenceErr instanceof Error ? presenceErr.message : String(presenceErr) });
+          return cached;
+        }
       }
       if (cached && !Array.isArray(cached)) {
         logger.warn(`[FleetCache] Corrupted cache (not array) for drivers:${transporterId.substring(0, 8)}, deleting`);
