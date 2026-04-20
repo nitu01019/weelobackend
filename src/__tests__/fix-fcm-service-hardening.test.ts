@@ -495,6 +495,155 @@ describe('FCM Service Hardening', () => {
   });
 
   // =========================================================================
+  // P2 F6.2: executeWithRetry honors Retry-After header on 429/503
+  // =========================================================================
+  describe('P2 F6.2: Retry-After header on quota/unavailable errors', () => {
+    beforeEach(async () => {
+      process.env.FIREBASE_SERVICE_ACCOUNT_PATH = '/tmp/test-sa.json';
+      await fcmService.initialize();
+    });
+
+    afterEach(() => {
+      delete process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
+    });
+
+    test('HTTP 429 with Retry-After: 3 backs off ≈3000ms then retries', async () => {
+      const setTimeoutSpy = jest.spyOn(global, 'setTimeout');
+
+      // Fail first with 429 + Retry-After, succeed on retry.
+      mockSend
+        .mockRejectedValueOnce({
+          code: 'messaging/quota-exceeded',
+          errorInfo: {
+            code: 'messaging/quota-exceeded',
+            httpResponse: { status: 429, headers: { 'retry-after': '3' } },
+          },
+        })
+        .mockResolvedValueOnce('msg-id');
+
+      await fcmService.sendToTokens(['t-1'], makeNotification(), 'u-1');
+
+      // First setTimeout from executeWithRetry's delay should be ~3000ms.
+      const retryDelay = setTimeoutSpy.mock.calls.find(
+        (c: unknown[]) => typeof c[1] === 'number' && (c[1] as number) >= 2900 && (c[1] as number) <= 3100
+      );
+      expect(retryDelay).toBeDefined();
+      // Send was retried — must have been called twice.
+      expect(mockSend).toHaveBeenCalledTimes(2);
+
+      setTimeoutSpy.mockRestore();
+    });
+
+    test('HTTP 503 with case-insensitive Retry-After header is honored', async () => {
+      const setTimeoutSpy = jest.spyOn(global, 'setTimeout');
+
+      mockSend
+        .mockRejectedValueOnce({
+          code: 'messaging/server-unavailable',
+          errorInfo: {
+            code: 'messaging/server-unavailable',
+            httpResponse: { status: 503, headers: { 'Retry-After': '4' } },
+          },
+        })
+        .mockResolvedValueOnce('msg-id');
+
+      await fcmService.sendToTokens(['t-2'], makeNotification(), 'u-2');
+
+      const retryDelay = setTimeoutSpy.mock.calls.find(
+        (c: unknown[]) => typeof c[1] === 'number' && (c[1] as number) >= 3900 && (c[1] as number) <= 4100
+      );
+      expect(retryDelay).toBeDefined();
+      expect(mockSend).toHaveBeenCalledTimes(2);
+
+      setTimeoutSpy.mockRestore();
+    });
+
+    test('non-quota errors without Retry-After fall back to exponential backoff (<2s on first retry)', async () => {
+      const setTimeoutSpy = jest.spyOn(global, 'setTimeout');
+
+      // messaging/internal-error is retryable but NOT a quota/unavailable case,
+      // so executeWithRetry uses exponential backoff with jitter (≤2000ms on attempt 0).
+      mockSend
+        .mockRejectedValueOnce({
+          code: 'messaging/internal-error',
+          errorInfo: {
+            code: 'messaging/internal-error',
+            httpResponse: { status: 500, headers: {} },
+          },
+        })
+        .mockResolvedValueOnce('msg-id');
+
+      await fcmService.sendToTokens(['t-3'], makeNotification(), 'u-3');
+
+      // First delay must be within exponential-backoff range (0-2000ms on attempt 0).
+      const firstDelay = setTimeoutSpy.mock.calls.find(
+        (c: unknown[]) => typeof c[1] === 'number' && (c[1] as number) >= 0 && (c[1] as number) <= 2000
+      );
+      expect(firstDelay).toBeDefined();
+      expect(mockSend).toHaveBeenCalledTimes(2);
+
+      setTimeoutSpy.mockRestore();
+    });
+  });
+
+  // =========================================================================
+  // P2 F6.3: buildMessage sets collapseKey on android + apns-collapse-id
+  // =========================================================================
+  describe('P2 F6.3: collapseKey on android + apns', () => {
+    beforeEach(async () => {
+      process.env.FIREBASE_SERVICE_ACCOUNT_PATH = '/tmp/test-sa.json';
+      await fcmService.initialize();
+    });
+
+    afterEach(() => {
+      delete process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
+    });
+
+    test('bookingId in data sets android.collapseKey AND apns-collapse-id', async () => {
+      const notification = makeNotification({
+        data: { bookingId: 'b-999', foo: 'bar' },
+      });
+
+      mockSend.mockResolvedValueOnce('msg-id');
+      await fcmService.sendToTokens(['tok-collapse-1'], notification, 'u-col-1');
+
+      const sent = mockSend.mock.calls[0][0];
+      expect(sent.android.collapseKey).toBe('b-999');
+      expect(sent.apns.headers['apns-collapse-id']).toBe('b-999');
+    });
+
+    test('falls back to orderId, then assignmentId when bookingId is absent', async () => {
+      const orderOnly = makeNotification({ data: { orderId: 'o-123' } });
+      mockSend.mockResolvedValueOnce('msg-id');
+      await fcmService.sendToTokens(['tok-collapse-2'], orderOnly, 'u-col-2');
+
+      const sentOrder = mockSend.mock.calls[0][0];
+      expect(sentOrder.android.collapseKey).toBe('o-123');
+      expect(sentOrder.apns.headers['apns-collapse-id']).toBe('o-123');
+
+      mockSend.mockClear();
+      const assignmentOnly = makeNotification({ data: { assignmentId: 'a-456' } });
+      mockSend.mockResolvedValueOnce('msg-id');
+      await fcmService.sendToTokens(['tok-collapse-3'], assignmentOnly, 'u-col-3');
+
+      const sentAssignment = mockSend.mock.calls[0][0];
+      expect(sentAssignment.android.collapseKey).toBe('a-456');
+      expect(sentAssignment.apns.headers['apns-collapse-id']).toBe('a-456');
+    });
+
+    test('omits collapseKey entirely when no business ID is present', async () => {
+      const notification = makeNotification({ data: { foo: 'bar' } });
+
+      mockSend.mockResolvedValueOnce('msg-id');
+      await fcmService.sendToTokens(['tok-collapse-4'], notification, 'u-col-4');
+
+      const sent = mockSend.mock.calls[0][0];
+      expect(sent.android).not.toHaveProperty('collapseKey');
+      expect(sent.apns.headers).not.toHaveProperty('apns-collapse-id');
+    });
+  });
+
+  // =========================================================================
   // Integration: exported API surface unchanged
   // =========================================================================
   describe('API surface unchanged', () => {

@@ -194,3 +194,83 @@ describe('P1-T1.2 M18 — socket_emit_while_adapter_down_total', () => {
     expect(source).toContain('Redis adapter down — broadcasting to local instance only');
   });
 });
+
+// -----------------------------------------------------------------------------
+// P2 F5.2 — socket_emit_buffered_adapter_down_total + notification-outbox buffer
+//
+// When the Redis adapter is down, emitToUser must (a) still route the payload
+// into notification-outbox via bufferNotification so cross-instance drop is
+// no longer silent, and (b) increment socket_emit_buffered_adapter_down_total.
+// We reuse the single-instance harness already set up above for M18.
+// -----------------------------------------------------------------------------
+
+describe('P2 F5.2 — socket_emit_buffered_adapter_down_total + outbox buffer', () => {
+  let socketModule: typeof import('../shared/services/socket.service') | null = null;
+  let outboxModule: typeof import('../shared/services/notification-outbox.service') | null = null;
+  let bufferSpy: jest.SpyInstance | null = null;
+
+  beforeAll(() => {
+    // Must be imported AFTER REDIS_ENABLED=false is set by the M18 describe's
+    // beforeAll (which runs first in file order). If run in isolation, this
+    // suite still works because the M18 setup forces single-instance mode.
+    process.env.REDIS_ENABLED = 'false';
+    socketModule = require('../shared/services/socket.service') as typeof import('../shared/services/socket.service');
+    outboxModule = require('../shared/services/notification-outbox.service') as typeof import('../shared/services/notification-outbox.service');
+  });
+
+  beforeEach(() => {
+    // Replace bufferNotification with a spy that resolves immediately — the
+    // production path only awaits the Redis lPush, so a no-op stand-in is
+    // sufficient to observe the call signature.
+    bufferSpy = jest
+      .spyOn(outboxModule!, 'bufferNotification')
+      .mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    bufferSpy?.mockRestore();
+    bufferSpy = null;
+  });
+
+  it('counter is pre-registered (no auto-create warn on first increment)', () => {
+    const warnSpy = jest.spyOn(logger, 'warn').mockImplementation();
+    metrics.incrementCounter('socket_emit_buffered_adapter_down_total', {
+      event: 'test_event'
+    });
+    expect(someStringCallIncludes(warnSpy, 'socket_emit_buffered_adapter_down_total')).toBe(false);
+    warnSpy.mockRestore();
+  });
+
+  it('emitToUser invokes bufferNotification with {type, data} envelope when adapter is down', async () => {
+    socketModule!.emitToUser('user-buf', 'trip_assigned', { tripId: 't-42' });
+    // bufferNotification is called without await (fire-and-forget .catch), so
+    // let the microtask queue flush.
+    await new Promise(resolve => setImmediate(resolve));
+
+    expect(bufferSpy).toHaveBeenCalledTimes(1);
+    expect(bufferSpy).toHaveBeenCalledWith(
+      'user-buf',
+      { type: 'trip_assigned', data: { tripId: 't-42' } }
+    );
+  });
+
+  it('emitToUser increments socket_emit_buffered_adapter_down_total{event} when adapter is down', () => {
+    const before = countersFor('socket_emit_buffered_adapter_down_total');
+    socketModule!.emitToUser('user-buf-2', 'booking_new', { bookingId: 'b-7' });
+
+    const after = countersFor('socket_emit_buffered_adapter_down_total');
+    const matchingKey = Object.keys(after).find(k => k.includes('event="booking_new"'));
+    expect(matchingKey).toBeDefined();
+    const beforeValue = before[matchingKey!] ?? 0;
+    expect(after[matchingKey!]).toBe(beforeValue + 1);
+  });
+
+  it('socket.service.ts wires bufferNotification + counter inside the adapter-down branch', () => {
+    const source = readSource('shared/services/socket.service.ts');
+    expect(source).toContain("require('./notification-outbox.service')");
+    expect(source).toContain("'socket_emit_buffered_adapter_down_total'");
+    // Guardrail: envelope shape must be { type: event, data } to round-trip
+    // cleanly through the outbox drain path.
+    expect(source).toContain('bufferNotification(userId, { type: event, data })');
+  });
+});

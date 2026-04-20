@@ -54,6 +54,12 @@ jest.mock('../shared/services/cache.service', () => ({
   },
 }));
 
+// Presence store is independent of cache store — driver:presence:{id} keys
+// live in Redis (never in fleetcache). We expose a handle so tests can toggle
+// per-driver presence between cache reads.
+const presenceStore = new Map<string, boolean>();
+const mockRedisExists = jest.fn(async (key: string) => presenceStore.get(key) === true);
+
 jest.mock('../shared/services/redis.service', () => ({
   redisService: {
     scanIterator: (pattern: string) => scanIteratorImpl(pattern),
@@ -65,6 +71,7 @@ jest.mock('../shared/services/redis.service', () => ({
       return 1;
     }),
     acquireLock: jest.fn(async () => ({ acquired: false })),
+    exists: (key: string) => mockRedisExists(key),
   },
 }));
 
@@ -77,9 +84,40 @@ jest.mock('../shared/services/logger.service', () => ({
   },
 }));
 
+// Minimal mocks for fleet-cache-read miss-path and metrics. The F3.1 / F3.NEW-2
+// tests below only exercise the HIT path, but getTransporterDrivers imports
+// these at module load.
+jest.mock('../shared/database/db', () => ({
+  db: {
+    getDriversByTransporter: jest.fn(async () => []),
+  },
+}));
+
+jest.mock('../shared/database/prisma.service', () => ({
+  prismaClient: {
+    assignment: {
+      groupBy: jest.fn(async () => []),
+      findMany: jest.fn(async () => []),
+    },
+  },
+}));
+
+jest.mock('../shared/monitoring/metrics.service', () => ({
+  metrics: {
+    incrementCounter: jest.fn(),
+    observeHistogram: jest.fn(),
+    setGauge: jest.fn(),
+  },
+}));
+
 // Import AFTER mocks are set up so the module picks up our in-memory backing.
 import { fleetCacheService } from '../shared/services/fleet-cache.service';
 import { clearAll as clearAllSplit } from '../shared/services/fleet-cache-write.service';
+import {
+  getTransporterDrivers,
+  getDriver,
+} from '../shared/services/fleet-cache-read.service';
+import { CACHE_KEYS } from '../shared/services/fleet-cache-types';
 
 const TRANSPORTER_UUID = '11111111-2222-3333-4444-555555555555';
 const OTHER_UUID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
@@ -186,5 +224,124 @@ describe('F-B-03 FleetCache / tracking namespace isolation', () => {
       expect(fleetcache.startsWith(tracking)).toBe(false);
       expect(tracking.startsWith(fleetcache)).toBe(false);
     });
+  });
+});
+
+// =============================================================================
+// P2 F3.1 + F3.NEW-2 — isOnline recompute from live presence on every HIT
+//
+// Invariant: the cache holds the driver shell (identity, availability flag)
+// but isOnline is ephemeral truth — it must be re-read from driver:presence:*
+// on every list-path (F3.1) and individual-path (F3.NEW-2) cache HIT so that
+// a driver whose presence key has been evicted between writes immediately
+// reports isOnline=false without waiting for a TTL roll.
+// =============================================================================
+
+describe('P2 F3.1 + F3.NEW-2 — isOnline recomputed from live presence on cache HIT', () => {
+  const T_ID = '11111111-aaaa-bbbb-cccc-dddddddddddd';
+  const D1 = 'driver-111';
+  const D2 = 'driver-222';
+
+  beforeEach(() => {
+    store.clear();
+    presenceStore.clear();
+    jest.clearAllMocks();
+  });
+
+  // --- F3.1: list path (getTransporterDrivers) ---
+
+  it('F3.1 — list path: isOnline=true when cache says online AND presence key exists', async () => {
+    const cached = [
+      {
+        id: D1, transporterId: T_ID, name: 'D1', phone: '1',
+        profilePhotoUrl: undefined, rating: 4.5, totalTrips: 0,
+        status: 'active' as const, isAvailable: true, isOnline: true,
+        currentTripId: undefined, lastUpdated: new Date().toISOString(),
+      },
+    ];
+    store.set(CACHE_KEYS.DRIVERS(T_ID), cached);
+    presenceStore.set(`driver:presence:${D1}`, true);
+
+    const result = await getTransporterDrivers(T_ID);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].isOnline).toBe(true);
+    expect(mockRedisExists).toHaveBeenCalledWith(`driver:presence:${D1}`);
+  });
+
+  it('F3.1 — list path: isOnline flips to FALSE when presence key is evicted between reads', async () => {
+    // First read seeds the cache with isOnline:true (driver was online).
+    const cached = [
+      {
+        id: D1, transporterId: T_ID, name: 'D1', phone: '1',
+        profilePhotoUrl: undefined, rating: 4.5, totalTrips: 0,
+        status: 'active' as const, isAvailable: true, isOnline: true,
+        currentTripId: undefined, lastUpdated: new Date().toISOString(),
+      },
+      {
+        id: D2, transporterId: T_ID, name: 'D2', phone: '2',
+        profilePhotoUrl: undefined, rating: 4.5, totalTrips: 0,
+        status: 'active' as const, isAvailable: true, isOnline: true,
+        currentTripId: undefined, lastUpdated: new Date().toISOString(),
+      },
+    ];
+    store.set(CACHE_KEYS.DRIVERS(T_ID), cached);
+    // Simulate presence key for D1 evicted (went offline) while D2 stays online.
+    presenceStore.set(`driver:presence:${D2}`, true);
+
+    const result = await getTransporterDrivers(T_ID);
+
+    const byId = Object.fromEntries(result.map(r => [r.id, r]));
+    expect(byId[D1].isOnline).toBe(false);
+    expect(byId[D2].isOnline).toBe(true);
+  });
+
+  it('F3.1 — list path: isAvailable=false forces isOnline=false regardless of presence', async () => {
+    const cached = [
+      {
+        id: D1, transporterId: T_ID, name: 'D1', phone: '1',
+        profilePhotoUrl: undefined, rating: 4.5, totalTrips: 0,
+        status: 'active' as const, isAvailable: false, isOnline: true,
+        currentTripId: undefined, lastUpdated: new Date().toISOString(),
+      },
+    ];
+    store.set(CACHE_KEYS.DRIVERS(T_ID), cached);
+    presenceStore.set(`driver:presence:${D1}`, true);
+
+    const result = await getTransporterDrivers(T_ID);
+
+    expect(result[0].isOnline).toBe(false);
+  });
+
+  // --- F3.NEW-2: individual path (getDriver) ---
+
+  it('F3.NEW-2 — individual path: isOnline=true when cache + presence agree', async () => {
+    store.set(CACHE_KEYS.DRIVER(D1), {
+      id: D1, transporterId: T_ID, name: 'D1', phone: '1',
+      rating: 4.5, totalTrips: 0,
+      status: 'active', isAvailable: true, isOnline: true,
+    });
+    presenceStore.set(`driver:presence:${D1}`, true);
+
+    const result = await getDriver(D1);
+
+    expect(result).not.toBeNull();
+    expect(result!.isOnline).toBe(true);
+    expect(mockRedisExists).toHaveBeenCalledWith(`driver:presence:${D1}`);
+  });
+
+  it('F3.NEW-2 — individual path: isOnline flips to FALSE when presence key is evicted', async () => {
+    store.set(CACHE_KEYS.DRIVER(D1), {
+      id: D1, transporterId: T_ID, name: 'D1', phone: '1',
+      rating: 4.5, totalTrips: 0,
+      status: 'active', isAvailable: true, isOnline: true,
+    });
+    // No presence key seeded → exists() returns false.
+
+    const result = await getDriver(D1);
+
+    expect(result).not.toBeNull();
+    expect(result!.isOnline).toBe(false);
+    expect(mockRedisExists).toHaveBeenCalledWith(`driver:presence:${D1}`);
   });
 });

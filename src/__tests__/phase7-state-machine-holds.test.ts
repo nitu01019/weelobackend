@@ -1229,6 +1229,115 @@ describe('Phase 7 — State Machine & Hold Transitions', () => {
   });
 
   // ===========================================================================
+  // P2 F4.1 — Confirmed-hold dispatch fans out trip_assigned via socket + FCM
+  // per driver. Mirrors truck-hold.service.ts:1612-1678 payload shape.
+  // ===========================================================================
+  describe('P2 F4.1 — Confirmed hold dispatch: per-driver trip_assigned emit + FCM', () => {
+    function seedHappyPathMocks() {
+      mockQueryRaw.mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }]);
+      mockQueryRaw.mockResolvedValueOnce([
+        { holdId: 'h-1', phase: 'FLEX', transporterId: 't-1', confirmedExpiresAt: null },
+      ]);
+      mockTruckHoldLedgerUpdate.mockResolvedValue({
+        holdId: 'h-1', orderId: 'o-1', transporterId: 't-1', quantity: 2,
+      });
+      mockAssignmentFindMany.mockResolvedValue([
+        {
+          id: 'a-1', driverId: 'd-1', driverName: 'D1', transporterId: 't-1',
+          vehicleId: 'v-1', vehicleNumber: 'KA01', vehicleType: 'truck',
+          tripId: 'trip-1', orderId: 'o-1', bookingId: 'b-1', truckRequestId: 'tr-1',
+        },
+        {
+          id: 'a-2', driverId: 'd-2', driverName: 'D2', transporterId: 't-1',
+          vehicleId: 'v-2', vehicleNumber: 'KA02', vehicleType: 'truck',
+          tripId: 'trip-2', orderId: 'o-1', bookingId: 'b-1', truckRequestId: 'tr-2',
+        },
+      ]);
+      mockOrderFindUnique.mockResolvedValue({
+        id: 'o-1',
+        pickup: { address: 'Pickup St', city: 'BLR', latitude: 12.9, longitude: 77.6 },
+        drop: { address: 'Drop St', city: 'BLR', latitude: 12.95, longitude: 77.65 },
+        distanceKm: 7.5,
+        customerName: 'C1',
+        customerPhone: '9876543210',
+      });
+    }
+
+    it('emits trip_assigned via socketService.emitToUser once per driver', async () => {
+      const { confirmedHoldService } = require('../modules/truck-hold/confirmed-hold.service');
+      seedHappyPathMocks();
+
+      await confirmedHoldService.initializeConfirmedHold('h-1', 't-1', [
+        { assignmentId: 'a-1', driverId: 'd-1', truckRequestId: 'tr-1' },
+        { assignmentId: 'a-2', driverId: 'd-2', truckRequestId: 'tr-2' },
+      ]);
+
+      const tripAssignedCalls = mockEmitToUser.mock.calls.filter(
+        (c: unknown[]) => c[1] === 'trip_assigned'
+      );
+      expect(tripAssignedCalls).toHaveLength(2);
+      const driverIds = tripAssignedCalls.map((c: unknown[]) => c[0]).sort();
+      expect(driverIds).toEqual(['d-1', 'd-2']);
+
+      const firstPayload = tripAssignedCalls[0][2] as Record<string, unknown>;
+      expect(firstPayload).toMatchObject({
+        type: 'trip_assigned',
+        orderId: 'o-1',
+        bookingId: 'b-1',
+      });
+      expect(firstPayload).toHaveProperty('pickup');
+      expect(firstPayload).toHaveProperty('drop');
+      expect(firstPayload).toHaveProperty('expiresAt');
+    });
+
+    it('enqueues FCM push via queueService.queuePushNotification once per driver', async () => {
+      const { confirmedHoldService } = require('../modules/truck-hold/confirmed-hold.service');
+      seedHappyPathMocks();
+
+      await confirmedHoldService.initializeConfirmedHold('h-1', 't-1', [
+        { assignmentId: 'a-1', driverId: 'd-1', truckRequestId: 'tr-1' },
+        { assignmentId: 'a-2', driverId: 'd-2', truckRequestId: 'tr-2' },
+      ]);
+
+      expect(mockQueuePushNotification).toHaveBeenCalledTimes(2);
+      const pushDriverIds = mockQueuePushNotification.mock.calls
+        .map((c: unknown[]) => c[0])
+        .sort();
+      expect(pushDriverIds).toEqual(['d-1', 'd-2']);
+
+      const firstPush = mockQueuePushNotification.mock.calls[0][1] as {
+        title: string;
+        body: string;
+        data: Record<string, string>;
+      };
+      expect(firstPush.title).toMatch(/New Trip Assigned/i);
+      expect(firstPush.data).toMatchObject({
+        type: 'trip_assigned',
+        orderId: 'o-1',
+        pickupAddress: 'Pickup St',
+        dropAddress: 'Drop St',
+      });
+    });
+
+    it('continues fanout when one driver socket emit fails', async () => {
+      const { confirmedHoldService } = require('../modules/truck-hold/confirmed-hold.service');
+      seedHappyPathMocks();
+      // First driver's socket emit throws — second driver must still be dispatched.
+      mockEmitToUser.mockImplementationOnce(() => {
+        throw new Error('socket down');
+      });
+
+      await confirmedHoldService.initializeConfirmedHold('h-1', 't-1', [
+        { assignmentId: 'a-1', driverId: 'd-1', truckRequestId: 'tr-1' },
+        { assignmentId: 'a-2', driverId: 'd-2', truckRequestId: 'tr-2' },
+      ]);
+
+      // Both FCM enqueues must still fire — per-driver try/catch isolates failures.
+      expect(mockQueuePushNotification).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  // ===========================================================================
   // Confirmed hold — driver acceptance distributed lock
   // ===========================================================================
   describe('Confirmed hold — driver acceptance lock', () => {
