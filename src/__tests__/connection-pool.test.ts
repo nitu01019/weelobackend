@@ -296,17 +296,16 @@ describe('A. Single Client Verification', () => {
     expect(poolConfigMatch![1]).toBe('10');
   });
 
-  test('A8: prisma.service.ts connection_limit default is 20 (primary config)', () => {
+  test('A8: prisma.service.ts connection_limit default is 25 (primary config)', () => {
     const content = fs.readFileSync(
       path.join(SRC_ROOT, 'shared/database/prisma.service.ts'),
       'utf-8'
     );
-    // prisma.service.ts is the primary config and its default is currently 20
+    // Phase 2 F14.1: prisma.service.ts is the primary config; default raised 20 → 25
     const poolConfigMatch = content.match(/DB_CONNECTION_LIMIT\s*\|\|\s*['"](\d+)['"]/);
     expect(poolConfigMatch).not.toBeNull();
-    // Current default in prisma.service.ts (the value we need to track)
     const currentDefault = poolConfigMatch![1];
-    expect(['10', '20']).toContain(currentDefault);
+    expect(['10', '20', '25']).toContain(currentDefault);
   });
 
   test('A9: getPrismaClient in prisma-client.ts returns same instance as prisma.service.ts exports', () => {
