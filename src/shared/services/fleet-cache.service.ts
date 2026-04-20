@@ -73,23 +73,21 @@
  * =============================================================================
  */
 
-import { cacheService } from './cache.service';
-import { logger } from './logger.service';
-import { db } from '../database/db';
-import { prismaClient } from '../database/prisma.service';
-import { redisService } from './redis.service';
 // F-B-02 Phase A: constants + shapes now live in fleet-cache-types.ts (single
 // source of truth). Local duplicates removed; the class below is marked
 // @deprecated — callers should migrate to the free-function module
 // (fleet-cache-read.service.ts / fleet-cache-write.service.ts) in Phase C.
 import {
   FLEET_CACHE_PREFIX,
-  CACHE_KEYS,
-  CACHE_TTL,
   CachedVehicle,
   CachedDriver,
   AvailabilitySnapshot,
 } from './fleet-cache-types';
+// F3.NEW-3 / F3.8: class methods delegate to free-function modules so the
+// F3.1 / F3.NEW-2 isOnline-on-HIT recompute (and any future read/write fixes)
+// take effect through every caller of the deprecated wrapper.
+import * as fleetCacheRead from './fleet-cache-read.service';
+import * as fleetCacheWrite from './fleet-cache-write.service';
 
 // =============================================================================
 // FLEET CACHE SERVICE (@deprecated — see F-B-02 Phase C for deletion plan)
@@ -112,699 +110,112 @@ class FleetCacheService {
   readonly registeredPrefixes: readonly string[] = [FLEET_CACHE_PREFIX];
 
   // ===========================================================================
-  // VEHICLE CACHE METHODS
+  // F3.8: All read/write methods below delegate to the free-function modules.
+  // F3.NEW-3: getAvailableDrivers (and all read methods) now route through the
+  // free functions, so the F3.1 list-HIT + F3.NEW-2 individual-HIT isOnline
+  // recomputes take effect via every caller of this deprecated wrapper.
   // ===========================================================================
 
-  /**
-   * Get all vehicles for a transporter (cached)
-   * 
-   * @param transporterId - The transporter's ID
-   * @param forceRefresh - Force database fetch (bypass cache)
-   * @returns Array of cached vehicles
-   */
+  // --- Vehicle reads -----------------------------------------------------
   async getTransporterVehicles(
     transporterId: string,
     forceRefresh: boolean = false
   ): Promise<CachedVehicle[]> {
-    const cacheKey = CACHE_KEYS.VEHICLES(transporterId);
-
-    // Check cache first (unless force refresh)
-    if (!forceRefresh) {
-      try {
-        const cached = await cacheService.get<CachedVehicle[]>(cacheKey);
-        if (cached && Array.isArray(cached)) {
-          logger.debug(`[FleetCache] HIT: vehicles for ${transporterId.substring(0, 8)}`);
-          return cached;
-        }
-        if (cached && !Array.isArray(cached)) {
-          logger.warn(`[FleetCache] Corrupted cache (not array) for vehicles:${transporterId.substring(0, 8)}, deleting`);
-          await cacheService.delete(cacheKey).catch(() => {});
-        }
-      } catch (error) {
-        logger.warn(`[FleetCache] Cache read error: ${error}`);
-      }
-    }
-
-    // Cache miss - fetch from database
-    logger.debug(`[FleetCache] MISS: vehicles for ${transporterId.substring(0, 8)}, fetching from DB`);
-
-    // IMPORTANT: db.getVehiclesByTransporter may return a Promise (Prisma) or array (JSON db)
-    // We need to handle both cases
-    const dbResult = await db.getVehiclesByTransporter(transporterId);
-    const dbVehicles = Array.isArray(dbResult) ? dbResult : await dbResult;
-
-    // Handle case where result is null/undefined
-    if (!dbVehicles || !Array.isArray(dbVehicles)) {
-      logger.warn(`[FleetCache] No vehicles found for ${transporterId.substring(0, 8)}`);
-      return [];
-    }
-
-    const vehicles: CachedVehicle[] = dbVehicles.map(v => ({
-      id: v.id,
-      transporterId: v.transporterId,
-      vehicleNumber: v.vehicleNumber,
-      vehicleType: v.vehicleType,
-      vehicleSubtype: v.vehicleSubtype || '',
-      capacityTons: v.capacityTons || 0,
-      status: v.status as any,
-      currentTripId: v.currentTripId,
-      assignedDriverId: v.assignedDriverId,
-      isActive: v.isActive,
-      lastUpdated: new Date().toISOString()
-    }));
-
-    // Store in cache
-    try {
-      await cacheService.set(cacheKey, vehicles, CACHE_TTL.VEHICLE_LIST);
-      logger.debug(`[FleetCache] Cached ${vehicles.length} vehicles for ${transporterId.substring(0, 8)}`);
-    } catch (error) {
-      logger.warn(`[FleetCache] Cache write error: ${error}`);
-    }
-
-    return vehicles;
+    return fleetCacheRead.getTransporterVehicles(transporterId, forceRefresh);
   }
 
-  /**
-   * Get vehicles filtered by type (cached)
-   * 
-   * @param transporterId - The transporter's ID
-   * @param vehicleType - Vehicle type (e.g., "Open", "Container")
-   * @param vehicleSubtype - Optional subtype (e.g., "17ft", "20-24 Ton")
-   * @returns Filtered array of vehicles
-   */
   async getTransporterVehiclesByType(
     transporterId: string,
     vehicleType: string,
     vehicleSubtype?: string
   ): Promise<CachedVehicle[]> {
-    const cacheKey = CACHE_KEYS.VEHICLES_BY_TYPE(transporterId, vehicleType, vehicleSubtype);
-
-    // Check cache first
-    try {
-      const cached = await cacheService.get<CachedVehicle[]>(cacheKey);
-      if (cached && Array.isArray(cached)) {
-        logger.debug(`[FleetCache] HIT: ${vehicleType} vehicles for ${transporterId.substring(0, 8)}`);
-        return cached;
-      }
-      if (cached && !Array.isArray(cached)) {
-        logger.warn(`[FleetCache] Corrupted cache (not array) for vehiclesByType:${transporterId.substring(0, 8)}, deleting`);
-        await cacheService.delete(cacheKey).catch(() => {});
-      }
-    } catch (error) {
-      logger.warn(`[FleetCache] Cache read error: ${error}`);
-    }
-
-    // Cache miss - get all vehicles and filter
-    const allVehicles = await this.getTransporterVehicles(transporterId);
-
-    const filtered = allVehicles.filter(v => {
-      const typeMatch = v.vehicleType.toLowerCase() === vehicleType.toLowerCase();
-      const subtypeMatch = !vehicleSubtype ||
-        v.vehicleSubtype.toLowerCase() === vehicleSubtype.toLowerCase();
-      return typeMatch && subtypeMatch;
-    });
-
-    // Store filtered result in cache
-    try {
-      await cacheService.set(cacheKey, filtered, CACHE_TTL.VEHICLE_LIST);
-    } catch (error) {
-      logger.warn(`[FleetCache] Cache write error: ${error}`);
-    }
-
-    return filtered;
+    return fleetCacheRead.getTransporterVehiclesByType(transporterId, vehicleType, vehicleSubtype);
   }
 
-  /**
-   * Get only available vehicles (cached)
-   * 
-   * @param transporterId - The transporter's ID
-   * @param vehicleType - Optional filter by type
-   * @param vehicleSubtype - Optional filter by subtype
-   * @returns Available vehicles only
-   */
   async getAvailableVehicles(
     transporterId: string,
     vehicleType?: string,
     vehicleSubtype?: string
   ): Promise<CachedVehicle[]> {
-    // Get all vehicles (cached)
-    const allVehicles = vehicleType
-      ? await this.getTransporterVehiclesByType(transporterId, vehicleType, vehicleSubtype)
-      : await this.getTransporterVehicles(transporterId);
-
-    // Filter for available only
-    return allVehicles.filter(v => v.status === 'available' && v.isActive);
+    return fleetCacheRead.getAvailableVehicles(transporterId, vehicleType, vehicleSubtype);
   }
 
-  /**
-   * Get single vehicle (cached)
-   */
   async getVehicle(vehicleId: string): Promise<CachedVehicle | null> {
-    const cacheKey = CACHE_KEYS.VEHICLE(vehicleId);
-
-    try {
-      const cached = await cacheService.get<CachedVehicle>(cacheKey);
-      if (cached && typeof cached === 'object' && cached.id) {
-        return cached;
-      }
-      if (cached && (typeof cached !== 'object' || !cached.id)) {
-        logger.warn(`[FleetCache] Corrupted cache for vehicle:${vehicleId.substring(0, 8)}, deleting`);
-        await cacheService.delete(cacheKey).catch(() => {});
-      }
-    } catch (error) {
-      logger.warn(`[FleetCache] Cache read error: ${error}`);
-    }
-
-    // Fetch from DB - handle both sync (JSON) and async (Prisma)
-    const dbResult = await db.getVehicleById(vehicleId);
-    const vehicle = dbResult && typeof dbResult.then === 'function' ? await dbResult : dbResult;
-    if (!vehicle) return null;
-
-    const cachedVehicle: CachedVehicle = {
-      id: vehicle.id,
-      transporterId: vehicle.transporterId,
-      vehicleNumber: vehicle.vehicleNumber,
-      vehicleType: vehicle.vehicleType,
-      vehicleSubtype: vehicle.vehicleSubtype || '',
-      capacityTons: vehicle.capacityTons || 0,
-      status: vehicle.status as any,
-      currentTripId: vehicle.currentTripId,
-      assignedDriverId: vehicle.assignedDriverId,
-      isActive: vehicle.isActive,
-      lastUpdated: new Date().toISOString()
-    };
-
-    try {
-      await cacheService.set(cacheKey, cachedVehicle, CACHE_TTL.INDIVIDUAL);
-    } catch (error) {
-      logger.warn(`[FleetCache] Cache write error: ${error}`);
-    }
-
-    return cachedVehicle;
+    return fleetCacheRead.getVehicle(vehicleId);
   }
 
-  // ===========================================================================
-  // DRIVER CACHE METHODS
-  // ===========================================================================
-
-  /**
-   * Get all drivers for a transporter (cached)
-   */
+  // --- Driver reads ------------------------------------------------------
   async getTransporterDrivers(
     transporterId: string,
     forceRefresh: boolean = false
   ): Promise<CachedDriver[]> {
-    const cacheKey = CACHE_KEYS.DRIVERS(transporterId);
-
-    if (!forceRefresh) {
-      try {
-        const cached = await cacheService.get<CachedDriver[]>(cacheKey);
-        if (cached && Array.isArray(cached)) {
-          logger.debug(`[FleetCache] HIT: drivers for ${transporterId.substring(0, 8)}`);
-          return cached;
-        }
-        if (cached && !Array.isArray(cached)) {
-          logger.warn(`[FleetCache] Corrupted cache (not array) for drivers:${transporterId.substring(0, 8)}, deleting`);
-          await cacheService.delete(cacheKey).catch(() => {});
-        }
-      } catch (error) {
-        logger.warn(`[FleetCache] Cache read error: ${error}`);
-      }
-    }
-
-    // Cache miss - fetch from database
-    logger.debug(`[FleetCache] MISS: drivers for ${transporterId.substring(0, 8)}, fetching from DB`);
-
-    // Handle both sync (JSON) and async (Prisma) database calls
-    let dbDrivers: any[] = [];
-    if (db.getDriversByTransporter) {
-      const dbResult = await db.getDriversByTransporter(transporterId);
-      dbDrivers = Array.isArray(dbResult) ? dbResult : await dbResult;
-    }
-
-    // Handle null/undefined
-    if (!dbDrivers || !Array.isArray(dbDrivers)) {
-      dbDrivers = [];
-    }
-
-    // =========================================================================
-    // REAL totalTrips FROM ASSIGNMENT RECORDS (Phase 5 — no more hardcoded 0)
-    // =========================================================================
-    // Batch-query completed assignment counts for all drivers in parallel.
-    // Uses @@index([driverId, status]) — O(log n) per query, sub-50ms.
-    // Graceful fallback: if Prisma fails, uses 0 (dashboard still loads).
-    // =========================================================================
-    let tripCountMap: Record<string, number> = {};
-    try {
-      const driverIds = dbDrivers.map((d: any) => d.id);
-      if (driverIds.length > 0) {
-        const tripCounts = await prismaClient.assignment.groupBy({
-          by: ['driverId'],
-          where: { driverId: { in: driverIds }, status: 'completed' },
-          _count: { id: true }
-        });
-        for (const tc of tripCounts) {
-          tripCountMap[tc.driverId] = tc._count.id;
-        }
-      }
-    } catch (err: any) {
-      logger.warn(`[FleetCache] Failed to query real trip counts, using fallback`, { error: err.message });
-    }
-
-    // =========================================================================
-    // ACTIVE ASSIGNMENT CHECK — Prevent assigning drivers with pending jobs
-    // =========================================================================
-    // A driver may have currentTripId=null in the User table (no trip running)
-    // but still have a 'pending' Assignment row from a previous hold/confirm.
-    // The @@unique([driverId, status]) constraint would block a new create.
-    // Industry standard (Uber/Ola): check assignment table at listing time.
-    // Uses @@index([driverId, status]) — O(log n), sub-50ms.
-    // =========================================================================
-    let activeAssignmentMap: Record<string, string> = {};
-    try {
-      const allDriverIds = dbDrivers.map((d: any) => d.id);
-      if (allDriverIds.length > 0) {
-        const activeAssignments = await prismaClient.assignment.findMany({
-          where: {
-            driverId: { in: allDriverIds },
-            status: { in: ['pending', 'driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit'] }
-          },
-          select: { driverId: true, tripId: true }
-        });
-        for (const a of activeAssignments) {
-          activeAssignmentMap[a.driverId] = a.tripId;
-        }
-        if (activeAssignments.length > 0) {
-          logger.info(`[FleetCache] ${activeAssignments.length} driver(s) have active assignments — excluded from available list`);
-        }
-      }
-    } catch (err: any) {
-      logger.warn(`[FleetCache] Failed to check active assignments, using fallback`, { error: err.message });
-    }
-
-    // =========================================================================
-    // REAL-TIME ONLINE STATUS — Check Redis presence for each driver
-    // =========================================================================
-    // Driver is ONLINE if: DB isAvailable=true AND Redis presence key exists
-    // This prevents ghost-online (DB says online but driver crashed).
-    // Batch check is efficient — Promise.all runs in parallel.
-    // =========================================================================
-    const driverIds = dbDrivers.map((d: any) => d.id);
-    let onlineStatusMap: Record<string, boolean> = {};
-    try {
-      if (driverIds.length > 0) {
-        const onlineChecks = await Promise.all(
-          driverIds.map(async (id: string) => {
-            const exists = await redisService.exists(`driver:presence:${id}`);
-            return { id, online: exists };
-          })
-        );
-        for (const check of onlineChecks) {
-          onlineStatusMap[check.id] = check.online;
-        }
-      }
-    } catch (err: any) {
-      logger.warn(`[FleetCache] Failed to check online status, using fallback`, { error: err.message });
-    }
-
-    const drivers: CachedDriver[] = dbDrivers.map((d: any) => ({
-      id: d.id,
-      transporterId: d.transporterId || transporterId,
-      name: d.name,
-      phone: d.phone,
-      profilePhotoUrl: d.profilePhotoUrl || d.profilePhoto, // Support both field names
-      rating: d.rating || 4.5, // Placeholder until customer rating system
-      totalTrips: tripCountMap[d.id] || d.totalTrips || 0,
-      status: d.status || 'active',
-      isAvailable: d.isAvailable !== false,
-      isOnline: (d.isAvailable !== false) && (onlineStatusMap[d.id] === true),
-      currentTripId: d.currentTripId || activeAssignmentMap[d.id] || undefined,
-      lastUpdated: new Date().toISOString()
-    }));
-
-    try {
-      await cacheService.set(cacheKey, drivers, CACHE_TTL.DRIVER_LIST);
-      logger.debug(`[FleetCache] Cached ${drivers.length} drivers for ${transporterId.substring(0, 8)}`);
-    } catch (error) {
-      logger.warn(`[FleetCache] Cache write error: ${error}`);
-    }
-
-    return drivers;
+    return fleetCacheRead.getTransporterDrivers(transporterId, forceRefresh);
   }
 
-  /**
-   * Get only available drivers (cached)
-   */
   async getAvailableDrivers(transporterId: string): Promise<CachedDriver[]> {
-    const allDrivers = await this.getTransporterDrivers(transporterId);
-    return allDrivers.filter(d => d.status === 'active' && d.isAvailable && !d.currentTripId);
+    return fleetCacheRead.getAvailableDrivers(transporterId);
   }
 
-  /**
-   * Get single driver (cached)
-   */
   async getDriver(driverId: string): Promise<CachedDriver | null> {
-    const cacheKey = CACHE_KEYS.DRIVER(driverId);
-
-    try {
-      const cached = await cacheService.get<CachedDriver>(cacheKey);
-      if (cached && typeof cached === 'object' && cached.id) {
-        return cached;
-      }
-      if (cached && (typeof cached !== 'object' || !cached.id)) {
-        logger.warn(`[FleetCache] Corrupted cache for driver:${driverId.substring(0, 8)}, deleting`);
-        await cacheService.delete(cacheKey).catch(() => {});
-      }
-    } catch (error) {
-      logger.warn(`[FleetCache] Cache read error: ${error}`);
-    }
-
-    // Fetch from DB - handle both sync (JSON) and async (Prisma)
-    const dbResult = await db.getUserById(driverId);
-    const driver = dbResult && typeof dbResult.then === 'function' ? await dbResult : dbResult;
-    if (!driver || driver.role !== 'driver') return null;
-
-    // Check Redis presence for online status
-    let isOnline = false;
-    try {
-      const presenceExists = await redisService.exists(`driver:presence:${driverId}`);
-      isOnline = (driver.isAvailable !== false) && presenceExists;
-    } catch (err: any) {
-      logger.warn(`[FleetCache] Failed to check online status for driver ${driverId}`, { error: err.message });
-    }
-
-    const cached: CachedDriver = {
-      id: driver.id,
-      transporterId: driver.transporterId || '',
-      name: driver.name,
-      phone: driver.phone,
-      rating: driver.rating || 4.5,
-      totalTrips: driver.totalTrips || 0,
-      status: driver.status || 'active',
-      isAvailable: driver.isAvailable !== false,
-      isOnline,
-      currentTripId: driver.currentTripId,
-      lastUpdated: new Date().toISOString()
-    };
-
-    try {
-      await cacheService.set(cacheKey, cached, CACHE_TTL.INDIVIDUAL);
-    } catch (error) {
-      logger.warn(`[FleetCache] Cache write error: ${error}`);
-    }
-
-    return cached;
+    return fleetCacheRead.getDriver(driverId);
   }
 
-  // ===========================================================================
-  // AVAILABILITY SNAPSHOT (for broadcasts)
-  // ===========================================================================
-
-  /**
-   * Get availability snapshot for a transporter (used in broadcasts)
-   * This is the data sent to each transporter showing their capacity
-   */
+  // --- Availability snapshot --------------------------------------------
   async getAvailabilitySnapshot(
     transporterId: string,
     vehicleType: string,
     vehicleSubtype?: string
   ): Promise<AvailabilitySnapshot> {
-    const cacheKey = CACHE_KEYS.AVAILABILITY_SNAPSHOT(transporterId, vehicleType);
-
-    try {
-      const cached = await cacheService.get<AvailabilitySnapshot>(cacheKey);
-      if (cached && typeof cached === 'object' && cached.transporterId) {
-        return cached;
-      }
-      if (cached && (typeof cached !== 'object' || !cached.transporterId)) {
-        logger.warn(`[FleetCache] Corrupted cache for snapshot:${transporterId.substring(0, 8)}, deleting`);
-        await cacheService.delete(cacheKey).catch(() => {});
-      }
-    } catch (error) {
-      logger.warn(`[FleetCache] Cache read error: ${error}`);
-    }
-
-    // Calculate snapshot
-    const vehicles = await this.getTransporterVehiclesByType(transporterId, vehicleType, vehicleSubtype);
-
-    // Handle both sync (JSON) and async (Prisma) database calls
-    const transporterResult = await db.getUserById(transporterId);
-    const transporter = transporterResult && typeof transporterResult.then === 'function'
-      ? await transporterResult
-      : transporterResult;
-
-    const snapshot: AvailabilitySnapshot = {
-      transporterId,
-      transporterName: transporter?.name || transporter?.businessName || 'Unknown',
-      vehicleType,
-      vehicleSubtype,
-      totalOwned: vehicles.filter(v => v.isActive).length,
-      available: vehicles.filter(v => v.status === 'available' && v.isActive).length,
-      inTransit: vehicles.filter(v => v.status === 'in_transit').length,
-      lastUpdated: new Date().toISOString()
-    };
-
-    try {
-      await cacheService.set(cacheKey, snapshot, CACHE_TTL.SNAPSHOT);
-    } catch (error) {
-      logger.warn(`[FleetCache] Cache write error: ${error}`);
-    }
-
-    return snapshot;
+    return fleetCacheRead.getAvailabilitySnapshot(transporterId, vehicleType, vehicleSubtype);
   }
 
-  // ===========================================================================
-  // CACHE INVALIDATION (Auto-Update)
-  // ===========================================================================
-
-  /**
-   * Invalidate vehicle cache when vehicle data changes
-   * Call this after: create, update, delete vehicle
-   */
+  // --- Cache invalidation -----------------------------------------------
   async invalidateVehicleCache(transporterId: string, vehicleId?: string): Promise<void> {
-    logger.info(`[FleetCache] Invalidating vehicle cache for ${transporterId.substring(0, 8)}`);
-
-    const keysToDelete = [
-      CACHE_KEYS.VEHICLES(transporterId),
-      CACHE_KEYS.VEHICLES_AVAILABLE(transporterId)
-    ];
-
-    // Also delete type-specific caches (we don't know which types changed)
-    try {
-      const iterator = cacheService.scanIterator(`fleetcache:vehicles:${transporterId}:type:*`);
-      for await (const key of iterator) {
-        keysToDelete.push(key);
-      }
-    } catch (error) {
-      logger.warn(`[FleetCache] Error getting pattern keys: ${error}`);
-    }
-
-    // Delete snapshot caches
-    try {
-      const iterator = cacheService.scanIterator(`fleetcache:snapshot:${transporterId}:*`);
-      for await (const key of iterator) {
-        keysToDelete.push(key);
-      }
-    } catch (error) {
-      logger.warn(`[FleetCache] Error getting snapshot keys: ${error}`);
-    }
-
-    // Delete individual vehicle cache
-    if (vehicleId) {
-      keysToDelete.push(CACHE_KEYS.VEHICLE(vehicleId));
-    }
-
-    // Delete all keys
-    for (const key of keysToDelete) {
-      try {
-        await cacheService.delete(key);
-      } catch (error) {
-        logger.warn(`[FleetCache] Error deleting key ${key}: ${error}`);
-      }
-    }
-
-    logger.debug(`[FleetCache] Invalidated ${keysToDelete.length} cache keys`);
+    return fleetCacheWrite.invalidateVehicleCache(transporterId, vehicleId);
   }
 
-  /**
-   * Invalidate driver cache when driver data changes
-   * Call this after: create, update, delete driver
-   */
   async invalidateDriverCache(transporterId: string, driverId?: string): Promise<void> {
-    logger.info(`[FleetCache] Invalidating driver cache for ${transporterId.substring(0, 8)}`);
-
-    const keysToDelete = [
-      CACHE_KEYS.DRIVERS(transporterId),
-      CACHE_KEYS.DRIVERS_AVAILABLE(transporterId)
-    ];
-
-    // Delete individual driver cache
-    if (driverId) {
-      keysToDelete.push(CACHE_KEYS.DRIVER(driverId));
-    }
-
-    for (const key of keysToDelete) {
-      try {
-        await cacheService.delete(key);
-      } catch (error) {
-        logger.warn(`[FleetCache] Error deleting key ${key}: ${error}`);
-      }
-    }
-
-    logger.debug(`[FleetCache] Invalidated ${keysToDelete.length} driver cache keys`);
+    return fleetCacheWrite.invalidateDriverCache(transporterId, driverId);
   }
 
-  /**
-   * Invalidate both vehicle and driver cache on trip assignment
-   * Call this when: trip assigned, trip completed, trip cancelled
-   */
   async invalidateOnTripChange(
     transporterId: string,
     vehicleId: string,
     driverId: string
   ): Promise<void> {
-    logger.info(`[FleetCache] Invalidating fleet cache on trip change`);
-
-    await Promise.all([
-      this.invalidateVehicleCache(transporterId, vehicleId),
-      this.invalidateDriverCache(transporterId, driverId)
-    ]);
+    return fleetCacheWrite.invalidateOnTripChange(transporterId, vehicleId, driverId);
   }
 
-  /**
-   * Update single vehicle status in cache (for real-time updates)
-   * More efficient than full invalidation for status changes
-   */
+  // --- Targeted updates -------------------------------------------------
   async updateVehicleStatus(
     vehicleId: string,
     status: 'available' | 'on_hold' | 'in_transit' | 'maintenance' | 'inactive',
     tripId?: string
   ): Promise<void> {
-    const cacheKey = CACHE_KEYS.VEHICLE(vehicleId);
-
-    try {
-      const vehicle = await cacheService.get<CachedVehicle>(cacheKey);
-      if (vehicle) {
-        vehicle.status = status;
-        vehicle.currentTripId = tripId;
-        vehicle.lastUpdated = new Date().toISOString();
-
-        await cacheService.set(cacheKey, vehicle, CACHE_TTL.INDIVIDUAL);
-
-        // Also invalidate list caches for this transporter
-        await this.invalidateVehicleCache(vehicle.transporterId);
-
-        logger.debug(`[FleetCache] Updated vehicle ${vehicleId} status to ${status}`);
-      }
-    } catch (error) {
-      logger.warn(`[FleetCache] Error updating vehicle status: ${error}`);
-    }
+    return fleetCacheWrite.updateVehicleStatus(vehicleId, status, tripId);
   }
 
-  /**
-   * Update single driver availability in cache
-   */
   async updateDriverAvailability(
     driverId: string,
     isAvailable: boolean,
     tripId?: string
   ): Promise<void> {
-    const cacheKey = CACHE_KEYS.DRIVER(driverId);
-
-    try {
-      const driver = await cacheService.get<CachedDriver>(cacheKey);
-      if (driver) {
-        driver.isAvailable = isAvailable;
-        driver.currentTripId = tripId;
-        driver.lastUpdated = new Date().toISOString();
-
-        await cacheService.set(cacheKey, driver, CACHE_TTL.INDIVIDUAL);
-
-        // Also invalidate list caches for this transporter
-        await this.invalidateDriverCache(driver.transporterId);
-
-        logger.debug(`[FleetCache] Updated driver ${driverId} availability to ${isAvailable}`);
-      }
-    } catch (error) {
-      logger.warn(`[FleetCache] Error updating driver availability: ${error}`);
-    }
+    return fleetCacheWrite.updateDriverAvailability(driverId, isAvailable, tripId);
   }
 
-  // ===========================================================================
-  // CACHE STATS & MONITORING
-  // ===========================================================================
-
-  /**
-   * Get cache statistics for monitoring
-   */
+  // --- Stats & clear ----------------------------------------------------
   async getStats(): Promise<{
     vehicleKeys: number;
     driverKeys: number;
     snapshotKeys: number;
   }> {
-    try {
-      let vehicleCount = 0;
-      for await (const _ of cacheService.scanIterator('fleetcache:vehicle*')) {
-        vehicleCount++;
-      }
-
-      let driverCount = 0;
-      for await (const _ of cacheService.scanIterator('fleetcache:driver*')) {
-        driverCount++;
-      }
-
-      let snapshotCount = 0;
-      for await (const _ of cacheService.scanIterator('fleetcache:snapshot*')) {
-        snapshotCount++;
-      }
-
-      return {
-        vehicleKeys: vehicleCount,
-        driverKeys: driverCount,
-        snapshotKeys: snapshotCount
-      };
-    } catch (error) {
-      logger.warn(`[FleetCache] Error getting stats: ${error}`);
-      return { vehicleKeys: 0, driverKeys: 0, snapshotKeys: 0 };
-    }
+    return fleetCacheRead.getStats();
   }
 
-  /**
-   * Clear all fleet caches (use with caution).
-   *
-   * F-B-03: Scan only the `fleetcache:*` prefix (FleetCache-owned) and additionally
-   * refuse to delete any key that resembles a tracking-owned `fleet:*` key
-   * (fleet:index:transporters or fleet:{uuid} active-driver sets). This is a
-   * fail-closed defense-in-depth against prefix-glob regressions.
-   */
   async clearAll(): Promise<void> {
-    logger.warn('[FleetCache] Clearing ALL fleet caches');
-
-    try {
-      const iterator = cacheService.scanIterator(`${FLEET_CACHE_PREFIX}*`);
-      let count = 0;
-      let skipped = 0;
-      for await (const key of iterator) {
-        if (TRACKING_KEY_DENYLIST.test(key)) {
-          // Fail-closed: refuse to delete tracking-owned keys even if a regression
-          // routes them under the fleetcache prefix.
-          logger.error(`[FleetCache] fleetcache_refuse_tracking_key: refused to delete tracking-shaped key under fleetcache scan: ${key}`);
-          skipped++;
-          continue;
-        }
-        await cacheService.delete(key);
-        count++;
-      }
-      logger.info(`[FleetCache] Cleared ${count} cache entries (skipped=${skipped})`);
-    } catch (error) {
-      logger.error(`[FleetCache] Error clearing caches: ${error}`);
-    }
+    return fleetCacheWrite.clearAll();
   }
 }
-
-// F-B-03: Tracking-shape regex — matches `fleet:index:transporters` and
-// `fleet:{uuid}` active-driver sets. Used as defensive deny-list in clearAll.
-const TRACKING_KEY_DENYLIST = /^fleet:(index:transporters|[0-9a-f]{8}-[0-9a-f]{4}-)/i;
 
 // =============================================================================
 // EXPORT SINGLETON
