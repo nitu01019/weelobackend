@@ -1718,6 +1718,9 @@ class TruckHoldService {
       // =========================================================================
       // STEP 7: Mark hold as confirmed and broadcast
       // =========================================================================
+      // P4 F2.4: drop silent post-commit catch — DB errors here must propagate to the
+      // outer catch at L1748 which handles P2002/P2034 and returns a user-visible failure.
+      // Swallowing left the ledger in an inconsistent phase with no signal to the caller.
       await prismaClient.truckHoldLedger.update({
         where: { holdId },
         data: {
@@ -1727,7 +1730,7 @@ class TruckHoldService {
           confirmedAt: new Date(),
           terminalReason: null
         }
-      }).catch(() => { });
+      });
       this.broadcastAvailabilityUpdate(hold.orderId);
 
       logger.info(`╔══════════════════════════════════════════════════════════════╗`);

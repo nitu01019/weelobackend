@@ -786,7 +786,20 @@ class ConfirmedHoldService {
           message: 'Driver accepted successfully',
         };
       } finally {
-        await redisService.releaseLock(lockKey, lockHolder).catch(() => {});
+        // P4 F2.3: surface Redis lock release failures so ops can spot a
+        // stuck/misconfigured Redis before holds build up. Lock TTL still
+        // bounds blast radius; we just refuse to silently swallow.
+        await redisService.releaseLock(lockKey, lockHolder).catch((err: unknown) => {
+          const message = err instanceof Error ? err.message : String(err);
+          logger.warn('redis_lock_release_failed', {
+            op: 'confirmed_hold_driver_accept',
+            assignmentId,
+            err: message,
+          });
+          metrics.incrementCounter('redis_lock_release_failed_total', {
+            op: 'confirmed_hold_driver_accept',
+          });
+        });
       }
     } catch (error: any) {
       // F-A-75: surface driver KYC/isActive ineligibility so client can prompt re-verify.
@@ -965,13 +978,44 @@ class ConfirmedHoldService {
           }
         }
 
-        // P6 fix: Release vehicle back to available (Saga compensation)
+        // P4 F2.NEW-4: durable vehicle release — fail-open with metric + queue
+        // retry so a transient Redis/fleet-cache hiccup can't leave a vehicle
+        // pinned in 'on_hold' forever. VEHICLE_RELEASE processor owns the
+        // retry schedule (5 attempts, exp backoff) and ultimately DLQs if
+        // still failing.
         if (assignment.vehicleId) {
-          await releaseVehicle(assignment.vehicleId, 'confirmedHoldDecline').catch((err: any) => {
-            logger.warn('[CONFIRMED HOLD] Vehicle release on decline failed (non-fatal)', {
-              vehicleId: assignment.vehicleId, error: err?.message,
+          const vehicleIdForRelease = assignment.vehicleId;
+          try {
+            await releaseVehicle(vehicleIdForRelease, 'confirmedHoldDecline');
+          } catch (err: unknown) {
+            const message = err instanceof Error ? err.message : String(err);
+            logger.warn('vehicle_release_failed_inline', {
+              op: 'confirmed_hold_driver_decline',
+              vehicleId: vehicleIdForRelease,
+              err: message,
             });
-          });
+            metrics.incrementCounter('vehicle_release_failed_total', {
+              reason: 'inline_throw',
+            });
+            try {
+              await queueService.enqueue(
+                'vehicle-release',
+                { vehicleId: vehicleIdForRelease, context: 'confirmedHoldDecline' },
+                { maxAttempts: 5 },
+              );
+            } catch (enqueueErr: unknown) {
+              const enqueueMessage =
+                enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr);
+              logger.error('vehicle_release_enqueue_failed', {
+                op: 'confirmed_hold_driver_decline',
+                vehicleId: vehicleIdForRelease,
+                err: enqueueMessage,
+              });
+              metrics.incrementCounter('vehicle_release_failed_total', {
+                reason: 'enqueue_throw',
+              });
+            }
+          }
         }
 
         // H9 FIX: Cascade auto-redispatch after decline (Grab/Uber pattern).
@@ -1009,7 +1053,19 @@ class ConfirmedHoldService {
           message: 'Driver declined successfully',
         };
       } finally {
-        await redisService.releaseLock(lockKey, lockHolder).catch(() => {});
+        // P4 F2.3: surface Redis lock release failures on the decline path
+        // for the same reasons as handleDriverAcceptance above.
+        await redisService.releaseLock(lockKey, lockHolder).catch((err: unknown) => {
+          const message = err instanceof Error ? err.message : String(err);
+          logger.warn('redis_lock_release_failed', {
+            op: 'confirmed_hold_driver_decline',
+            assignmentId,
+            err: message,
+          });
+          metrics.incrementCounter('redis_lock_release_failed_total', {
+            op: 'confirmed_hold_driver_decline',
+          });
+        });
       }
     } catch (error: any) {
       logger.error('[CONFIRMED HOLD] Failed to handle driver decline', {

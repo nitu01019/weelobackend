@@ -48,6 +48,7 @@ import { redisService } from '../../shared/services/redis.service';
 import { socketService } from '../../shared/services/socket.service';
 import { holdExpiryCleanupService } from '../hold-expiry/hold-expiry-cleanup.service';
 import { validateActorEligibility, HoldEligibilityError } from './hold-eligibility';
+import { metrics } from '../../shared/monitoring/metrics.service';
 
 // =============================================================================
 // TYPES & INTERFACES
@@ -635,7 +636,19 @@ class FlexHoldService {
         error: error.message,
       };
     } finally {
-      await redisService.releaseLock(lockKey, 'flex-hold-extension').catch(() => {});
+      // P4 F2.3: surface Redis lock release failures instead of silently swallowing.
+      // Lock will expire via TTL, but invisible failures mask Redis connectivity issues.
+      await redisService
+        .releaseLock(lockKey, 'flex-hold-extension')
+        .catch((err: unknown) => {
+          logger.warn('redis_lock_release_failed', {
+            op: 'flex_hold_extend',
+            err: err instanceof Error ? err.message : String(err),
+          });
+          metrics.incrementCounter('redis_lock_release_failed_total', {
+            op: 'flex_hold_extend',
+          });
+        });
     }
   }
 
@@ -770,12 +783,27 @@ class FlexHoldService {
       }
 
       // Redis clear stays OUTSIDE TX (cache, not source of truth)
-      await redisService.del(REDIS_KEYS.FLEX_HOLD_STATE(holdId)).catch(() => {});
+      // P4 F2.3: surface cache delete failures — stale cache is recoverable but masks Redis issues
+      await redisService.del(REDIS_KEYS.FLEX_HOLD_STATE(holdId)).catch((err: unknown) => {
+        logger.warn('flex_hold_cache_clear_failed', {
+          op: 'flex_hold_transition_to_confirmed',
+          holdId,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      });
 
       // F-M13 FIX: Cancel the flex hold expiry cleanup since we transitioned to confirmed
+      // P4 F2.3: surface cleanup-cancel failures — stale FLEX expiry jobs have phase-mismatch guard
+      // (so still non-fatal), but we want the signal instead of a silent swallow
       try {
         const { holdExpiryCleanupService } = await import('../hold-expiry/hold-expiry-cleanup.service');
-        holdExpiryCleanupService.cancelScheduledCleanup(holdId, 'flex').catch(() => {});
+        holdExpiryCleanupService.cancelScheduledCleanup(holdId, 'flex').catch((err: unknown) => {
+          logger.warn('flex_hold_expiry_cancel_failed', {
+            op: 'flex_hold_transition_to_confirmed',
+            holdId,
+            err: err instanceof Error ? err.message : String(err),
+          });
+        });
       } catch (_) {
         // Non-fatal — stale FLEX expiry jobs have phase-mismatch guard
       }

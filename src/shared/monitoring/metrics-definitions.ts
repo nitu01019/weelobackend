@@ -377,6 +377,27 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
       'tx_serializable_conflict_total',
       'Serializable transaction conflicts by site and outcome (retry|exhausted)',
     ),
+
+    // === P4 F2.3: Redis lock release failure observability ===
+    // Fires when releaseLock() rejects in a finally block. Locks still auto-expire
+    // via TTL so the flow recovers, but recurring failures here signal Redis
+    // connectivity or lock-token drift that was previously invisible. Label: `op`
+    // identifies the calling method (e.g. 'flex_hold_extend') for dashboard grouping.
+    counter(
+      'redis_lock_release_failed_total',
+      'Redis distributed lock release failures by originating op',
+    ),
+
+    // === P4 F2.NEW-4: Vehicle release failure observability ===
+    // Fires when releaseVehicle() throws inline OR when the VEHICLE_RELEASE
+    // retry enqueue itself throws. Label: `reason` = 'inline_throw' |
+    // 'enqueue_throw' so we can distinguish a transient vehicle-lifecycle
+    // fault (recoverable via queue retry) from a Redis/queue subsystem
+    // failure (vehicle may be pinned until reconciliation sweeps pick it up).
+    counter(
+      'vehicle_release_failed_total',
+      'Vehicle release failures by reason (inline_throw vs enqueue_throw)',
+    ),
   ];
 
   for (const def of defs) {
