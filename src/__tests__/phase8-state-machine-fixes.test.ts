@@ -34,6 +34,7 @@ const mockUpdate = jest.fn();
 const mockCount = jest.fn();
 const mockQueryRaw = jest.fn();
 const mockTransaction = jest.fn();
+const mockWithDbTimeout = jest.fn();
 const mockLedgerCreate = jest.fn();
 const mockAbuseUpsert = jest.fn();
 
@@ -42,10 +43,14 @@ jest.mock('../shared/database/prisma.service', () => ({
     truckHoldLedger: { findMany: mockFindMany, findUnique: mockFindUnique, update: mockUpdate, count: mockCount },
     assignment: { findMany: mockFindMany, findUnique: mockFindUnique, updateMany: mockUpdateMany, findUniqueOrThrow: mockFindUnique, count: mockCount },
     booking: { updateMany: mockUpdateMany },
+    // P2 F4.1: initializeConfirmedHold now reads parent order for fanout payload.
+    order: { findUnique: jest.fn().mockResolvedValue(null) },
     cancellationLedger: { create: mockLedgerCreate },
     cancellationAbuseCounter: { upsert: mockAbuseUpsert },
     $transaction: mockTransaction, $queryRaw: mockQueryRaw,
   },
+  // P4 F2.NEW-1: confirmed-hold runs through withDbTimeout.
+  withDbTimeout: mockWithDbTimeout,
   HoldPhase: { FLEX: 'FLEX', CONFIRMED: 'CONFIRMED', EXPIRED: 'EXPIRED', RELEASED: 'RELEASED' },
   AssignmentStatus: {
     pending: 'pending', driver_accepted: 'driver_accepted', driver_declined: 'driver_declined',
@@ -178,9 +183,17 @@ describe('H-6: Hold reconciliation bounded concurrency', () => {
 describe('H-8: Confirmed hold uses SELECT FOR UPDATE', () => {
   beforeEach(() => jest.clearAllMocks());
 
-  it('initializeConfirmedHold wraps read-check-write in $transaction', async () => {
-    mockTransaction.mockImplementation(async (cb: Function) => {
-      const tx = { $queryRaw: mockQueryRaw, truckHoldLedger: { update: mockUpdate } };
+  it('initializeConfirmedHold wraps read-check-write in withDbTimeout', async () => {
+    // P4 F2.NEW-1: confirmed-hold tx now runs through withDbTimeout with
+    // Serializable isolation and P2034 retry. Previously this test targeted
+    // prismaClient.$transaction directly.
+    const assignmentFindManyInTx = jest.fn().mockResolvedValue([]);
+    mockWithDbTimeout.mockImplementation(async (cb: Function) => {
+      const tx = {
+        $queryRaw: mockQueryRaw,
+        truckHoldLedger: { update: mockUpdate },
+        assignment: { findMany: assignmentFindManyInTx },
+      };
       // F-A-75: helper queries User row first (FOR UPDATE), then the hold row.
       mockQueryRaw
         .mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }])
@@ -188,21 +201,24 @@ describe('H-8: Confirmed hold uses SELECT FOR UPDATE', () => {
       mockUpdate.mockResolvedValue({ orderId: 'o-1', transporterId: 't-1', quantity: 2 });
       return cb(tx);
     });
-    mockFindMany.mockResolvedValue([]);
     const { confirmedHoldService } = require('../modules/truck-hold/confirmed-hold.service');
     const result = await confirmedHoldService.initializeConfirmedHold('h-1', 't-1', []);
     expect(result.success).toBe(true);
-    expect(mockTransaction).toHaveBeenCalledTimes(1);
+    expect(mockWithDbTimeout).toHaveBeenCalledTimes(1);
     expect(mockQueryRaw).toHaveBeenCalled();
   });
 
   it('rejects when hold is not in FLEX phase', async () => {
-    mockTransaction.mockImplementation(async (cb: Function) => {
+    mockWithDbTimeout.mockImplementation(async (cb: Function) => {
       const qr = jest.fn()
         // F-A-75: User row comes first.
         .mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }])
         .mockResolvedValueOnce([{ holdId: 'h-2', phase: 'EXPIRED', transporterId: 't-1', confirmedExpiresAt: null }]);
-      return cb({ $queryRaw: qr, truckHoldLedger: { update: mockUpdate } });
+      return cb({
+        $queryRaw: qr,
+        truckHoldLedger: { update: mockUpdate },
+        assignment: { findMany: jest.fn().mockResolvedValue([]) },
+      });
     });
     const { confirmedHoldService } = require('../modules/truck-hold/confirmed-hold.service');
     const result = await confirmedHoldService.initializeConfirmedHold('h-2', 't-1', []);
@@ -211,12 +227,16 @@ describe('H-8: Confirmed hold uses SELECT FOR UPDATE', () => {
   });
 
   it('rejects when transporterId does not match (ownership)', async () => {
-    mockTransaction.mockImplementation(async (cb: Function) => {
+    mockWithDbTimeout.mockImplementation(async (cb: Function) => {
       const qr = jest.fn()
         // F-A-75: User row comes first.
         .mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }])
         .mockResolvedValueOnce([{ holdId: 'h-3', phase: 'FLEX', transporterId: 't-owner', confirmedExpiresAt: null }]);
-      return cb({ $queryRaw: qr, truckHoldLedger: { update: mockUpdate } });
+      return cb({
+        $queryRaw: qr,
+        truckHoldLedger: { update: mockUpdate },
+        assignment: { findMany: jest.fn().mockResolvedValue([]) },
+      });
     });
     const { confirmedHoldService } = require('../modules/truck-hold/confirmed-hold.service');
     const result = await confirmedHoldService.initializeConfirmedHold('h-3', 't-fake', []);

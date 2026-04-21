@@ -371,6 +371,13 @@ function resetAllMocks() {
     if (typeof fnOrArray === 'function') return fnOrArray(prismaClient);
     return Promise.all(fnOrArray);
   });
+  // P4 F2.NEW-1: confirmed-hold now runs through withDbTimeout. Previous
+  // describe blocks rebind its mock implementation (mockRejectedValue, etc.),
+  // so `clearAllMocks` alone leaves the pass-through behavior broken. Restore
+  // it here so each test starts from a clean baseline.
+  (withDbTimeout as jest.Mock).mockImplementation(
+    async (fn: Function, _opts?: unknown) => fn(prismaClient),
+  );
   mockQueryRaw.mockReset().mockResolvedValue([]);
 }
 
@@ -1205,10 +1212,14 @@ describe('Phase 7 — State Machine & Hold Transitions', () => {
       mockQueryRaw.mockResolvedValueOnce([
         { holdId: 'h-1', phase: 'FLEX', transporterId: 't-1', confirmedExpiresAt: null },
       ]);
+      // P4 F2.8: TruckRequest FOR UPDATE (scoped by heldById). Returns a row
+      // per truckRequestId so the length guard passes.
+      mockQueryRaw.mockResolvedValueOnce([{ id: 'tr-1' }, { id: 'tr-2' }]);
       mockTruckHoldLedgerUpdate.mockResolvedValue({
         holdId: 'h-1', orderId: 'o-1', transporterId: 't-1', quantity: 2,
       });
-      // This is called by prismaClient.assignment.findMany inside initializeConfirmedHold
+      // P4 F2.2: Assignment.findMany now runs inside the TX scoped by
+      // transporterId — the test mock already returns rows matching ids + t-1.
       mockAssignmentFindMany.mockResolvedValue([
         { id: 'a-1', driverId: 'd-1', driverName: 'D1', transporterId: 't-1', vehicleId: 'v-1', vehicleNumber: 'KA01', tripId: 'trip-1', orderId: 'o-1', truckRequestId: 'tr-1' },
         { id: 'a-2', driverId: 'd-2', driverName: 'D2', transporterId: 't-1', vehicleId: 'v-2', vehicleNumber: 'KA02', tripId: 'trip-2', orderId: 'o-1', truckRequestId: 'tr-2' },
@@ -1238,6 +1249,9 @@ describe('Phase 7 — State Machine & Hold Transitions', () => {
       mockQueryRaw.mockResolvedValueOnce([
         { holdId: 'h-1', phase: 'FLEX', transporterId: 't-1', confirmedExpiresAt: null },
       ]);
+      // P4 F2.8: TruckRequest FOR UPDATE returns both held rows so the
+      // in-tx ownership length guard passes.
+      mockQueryRaw.mockResolvedValueOnce([{ id: 'tr-1' }, { id: 'tr-2' }]);
       mockTruckHoldLedgerUpdate.mockResolvedValue({
         holdId: 'h-1', orderId: 'o-1', transporterId: 't-1', quantity: 2,
       });

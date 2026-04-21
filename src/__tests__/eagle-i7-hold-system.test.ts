@@ -164,7 +164,11 @@ jest.mock('../shared/database/prisma.service', () => ({
     driver_declined: 'driver_declined',
     cancelled: 'cancelled',
   },
-  withDbTimeout: jest.fn(),
+  // P4 F2.NEW-1: confirmed-hold runs via withDbTimeout; pass through by default.
+  withDbTimeout: jest.fn().mockImplementation(async (cb: any, _opts?: unknown) => {
+    const prismaServiceMod = require('../shared/database/prisma.service');
+    return cb(prismaServiceMod.prismaClient);
+  }),
   TruckRequestStatus: {
     searching: 'searching',
     held: 'held',
@@ -336,10 +340,10 @@ describe('EAGLE I7 — Hold System Fixes', () => {
     it('should return idempotent success when hold is already CONFIRMED', async () => {
       const confirmedExpiresAt = new Date(Date.now() + 60_000);
 
-      // H-8: initializeConfirmedHold now uses $transaction with $queryRaw FOR UPDATE
+      // P4 F2.NEW-1: initializeConfirmedHold now runs through withDbTimeout.
       // F-A-75: helper queries User row first, then hold row.
       const prismaServiceMod = require('../shared/database/prisma.service');
-      prismaServiceMod.prismaClient.$transaction.mockImplementation(async (cb: any) => {
+      prismaServiceMod.withDbTimeout.mockImplementationOnce(async (cb: any) => {
         const txClient = {
           ...prismaServiceMod.prismaClient,
           $queryRaw: jest.fn()

@@ -104,7 +104,13 @@ jest.mock('../shared/database/prisma.service', () => ({
     $queryRaw: jest.fn().mockResolvedValue([{ isActive: true, kycStatus: 'VERIFIED' }]),
     $executeRaw: jest.fn().mockResolvedValue(0),
   },
-  withDbTimeout: jest.fn(),
+  // P4 F2.NEW-1: confirmed-hold now runs through withDbTimeout. Default to a
+  // pass-through so existing tests that inject per-tx state via
+  // prismaClient.$transaction keep working; individual tests can override.
+  withDbTimeout: jest.fn().mockImplementation(async (cb: any, _opts?: unknown) => {
+    const prismaServiceMod = require('../shared/database/prisma.service');
+    return cb(prismaServiceMod.prismaClient);
+  }),
   HoldPhase: {
     FLEX: 'FLEX',
     CONFIRMED: 'CONFIRMED',
@@ -713,13 +719,20 @@ describe('Confirmed Hold Lifecycle', () => {
   });
 
   test('18. initializeConfirmedHold sets 180s timer, schedules driver timeouts', async () => {
-    // H-8: initializeConfirmedHold now uses $transaction with $queryRaw FOR UPDATE
-    // Mock $queryRaw inside the transaction to return the hold row
+    // P4 F2.NEW-1 / F2.2 / F2.8: initializeConfirmedHold now runs through
+    // withDbTimeout and issues three $queryRaw calls inside the TX:
+    //   1. F-A-75 User-row eligibility (SELECT ... FOR UPDATE).
+    //   2. H-8 TruckHoldLedger SELECT ... FOR UPDATE.
+    //   3. F2.8 TruckRequest SELECT ... FOR UPDATE scoped by heldById.
+    // The fourth in-TX read is `tx.assignment.findMany`, scoped by transporterId.
     const prismaServiceMod = require('../shared/database/prisma.service');
-    prismaServiceMod.prismaClient.$transaction.mockImplementation(async (cb: any) => {
+    prismaServiceMod.withDbTimeout.mockImplementationOnce(async (cb: any) => {
+      const assignmentFindManyInTx = jest.fn().mockResolvedValue([
+        { id: 'assign-1', driverId: 'driver-1', driverName: 'Driver One', transporterId: TEST_TRANSPORTER_ID, vehicleId: 'v-1', vehicleNumber: 'KA-01', vehicleType: 'truck', tripId: 'trip-1', orderId: TEST_ORDER_ID, bookingId: null, truckRequestId: 'tr-1' },
+        { id: 'assign-2', driverId: 'driver-2', driverName: 'Driver Two', transporterId: TEST_TRANSPORTER_ID, vehicleId: 'v-2', vehicleNumber: 'KA-02', vehicleType: 'truck', tripId: 'trip-2', orderId: TEST_ORDER_ID, bookingId: null, truckRequestId: 'tr-2' },
+      ]);
       const txClient = {
         ...prismaServiceMod.prismaClient,
-        // F-A-75: first $queryRaw is User eligibility, second is the hold lookup.
         $queryRaw: jest.fn()
           .mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }])
           .mockResolvedValueOnce([{
@@ -727,7 +740,12 @@ describe('Confirmed Hold Lifecycle', () => {
             phase: 'FLEX',
             transporterId: TEST_TRANSPORTER_ID,
             confirmedExpiresAt: null,
-          }]),
+          }])
+          .mockResolvedValueOnce([{ id: 'tr-1' }, { id: 'tr-2' }]),
+        assignment: {
+          ...prismaServiceMod.prismaClient.assignment,
+          findMany: assignmentFindManyInTx,
+        },
         truckHoldLedger: {
           ...prismaServiceMod.prismaClient.truckHoldLedger,
           update: mockTruckHoldLedgerUpdate,

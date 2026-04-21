@@ -329,6 +329,7 @@ describe('FIX-6 (#37): Ownership check on hold confirmation', () => {
       });
       // H-8: $queryRaw returns rows array
       // F-A-75: helper queries User first (FOR UPDATE), then the hold row.
+      // P4 F2.8: third $queryRaw is TruckRequest FOR UPDATE scoped by heldById.
       mockPrisma.$queryRaw
         .mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }])
         .mockResolvedValueOnce([{
@@ -336,7 +337,8 @@ describe('FIX-6 (#37): Ownership check on hold confirmation', () => {
           phase: 'FLEX',
           confirmedExpiresAt: null,
           transporterId: 'transporter-owner',
-        }]);
+        }])
+        .mockResolvedValueOnce([{ id: 'tr-1' }]);
       mockPrisma.truckHoldLedger.update.mockResolvedValue({
         ...hold,
         phase: 'CONFIRMED',
