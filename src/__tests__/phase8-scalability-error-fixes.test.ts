@@ -268,3 +268,147 @@ describe('H-17: Assignment route structured errors', () => {
     expect(overrideSection).toContain("code: 'FORBIDDEN'");
   });
 });
+
+// ===========================================================================
+// P4 F2.7 — X-Idempotency-Key replay on /confirmed-hold/initialize
+// Source-level contract: idempotency must read from Redis BEFORE invoking the
+// service, and must cache the response body AFTER a success. A duplicate
+// request (same key) short-circuits to the cached body with cached status.
+// ===========================================================================
+describe('P4 F2.7: /confirmed-hold/initialize idempotency-key replay', () => {
+  test('route reads cache BEFORE calling initializeConfirmedHold', () => {
+    const fs = require('fs');
+    const source = fs.readFileSync(
+      require.resolve('../modules/truck-hold/truck-hold.routes'),
+      'utf-8'
+    );
+    // Locate the /confirmed-hold/initialize handler block
+    const start = source.indexOf("'/confirmed-hold/initialize'");
+    const end = source.indexOf("'/confirmed-hold/:holdId'", start);
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const section = source.slice(start, end);
+
+    // Idempotency lookup must happen BEFORE the service call
+    const lookupPos = section.indexOf('redisService.getJSON');
+    const servicePos = section.indexOf('confirmedHoldService.initializeConfirmedHold');
+    expect(lookupPos).toBeGreaterThan(-1);
+    expect(servicePos).toBeGreaterThan(-1);
+    expect(lookupPos).toBeLessThan(servicePos);
+  });
+
+  test('route caches successful response AFTER initializeConfirmedHold returns', () => {
+    const fs = require('fs');
+    const source = fs.readFileSync(
+      require.resolve('../modules/truck-hold/truck-hold.routes'),
+      'utf-8'
+    );
+    const start = source.indexOf("'/confirmed-hold/initialize'");
+    const end = source.indexOf("'/confirmed-hold/:holdId'", start);
+    const section = source.slice(start, end);
+
+    // Cache write after service returns success; must use 200 status and the
+    // full response body so the replay is byte-identical.
+    expect(section).toContain('redisService.setJSON(idempotencyCacheKey, { status: 200, body: responseBody }');
+    // Cache key must be scoped by (transporterId, holdId, idempotencyKey) so
+    // two different captains or two different holds can't collide.
+    expect(section).toContain('`idempotency:truck-hold:confirmed-hold:initialize:${transporterId}:${holdId}:${idempotencyKey}`');
+  });
+
+  test('behavioral: duplicate X-Idempotency-Key returns cached body without re-invoking service', async () => {
+    // Isolate module cache so our mocks apply to this test only
+    jest.resetModules();
+
+    // Redis mock — getJSON returns null on first call, cached body on second
+    const mockGetJSON = jest
+      .fn()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        status: 200,
+        body: {
+          success: true,
+          data: { confirmedExpiresAt: '2026-01-01T00:00:00.000Z' },
+          message: 'Confirmed hold initialized',
+        },
+      });
+    const mockSetJSON = jest.fn().mockResolvedValue('OK');
+    jest.doMock('../shared/services/redis.service', () => ({
+      redisService: {
+        getJSON: mockGetJSON,
+        setJSON: mockSetJSON,
+        get: jest.fn(),
+        set: jest.fn(),
+        del: jest.fn(),
+        acquireLock: jest.fn().mockResolvedValue({ acquired: true }),
+        releaseLock: jest.fn().mockResolvedValue(undefined),
+      },
+    }));
+
+    // Service mock — would throw if called on replay; first call returns success
+    const mockInitialize = jest.fn().mockResolvedValueOnce({
+      success: true,
+      confirmedExpiresAt: new Date('2026-01-01T00:00:00.000Z'),
+      message: 'Confirmed hold initialized',
+    });
+    jest.doMock('../modules/truck-hold/confirmed-hold.service', () => ({
+      confirmedHoldService: { initializeConfirmedHold: mockInitialize },
+    }));
+
+    // Middleware stubs — skip auth + role gate so we can hit the handler
+    jest.doMock('../shared/middleware/auth.middleware', () => ({
+      authMiddleware: (req: any, _res: any, next: any) => {
+        req.user = { userId: 'transporter-X', role: 'transporter' };
+        next();
+      },
+      roleGuard: () => (_req: any, _res: any, next: any) => next(),
+    }));
+
+    // Logger noise-kill
+    jest.doMock('../shared/services/logger.service', () => ({
+      logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+    }));
+
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { truckHoldRouter } = require('../modules/truck-hold/truck-hold.routes');
+
+    // Locate the handler for POST /confirmed-hold/initialize
+    const layer = truckHoldRouter.stack.find(
+      (l: any) => l.route?.path === '/confirmed-hold/initialize' && l.route?.methods?.post
+    );
+    expect(layer).toBeDefined();
+    // Business handler is the LAST entry in route.stack (middleware come before it)
+    const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+
+    async function invoke() {
+      const req: any = {
+        body: { holdId: 'hold-X', assignments: [{ assignmentId: 'a-1', driverId: 'd-1', truckRequestId: 'tr-1' }] },
+        header: (name: string) => (name.toLowerCase() === 'x-idempotency-key' ? 'replay-key-42' : undefined),
+        user: { userId: 'transporter-X', role: 'transporter' },
+      };
+      let statusCode: number | null = null;
+      let body: any = null;
+      const res: any = {
+        status(code: number) { statusCode = code; return this; },
+        json(payload: any) { body = payload; return this; },
+      };
+      await handler(req, res, () => {});
+      return { statusCode, body };
+    }
+
+    // 1st call: cache miss → service invoked → body cached
+    const first = await invoke();
+    expect(mockInitialize).toHaveBeenCalledTimes(1);
+    expect(mockSetJSON).toHaveBeenCalledTimes(1);
+    expect(first.body.success).toBe(true);
+
+    // 2nd call: cache hit → service NOT invoked → cached body returned
+    const second = await invoke();
+    expect(mockInitialize).toHaveBeenCalledTimes(1); // still 1 — service short-circuited
+    expect(second.body).toEqual({
+      success: true,
+      data: { confirmedExpiresAt: '2026-01-01T00:00:00.000Z' },
+      message: 'Confirmed hold initialized',
+    });
+    expect(second.statusCode).toBe(200);
+  });
+});

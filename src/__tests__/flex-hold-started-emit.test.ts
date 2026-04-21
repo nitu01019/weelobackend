@@ -288,6 +288,55 @@ describe('F-C-50: flex_hold_started socket emit on FLEX hold creation', () => {
     // And ledger.create must not be called
     expect(mockPrismaClientFc50.truckHoldLedger.create).not.toHaveBeenCalled();
   });
+
+  // -------------------------------------------------------------------------
+  // Test 5 (P4 F2.5 + F2.NEW-3): 5 parallel creates for the same
+  // (orderId, transporterId) must commit exactly 1 ledger row. The other 4
+  // either fail to acquire the Redis create-lock (LOCK_ACQUISITION_FAILED)
+  // or pass the lock and see the existing hold via findFirst inside the
+  // Serializable tx — both paths return `success: true` with the same
+  // holdId and NO ledger.create call.
+  // -------------------------------------------------------------------------
+  test('5 (P4 F2.5): 5 parallel createFlexHold on same (order,transporter) — only 1 ledger.create', async () => {
+    const { flexHoldService } = require('../modules/truck-hold/flex-hold.service');
+
+    // First caller wins the create-lock; the other 4 lose it and return
+    // LOCK_ACQUISITION_FAILED — this is the primary F2.5 guarantee. The
+    // Serializable tx + partial unique (F2.NEW-3 + M-015) is defense in
+    // depth; this test intentionally drives the Redis-lock path since the
+    // in-memory mock tx does not model MVCC.
+    mockRedisServiceFc50.acquireLock.mockReset();
+    mockRedisServiceFc50.acquireLock.mockResolvedValueOnce({ acquired: true });
+    for (let i = 1; i < 5; i++) {
+      mockRedisServiceFc50.acquireLock.mockResolvedValueOnce({ acquired: false });
+    }
+
+    mockPrismaClientFc50.order.findUnique.mockResolvedValue({
+      expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+      status: 'active',
+      customerId: null,
+    });
+    mockPrismaClientFc50.truckHoldLedger.findFirst.mockResolvedValue(null);
+    mockPrismaClientFc50.truckHoldLedger.create.mockResolvedValue({
+      holdId: 'parallel-test-hold',
+      phase: 'FLEX',
+      flexExpiresAt: new Date(),
+      expiresAt: new Date(),
+    });
+
+    const results = await Promise.all(
+      Array.from({ length: 5 }, () => flexHoldService.createFlexHold(baseRequest)),
+    );
+
+    const wins = results.filter((r) => r.success === true);
+    const lockFails = results.filter(
+      (r) => r.success === false && r.error === 'LOCK_ACQUISITION_FAILED',
+    );
+    expect(wins).toHaveLength(1);
+    expect(lockFails).toHaveLength(4);
+    // Exactly one ledger.create call across all 5 concurrent attempts.
+    expect(mockPrismaClientFc50.truckHoldLedger.create).toHaveBeenCalledTimes(1);
+  });
 });
 
 // =============================================================================

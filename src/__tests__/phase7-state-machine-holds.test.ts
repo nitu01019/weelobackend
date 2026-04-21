@@ -1237,6 +1237,67 @@ describe('Phase 7 — State Machine & Hold Transitions', () => {
       expect(calls[1][0].assignmentId).toBe('a-2');
       expect(calls[0][1]).toBe(HOLD_CONFIG.driverAcceptTimeoutSeconds * 1000);
     });
+
+    // =========================================================================
+    // P4 F2.2 + F2.8: cross-tenant confirmed-hold init must surface as
+    // 403 FORBIDDEN_REQUEST, not silent leak.
+    // =========================================================================
+    it('P4 F2.2: rejects with 403 FORBIDDEN_REQUEST when assignmentIds belong to another transporter', async () => {
+      const { confirmedHoldService } = require('../modules/truck-hold/confirmed-hold.service');
+
+      // Caller is 't-1' and owns the hold + the TruckRequest rows…
+      mockQueryRaw.mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }]);
+      mockQueryRaw.mockResolvedValueOnce([
+        { holdId: 'h-1', phase: 'FLEX', transporterId: 't-1', confirmedExpiresAt: null },
+      ]);
+      mockQueryRaw.mockResolvedValueOnce([{ id: 'tr-1' }, { id: 'tr-2' }]);
+      mockTruckHoldLedgerUpdate.mockResolvedValue({
+        holdId: 'h-1', orderId: 'o-1', transporterId: 't-1', quantity: 2,
+      });
+      // …but the assignment.findMany (scoped by transporterId='t-1') returns
+      // only 1 of the 2 requested ids — because 'a-2' actually belongs to
+      // another tenant and was filtered out by the `transporterId` predicate.
+      // Before P4 F2.2 the fetch was post-commit + unscoped, so attacker
+      // payloads would leak driver/vehicle/trip data for other tenants.
+      mockAssignmentFindMany.mockResolvedValue([
+        { id: 'a-1', driverId: 'd-1', driverName: 'D1', transporterId: 't-1', vehicleId: 'v-1', vehicleNumber: 'KA01', tripId: 'trip-1', orderId: 'o-1', truckRequestId: 'tr-1' },
+      ]);
+
+      const result = await confirmedHoldService.initializeConfirmedHold('h-1', 't-1', [
+        { assignmentId: 'a-1', driverId: 'd-1', truckRequestId: 'tr-1' },
+        { assignmentId: 'a-2', driverId: 'd-2', truckRequestId: 'tr-2' },
+      ]);
+
+      expect(result.success).toBe(false);
+      expect(result.errorCode).toBe('FORBIDDEN_REQUEST');
+      expect(result.httpStatus).toBe(403);
+      expect(result.message).toMatch(/assignments owned by transporter/i);
+    });
+
+    it('P4 F2.8: rejects with 403 FORBIDDEN_REQUEST when truckRequestIds not held by caller', async () => {
+      const { confirmedHoldService } = require('../modules/truck-hold/confirmed-hold.service');
+
+      mockQueryRaw.mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }]);
+      mockQueryRaw.mockResolvedValueOnce([
+        { holdId: 'h-1', phase: 'FLEX', transporterId: 't-1', confirmedExpiresAt: null },
+      ]);
+      // TruckRequest FOR UPDATE with `heldById=t-1` only returns 1 of the 2
+      // ids — the other is either stale or owned by another tenant. The in-tx
+      // length guard (confirmed-hold.service.ts L237-244) must throw 403
+      // before any state mutation so the caller can't confirm-hold rows they
+      // don't own.
+      mockQueryRaw.mockResolvedValueOnce([{ id: 'tr-1' }]);
+
+      const result = await confirmedHoldService.initializeConfirmedHold('h-1', 't-1', [
+        { assignmentId: 'a-1', driverId: 'd-1', truckRequestId: 'tr-1' },
+        { assignmentId: 'a-2', driverId: 'd-2', truckRequestId: 'tr-2' },
+      ]);
+
+      expect(result.success).toBe(false);
+      expect(result.errorCode).toBe('FORBIDDEN_REQUEST');
+      expect(result.httpStatus).toBe(403);
+      expect(result.message).toMatch(/truck requests held by transporter/i);
+    });
   });
 
   // ===========================================================================
