@@ -40,7 +40,8 @@
  */
 
 import { v4 as uuidv4 } from 'uuid';
-import { prismaClient, HoldPhase } from '../../shared/database/prisma.service';
+import { Prisma } from '@prisma/client';
+import { prismaClient, withDbTimeout, HoldPhase } from '../../shared/database/prisma.service';
 import { HOLD_CONFIG } from '../../core/config/hold-config';
 import { logger } from '../../shared/services/logger.service';
 import { redisService } from '../../shared/services/redis.service';
@@ -142,6 +143,11 @@ const DEFAULT_CONFIG: FlexHoldConfig = {
 const REDIS_KEYS = {
   // Standardized: lock: prefix for all distributed locks (added by acquireLock automatically)
   FLEX_HOLD_LOCK: (holdId: string) => `flex-hold:${holdId}`,
+  // P4 F2.5: Stable per-(order,transporter) create lock — acquired BEFORE the dedup
+  // findFirst so two concurrent create-flex-hold requests for the same pair serialize
+  // at the lock boundary rather than both seeing "no existing hold" and racing to create.
+  FLEX_HOLD_CREATE_LOCK: (orderId: string, transporterId: string) =>
+    `flex-hold:create:${orderId}:${transporterId}`,
   FLEX_HOLD_STATE: (holdId: string) => `flex-hold:${holdId}:state`,
   FLEX_HOLD_EXTENSIONS: (holdId: string) => `flex-hold:${holdId}:extensions`,
 };
@@ -167,103 +173,114 @@ class FlexHoldService {
       quantity: request.quantity,
     });
 
-    // M-22 FIX: Dedup — return existing active flex hold if one already exists
-    // for this order+transporter combination. Makes the endpoint idempotent at the
-    // service level (was only protected at the API/holdTrucks level).
-    const existingHold = await prismaClient.truckHoldLedger.findFirst({
-      where: {
-        orderId: request.orderId,
-        transporterId: request.transporterId,
-        status: 'active',
-        phase: HoldPhase.FLEX,
-      },
-    });
-
-    if (existingHold) {
-      const now = new Date();
-      const remainingSeconds = Math.max(
-        0,
-        Math.floor((existingHold.expiresAt.getTime() - now.getTime()) / 1000)
-      );
-      logger.info('[FLEX HOLD] Returning existing active hold (dedup)', {
-        holdId: existingHold.holdId,
-        orderId: request.orderId,
-        transporterId: request.transporterId,
-      });
-      return {
-        success: true,
-        holdId: existingHold.holdId,
-        phase: HoldPhase.FLEX,
-        expiresAt: existingHold.expiresAt,
-        remainingSeconds,
-        canExtend: (existingHold.flexExtendedCount || 0) < this.config.maxExtensions,
-        message: `Existing flex hold returned. Expires in ${remainingSeconds} seconds.`,
-      };
-    }
-
-    // AB-2 fix: Reject hold creation if the parent broadcast/order has expired.
-    // Prevents stale broadcasts from locking trucks after expiry.
-    // F-C-50: Also select customerId so we can mirror `flex_hold_started` to the customer room.
-    const parentOrder = await prismaClient.order.findUnique({
-      where: { id: request.orderId },
-      select: { expiresAt: true, status: true, customerId: true },
-    });
-    if (!parentOrder) {
+    // P4 F2.5: Acquire per-(order,transporter) distributed lock BEFORE the dedup
+    // findFirst to close the TOCTOU window where two concurrent requests both
+    // observed "no existing hold" and raced to create duplicate ledger rows.
+    // Lock key is stable across the request (does NOT depend on the not-yet-
+    // generated holdId) so concurrent callers actually contend on the same key.
+    const createLockKey = REDIS_KEYS.FLEX_HOLD_CREATE_LOCK(
+      request.orderId,
+      request.transporterId,
+    );
+    const createLockHolder = `flex-hold-create:${uuidv4()}`;
+    const createLock = await redisService.acquireLock(createLockKey, createLockHolder, 30);
+    if (!createLock.acquired) {
       return {
         success: false,
-        message: 'Order not found. Cannot create hold for a non-existent order.',
-        error: 'ORDER_NOT_FOUND',
-      };
-    }
-    if (new Date(parentOrder.expiresAt).getTime() < Date.now()) {
-      return {
-        success: false,
-        message: 'Cannot create hold — broadcast has expired.',
-        error: 'BROADCAST_EXPIRED',
-      };
-    }
-    if (parentOrder.status === 'cancelled' || parentOrder.status === 'expired' || parentOrder.status === 'completed') {
-      return {
-        success: false,
-        message: `Cannot create hold — order is ${parentOrder.status}.`,
-        error: 'ORDER_TERMINAL',
-      };
-    }
-
-    const holdId = uuidv4();
-    const now = new Date();
-    const holdDurationMs = this.config.baseDurationSeconds * 1000;
-    // AB3: Cap hold lifetime to broadcast/order remaining time.
-    // A hold must never outlive its parent broadcast.
-    const broadcastRemainingMs = new Date(parentOrder.expiresAt).getTime() - now.getTime();
-    const cappedDurationMs = broadcastRemainingMs > 0
-      ? Math.min(holdDurationMs, broadcastRemainingMs)
-      : holdDurationMs;
-    const baseExpiresAt = new Date(now.getTime() + cappedDurationMs);
-
-    // Distributed lock to prevent race conditions
-    const lockKey = REDIS_KEYS.FLEX_HOLD_LOCK(holdId);
-    const lock = await redisService.acquireLock(lockKey, 'flex-hold-creation', 10);
-
-    if (!lock.acquired) {
-      return {
-        success: false,
-        message: 'Could not acquire lock for hold creation',
+        message: 'Another flex-hold request is in flight for this order+transporter. Retry shortly.',
         error: 'LOCK_ACQUISITION_FAILED',
       };
     }
 
     try {
-      // F-A-75: Create hold inside a transaction so the KYC+isActive re-check can use
-      // SELECT ... FOR UPDATE on the User row and roll back atomically if the actor is
-      // no longer eligible at hold-creation time. The outer Redis lock still serializes
-      // concurrent flex-hold attempts on the same holdId; this TX adds per-User row
-      // serialization against the admin revoke/suspend path.
-      const holdLedger = await prismaClient.$transaction(async (tx) => {
+      // P4 F2.NEW-3: Dedup findFirst + create inside a Serializable tx with a
+      // pessimistic FOR UPDATE on any non-terminal hold for this (orderId,
+      // transporterId) pair. Combined with the DB-level partial unique index
+      // (migrations/M-015-flex-hold-dedup-partial-index.sql), concurrent creates
+      // are impossible even if the Redis create lock above fails.
+      const dedupOrCreate = await withDbTimeout(async (tx) => {
+        // P4 F2.NEW-3: pessimistic lock on any existing non-terminal hold for
+        // this (orderId, transporterId) — a no-op on first-creator but blocks
+        // any sibling tx from racing past this point.
+        await tx.$queryRaw`
+          SELECT "holdId" FROM "TruckHoldLedger"
+          WHERE "orderId" = ${request.orderId}
+            AND "transporterId" = ${request.transporterId}
+            AND "phase" NOT IN ('EXPIRED', 'RELEASED')
+          FOR UPDATE
+        `;
+
+        // M-22 FIX (hardened by F2.NEW-3): Dedup — return existing active flex
+        // hold if one already exists for this order+transporter combination.
+        // Now runs INSIDE the serializable tx with the FOR UPDATE above so the
+        // read is pessimistically consistent.
+        const existingHold = await tx.truckHoldLedger.findFirst({
+          where: {
+            orderId: request.orderId,
+            transporterId: request.transporterId,
+            status: 'active',
+            phase: HoldPhase.FLEX,
+          },
+        });
+
+        if (existingHold) {
+          return { kind: 'existing' as const, hold: existingHold };
+        }
+
+        // AB-2 fix: Reject hold creation if the parent broadcast/order has expired.
+        // Prevents stale broadcasts from locking trucks after expiry.
+        // F-C-50: Also select customerId so we can mirror `flex_hold_started` to the customer room.
+        const parentOrder = await tx.order.findUnique({
+          where: { id: request.orderId },
+          select: { expiresAt: true, status: true, customerId: true },
+        });
+        if (!parentOrder) {
+          return {
+            kind: 'error' as const,
+            message: 'Order not found. Cannot create hold for a non-existent order.',
+            errorCode: 'ORDER_NOT_FOUND',
+          };
+        }
+        if (new Date(parentOrder.expiresAt).getTime() < Date.now()) {
+          return {
+            kind: 'error' as const,
+            message: 'Cannot create hold — broadcast has expired.',
+            errorCode: 'BROADCAST_EXPIRED',
+          };
+        }
+        if (
+          parentOrder.status === 'cancelled' ||
+          parentOrder.status === 'expired' ||
+          parentOrder.status === 'completed'
+        ) {
+          return {
+            kind: 'error' as const,
+            message: `Cannot create hold — order is ${parentOrder.status}.`,
+            errorCode: 'ORDER_TERMINAL',
+          };
+        }
+
+        // F-A-75: KYC+isActive re-check uses SELECT ... FOR UPDATE on the User
+        // row (inside validateActorEligibility) so admin revoke/suspend serializes
+        // against this path.
         await validateActorEligibility(tx, request.transporterId, 'flex_hold');
-        return tx.truckHoldLedger.create({
+
+        const now = new Date();
+        const holdDurationMs = this.config.baseDurationSeconds * 1000;
+        // AB3: Cap hold lifetime to broadcast/order remaining time.
+        // A hold must never outlive its parent broadcast.
+        const broadcastRemainingMs =
+          new Date(parentOrder.expiresAt).getTime() - now.getTime();
+        const cappedDurationMs =
+          broadcastRemainingMs > 0
+            ? Math.min(holdDurationMs, broadcastRemainingMs)
+            : holdDurationMs;
+        const baseExpiresAt = new Date(now.getTime() + cappedDurationMs);
+        const newHoldId = uuidv4();
+
+        const created = await tx.truckHoldLedger.create({
           data: {
-            holdId,
+            holdId: newHoldId,
             orderId: request.orderId,
             transporterId: request.transporterId,
             vehicleType: request.vehicleType,
@@ -279,7 +296,53 @@ class FlexHoldService {
             createdAt: now,
           },
         });
+
+        return {
+          kind: 'created' as const,
+          hold: created,
+          now,
+          baseExpiresAt,
+          customerId: parentOrder.customerId,
+        };
+      }, {
+        isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+        timeoutMs: 5_000,
+        site: 'flex_hold_create',
       });
+
+      if (dedupOrCreate.kind === 'existing') {
+        const existingHold = dedupOrCreate.hold;
+        const remainingSeconds = Math.max(
+          0,
+          Math.floor((existingHold.expiresAt.getTime() - Date.now()) / 1000),
+        );
+        logger.info('[FLEX HOLD] Returning existing active hold (dedup)', {
+          holdId: existingHold.holdId,
+          orderId: request.orderId,
+          transporterId: request.transporterId,
+        });
+        return {
+          success: true,
+          holdId: existingHold.holdId,
+          phase: HoldPhase.FLEX,
+          expiresAt: existingHold.expiresAt,
+          remainingSeconds,
+          canExtend:
+            (existingHold.flexExtendedCount || 0) < this.config.maxExtensions,
+          message: `Existing flex hold returned. Expires in ${remainingSeconds} seconds.`,
+        };
+      }
+
+      if (dedupOrCreate.kind === 'error') {
+        return {
+          success: false,
+          message: dedupOrCreate.message,
+          error: dedupOrCreate.errorCode,
+        };
+      }
+
+      const { hold, baseExpiresAt, customerId } = dedupOrCreate;
+      const holdId = hold.holdId;
 
       // Cache state in Redis for fast access
       await this.cacheFlexHoldState(holdId, {
@@ -316,9 +379,17 @@ class FlexHoldService {
         canExtend: true,
         maxExtensions: this.config.maxExtensions,
       };
-      await socketService.emitToUser(request.transporterId, 'flex_hold_started', flexHoldStartedPayload);
-      if (parentOrder.customerId) {
-        await socketService.emitToUser(parentOrder.customerId, 'flex_hold_started', flexHoldStartedPayload);
+      await socketService.emitToUser(
+        request.transporterId,
+        'flex_hold_started',
+        flexHoldStartedPayload,
+      );
+      if (customerId) {
+        await socketService.emitToUser(
+          customerId,
+          'flex_hold_started',
+          flexHoldStartedPayload,
+        );
       }
 
       return {
@@ -344,6 +415,38 @@ class FlexHoldService {
           error: error.code,
         };
       }
+      // P4 F2.NEW-3: Unique-violation on the partial unique index means a concurrent
+      // writer won the create race. Treat as idempotent — return the winning row.
+      if (error?.code === 'P2002') {
+        logger.info('[FLEX HOLD] Unique-violation on create race — returning winning hold', {
+          orderId: request.orderId,
+          transporterId: request.transporterId,
+        });
+        const winner = await prismaClient.truckHoldLedger.findFirst({
+          where: {
+            orderId: request.orderId,
+            transporterId: request.transporterId,
+            status: 'active',
+            phase: HoldPhase.FLEX,
+          },
+        });
+        if (winner) {
+          const remainingSeconds = Math.max(
+            0,
+            Math.floor((winner.expiresAt.getTime() - Date.now()) / 1000),
+          );
+          return {
+            success: true,
+            holdId: winner.holdId,
+            phase: HoldPhase.FLEX,
+            expiresAt: winner.expiresAt,
+            remainingSeconds,
+            canExtend:
+              (winner.flexExtendedCount || 0) < this.config.maxExtensions,
+            message: `Existing flex hold returned. Expires in ${remainingSeconds} seconds.`,
+          };
+        }
+      }
       logger.error('[FLEX HOLD] Failed to create flex hold', {
         error: error.message,
         orderId: request.orderId,
@@ -355,7 +458,9 @@ class FlexHoldService {
         error: error.message,
       };
     } finally {
-      await redisService.releaseLock(lockKey, 'flex-hold-creation').catch(() => {});
+      await redisService
+        .releaseLock(createLockKey, createLockHolder)
+        .catch(() => {});
     }
   }
 
