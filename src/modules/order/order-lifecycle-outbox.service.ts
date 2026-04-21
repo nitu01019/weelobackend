@@ -36,8 +36,11 @@ import type {
   OrderLifecycleOutboxPayload,
   OrderCancelledOutboxPayload,
   TripCompletedOutboxPayload,
+  AssignmentTimerSchedulePayload,
+  AssignmentCacheRefreshPayload,
   LifecycleOutboxRow,
 } from './order-types';
+import { fleetCacheService } from '../../shared/services/fleet-cache.service';
 import type { CreateOrderResponse } from './order.service';
 import {
   emitToTransportersWithAdaptiveFanout,
@@ -73,6 +76,14 @@ export function parseLifecycleOutboxPayload(payload: Prisma.JsonValue): OrderLif
 
   if (type === 'trip_completed') {
     return parseTripCompletedPayload(raw);
+  }
+
+  // P4 F2.1/F2.NEW-2: post-commit coordination events emitted from confirmed-hold tx.
+  if (type === 'assignment_timer_schedule') {
+    return parseAssignmentTimerSchedulePayload(raw);
+  }
+  if (type === 'assignment_cache_refresh') {
+    return parseAssignmentCacheRefreshPayload(raw);
   }
 
   if (type !== 'order_cancelled') return null;
@@ -179,6 +190,70 @@ function parseTripCompletedPayload(raw: Record<string, unknown>): TripCompletedO
   };
 }
 
+function parseAssignmentTimerSchedulePayload(raw: Record<string, unknown>): AssignmentTimerSchedulePayload | null {
+  const assignmentId = typeof raw.assignmentId === 'string' ? raw.assignmentId.trim() : '';
+  const driverId = typeof raw.driverId === 'string' ? raw.driverId.trim() : '';
+  const transporterId = typeof raw.transporterId === 'string' ? raw.transporterId.trim() : '';
+  const vehicleId = typeof raw.vehicleId === 'string' ? raw.vehicleId.trim() : '';
+  const orderId = typeof raw.orderId === 'string' ? raw.orderId.trim() : '';
+  if (!assignmentId || !driverId || !transporterId || !vehicleId || !orderId) return null;
+
+  const driverName = typeof raw.driverName === 'string' ? raw.driverName : '';
+  const vehicleNumber = typeof raw.vehicleNumber === 'string' ? raw.vehicleNumber : '';
+  const tripId = typeof raw.tripId === 'string' ? raw.tripId : null;
+  const bookingId = typeof raw.bookingId === 'string' ? raw.bookingId : null;
+  const truckRequestId = typeof raw.truckRequestId === 'string' ? raw.truckRequestId : null;
+  const scheduleAt = typeof raw.scheduleAt === 'string' && raw.scheduleAt.trim().length > 0
+    ? raw.scheduleAt
+    : new Date().toISOString();
+  const createdAt = typeof raw.createdAt === 'string' && raw.createdAt.trim().length > 0
+    ? raw.createdAt
+    : new Date().toISOString();
+  const eventId = typeof raw.eventId === 'string' && raw.eventId.trim().length > 0 ? raw.eventId : uuidv4();
+  const eventVersion = Number(raw.eventVersion || 1);
+  const serverTimeMs = Number(raw.serverTimeMs || Date.now());
+
+  return {
+    type: 'assignment_timer_schedule',
+    assignmentId,
+    driverId,
+    driverName,
+    transporterId,
+    vehicleId,
+    vehicleNumber,
+    tripId,
+    orderId,
+    bookingId,
+    truckRequestId,
+    scheduleAt,
+    eventId,
+    eventVersion: Number.isFinite(eventVersion) && eventVersion > 0 ? Math.floor(eventVersion) : 1,
+    serverTimeMs: Number.isFinite(serverTimeMs) && serverTimeMs > 0 ? Math.floor(serverTimeMs) : Date.now(),
+    createdAt,
+  };
+}
+
+function parseAssignmentCacheRefreshPayload(raw: Record<string, unknown>): AssignmentCacheRefreshPayload | null {
+  const transporterId = typeof raw.transporterId === 'string' ? raw.transporterId.trim() : '';
+  if (!transporterId) return null;
+  const vehicleIds = Array.isArray(raw.vehicleIds)
+    ? raw.vehicleIds.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+  const assignmentIds = Array.isArray(raw.assignmentIds)
+    ? raw.assignmentIds.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+  const eventId = typeof raw.eventId === 'string' && raw.eventId.trim().length > 0 ? raw.eventId : uuidv4();
+  const serverTimeMs = Number(raw.serverTimeMs || Date.now());
+  return {
+    type: 'assignment_cache_refresh',
+    transporterId,
+    vehicleIds,
+    assignmentIds,
+    eventId,
+    serverTimeMs: Number.isFinite(serverTimeMs) && serverTimeMs > 0 ? Math.floor(serverTimeMs) : Date.now(),
+  };
+}
+
 export function calculateLifecycleRetryDelayMs(attempt: number): number {
   const scheduleMs = [1000, 2000, 4000, 8000, 16000, 30000, 60000];
   const base = scheduleMs[Math.max(0, Math.min(scheduleMs.length - 1, attempt - 1))];
@@ -226,6 +301,15 @@ export function startLifecycleOutboxWorker(state: {
   return timer;
 }
 
+function resolveOutboxOrderId(payload: OrderLifecycleOutboxPayload): string {
+  if (payload.type === 'order_cancelled' || payload.type === 'trip_completed' || payload.type === 'assignment_timer_schedule') {
+    return payload.orderId;
+  }
+  // assignment_cache_refresh has no orderId — use transporterId as the partition
+  // key for the outbox row (eventType discriminates semantics at dispatch time).
+  return payload.transporterId;
+}
+
 export async function enqueueCancelLifecycleOutbox(
   payload: OrderLifecycleOutboxPayload,
   tx?: Prisma.TransactionClient
@@ -234,7 +318,7 @@ export async function enqueueCancelLifecycleOutbox(
   await lifecycleOutboxDelegate(tx).create({
     data: {
       id: outboxId,
-      orderId: payload.orderId,
+      orderId: resolveOutboxOrderId(payload),
       eventType: payload.type,
       payload: payload as unknown as Prisma.InputJsonValue,
       status: 'pending',
@@ -507,6 +591,53 @@ export async function emitTripCompletedLifecycle(payload: TripCompletedOutboxPay
   });
 }
 
+// P4 F2.1: Replay driver-acceptance timeout scheduling from outbox payload.
+// Mirrors scheduleDriverAcceptanceTimeout() in confirmed-hold.service.ts — the
+// original call site lived post-commit and could leak on process crash.
+export async function scheduleAssignmentTimerFromOutbox(payload: AssignmentTimerSchedulePayload): Promise<void> {
+  const scheduleAtMs = new Date(payload.scheduleAt).getTime();
+  const delayMs = Math.max(0, scheduleAtMs - Date.now());
+  await queueService.scheduleAssignmentTimeout({
+    assignmentId: payload.assignmentId,
+    driverId: payload.driverId,
+    driverName: payload.driverName,
+    transporterId: payload.transporterId,
+    vehicleId: payload.vehicleId,
+    vehicleNumber: payload.vehicleNumber,
+    tripId: payload.tripId ?? '',
+    orderId: payload.orderId,
+    bookingId: payload.bookingId ?? undefined,
+    truckRequestId: payload.truckRequestId ?? undefined,
+    createdAt: payload.createdAt,
+  }, delayMs);
+
+  logger.info('[LIFECYCLE OUTBOX] Assignment timer scheduled from outbox', {
+    assignmentId: payload.assignmentId,
+    driverId: payload.driverId,
+    delayMs,
+  });
+}
+
+// P4 F2.NEW-2: Replay fleet-cache invalidation from outbox payload. Invalidates
+// per-vehicle entries so subsequent reads pick up the confirmed-hold side effects
+// (vehicle tied up in an assignment). Transporter-scoped invalidation is implicit
+// in invalidateVehicleCache via the vehicle->transporter lookup when vehicleId
+// is passed.
+export async function invalidateFleetCacheFromOutbox(payload: AssignmentCacheRefreshPayload): Promise<void> {
+  if (payload.vehicleIds.length === 0) {
+    await fleetCacheService.invalidateVehicleCache(payload.transporterId);
+  } else {
+    for (const vehicleId of payload.vehicleIds) {
+      await fleetCacheService.invalidateVehicleCache(payload.transporterId, vehicleId);
+    }
+  }
+  logger.info('[LIFECYCLE OUTBOX] Fleet cache invalidated from outbox', {
+    transporterId: payload.transporterId,
+    vehicleCount: payload.vehicleIds.length,
+    assignmentCount: payload.assignmentIds.length,
+  });
+}
+
 export async function processLifecycleOutboxRow(row: LifecycleOutboxRow): Promise<void> {
   const payload = parseLifecycleOutboxPayload(row.payload);
   const nextAttempt = Math.max(1, row.attempts + 1);
@@ -529,6 +660,10 @@ export async function processLifecycleOutboxRow(row: LifecycleOutboxRow): Promis
     // Dispatch to the correct handler based on event type
     if (payload.type === 'trip_completed') {
       await emitTripCompletedLifecycle(payload);
+    } else if (payload.type === 'assignment_timer_schedule') {
+      await scheduleAssignmentTimerFromOutbox(payload);
+    } else if (payload.type === 'assignment_cache_refresh') {
+      await invalidateFleetCacheFromOutbox(payload);
     } else {
       await emitCancellationLifecycle(payload);
     }
@@ -544,7 +679,13 @@ export async function processLifecycleOutboxRow(row: LifecycleOutboxRow): Promis
       }
     });
   } catch (error: unknown) {
-    const errorLabel = payload.type === 'trip_completed' ? 'TRIP_COMPLETED_EMIT_FAILED' : 'CANCEL_LIFECYCLE_EMIT_FAILED';
+    const errorLabel = payload.type === 'trip_completed'
+      ? 'TRIP_COMPLETED_EMIT_FAILED'
+      : payload.type === 'assignment_timer_schedule'
+        ? 'ASSIGNMENT_TIMER_SCHEDULE_FAILED'
+        : payload.type === 'assignment_cache_refresh'
+          ? 'ASSIGNMENT_CACHE_REFRESH_FAILED'
+          : 'CANCEL_LIFECYCLE_EMIT_FAILED';
     const message = error instanceof Error ? error.message : errorLabel;
     const retryable = nextAttempt < row.maxAttempts;
     metrics.incrementCounter('cancel_emit_retry_total', {

@@ -96,7 +96,47 @@ export interface TripCompletedOutboxPayload {
   serverTimeMs: number;
 }
 
-export type OrderLifecycleOutboxPayload = OrderCancelledOutboxPayload | TripCompletedOutboxPayload;
+// P4 F2.1: post-commit assignment-timer scheduling via durable outbox.
+// Replaces fire-and-forget queueService.scheduleAssignmentTimeout(...) call
+// after confirmed-hold tx commit — poller replays the scheduling so the 45s
+// driver-acceptance timer survives a crash between commit and timer insert.
+export interface AssignmentTimerSchedulePayload {
+  type: 'assignment_timer_schedule';
+  assignmentId: string;
+  driverId: string;
+  driverName: string;
+  transporterId: string;
+  vehicleId: string;
+  vehicleNumber: string;
+  tripId: string | null;
+  orderId: string;
+  bookingId: string | null;
+  truckRequestId: string | null;
+  scheduleAt: string;
+  eventId: string;
+  eventVersion: number;
+  serverTimeMs: number;
+  createdAt: string;
+}
+
+// P4 F2.NEW-2: post-commit fleet-cache invalidation via durable outbox.
+// Replaces the non-transactional Redis write after confirmed-hold tx commit so
+// fleet-cache never stays stale if the process crashes between commit and the
+// cache invalidate — poller replays invalidateVehicleCache per vehicle.
+export interface AssignmentCacheRefreshPayload {
+  type: 'assignment_cache_refresh';
+  transporterId: string;
+  vehicleIds: string[];
+  assignmentIds: string[];
+  eventId: string;
+  serverTimeMs: number;
+}
+
+export type OrderLifecycleOutboxPayload =
+  | OrderCancelledOutboxPayload
+  | TripCompletedOutboxPayload
+  | AssignmentTimerSchedulePayload
+  | AssignmentCacheRefreshPayload;
 
 export interface LifecycleOutboxRow {
   id: string;

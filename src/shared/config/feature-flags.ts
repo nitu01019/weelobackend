@@ -255,10 +255,50 @@ export const FLAGS = {
   // unacked in seq order; BROADCAST_ACK prunes by score. Default OFF for
   // soak-safe rollout (10% -> 50% -> 100%). When OFF, identical existing
   // behavior (global seq stamp only, no ZADD outside queue processor path).
+  // C-2 (Phase 1): defaultValue flipped ON. The 'release' category otherwise
+  // falls through to OFF when the env var is unset, which silently disabled
+  // every durable-emit path outside the queue processor. Explicit
+  // `defaultValue: true` mirrors DUAL_CHANNEL_DELIVERY (below) so durable
+  // emit is always armed; the env var remains as the ops-override kill switch.
   DURABLE_EMIT_ENABLED: {
     env: 'FF_DURABLE_EMIT_ENABLED',
     category: 'release' as const,
     description: 'At-least-once durable Socket.IO emit via per-user ZSET + seq',
+    defaultValue: true,
+  },
+
+  // H-14 (Phase 3): H3-res5 sharded GEORADIUS keys. When ON, writers emit to
+  // new sharded pattern `geo:transporters:{vehicleKey}:{h3_res5}` and readers
+  // query both the flat legacy key AND the per-H3-res5 shards, dedup via
+  // existing Promise.all + Set pattern. Heartbeat self-populates new shards
+  // in ~10s after flag flip. Defaults OFF until the 8 cut-over sites are
+  // wired and staging soak is green. See IMPLEMENTATION_PLAN.md Phase 3
+  // Teammate 7 for the full site list.
+  GEO_H3_SHARD_ENABLED: {
+    env: 'FF_GEO_H3_SHARD_ENABLED',
+    category: 'release' as const,
+    description: 'Dual-read GEORADIUS keys from H3-res5 sharded namespace + flat legacy keys',
+    defaultValue: false,
+  },
+
+  // Phase 2 risk register (C-1): kill switch for the H3 ring-K constant fix.
+  // Not used by any code path today — exists so an ops flip can force the
+  // matcher to skip the H3 fast path if the corrected constants produce
+  // unexpected empty candidate sets in prod. Toggle via env only.
+  H3_RING_K_FIX_ENABLED: {
+    env: 'FF_H3_RING_K_FIX',
+    category: 'release' as const,
+    description: 'Use corrected H3 centroid-spacing constant (0.798 km) in progressive radius matcher',
+    defaultValue: true,
+  },
+
+  // Phase 5 (M-20): daily DeviceToken sweep cron. Default OFF on prod until
+  // the first daily run on staging has been verified.
+  DEVICE_TOKEN_SWEEP_ENABLED: {
+    env: 'FF_DEVICE_TOKEN_SWEEP_ENABLED',
+    category: 'release' as const,
+    description: 'Enable daily DeviceToken.lastSeenAt > 90d sweep cron at 03:00 IST',
+    defaultValue: false,
   },
 
   // --- Dual channel delivery (queue.service.ts:81) ---
@@ -428,6 +468,21 @@ export const FLAGS = {
     env: 'FF_VEHICLE_TRANSITION_OUTBOX',
     category: 'release' as const,
     description: 'In-TX outbox + leader-elected poller for vehicle transitions (F-A-64)',
+  },
+
+  // --- P4 F2.1 + F2.NEW-2: Assignment timer + fleet-cache outbox ---
+  // When ON, confirmed-hold initialize writes post-commit side effects
+  // (scheduleAssignmentTimeout + fleet-cache invalidate) as OrderLifecycleOutbox
+  // rows INSIDE the phase-flip transaction so a crash between commit and the
+  // side effect cannot lose the timer or leave the cache stale — the poller
+  // replays them after commit. When OFF: legacy fire-and-forget path runs
+  // post-commit exactly as before (fallback preserved for soak-safe rollout).
+  // Default OFF — flip ON after smoke verification on staging.
+  ASSIGNMENT_TIMER_OUTBOX_ENABLED: {
+    env: 'FF_ASSIGNMENT_TIMER_OUTBOX_ENABLED',
+    category: 'release' as const,
+    description: 'Durable-outbox post-commit timer + fleet-cache refresh on confirmed-hold init (P4 F2.1/F2.NEW-2)',
+    defaultValue: false,
   },
 
   // --- F-A-40: Truck-route avoid=highways|tolls legacy gate ---

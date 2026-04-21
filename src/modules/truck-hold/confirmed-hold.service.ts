@@ -44,6 +44,7 @@ import { tryAutoRedispatch } from '../assignment/auto-redispatch.service';
 import { validateActorEligibility, HoldEligibilityError } from './hold-eligibility';
 import { metrics } from '../../shared/monitoring/metrics.service';
 import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
+import { FLAGS, isEnabled } from '../../shared/config/feature-flags';
 
 // =============================================================================
 // TYPES & INTERFACES
@@ -291,6 +292,79 @@ class ConfirmedHoldService {
           },
         });
 
+        // P4 F2.1 + F2.NEW-2: durable post-commit coordination via OrderLifecycleOutbox.
+        // The 45s driver-acceptance timer and fleet-cache invalidation used to run
+        // fire-and-forget after commit — a process crash between commit and those
+        // side effects leaves the hold uncleaned-up and the cache desynced. Writing
+        // them as outbox rows INSIDE the tx means the poller replays them post-commit
+        // transactionally-safely. Gated OFF by default for soak-safe rollout.
+        if (isEnabled(FLAGS.ASSIGNMENT_TIMER_OUTBOX_ENABLED)) {
+          const driverTimerScheduleAt = new Date(
+            now.getTime() + this.config.driverAcceptTimeoutSeconds * 1000
+          ).toISOString();
+          const createdAtIso = now.toISOString();
+
+          for (const assignment of assignmentsData) {
+            const timerPayload = {
+              type: 'assignment_timer_schedule',
+              assignmentId: assignment.id,
+              driverId: assignment.driverId,
+              driverName: assignment.driverName,
+              transporterId: assignment.transporterId,
+              vehicleId: assignment.vehicleId,
+              vehicleNumber: assignment.vehicleNumber,
+              tripId: assignment.tripId,
+              orderId: assignment.orderId ?? updated.orderId,
+              bookingId: assignment.bookingId,
+              truckRequestId: assignment.truckRequestId,
+              scheduleAt: driverTimerScheduleAt,
+              eventId: uuidv4(),
+              eventVersion: 1,
+              serverTimeMs: now.getTime(),
+              createdAt: createdAtIso,
+            };
+            await tx.orderLifecycleOutbox.create({
+              data: {
+                id: uuidv4(),
+                orderId: assignment.orderId ?? updated.orderId,
+                eventType: 'assignment_timer_schedule',
+                payload: timerPayload as unknown as Prisma.InputJsonValue,
+                status: 'pending',
+                attempts: 0,
+                maxAttempts: 10,
+                nextRetryAt: now,
+              },
+            });
+          }
+
+          const cachePayload = {
+            type: 'assignment_cache_refresh',
+            transporterId: updated.transporterId,
+            vehicleIds: Array.from(
+              new Set(
+                assignmentsData
+                  .map((a) => a.vehicleId)
+                  .filter((v): v is string => typeof v === 'string' && v.length > 0)
+              )
+            ),
+            assignmentIds: assignmentsData.map((a) => a.id),
+            eventId: uuidv4(),
+            serverTimeMs: now.getTime(),
+          };
+          await tx.orderLifecycleOutbox.create({
+            data: {
+              id: uuidv4(),
+              orderId: updated.orderId,
+              eventType: 'assignment_cache_refresh',
+              payload: cachePayload as unknown as Prisma.InputJsonValue,
+              status: 'pending',
+              attempts: 0,
+              maxAttempts: 10,
+              nextRetryAt: now,
+            },
+          });
+        }
+
         return { success: true as const, updated, now, confirmedExpiresAt, assignmentsData };
       }, {
         isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
@@ -355,9 +429,17 @@ class ConfirmedHoldService {
         trucksPending: updated.quantity,
       });
 
-      // Schedule expiry cleanup job (Layer 1)
-      await holdExpiryCleanupService.scheduleConfirmedHoldCleanup(holdId, confirmedExpiresAt);
-      logger.debug('[CONFIRMED HOLD] Cleanup job scheduled', { holdId });
+      // Schedule expiry cleanup job (Layer 1).
+      // P4 F2.1: When the assignment-timer outbox is enabled, the post-commit
+      // scheduling becomes durable via OrderLifecycleOutbox (written inside the
+      // tx above). Keep the legacy fire-and-forget call as the fallback path when
+      // the flag is OFF so behavior is unchanged during the soak period.
+      if (!isEnabled(FLAGS.ASSIGNMENT_TIMER_OUTBOX_ENABLED)) {
+        await holdExpiryCleanupService.scheduleConfirmedHoldCleanup(holdId, confirmedExpiresAt);
+        logger.debug('[CONFIRMED HOLD] Cleanup job scheduled', { holdId });
+      } else {
+        logger.debug('[CONFIRMED HOLD] Cleanup scheduling delegated to lifecycle outbox', { holdId });
+      }
 
       // Create a map for quick lookup
       const assignmentMap = new Map(
@@ -395,13 +477,19 @@ class ConfirmedHoldService {
           continue;
         }
 
-        // FIX-39: Pass the operation-level `now` timestamp for consistency
-        await this.scheduleDriverAcceptanceTimeout(
-          assignment.assignmentId,
-          fullData,
-          this.config.driverAcceptTimeoutSeconds,
-          now
-        );
+        // FIX-39: Pass the operation-level `now` timestamp for consistency.
+        // P4 F2.1: When the outbox is enabled, the per-driver 45s timer is
+        // replayed by the lifecycle-outbox poller from the row inserted in the
+        // tx above — skip the fire-and-forget call here so the timer cannot be
+        // scheduled twice. Fanout (socket + FCM below) is unaffected.
+        if (!isEnabled(FLAGS.ASSIGNMENT_TIMER_OUTBOX_ENABLED)) {
+          await this.scheduleDriverAcceptanceTimeout(
+            assignment.assignmentId,
+            fullData,
+            this.config.driverAcceptTimeoutSeconds,
+            now
+          );
+        }
 
         // P2 F4.1: per-driver try/catch so one failure never aborts the fanout.
         try {
@@ -531,11 +619,8 @@ class ConfirmedHoldService {
       }
       logger.error('[CONFIRMED HOLD] Failed to initialize confirmed hold', {
         error: error.message,
-        stack: error.stack,
         holdId,
       });
-      // eslint-disable-next-line no-console
-      if (process.env.NODE_ENV === 'test') console.error('DEBUG initializeConfirmedHold error:', error);
 
       return {
         success: false,
