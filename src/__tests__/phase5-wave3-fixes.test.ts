@@ -359,7 +359,10 @@ describe('AB2: Broadcast-expiry guard on hold creation', () => {
   test('AB2-02: flex-hold.service.ts checks broadcast expiry before creating hold', () => {
     const source = readSource('modules/truck-hold/flex-hold.service.ts');
     expect(source).toContain('AB-2 fix');
-    expect(source).toContain("error: 'BROADCAST_EXPIRED'");
+    // P4 F2.NEW-3 moved broadcast-expiry check inside the serializable tx —
+    // the dedupOrCreate result uses `errorCode` (translated to `error` at the
+    // outer return). Still asserts the BROADCAST_EXPIRED invariant is checked.
+    expect(source).toContain("errorCode: 'BROADCAST_EXPIRED'");
   });
 
   test('AB2-03: truck-hold.service.ts checks for terminal order status', () => {
@@ -369,7 +372,10 @@ describe('AB2: Broadcast-expiry guard on hold creation', () => {
 
   test('AB2-04: flex-hold.service.ts checks for terminal order status', () => {
     const source = readSource('modules/truck-hold/flex-hold.service.ts');
-    expect(source).toContain("error: 'ORDER_TERMINAL'");
+    // P4 F2.NEW-3 moved the terminal-order check inside the serializable tx —
+    // the dedupOrCreate result uses `errorCode` (translated to `error` at the
+    // outer return). Still asserts the ORDER_TERMINAL invariant is checked.
+    expect(source).toContain("errorCode: 'ORDER_TERMINAL'");
   });
 
   test('AB2-05: truck-hold.service.ts queries parentOrder.expiresAt', () => {

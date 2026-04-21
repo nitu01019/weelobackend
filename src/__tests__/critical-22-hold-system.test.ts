@@ -533,8 +533,10 @@ describe('#5 — Flex Hold Lock Key Fix', () => {
       'utf-8'
     );
 
-    // Lock key uses holdId via REDIS_KEYS helper
-    expect(source).toContain('FLEX_HOLD_LOCK(holdId)');
+    // P4 F2.5: extendFlexHold uses FLEX_HOLD_LOCK keyed by holdId; REDIS_KEYS
+    // helper is parameterized by holdId for unique per-hold scoping.
+    expect(source).toContain('FLEX_HOLD_LOCK: (holdId: string)');
+    expect(source).toContain('FLEX_HOLD_LOCK(request.holdId)');
   });
 
   test('5.5: Lock TTL is 10 seconds', () => {

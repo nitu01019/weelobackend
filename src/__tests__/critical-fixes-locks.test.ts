@@ -248,9 +248,12 @@ describe('C-02: Static lock holder replaced with uuidv4()', () => {
         'utf-8'
       );
 
-      // The decline handler is ~6500 chars long; use a wide window
+      // P4 F2.NEW-4 grew the method (~10k chars). Use a window wide enough to
+      // include the finally block's releaseLock call, bounded by the next
+      // method to avoid false positives.
       const declineStart = source.indexOf('async handleDriverDecline');
-      const declineMethod = source.substring(declineStart, declineStart + 8000);
+      const declineEnd = source.indexOf('async handleDriverTimeout');
+      const declineMethod = source.substring(declineStart, declineEnd);
 
       // The releaseLock call includes .catch(() => {}) — match the full pattern
       expect(declineMethod).toContain('releaseLock(lockKey, lockHolder)');

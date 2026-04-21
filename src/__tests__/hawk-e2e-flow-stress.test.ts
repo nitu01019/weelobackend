@@ -310,6 +310,20 @@ jest.mock('../shared/database/prisma.service', () => ({
       findMany: mockPrismaTruckRequestFindMany,
       updateMany: mockPrismaTruckRequestUpdateMany,
     },
+    // P4 F2.NEW-3: flex-hold dedup+create moved INSIDE the serializable tx,
+    // so the `tx` passed to callbacks must expose truckHoldLedger and $queryRaw
+    // (for the FOR UPDATE pessimistic lock).
+    truckHoldLedger: {
+      findUnique: mockPrismaTruckHoldLedgerFindUnique,
+      findFirst: mockPrismaTruckHoldLedgerFindFirst,
+      create: mockPrismaTruckHoldLedgerCreate,
+      update: mockPrismaTruckHoldLedgerUpdate,
+    },
+    orderLifecycleOutbox: {
+      create: jest.fn().mockResolvedValue({ id: 'outbox-1' }),
+    },
+    $queryRaw: jest.fn().mockResolvedValue([]),
+    $executeRaw: mockPrismaExecuteRaw,
   })),
   BookingStatus: {
     created: 'created',
@@ -451,6 +465,23 @@ jest.mock('../modules/driver/driver.service', () => ({
 jest.mock('../modules/hold-expiry/hold-expiry-cleanup.service', () => ({
   holdExpiryCleanupService: {
     scheduleFlexHoldCleanup: jest.fn().mockResolvedValue(undefined),
+  },
+}));
+
+// -- Hold Eligibility (F-A-75 KYC second-gate) --
+// P4 F2.NEW-3 moved eligibility check inside the serializable tx, so it must
+// not throw in tests that focus on dedup/happy-path flex-hold flows.
+jest.mock('../modules/truck-hold/hold-eligibility', () => ({
+  validateActorEligibility: jest.fn().mockResolvedValue(undefined),
+  HoldEligibilityError: class HoldEligibilityError extends Error {
+    public readonly code: string;
+    public readonly userId: string;
+    constructor(code: string, userId: string, message: string) {
+      super(message);
+      this.name = 'HoldEligibilityError';
+      this.code = code;
+      this.userId = userId;
+    }
   },
 }));
 

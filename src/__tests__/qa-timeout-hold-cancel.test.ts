@@ -1327,34 +1327,53 @@ describe('QA Timeout/Hold/Cancel Tests', () => {
   // ===========================================================================
 
   describe('Confirmed hold phase guard', () => {
-    // H-8: initializeConfirmedHold now uses $queryRaw with FOR UPDATE inside $transaction
-    // We must mock $transaction to provide a tx with $queryRaw returning the hold data.
+    // H-8 + P4 F2.2/F2.8/F2.NEW-1: initializeConfirmedHold now wraps the FOR UPDATE
+    // read and phase flip inside a Serializable `withDbTimeout(async (tx) => ...)`
+    // call (see confirmed-hold.service.ts::initializeConfirmedHold). We must
+    // configure the `withDbTimeout` mock to provide a `tx` proxy with the
+    // $queryRaw sequence:
+    //   1st call → validateActorEligibility user-row lookup (VERIFIED + active)
+    //   2nd call → SELECT ... FROM "TruckHoldLedger" WHERE holdId = ... FOR UPDATE
+    // The legacy `mockTransaction` override is retained for any call-site that
+    // still goes through prismaClient.$transaction.
     function setupTxWithQueryRaw(holdRow: Record<string, any> | null) {
-      mockTransaction.mockImplementation(async (fn: Function) => {
-        const txProxy = {
-          truckHoldLedger: {
-            findUnique: (...a: any[]) => mockTruckHoldLedgerFindUnique(...a),
-            update: (...a: any[]) => mockTruckHoldLedgerUpdate(...a),
-          },
-          assignment: {
-            updateMany: (...a: any[]) => mockAssignmentUpdateMany(...a),
-            findMany: (...a: any[]) => mockAssignmentFindMany(...a),
-            create: (...a: any[]) => mockAssignmentCreate(...a),
-          },
-          order: {
-            findUnique: (...a: any[]) => mockOrderFindUnique(...a),
-          },
-          truckRequest: {
-            update: (...a: any[]) => mockTruckRequestUpdate(...a),
-          },
-          // F-A-75: first $queryRaw is User eligibility, second is the hold lookup.
-          $queryRaw: jest.fn()
-            .mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }])
-            .mockResolvedValueOnce(holdRow ? [holdRow] : []),
-          $executeRaw: (...a: any[]) => mockExecuteRaw(...a),
-        };
-        return fn(txProxy);
+      const buildTxProxy = () => ({
+        truckHoldLedger: {
+          findUnique: (...a: any[]) => mockTruckHoldLedgerFindUnique(...a),
+          update: (...a: any[]) => mockTruckHoldLedgerUpdate(...a),
+        },
+        assignment: {
+          updateMany: (...a: any[]) => mockAssignmentUpdateMany(...a),
+          findMany: (...a: any[]) => mockAssignmentFindMany(...a),
+          create: (...a: any[]) => mockAssignmentCreate(...a),
+        },
+        order: {
+          findUnique: (...a: any[]) => mockOrderFindUnique(...a),
+        },
+        truckRequest: {
+          update: (...a: any[]) => mockTruckRequestUpdate(...a),
+        },
+        orderLifecycleOutbox: {
+          create: jest.fn().mockResolvedValue(undefined),
+        },
+        // F-A-75 + P4 F2.2: first $queryRaw is User eligibility, second is the
+        // hold lookup, third (if reached) is the TruckRequest FOR UPDATE lock.
+        $queryRaw: jest.fn()
+          .mockResolvedValueOnce([{ isActive: true, kycStatus: 'VERIFIED' }])
+          .mockResolvedValueOnce(holdRow ? [holdRow] : [])
+          .mockResolvedValue([]),
+        $executeRaw: (...a: any[]) => mockExecuteRaw(...a),
       });
+
+      mockTransaction.mockImplementation(async (fn: Function) => fn(buildTxProxy()));
+
+      // P4 F2.2/F2.8/F2.NEW-1: initializeConfirmedHold uses withDbTimeout, not
+      // $transaction. Re-point the mock to the same tx proxy so both paths work.
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const prismaServiceMock = require('../shared/database/prisma.service');
+      prismaServiceMock.withDbTimeout.mockImplementation(async (fn: Function) =>
+        fn(buildTxProxy())
+      );
     }
 
     it('should reject initialization from non-FLEX phase', async () => {

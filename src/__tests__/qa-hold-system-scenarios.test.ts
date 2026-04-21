@@ -169,6 +169,8 @@ jest.mock('../shared/database/prisma.service', () => ({
       },
       truckHoldLedger: {
         update: (...a: any[]) => mockTruckHoldLedgerUpdate(...a),
+        findFirst: (...a: any[]) => mockTruckHoldLedgerFindFirst(...a),
+        create: (...a: any[]) => mockTruckHoldLedgerCreate(...a),
       },
       assignment: {
         findMany: (...a: any[]) => mockAssignmentFindMany(...a),
@@ -176,6 +178,14 @@ jest.mock('../shared/database/prisma.service', () => ({
       },
       vehicle: {
         updateMany: (...a: any[]) => mockVehicleUpdateMany(...a),
+      },
+      // P4 F2.2/F2.NEW-3: initializeConfirmedHold + createFlexHold both use
+      // $queryRaw with SELECT ... FOR UPDATE inside the withDbTimeout tx (for
+      // user-eligibility row-lock + hold-row lock). Tests configure mock$QueryRaw
+      // with a per-call queue of results.
+      $queryRaw: (...a: any[]) => mock$QueryRaw(...a),
+      orderLifecycleOutbox: {
+        create: jest.fn().mockResolvedValue(undefined),
       },
     });
   }),

@@ -112,7 +112,13 @@ describe('F-A-75: helper is called from every privileged hold call-site', () => 
       flexSource.indexOf('async createFlexHold('),
       flexSource.indexOf('async extendFlexHold(')
     );
-    expect(createSection).toContain('prismaClient.$transaction(async (tx)');
+    // P4 F2.5/F2.NEW-3: createFlexHold wraps the dedup findFirst + create in a
+    // Serializable withDbTimeout(async (tx) => ...) block (the same retry/timeout
+    // wrapper used across the accept-path). We still verify the tx shape —
+    // (a) the create lives inside a tx callback, AND
+    // (b) validateActorEligibility runs inside the same tx BEFORE the create —
+    // but the tx-wrapping construct is now withDbTimeout, not $transaction.
+    expect(createSection).toMatch(/withDbTimeout\(async\s*\(tx\)\s*=>\s*{/);
     expect(createSection).toMatch(
       /validateActorEligibility\(tx,\s*request\.transporterId,\s*'flex_hold'\)/
     );
