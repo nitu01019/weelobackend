@@ -117,6 +117,9 @@ jest.mock('../shared/database/prisma.service', () => ({
   withDbTimeout: jest.fn(async (fn: (tx: any) => Promise<any>) => {
     return fn(mockTx);
   }),
+  HoldPhase: {
+    FLEX: 'FLEX', CONFIRMED: 'CONFIRMED', EXPIRED: 'EXPIRED', RELEASED: 'RELEASED',
+  },
 }));
 
 // --- Redis mock ---

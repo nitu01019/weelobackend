@@ -213,6 +213,9 @@ jest.mock('../shared/database/prisma.service', () => {
       partially_filled: 'partially_filled', fully_filled: 'fully_filled',
       cancelled: 'cancelled', expired: 'expired',
     },
+    HoldPhase: {
+      FLEX: 'FLEX', CONFIRMED: 'CONFIRMED', EXPIRED: 'EXPIRED', RELEASED: 'RELEASED',
+    },
     Prisma: {
       TransactionIsolationLevel: { Serializable: 'Serializable' },
     },

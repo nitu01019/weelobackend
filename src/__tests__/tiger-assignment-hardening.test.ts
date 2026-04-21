@@ -87,6 +87,9 @@ jest.mock('../shared/database/prisma.service', () => ({
     at_pickup: 'at_pickup',
     in_transit: 'in_transit',
   },
+  HoldPhase: {
+    FLEX: 'FLEX', CONFIRMED: 'CONFIRMED', EXPIRED: 'EXPIRED', RELEASED: 'RELEASED',
+  },
 }));
 
 jest.mock('../shared/services/logger.service', () => ({
