@@ -623,6 +623,7 @@ router.post(
     try {
       const transporterId = req.user!.userId;
       const { holdId, assignments } = req.body;
+      let idempotencyCacheKey: string | null = null;
 
       if (!holdId || !Array.isArray(assignments) || assignments.length === 0) {
         return res.status(400).json({
@@ -631,21 +632,51 @@ router.post(
         });
       }
 
+      // F2.7 — X-Idempotency-Key protection against duplicate Phase-2 initialization
+      // (network retry, captain double-tap). Mirrors /confirm-with-assignments pattern.
+      // Cache lookup runs BEFORE the service-layer transaction so a Redis outage on
+      // the read path does not block the request — cacheError is logged and we proceed.
+      const idempotencyKey = (req.header('X-Idempotency-Key') || req.header('x-idempotency-key') || '').trim();
+      idempotencyCacheKey = idempotencyKey
+        ? `idempotency:truck-hold:confirmed-hold:initialize:${transporterId}:${holdId}:${idempotencyKey}`
+        : null;
+
+      if (idempotencyCacheKey) {
+        try {
+          const cached = await redisService.getJSON<{ status: number; body: any }>(idempotencyCacheKey);
+          if (cached) {
+            return res.status(cached.status).json(cached.body);
+          }
+        } catch (cacheError: any) {
+          logger.warn(`[TruckHoldRoutes] Idempotency read failed: ${cacheError?.message || 'unknown'}`);
+        }
+      }
+
       const result = await confirmedHoldService.initializeConfirmedHold(holdId, transporterId, assignments);
 
       if (result.success) {
-        res.json({
+        const responseBody = {
           success: true,
           data: {
             confirmedExpiresAt: result.confirmedExpiresAt
           },
           message: result.message
-        });
+        };
+        if (idempotencyCacheKey) {
+          await redisService.setJSON(idempotencyCacheKey, { status: 200, body: responseBody }, 120)
+            .catch(() => {});
+        }
+        res.json(responseBody);
       } else {
-        res.status(400).json({
+        const responseBody = {
           success: false,
           error: { code: 'INITIALIZE_FAILED', message: result.message }
-        });
+        };
+        if (idempotencyCacheKey) {
+          await redisService.setJSON(idempotencyCacheKey, { status: 400, body: responseBody }, 45)
+            .catch(() => {});
+        }
+        res.status(400).json(responseBody);
       }
     } catch (error) {
       next(error);
