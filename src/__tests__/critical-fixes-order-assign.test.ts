@@ -212,6 +212,9 @@ jest.mock('../shared/database/prisma.service', () => {
       cancelled: 'cancelled',
       expired: 'expired',
     },
+    HoldPhase: {
+      FLEX: 'FLEX', CONFIRMED: 'CONFIRMED', EXPIRED: 'EXPIRED', RELEASED: 'RELEASED',
+    },
     Prisma: {
       TransactionIsolationLevel: { Serializable: 'Serializable' },
     },
@@ -922,11 +925,19 @@ describe('C-11: Side-effect idempotency guard in acceptAssignment', () => {
     expect(result).toBeDefined();
     expect(result.status).toBe('driver_accepted');
 
-    // Verify side-effect lock was requested with correct key
+    // Verify side-effect lock was requested with correct key.
+    // P4 F12.7 (commit fa5a21b8) unified accept-path lock lifecycle via the
+    // acquireAcceptLock helper in assignment-response.service.ts:46-54. The
+    // helper generates a per-attempt UUID-like token
+    //   `accept:${assignmentId}:${Date.now()}:${Math.random().toString(36).slice(2,10)}`
+    // and uses ACCEPT_LOCK_TTL_SECONDS=30 instead of the legacy 'accept-guard'
+    // static holder + 300s TTL. Assertion below preserves the original intent
+    // (lock is acquired, key is correct, assignment-scoped holder) while
+    // matching the new dynamic token shape.
     expect(mockRedisAcquireLock).toHaveBeenCalledWith(
       'side-effect:accept:assignment-001',
-      'accept-guard',
-      300
+      expect.stringMatching(/^accept:assignment-001:\d+:[a-z0-9]{1,8}$/),
+      30
     );
 
     // Verify tracking was initialized
@@ -985,11 +996,12 @@ describe('C-11: Side-effect idempotency guard in acceptAssignment', () => {
     expect(result).toBeDefined();
     expect(result.status).toBe('driver_accepted');
 
-    // Verify side-effect lock was checked
+    // Verify side-effect lock was checked — P4 F12.7 dynamic holder/TTL
+    // (see test 8 above for full rationale).
     expect(mockRedisAcquireLock).toHaveBeenCalledWith(
       'side-effect:accept:assignment-001',
-      'accept-guard',
-      300
+      expect.stringMatching(/^accept:assignment-001:\d+:[a-z0-9]{1,8}$/),
+      30
     );
 
     // Verify tracking was NOT initialized (side effects skipped)

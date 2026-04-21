@@ -225,6 +225,9 @@ jest.mock('../shared/database/prisma.service', () => ({
     maintenance: 'maintenance',
     inactive: 'inactive',
   },
+  HoldPhase: {
+    FLEX: 'FLEX', CONFIRMED: 'CONFIRMED', EXPIRED: 'EXPIRED', RELEASED: 'RELEASED',
+  },
 }));
 
 // --- DB mock ---
