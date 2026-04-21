@@ -18,6 +18,7 @@ import { redisService } from '../../shared/services/redis.service';
 import { liveAvailabilityService } from '../../shared/services/live-availability.service';
 import { invalidateVehicleCache } from '../../shared/services/fleet-cache-write.service';
 import { trackingService } from '../tracking/tracking.service';
+import { FLAGS, isEnabled } from '../../shared/config/feature-flags';
 
 // =============================================================================
 // RESPONSE SERVICE
@@ -119,7 +120,15 @@ class AssignmentResponseService {
 
       // 2. Atomically update vehicle status: on_hold → in_transit
       if (assignment.vehicleId) {
-        await tx.vehicle.updateMany({
+        // P4 F12.1: Fetch vehicle inside TX to capture actual fromStatus +
+        // vehicleKey/transporterId for the VehicleTransitionOutbox INSERT.
+        // The CAS below accepts from on_hold (normal) or available (legacy).
+        const preCasVehicle = await tx.vehicle.findUnique({
+          where: { id: assignment.vehicleId },
+          select: { status: true, vehicleKey: true, transporterId: true }
+        });
+
+        const casResult = await tx.vehicle.updateMany({
           where: {
             id: assignment.vehicleId,
             status: { in: ['on_hold', 'available'] as VehicleStatus[] }  // Accept from on_hold (normal) or available (legacy)
@@ -131,6 +140,34 @@ class AssignmentResponseService {
             lastStatusChange: new Date().toISOString()
           }
         });
+
+        // P4 F12.2: Fail-closed if the CAS mutated zero rows — the vehicle was
+        // transitioned away from {on_hold, available} by a concurrent accept
+        // between the `findFirst` precheck and this CAS. Silently proceeding
+        // would allow a double-accept with inconsistent Vehicle/Assignment state.
+        if (casResult.count === 0) {
+          throw new AppError(
+            409,
+            'VEHICLE_STATE_CHANGED',
+            `Vehicle ${assignment.vehicleId} was mutated by concurrent operation between precheck and CAS update`
+          );
+        }
+
+        // P4 F12.1: VehicleTransitionOutbox — in-TX INSERT so Redis/fleet-cache
+        // replay shares the same commit boundary as the Vehicle.status CAS.
+        // Mirrors src/modules/order/order-accept.service.ts:335-344 (F-A-64).
+        // When OFF: legacy post-TX Redis path (below) runs — soak-safe rollout.
+        if (isEnabled(FLAGS.VEHICLE_TRANSITION_OUTBOX)) {
+          const fromStatus = preCasVehicle?.status === 'available' ? 'available' : 'on_hold';
+          await tx.$executeRaw`
+            INSERT INTO "VehicleTransitionOutbox"
+              ("vehicleId", "vehicleKey", "transporterId",
+               "fromStatus", "toStatus", "reason")
+            VALUES
+              (${assignment.vehicleId}, ${preCasVehicle?.vehicleKey || null}, ${preCasVehicle?.transporterId || assignment.transporterId},
+               ${fromStatus}, ${'in_transit'}, ${'assignmentAccept'})
+          `;
+        }
       }
 
       // Return the updated assignment
