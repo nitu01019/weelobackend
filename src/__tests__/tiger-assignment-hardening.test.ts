@@ -669,11 +669,16 @@ describe('All timeout paths emit expired status (Fix #21)', () => {
 // =============================================================================
 
 describe('ASSIGNMENT_TIMEOUT separate from DRIVER_TIMEOUT (Fix #22)', () => {
+  // The SocketEvent enum was extracted into the codegen-managed contracts
+  // package at packages/contracts/events.generated.ts; socket.service.ts now
+  // re-exports it (`export { SocketEvent } from '../../../packages/contracts/events.generated'`).
+  // These three Fix-#22 assertions follow that move — they read the generated
+  // source of truth instead of the (no-longer-literal) socket.service.ts.
   test('6.1: SocketEvent has both ASSIGNMENT_TIMEOUT and DRIVER_TIMEOUT', () => {
     const fs = require('fs');
     const path = require('path');
     const source = fs.readFileSync(
-      path.resolve(__dirname, '../shared/services/socket.service.ts'),
+      path.resolve(__dirname, '../../packages/contracts/events.generated.ts'),
       'utf-8'
     );
 
@@ -685,7 +690,7 @@ describe('ASSIGNMENT_TIMEOUT separate from DRIVER_TIMEOUT (Fix #22)', () => {
     const fs = require('fs');
     const path = require('path');
     const source = fs.readFileSync(
-      path.resolve(__dirname, '../shared/services/socket.service.ts'),
+      path.resolve(__dirname, '../../packages/contracts/events.generated.ts'),
       'utf-8'
     );
 
@@ -696,7 +701,7 @@ describe('ASSIGNMENT_TIMEOUT separate from DRIVER_TIMEOUT (Fix #22)', () => {
     const fs = require('fs');
     const path = require('path');
     const source = fs.readFileSync(
-      path.resolve(__dirname, '../shared/services/socket.service.ts'),
+      path.resolve(__dirname, '../../packages/contracts/events.generated.ts'),
       'utf-8'
     );
 
