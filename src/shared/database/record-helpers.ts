@@ -106,6 +106,7 @@ export function toAssignmentRecord(assignment: Assignment): AssignmentRecord {
     ...assignment,
     bookingId: assignment.bookingId || '',
     status: assignment.status as AssignmentRecord['status'],
+    supersededAt: assignment.supersededAt ? assignment.supersededAt.toISOString() : null,
   };
 }
 

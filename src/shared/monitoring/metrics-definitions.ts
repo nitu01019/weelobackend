@@ -378,6 +378,16 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
       'Serializable transaction conflicts by site and outcome (retry|exhausted)',
     ),
 
+    // === P4 F12.5: Sibling-assignment supersede observability ===
+    // Fires inside the accept TX when a driver-accept cancels OTHER pending
+    // assignments on the same vehicle. Label: `count_bucket` = '1' | '2' | '3'
+    // | 'many' tracks how often multiple siblings pile up on one vehicle.
+    // Sustained counts > 1 mean matcher is over-dispatching on the same truck.
+    counter(
+      'assignment_sibling_superseded_total',
+      'Sibling pending assignments superseded inside accept TX (F12.5) — labels: count_bucket',
+    ),
+
     // === P4 F2.3: Redis lock release failure observability ===
     // Fires when releaseLock() rejects in a finally block. Locks still auto-expire
     // via TTL so the flow recovers, but recurring failures here signal Redis

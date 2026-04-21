@@ -9,7 +9,7 @@
 
 import { db, AssignmentRecord } from '../../shared/database/db';
 import { Prisma, VehicleStatus } from '@prisma/client';
-import { prismaClient, withDbTimeout } from '../../shared/database/prisma.service';
+import { prismaClient, withDbTimeout, HoldPhase } from '../../shared/database/prisma.service';
 import { AppError } from '../../shared/types/error.types';
 import { logger } from '../../shared/services/logger.service';
 import { emitToUser, emitToBooking, SocketEvent } from '../../shared/services/socket.service';
@@ -19,6 +19,9 @@ import { liveAvailabilityService } from '../../shared/services/live-availability
 import { invalidateVehicleCache } from '../../shared/services/fleet-cache-write.service';
 import { trackingService } from '../tracking/tracking.service';
 import { FLAGS, isEnabled } from '../../shared/config/feature-flags';
+import { metrics } from '../../shared/monitoring/metrics.service';
+import { guardedConfirmFlexToConfirmed } from '../truck-hold/hold-state-machine';
+import { HOLD_CONFIG } from '../../core/config/hold-config';
 
 // =============================================================================
 // RESPONSE SERVICE
@@ -168,6 +171,91 @@ class AssignmentResponseService {
               (${assignment.vehicleId}, ${preCasVehicle?.vehicleKey || null}, ${preCasVehicle?.transporterId || assignment.transporterId},
                ${fromStatus}, ${'in_transit'}, ${'assignmentAccept'})
           `;
+        }
+
+        // =================================================================
+        // P4 F12.5: ATOMICALLY SUPERSEDE SIBLING PENDING ASSIGNMENTS
+        // =================================================================
+        // On successful accept of assignment A for vehicle V, any OTHER
+        // pending assignments for V must be cancelled in the same commit so
+        // a late second accept on a sibling cannot race us. Running this
+        // inside the Serializable TX together with the CAS above ensures the
+        // winning accept deterministically invalidates its siblings.
+        //
+        // Using raw SQL (not tx.assignment.updateMany) because the freshly
+        // added `superseded` enum value may not be known to the installed
+        // Prisma client until `npx prisma generate` runs in production.
+        // Raw SQL is type-agnostic and survives the rollout gap.
+        // =================================================================
+        const supersededCount = await tx.$executeRaw`
+          UPDATE "Assignment"
+          SET status = 'superseded'::"AssignmentStatus",
+              "supersededAt" = NOW()
+          WHERE "vehicleId" = ${assignment.vehicleId}
+            AND status = 'pending'
+            AND id <> ${assignmentId}
+        `;
+        if (supersededCount > 0) {
+          logger.info('assignment_sibling_superseded', {
+            vehicleId: assignment.vehicleId,
+            winningAssignmentId: assignmentId,
+            count: supersededCount,
+          });
+          metrics.incrementCounter('assignment_sibling_superseded_total', {
+            count_bucket: supersededCount > 3 ? 'many' : String(supersededCount),
+          });
+        }
+      }
+
+      // =================================================================
+      // P4 F12.3: IDEMPOTENT FLEX → CONFIRMED LEDGER FLIP
+      // =================================================================
+      // Normal flow: transporter has already moved the hold to CONFIRMED
+      // before the driver receives the accept button, so this call is a
+      // no-op (CAS-miss because phase is already CONFIRMED). The call is
+      // kept for the legacy-bypass path where a driver receives an
+      // assignment whose parent hold is still FLEX — in that case the
+      // ledger MUST flip in the same commit boundary as the accept so the
+      // downstream post-commit side-effects (tracking init, socket emits,
+      // FCM) don't observe a half-confirmed state.
+      //
+      // Only attempts the flip when we can derive an orderId (modern flow).
+      // Legacy bookingId-only assignments have no TruckHoldLedger row and
+      // correctly skip this step.
+      //
+      // `guardedConfirmFlexToConfirmed` is the canonical CAS — it evaluates
+      // `WHERE phase='FLEX' AND status='active'` atomically so two concurrent
+      // attempts resolve to exactly one flip. `rowsAffected===0` is the
+      // expected case when the hold is already CONFIRMED/EXPIRED/RELEASED.
+      // =================================================================
+      if (assignment.orderId) {
+        const holdLedger = await tx.truckHoldLedger.findFirst({
+          where: {
+            orderId: assignment.orderId,
+            transporterId: assignment.transporterId,
+          },
+          select: { holdId: true, phase: true },
+        });
+        if (holdLedger && holdLedger.phase === HoldPhase.FLEX) {
+          const now = new Date();
+          const confirmedExpiresAt = new Date(
+            now.getTime() + HOLD_CONFIG.confirmedHoldMaxSeconds * 1000,
+          );
+          const flipResult = await guardedConfirmFlexToConfirmed(
+            tx,
+            holdLedger.holdId,
+            { confirmedExpiresAt, confirmedAt: now, phaseChangedAt: now },
+          );
+          if (flipResult.updated) {
+            logger.info('hold_flex_confirmed_on_accept', {
+              holdId: holdLedger.holdId,
+              orderId: assignment.orderId,
+              assignmentId,
+            });
+            metrics.incrementCounter('hold_confirmed_committed_total', {
+              stage: 'assignment_accept',
+            });
+          }
         }
       }
 

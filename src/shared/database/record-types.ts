@@ -187,11 +187,15 @@ export interface AssignmentRecord {
   driverName: string;
   driverPhone: string;
   tripId: string;
-  status: 'pending' | 'driver_accepted' | 'driver_declined' | 'en_route_pickup' | 'at_pickup' | 'in_transit' | 'arrived_at_drop' | 'completed' | 'partial_delivery' | 'cancelled';
+  status: 'pending' | 'driver_accepted' | 'driver_declined' | 'en_route_pickup' | 'at_pickup' | 'in_transit' | 'arrived_at_drop' | 'completed' | 'partial_delivery' | 'cancelled' | 'superseded';
   assignedAt: string;
   driverAcceptedAt?: string | null;
   startedAt?: string | null;
   completedAt?: string | null;
+  // P4 F12.5: supersededAt accepts Date | string | null so both the raw Prisma
+  // return (Date) and normalized adapter output (ISO string) satisfy the type
+  // without forcing an adapter call at every `return updated` site.
+  supersededAt?: Date | string | null;
 }
 
 export interface TrackingRecord {

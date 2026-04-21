@@ -101,6 +101,7 @@ enum AssignmentStatus {
   completed          // Trip completed
   partial_delivery   // L-17: Trip partially delivered (driver reported reason)
   cancelled          // Trip cancelled
+  superseded         // P4 F12.5: cancelled atomically because a sibling assignment on same vehicle won accept race
 }
 
 // Route point type for multi-stop orders
@@ -462,6 +463,13 @@ model Order {
   // =========================================
   status         OrderStatus @default(active)
   stateChangedAt DateTime?   @default(now()) // Timestamp of last state transition
+
+  // H-20 (Phase 4): typed view of the column added by
+  // migrations/phase3-f-a-02-order-unique.sql. The column already exists in
+  // prod (applied via direct psql — no prisma db push / migrate deploy per
+  // CLAUDE.md DB rules). Adding it to the Prisma model fixes untyped-SELECT
+  // drift so `order.update({ data: { idempotencyKey } })` type-checks.
+  idempotencyKey String? @unique(map: "idx_order_idempotency_key")
 
   // =========================================
   // DISPATCH OBSERVABILITY (Create/Broadcast lifecycle)
@@ -1003,6 +1011,7 @@ model Assignment {
   driverAcceptedAt String?
   startedAt        String?
   completedAt      String?
+  supersededAt     DateTime?  // P4 F12.5: set when a sibling accept flips this row to 'superseded'
 
   // =========================================
   // INDEXES FOR SCALABILITY

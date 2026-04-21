@@ -222,11 +222,14 @@ export interface AssignmentRecord {
   driverName: string;
   driverPhone: string;
   tripId: string;
-  status: 'pending' | 'driver_accepted' | 'driver_declined' | 'en_route_pickup' | 'at_pickup' | 'in_transit' | 'arrived_at_drop' | 'completed' | 'partial_delivery' | 'cancelled';
+  status: 'pending' | 'driver_accepted' | 'driver_declined' | 'en_route_pickup' | 'at_pickup' | 'in_transit' | 'arrived_at_drop' | 'completed' | 'partial_delivery' | 'cancelled' | 'superseded';
   assignedAt: string;
   driverAcceptedAt?: string;
   startedAt?: string;
   completedAt?: string;
+  // P4 F12.5: accepts Date | string | null to match both Prisma raw rows and
+  // adapter-normalized ISO strings.
+  supersededAt?: Date | string | null;
 }
 
 export interface TrackingRecord {
