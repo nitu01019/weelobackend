@@ -1879,23 +1879,67 @@ describe('QueueService Management Layer', () => {
     expect(() => qs.stop()).not.toThrow();
   });
 
-  it('should fall back to setTimeout if Redis setTimer fails', async () => {
+  // P5 F7.x (2026-04-21): Durable-timer contract — rethrow instead of setTimeout fallback.
+  // Replaces the old "should fall back to setTimeout if Redis setTimer fails" test.
+  it('should THROW (not fall back to setTimeout) if Redis setTimer fails', async () => {
     mockRedisSetTimer.mockRejectedValueOnce(new Error('Redis down'));
     const qs = new QueueService();
-    const timerKey = await qs.scheduleAssignmentTimeout(
-      {
-        assignmentId: 'asgn-fallback',
-        driverId: 'drv-1',
-        driverName: 'Driver',
-        transporterId: 'trans-1',
-        vehicleId: 'veh-1',
-        vehicleNumber: 'KA01AB1234',
-        tripId: 'trip-1',
-        createdAt: new Date().toISOString(),
-      },
-      30000
+    const timerData = {
+      assignmentId: 'asgn-fallback',
+      driverId: 'drv-1',
+      driverName: 'Driver',
+      transporterId: 'trans-1',
+      vehicleId: 'veh-1',
+      vehicleNumber: 'KA01AB1234',
+      tripId: 'trip-1',
+      createdAt: new Date().toISOString(),
+    };
+
+    await expect(qs.scheduleAssignmentTimeout(timerData, 30000)).rejects.toThrow('Redis down');
+
+    // Counter must be incremented with the correct labels
+    const { metrics } = require('../shared/monitoring/metrics.service');
+    expect(metrics.incrementCounter).toHaveBeenCalledWith(
+      'queue_schedule_failed_total',
+      { timer_type: 'assignment_timeout' }
     );
-    expect(timerKey).toContain('timer:assignment-timeout:asgn-fallback');
+
+    // assignmentTimers Map MUST NOT be populated (no in-memory timer scheduled)
+    expect((qs as any).assignmentTimers.has('asgn-fallback')).toBe(false);
+    expect((qs as any).assignmentTimers.size).toBe(0);
+
+    qs.stop();
+  });
+
+  it('should log an error (not a warn) when Redis setTimer fails', async () => {
+    mockRedisSetTimer.mockRejectedValueOnce(new Error('Redis outage'));
+    const { logger } = require('../shared/services/logger.service');
+    (logger.error as jest.Mock).mockClear();
+
+    const qs = new QueueService();
+    await expect(
+      qs.scheduleAssignmentTimeout(
+        {
+          assignmentId: 'asgn-err-severity',
+          driverId: 'drv-9',
+          driverName: 'Driver',
+          transporterId: 'trans-1',
+          vehicleId: 'veh-1',
+          vehicleNumber: 'KA01AB1234',
+          tripId: 'trip-1',
+          createdAt: new Date().toISOString(),
+        },
+        30000
+      )
+    ).rejects.toThrow('Redis outage');
+
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining('Redis setTimer failed'),
+      expect.objectContaining({
+        assignmentId: 'asgn-err-severity',
+        error: 'Redis outage',
+      })
+    );
     qs.stop();
   });
 

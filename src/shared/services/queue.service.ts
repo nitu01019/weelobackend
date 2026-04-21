@@ -1009,7 +1009,11 @@ export class QueueService {
   private readonly inactiveOrderStatuses = new Set(['cancelled', 'expired', 'completed', 'fully_filled']);
   private readonly orderStatusCacheTtlMs = CANCELLED_ORDER_QUEUE_GUARD_CACHE_TTL_MS;
   private readonly orderStatusCache = new Map<string, { status: string | null; expiresAt: number }>();
-  // FIX-42: Store setTimeout handles for assignment timeouts so they can be cleared on cancel/complete
+  // FIX-42 (legacy): Map used to store setTimeout handles for the in-process
+  // assignment-timer fallback. P5 F7.x removed the fallback (durable-timer
+  // contract); the Map is retained only so cancelAssignmentTimeout can still
+  // defensively clear handles scheduled by older deploys mid-rollout. No new
+  // entries are ever added — see scheduleAssignmentTimeout below.
   private assignmentTimers = new Map<string, NodeJS.Timeout>();
 
   // Queue names for organization
@@ -2021,9 +2025,27 @@ export class QueueService {
    * AFTER:  Redis sorted-set timer (setTimer/getExpiredTimers infrastructure)
    *         - survives restarts, shared across ECS instances.
    *
-   * SAFETY:
-   *   - handleAssignmentTimeout() is 100% idempotent
-   *   - ASSIGNMENT_RECONCILIATION (every 5 min) is the backstop
+   * P5 F7.x (2026-04-21): REMOVED the in-memory setTimeout fallback.
+   * Previously, if Redis setTimer threw, we silently scheduled a setTimeout
+   * whose handle lived in V8 memory — defeating the whole "durable timer"
+   * contract (ECS restart → timer gone → assignment stuck in pending forever
+   * → vehicle stuck on_hold → driver never gets new work).
+   *
+   * NEW CONTRACT: Redis failure → log ERROR, increment metric, rethrow.
+   * Callers are already wrapped in try/catch and handle the rethrow:
+   *   - assignment.service.ts: retries once after 500ms, then compensates by
+   *     marking assignment driver_declined and releasing the vehicle.
+   *   - assignment-dispatch.service.ts / broadcast-accept.service.ts: log CRITICAL
+   *     and continue; ASSIGNMENT_RECONCILIATION (every 2 min) is the backstop.
+   *
+   * BACKSTOPS (all still in place):
+   *   - handleAssignmentTimeout() is 100% idempotent (updateMany CAS on status=pending)
+   *   - ASSIGNMENT_RECONCILIATION queue job scans pending>90s and fires handler
+   *   - Callers compensate inline when retry also fails
+   *
+   * The `assignmentTimers` Map is kept purely for cancellation-path
+   * compatibility with any lingering in-memory entries scheduled before this
+   * change landed (defensive; no new entries are ever added).
    */
   async scheduleAssignmentTimeout(data: {
     assignmentId: string;
@@ -2044,34 +2066,34 @@ export class QueueService {
     try {
       await redisService.setTimer(timerKey, data, expiresAt);
       logger.info(`[TIMER] Assignment timeout set via Redis: ${data.assignmentId} fires in ${delayMs / 1000}s`);
+      return timerKey;
     } catch (err: any) {
-      // Fallback: use in-process setTimeout if Redis is unavailable
-      logger.warn(`[TIMER] Redis setTimer failed, falling back to setTimeout: ${err?.message}`);
-      // FIX-42: Store the setTimeout handle so it can be cleared on cancel/complete
-      const handle = setTimeout(async () => {
-        try {
-          const { assignmentService }: typeof import('../../modules/assignment/assignment.service') = require('../../modules/assignment/assignment.service');
-          await assignmentService.handleAssignmentTimeout(data);
-          logger.info(`[TIMER] setTimeout fallback fired: ${data.assignmentId} (${data.driverName})`);
-        } catch (timeoutErr: any) {
-          logger.error('[TIMER] setTimeout fallback handler failed', {
-            assignmentId: data.assignmentId,
-            error: timeoutErr?.message
-          });
-        } finally {
-          this.assignmentTimers.delete(data.assignmentId);
-        }
-      }, delayMs);
-      this.assignmentTimers.set(data.assignmentId, handle);
-    }
+      // P5 F7.x: NO in-memory fallback. Durable-timer contract demands we fail
+      // loudly so the caller can retry/compensate, and ASSIGNMENT_RECONCILIATION
+      // (every 2 min) is the last-resort safety net.
+      try {
+        metrics.incrementCounter('queue_schedule_failed_total', { timer_type: 'assignment_timeout' });
+      } catch { /* never break the failure path on a metric write */ }
 
-    return timerKey;
+      logger.error('[TIMER] Redis setTimer failed — rethrowing (no in-memory fallback); caller must retry or rely on ASSIGNMENT_RECONCILIATION', {
+        assignmentId: data.assignmentId,
+        driverId: data.driverId,
+        timerKey,
+        delayMs,
+        error: err?.message
+      });
+
+      throw err;
+    }
   }
 
   /**
    * Cancel a scheduled assignment timeout (driver accepted or assignment cancelled).
    * FIX Problem 16: Replaces old clearTimeout pattern with Redis cancelTimer.
-   * FIX-42: Also clears the in-memory setTimeout fallback handle if one exists.
+   * FIX-42 (legacy, P5 F7.x): The in-memory setTimeout fallback was removed, but
+   * we still clear any handle still present in the Map for defensive compatibility
+   * with entries that may have been scheduled by older deploys before the change
+   * landed. No new entries are ever added post-P5.
    */
   async cancelAssignmentTimeout(assignmentId: string): Promise<void> {
     const timerKey = `timer:assignment-timeout:${assignmentId}`;

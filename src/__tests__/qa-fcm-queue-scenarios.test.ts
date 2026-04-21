@@ -633,42 +633,48 @@ describe('QUEUE GROUP 2: Immutable Jobs (FIX-41)', () => {
 // QUEUE GROUP 3: Timer Handles (FIX-42)
 // =============================================================================
 
-describe('QUEUE GROUP 3: Timer Handles (FIX-42)', () => {
+describe('QUEUE GROUP 3: Timer Handles (FIX-42 / P5 F7.x)', () => {
   // We need to reimport queueService to test it, but it has complex
   // constructor-time side effects. Instead we test the patterns used.
 
-  test('source code stores setTimeout handle in assignmentTimers Map', () => {
+  test('P5 F7.x: source code declares assignmentTimers Map but does NOT populate it from scheduleAssignmentTimeout', () => {
     const actualFs = jest.requireActual('fs');
     const source = actualFs.readFileSync(
       require('path').resolve(__dirname, '../shared/services/queue.service.ts'),
       'utf8'
     );
-    // Verify the Map is declared
+    // Map is still declared for defensive legacy-cancel compatibility.
     expect(source).toContain('private assignmentTimers = new Map<string, NodeJS.Timeout>()');
-    // Verify handle is stored after setTimeout
-    expect(source).toContain('this.assignmentTimers.set(data.assignmentId, handle)');
+    // The P5 contract removed the in-process setTimeout fallback, so no new
+    // handle is ever stored with this specific call shape.
+    expect(source).not.toContain('this.assignmentTimers.set(data.assignmentId, handle)');
   });
 
-  test('cancelAssignmentTimeout clears the timer from Map', () => {
+  test('cancelAssignmentTimeout clears the timer from Map (legacy compat)', () => {
     const actualFs = jest.requireActual('fs');
     const source = actualFs.readFileSync(
       require('path').resolve(__dirname, '../shared/services/queue.service.ts'),
       'utf8'
     );
-    // Verify clearTimeout is called
+    // Verify clearTimeout is called (for any lingering legacy entries).
     expect(source).toContain('clearTimeout(timer)');
-    // Verify timer is deleted from Map
+    // Verify timer is deleted from Map.
     expect(source).toContain('this.assignmentTimers.delete(assignmentId)');
   });
 
-  test('timer fires -> handle removed from Map (finally block)', () => {
+  test('P5 F7.x: scheduleAssignmentTimeout rethrows on Redis failure instead of scheduling setTimeout', () => {
     const actualFs = jest.requireActual('fs');
     const source = actualFs.readFileSync(
       require('path').resolve(__dirname, '../shared/services/queue.service.ts'),
       'utf8'
     );
-    // The finally block in the setTimeout callback removes the handle
-    expect(source).toContain('this.assignmentTimers.delete(data.assignmentId)');
+    // No silent fallback log line.
+    expect(source).not.toContain('falling back to setTimeout');
+    // Durable-timer contract markers present.
+    expect(source).toContain("'queue_schedule_failed_total'");
+    expect(source).toContain("timer_type: 'assignment_timeout'");
+    // Redis failure path rethrows (there is a `throw err;` line now).
+    expect(source).toContain('throw err;');
   });
 
   test('cancel non-existent timer -> no crash (pattern simulation)', () => {

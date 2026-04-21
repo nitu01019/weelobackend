@@ -315,10 +315,14 @@ describe('Queue Service Hardening Fixes', () => {
   });
 
   // ===========================================================================
-  // FIX-42: setTimeout handles are stored and can be cleared
+  // FIX-42 / P5 F7.x: Durable-timer contract — Redis failure rethrows.
+  // The in-memory setTimeout fallback was REMOVED in P5 because the handle lived
+  // in V8 memory and was lost on ECS restart, making assignments permanently stuck.
+  // The `assignmentTimers` Map is kept only for legacy cancellation compatibility;
+  // no new entries are added by scheduleAssignmentTimeout.
   // ===========================================================================
-  describe('FIX-42: Assignment timer handle storage and cleanup', () => {
-    it('should store setTimeout handle when Redis setTimer fails', async () => {
+  describe('P5 F7.x (ex-FIX-42): Assignment timer — no in-memory fallback', () => {
+    it('should THROW (not populate assignmentTimers) when Redis setTimer fails', async () => {
       mockSetTimer.mockRejectedValueOnce(new Error('Redis unavailable'));
 
       let queueService: any;
@@ -339,17 +343,56 @@ describe('Queue Service Hardening Fixes', () => {
           createdAt: new Date().toISOString(),
         };
 
-        await queueService.scheduleAssignmentTimeout(assignmentData, 30000);
+        // P5 contract: Redis failure propagates to caller (no in-memory fallback).
+        await expect(
+          queueService.scheduleAssignmentTimeout(assignmentData, 30000)
+        ).rejects.toThrow('Redis unavailable');
 
-        // The timer should be stored in the assignmentTimers map
-        expect(queueService['assignmentTimers'].has('test-assignment-123')).toBe(true);
-        expect(queueService['assignmentTimers'].get('test-assignment-123')).toBeDefined();
+        // assignmentTimers Map MUST NOT be populated.
+        expect(queueService['assignmentTimers'].has('test-assignment-123')).toBe(false);
+        expect(queueService['assignmentTimers'].size).toBe(0);
       } finally {
         queueService?.stop();
       }
     });
 
-    it('should NOT store timer handle when Redis setTimer succeeds', async () => {
+    it('should increment queue_schedule_failed_total on Redis setTimer failure', async () => {
+      mockSetTimer.mockRejectedValueOnce(new Error('Redis unavailable'));
+
+      let queueService: any;
+      let mockedMetrics: any;
+      jest.isolateModules(() => {
+        const mod = require('../shared/services/queue.service');
+        queueService = mod.queueService;
+        mockedMetrics = require('../shared/monitoring/metrics.service').metrics;
+      });
+
+      try {
+        const assignmentData = {
+          assignmentId: 'metric-test-321',
+          driverId: 'driver-1',
+          driverName: 'Test Driver',
+          transporterId: 'transporter-1',
+          vehicleId: 'vehicle-1',
+          vehicleNumber: 'KA-01-1234',
+          tripId: 'trip-1',
+          createdAt: new Date().toISOString(),
+        };
+
+        await expect(
+          queueService.scheduleAssignmentTimeout(assignmentData, 30000)
+        ).rejects.toThrow();
+
+        expect(mockedMetrics.incrementCounter).toHaveBeenCalledWith(
+          'queue_schedule_failed_total',
+          { timer_type: 'assignment_timeout' }
+        );
+      } finally {
+        queueService?.stop();
+      }
+    });
+
+    it('should NOT populate assignmentTimers when Redis setTimer succeeds', async () => {
       mockSetTimer.mockResolvedValueOnce(undefined);
 
       let queueService: any;
@@ -370,44 +413,11 @@ describe('Queue Service Hardening Fixes', () => {
           createdAt: new Date().toISOString(),
         };
 
-        await queueService.scheduleAssignmentTimeout(assignmentData, 30000);
+        const timerKey = await queueService.scheduleAssignmentTimeout(assignmentData, 30000);
+        expect(timerKey).toContain('timer:assignment-timeout:redis-success-789');
 
-        // Redis succeeded, so no in-memory fallback should be stored
+        // Redis succeeded → no in-memory fallback ever stored.
         expect(queueService['assignmentTimers'].has('redis-success-789')).toBe(false);
-      } finally {
-        queueService?.stop();
-      }
-    });
-
-    it('should clear the stored timer handle on cancelAssignmentTimeout', async () => {
-      mockSetTimer.mockRejectedValueOnce(new Error('Redis unavailable'));
-
-      let queueService: any;
-      jest.isolateModules(() => {
-        const mod = require('../shared/services/queue.service');
-        queueService = mod.queueService;
-      });
-
-      try {
-        const assignmentData = {
-          assignmentId: 'cancel-test-456',
-          driverId: 'driver-2',
-          driverName: 'Cancel Driver',
-          transporterId: 'transporter-2',
-          vehicleId: 'vehicle-2',
-          vehicleNumber: 'KA-02-5678',
-          tripId: 'trip-2',
-          createdAt: new Date().toISOString(),
-        };
-
-        await queueService.scheduleAssignmentTimeout(assignmentData, 60000);
-        expect(queueService['assignmentTimers'].has('cancel-test-456')).toBe(true);
-
-        // Cancel the timeout
-        await queueService.cancelAssignmentTimeout('cancel-test-456');
-
-        // Timer should be removed from the map
-        expect(queueService['assignmentTimers'].has('cancel-test-456')).toBe(false);
       } finally {
         queueService?.stop();
       }
@@ -429,8 +439,10 @@ describe('Queue Service Hardening Fixes', () => {
       }
     });
 
-    it('should use clearTimeout with the stored handle on cancel', async () => {
-      mockSetTimer.mockRejectedValueOnce(new Error('Redis unavailable'));
+    it('cancel path still clears lingering legacy Map entries (defensive)', async () => {
+      // P5 F7.x: the Map is retained only to defensively clear stale entries that
+      // may have been populated by older deploys mid-rollout. Simulate a legacy
+      // entry by directly injecting a handle, then verify cancel clears it.
       const clearTimeoutSpy = jest.spyOn(global, 'clearTimeout');
 
       let queueService: any;
@@ -440,25 +452,14 @@ describe('Queue Service Hardening Fixes', () => {
       });
 
       try {
-        const assignmentData = {
-          assignmentId: 'cleartest-999',
-          driverId: 'driver-9',
-          driverName: 'Clear Test',
-          transporterId: 'transporter-9',
-          vehicleId: 'vehicle-9',
-          vehicleNumber: 'KA-09-9999',
-          tripId: 'trip-9',
-          createdAt: new Date().toISOString(),
-        };
+        const legacyHandle = setTimeout(() => {}, 60000);
+        queueService['assignmentTimers'].set('legacy-entry', legacyHandle);
+        expect(queueService['assignmentTimers'].has('legacy-entry')).toBe(true);
 
-        await queueService.scheduleAssignmentTimeout(assignmentData, 30000);
-        const storedHandle = queueService['assignmentTimers'].get('cleartest-999');
-        expect(storedHandle).toBeDefined();
+        await queueService.cancelAssignmentTimeout('legacy-entry');
 
-        await queueService.cancelAssignmentTimeout('cleartest-999');
-
-        // clearTimeout should have been called with the stored handle
-        expect(clearTimeoutSpy).toHaveBeenCalledWith(storedHandle);
+        expect(clearTimeoutSpy).toHaveBeenCalledWith(legacyHandle);
+        expect(queueService['assignmentTimers'].has('legacy-entry')).toBe(false);
       } finally {
         clearTimeoutSpy.mockRestore();
         queueService?.stop();

@@ -408,6 +408,18 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
       'vehicle_release_failed_total',
       'Vehicle release failures by reason (inline_throw vs enqueue_throw)',
     ),
+
+    // === P5 F7.x: Durable assignment timer schedule failure observability ===
+    // Fires inside scheduleAssignmentTimeout() when the primary Redis-backed
+    // setTimer call throws. The in-memory setTimeout fallback has been removed
+    // (P5 contract: timers MUST be durable). A non-zero rate means callers are
+    // rethrowing and relying on their own retry/compensation path or on the
+    // ASSIGNMENT_RECONCILIATION backstop (every 2 min). Labels:
+    //   timer_type = 'assignment_timeout' (reserved for future timer kinds)
+    counter(
+      'queue_schedule_failed_total',
+      'Durable timer schedule failures by timer_type (Redis setTimer rejection; no in-memory fallback)',
+    ),
   ];
 
   for (const def of defs) {

@@ -633,9 +633,10 @@ describe('FIX-41: Immutable job copies', () => {
 });
 
 // ---------------------------------------------------------------------------
-// FIX-42: queue.service.ts has assignmentTimers Map
+// FIX-42 (legacy) / P5 F7.x: assignmentTimers Map kept for cancel-path
+// compatibility; no new entries added by scheduleAssignmentTimeout.
 // ---------------------------------------------------------------------------
-describe('FIX-42: assignmentTimers Map', () => {
+describe('FIX-42 / P5 F7.x: assignmentTimers Map + durable-timer contract', () => {
   const src = readSrc('shared/services/queue.service.ts');
 
   test('contains FIX-42 comment', () => {
@@ -646,11 +647,22 @@ describe('FIX-42: assignmentTimers Map', () => {
     expect(src).toContain('assignmentTimers');
   });
 
-  test('stores setTimeout handles in assignmentTimers', () => {
-    expect(src).toContain('this.assignmentTimers.set(data.assignmentId, handle)');
+  test('P5 F7.x: scheduleAssignmentTimeout does NOT store setTimeout handles', () => {
+    // Old behavior (removed): `this.assignmentTimers.set(data.assignmentId, handle)` in the fallback.
+    expect(src).not.toContain('this.assignmentTimers.set(data.assignmentId, handle)');
   });
 
-  test('clears timer on cancel', () => {
+  test('P5 F7.x: scheduleAssignmentTimeout has no setTimeout fallback', () => {
+    // The durable-timer contract forbids silently scheduling in-process timers.
+    expect(src).not.toContain('falling back to setTimeout');
+  });
+
+  test('P5 F7.x: emits queue_schedule_failed_total counter on Redis failure', () => {
+    expect(src).toContain("'queue_schedule_failed_total'");
+    expect(src).toContain("timer_type: 'assignment_timeout'");
+  });
+
+  test('cancel path still clears lingering legacy handles', () => {
     expect(src).toContain('this.assignmentTimers.delete(assignmentId)');
   });
 });
