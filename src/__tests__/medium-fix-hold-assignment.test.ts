@@ -516,9 +516,11 @@ describe('Issue #42: Cancel uses actual vehicle status for Redis sync', () => {
 // =============================================================================
 describe('Issue #43: Driver busy check uses direct DB query (not stale cache)', () => {
   it('acceptAssignment checks for active assignments via DB findFirst', () => {
-    // H-17 FIX: The code now uses prismaClient.assignment.findFirst instead of
-    // Redis getOrSet cache for the safety-critical driver busy check.
-    // This prevents double-accept when two requests arrive within the cache window.
+    // H-17 + P4 F12.4: The original fix replaced the stale Redis cache with a
+    // direct prismaClient.assignment.findFirst call. P4 F12.4 (A7) moved that
+    // call INSIDE the withDbTimeout Serializable tx (tx.assignment.findFirst)
+    // so the busy precheck observes the same MVCC snapshot as the CAS below —
+    // closing the TOCTOU window that the pre-tx version still had.
     const fs = require('fs');
     const path = require('path');
     const source = fs.readFileSync(
@@ -526,11 +528,11 @@ describe('Issue #43: Driver busy check uses direct DB query (not stale cache)', 
       'utf-8'
     );
 
-    // Must use direct DB query for driver busy check
-    expect(source).toContain('assignment.findFirst');
+    // Must use direct DB query for driver busy check (now inside the tx).
+    expect(source).toContain('tx.assignment.findFirst');
     expect(source).toContain('DRIVER_BUSY');
-    // Comment explains why cache was replaced
-    expect(source).toContain('direct DB query instead of stale cache');
+    // Comment explains why cache was replaced AND why the call was moved inside tx.
+    expect(source).toContain('ONE ACTIVE TRIP PER DRIVER');
   });
 });
 
