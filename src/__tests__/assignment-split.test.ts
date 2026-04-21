@@ -1055,9 +1055,9 @@ describe('4. Response (assignment-response.service.ts)', () => {
 
   test('4.8 acceptAssignment - throws DRIVER_BUSY when driver has another active trip', async () => {
     mockGetAssignmentById.mockResolvedValue(buildAssignment({ status: 'pending' }));
-    // Source code now uses prismaClient.assignment.findFirst for driver busy check
-    const prismaClient = require('../shared/database/prisma.service').prismaClient;
-    prismaClient.assignment.findFirst.mockResolvedValue(buildAssignment({ id: 'other-assignment', status: 'in_transit' }));
+    // P4 F12.4: busy check now runs on tx.assignment.findFirst inside the
+    // Serializable withDbTimeout transaction (was prismaClient.assignment.findFirst).
+    mockTxAssignmentFindFirst.mockResolvedValue(buildAssignment({ id: 'other-assignment', status: 'in_transit' }));
 
     await expect(
       assignmentResponseService.acceptAssignment(ASSIGNMENT_ID, DRIVER_ID)

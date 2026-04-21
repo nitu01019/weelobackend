@@ -8,7 +8,7 @@
  */
 
 import { db, AssignmentRecord } from '../../shared/database/db';
-import { VehicleStatus } from '@prisma/client';
+import { Prisma, VehicleStatus } from '@prisma/client';
 import { prismaClient, withDbTimeout } from '../../shared/database/prisma.service';
 import { AppError } from '../../shared/types/error.types';
 import { logger } from '../../shared/services/logger.service';
@@ -70,28 +70,6 @@ class AssignmentResponseService {
       throw error;
     }
 
-    // =================================================================
-    // RULE: ONE ACTIVE TRIP PER DRIVER (Double-check at accept time)
-    // Even if assignment was created, driver might have accepted another
-    // trip in the meantime. This is the final safety check.
-    // =================================================================
-    // H-17 FIX: Use direct DB query instead of stale cache for the safety-critical
-    // driver busy check. The previous 3s cache could allow double-accept when two
-    // accept requests arrive within the cache window. This is a safety guard so
-    // correctness > performance. Cache is kept below for read-only display purposes.
-    const activeAssignment = await prismaClient.assignment.findFirst({
-      where: {
-        driverId,
-        status: { in: ['pending', 'driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit'] },
-        id: { not: assignmentId },
-      },
-    });
-    if (activeAssignment) {
-      logger.warn(`Driver ${driverId} tried to accept ${assignmentId} but already has active assignment: ${activeAssignment.id}`);
-      throw new AppError(400, 'DRIVER_BUSY',
-        `Driver already has active assignment ${activeAssignment.id}`);
-    }
-
     // Queue job is idempotent: handleAssignmentTimeout() uses updateMany({ where: { status: 'pending' }})
     // so if driver accepted first, the timer no-ops when it fires.
     // No explicit cancellation needed.
@@ -102,8 +80,31 @@ class AssignmentResponseService {
     // BEFORE: Two separate DB writes — assignment update could succeed
     //   but vehicle update could fail, leaving inconsistent state.
     // NOW: Single Prisma transaction — both succeed or both roll back.
+    // P4 F12.6: Serializable isolation so the one-active-trip precheck,
+    //   assignment CAS, and vehicle CAS all observe the same MVCC snapshot.
+    //   P2034 retry is handled by withDbTimeout — no extra loop needed.
     // =====================================================================
     const updated = await withDbTimeout(async (tx) => {
+      // =================================================================
+      // P4 F12.4: ONE ACTIVE TRIP PER DRIVER — inside TX
+      // Moved from outside the tx (was classic TOCTOU): previously two
+      // concurrent accepts could both read "no active trip", then both
+      // proceed to CAS. Running the precheck on the same Serializable
+      // snapshot as the CAS surfaces the race as a P2034 conflict-retry.
+      // =================================================================
+      const activeAssignment = await tx.assignment.findFirst({
+        where: {
+          driverId,
+          status: { in: ['pending', 'driver_accepted', 'en_route_pickup', 'at_pickup', 'in_transit'] },
+          id: { not: assignmentId },
+        },
+      });
+      if (activeAssignment) {
+        logger.warn(`Driver ${driverId} tried to accept ${assignmentId} but already has active assignment: ${activeAssignment.id}`);
+        throw new AppError(400, 'DRIVER_BUSY',
+          `Driver already has active assignment ${activeAssignment.id}`);
+      }
+
       // 1. Atomically update assignment status (only if still pending)
       const updatedAssignment = await tx.assignment.updateMany({
         where: { id: assignmentId, status: 'pending' },
@@ -172,7 +173,11 @@ class AssignmentResponseService {
 
       // Return the updated assignment
       return await tx.assignment.findUnique({ where: { id: assignmentId } });
-    }, { timeoutMs: 8000 });
+    }, {
+      isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+      timeoutMs: 8000,
+      site: 'assignment_accept',
+    });
 
     if (!updated) {
       throw new AppError(500, 'ACCEPT_FAILED', 'Failed to accept assignment');
