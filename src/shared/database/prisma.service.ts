@@ -448,9 +448,12 @@ export async function withDbTimeout<T>(
     timeoutMs?: number;
     /** Max retries for serializable conflicts (P2034). Default: 3. Industry standard. */
     maxRetries?: number;
+    /** P4 F2.NEW-1: metric label so dashboards can localize retry hot spots. */
+    site?: string;
   } = {}
 ): Promise<T> {
   const timeoutMs = options.timeoutMs ?? DB_STATEMENT_TIMEOUT_MS;
+  const metricSite = options.site ?? 'unknown';
   // =====================================================================
   // INDUSTRY STANDARD: Automatic retry for serializable conflicts
   // =====================================================================
@@ -491,6 +494,11 @@ export async function withDbTimeout<T>(
         // Exponential backoff: 100ms, 200ms, 400ms
         const backoffMs = 100 * Math.pow(2, attempt - 1);
         logger.warn(`[withDbTimeout] Serializable conflict (${prismaCode}), retry ${attempt}/${maxRetries} after ${backoffMs}ms`);
+        // P4 F2.NEW-1: observability for serializable retries.
+        try {
+          const { metrics } = require('../monitoring/metrics.service');
+          metrics.incrementCounter('tx_serializable_conflict_total', { site: metricSite, outcome: 'retry', code: prismaCode });
+        } catch { /* metrics optional — never block the retry */ }
         await new Promise(resolve => setTimeout(resolve, backoffMs));
         continue;
       }
@@ -500,6 +508,10 @@ export async function withDbTimeout<T>(
         logger.error(`[withDbTimeout] Serializable conflict persisted after ${maxRetries} retries`, {
           error: error instanceof Error ? sanitizeDbError(error.message) : String(error),
         });
+        try {
+          const { metrics } = require('../monitoring/metrics.service');
+          metrics.incrementCounter('tx_serializable_conflict_total', { site: metricSite, outcome: 'exhausted', code: prismaCode });
+        } catch { /* metrics optional */ }
         const { AppError } = require('../types/error.types');
         throw new AppError(
           409,

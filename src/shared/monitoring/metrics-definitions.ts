@@ -366,6 +366,17 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
       'fcm_quota_consumed_total',
       'FCM quota consumed per send success (F14.5) — labels: type, tokens_bucket',
     ),
+
+    // === P4 F2.NEW-1: Serializable transaction retry observability ===
+    // Fires each time withDbTimeout retries after P2034 (serializable conflict)
+    // or P2028 (transaction already closed). Labels: `site` identifies the
+    // caller (e.g. 'confirmed_hold_init') so dashboards can localize hot spots;
+    // `outcome` is 'retry' for a successful retry or 'exhausted' when all
+    // retries fail and the 409 TRANSACTION_CONFLICT surfaces to the client.
+    counter(
+      'tx_serializable_conflict_total',
+      'Serializable transaction conflicts by site and outcome (retry|exhausted)',
+    ),
   ];
 
   for (const def of defs) {

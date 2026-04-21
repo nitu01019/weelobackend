@@ -29,7 +29,9 @@
  */
 
 import { v4 as uuidv4 } from 'uuid';
-import { prismaClient, HoldPhase, AssignmentStatus } from '../../shared/database/prisma.service';
+import { Prisma } from '@prisma/client';
+import { prismaClient, withDbTimeout, HoldPhase, AssignmentStatus } from '../../shared/database/prisma.service';
+import { AppError } from '../../shared/types/error.types';
 import { logger } from '../../shared/services/logger.service';
 import { redisService } from '../../shared/services/redis.service';
 import { socketService, SocketEvent } from '../../shared/services/socket.service';
@@ -140,11 +142,22 @@ class ConfirmedHoldService {
       assignmentsCount: assignments.length,
     });
 
+    // P4 F2.2/F2.8/F2.NEW-1: scope assignment IDs + pessimistic lock on TruckRequest
+    // rows + Serializable isolation all live inside withDbTimeout so the retry/timeout
+    // wrapper at src/shared/database/prisma.service.ts:444 covers the whole critical
+    // section. Returning cross-tenant rows or racing sibling flex-holds is no longer
+    // possible because (a) the assignment findMany is now scoped by transporterId and
+    // (b) the matching TruckRequest rows are SELECT ... FOR UPDATE locked inside the TX.
+    const assignmentIds = assignments.map(a => a.assignmentId);
+    const truckRequestIds = assignments
+      .map(a => a.truckRequestId)
+      .filter((v): v is string => typeof v === 'string' && v.length > 0);
+
     try {
       // H-8 FIX: Wrap read-check-write in a Prisma $transaction with SELECT FOR UPDATE
       // to prevent TOCTOU race where two concurrent requests both read phase=FLEX
       // and both update to CONFIRMED.
-      const txResult = await prismaClient.$transaction(async (tx) => {
+      const txResult = await withDbTimeout(async (tx) => {
         // F-A-75: row-locked KYC+isActive re-check (same TX as the phase transition).
         await validateActorEligibility(tx, transporterId, 'confirmed_hold');
 
@@ -208,6 +221,62 @@ class ConfirmedHoldService {
           now.getTime() + this.config.maxDurationSeconds * 1000
         );
 
+        // P4 F2.8: Pessimistic lock the caller's TruckRequest rows INSIDE the tx.
+        // Blocks sibling flex-hold/confirmed-hold operations on the same rows until
+        // we commit, and — combined with the `heldById` filter — makes it impossible
+        // to acquire a confirmed hold over rows owned by a different transporter.
+        if (truckRequestIds.length > 0) {
+          const lockedRows = await tx.$queryRaw<Array<{ id: string }>>`
+            SELECT id
+            FROM "TruckRequest"
+            WHERE id = ANY(${truckRequestIds}::text[])
+              AND "heldById" = ${transporterId}
+            FOR UPDATE
+          `;
+          if (lockedRows.length !== truckRequestIds.length) {
+            // Cross-tenant attempt OR caller submitted stale truck-request ids.
+            // Surface as 403 FORBIDDEN_REQUEST — same shape as F2.2 throw below.
+            throw new AppError(
+              403,
+              'FORBIDDEN_REQUEST',
+              `Expected ${truckRequestIds.length} truck requests held by transporter ${transporterId}; found ${lockedRows.length}`,
+            );
+          }
+        }
+
+        // P4 F2.2: Scope the assignment fetch by transporterId BEFORE the phase flip
+        // so an attacker cannot hand us another tenant's assignment IDs and have
+        // this service leak their driver / vehicle / trip data via the fanout
+        // payload below. Fetching inside the tx also closes the post-commit
+        // TOCTOU window where an assignment could be reassigned between the
+        // ledger flip and the findMany.
+        const assignmentsData = await tx.assignment.findMany({
+          where: {
+            id: { in: assignmentIds },
+            transporterId,
+          },
+          select: {
+            id: true,
+            driverId: true,
+            driverName: true,
+            transporterId: true,
+            vehicleId: true,
+            vehicleNumber: true,
+            vehicleType: true,
+            tripId: true,
+            orderId: true,
+            bookingId: true,
+            truckRequestId: true,
+          },
+        });
+        if (assignmentsData.length !== assignmentIds.length) {
+          throw new AppError(
+            403,
+            'FORBIDDEN_REQUEST',
+            `Expected ${assignmentIds.length} assignments owned by transporter ${transporterId}; found ${assignmentsData.length}`,
+          );
+        }
+
         // Update hold to confirmed phase (within the same TX that holds the row lock)
         const updated = await tx.truckHoldLedger.update({
           where: { holdId },
@@ -222,7 +291,11 @@ class ConfirmedHoldService {
           },
         });
 
-        return { success: true as const, updated, now, confirmedExpiresAt };
+        return { success: true as const, updated, now, confirmedExpiresAt, assignmentsData };
+      }, {
+        isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+        timeoutMs: 10_000,
+        site: 'confirmed_hold_init',
       });
 
       // Handle early-return cases from the transaction
@@ -243,12 +316,28 @@ class ConfirmedHoldService {
         };
       }
 
-      // Transaction succeeded with a phase transition — extract results
-      const { updated, now, confirmedExpiresAt } = txResult as {
+      // Transaction succeeded with a phase transition — extract results.
+      // P4 F2.2: assignmentsData now flows out of the same tx that did the ledger
+      // flip + truck-request FOR UPDATE, so fanout below always runs against the
+      // transporter-scoped view the tx validated (no post-commit re-fetch leak).
+      const { updated, now, confirmedExpiresAt, assignmentsData } = txResult as {
         success: true;
         updated: { orderId: string; transporterId: string; quantity: number };
         now: Date;
         confirmedExpiresAt: Date;
+        assignmentsData: Array<{
+          id: string;
+          driverId: string;
+          driverName: string;
+          transporterId: string;
+          vehicleId: string;
+          vehicleNumber: string;
+          vehicleType: string;
+          tripId: string | null;
+          orderId: string | null;
+          bookingId: string | null;
+          truckRequestId: string | null;
+        }>;
       };
 
       // Cache state
@@ -269,30 +358,6 @@ class ConfirmedHoldService {
       // Schedule expiry cleanup job (Layer 1)
       await holdExpiryCleanupService.scheduleConfirmedHoldCleanup(holdId, confirmedExpiresAt);
       logger.debug('[CONFIRMED HOLD] Cleanup job scheduled', { holdId });
-
-      // ================================================================
-      // FIX #3: Fetch full assignment data with driver and vehicle info
-      // ================================================================
-      const assignmentIds = assignments.map(a => a.assignmentId);
-
-      const assignmentsData = await prismaClient.assignment.findMany({
-        where: {
-          id: { in: assignmentIds }
-        },
-        select: {
-          id: true,
-          driverId: true,
-          driverName: true,
-          transporterId: true,
-          vehicleId: true,
-          vehicleNumber: true,
-          vehicleType: true,
-          tripId: true,
-          orderId: true,
-          bookingId: true,
-          truckRequestId: true,
-        }
-      });
 
       // Create a map for quick lookup
       const assignmentMap = new Map(
@@ -447,10 +512,30 @@ class ConfirmedHoldService {
         logger.warn('[CONFIRMED HOLD] Eligibility denied', { code: error.code, transporterId, holdId });
         return { success: false, message: error.message, errorCode: error.code, httpStatus: 403 };
       }
+      // P4 F2.2/F2.8/F2.NEW-1: surface cross-tenant FORBIDDEN_REQUEST and
+      // TRANSACTION_CONFLICT (withDbTimeout wraps exhausted P2034 retries as 409)
+      // with their intended HTTP status instead of collapsing to 500.
+      if (error instanceof AppError) {
+        logger.warn('[CONFIRMED HOLD] AppError from tx', {
+          code: error.code,
+          statusCode: error.statusCode,
+          transporterId,
+          holdId,
+        });
+        return {
+          success: false,
+          message: error.message,
+          errorCode: error.code,
+          httpStatus: error.statusCode,
+        };
+      }
       logger.error('[CONFIRMED HOLD] Failed to initialize confirmed hold', {
         error: error.message,
+        stack: error.stack,
         holdId,
       });
+      // eslint-disable-next-line no-console
+      if (process.env.NODE_ENV === 'test') console.error('DEBUG initializeConfirmedHold error:', error);
 
       return {
         success: false,
