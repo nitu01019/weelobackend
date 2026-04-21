@@ -168,6 +168,23 @@ const mockTxAssignmentFindFirst = jest.fn();
 const mockTxAssignmentCreate = jest.fn();
 const mockTxVehicleUpdateMany = jest.fn();
 const mockTxAssignmentUpdate = jest.fn();
+// P4 F12.1 (A6): acceptAssignment path now reads pre-CAS vehicle inside the tx
+// to capture status/vehicleKey/transporterId for the VehicleTransitionOutbox
+// INSERT. Default status 'on_hold' matches the normal two-phase-hold flow; the
+// CAS at L181 accepts from on_hold OR available, so tests can still override
+// via mockTxVehicleFindUnique.mockResolvedValueOnce(...) for legacy scenarios.
+const mockTxVehicleFindUnique = jest.fn().mockResolvedValue({
+  status: 'on_hold',
+  vehicleKey: 'KA-01-AB-0000',
+  transporterId: 'TRANSPORTER_1',
+});
+// P4 F12.3 (A8): acceptAssignment path looks up the hold ledger inside the tx
+// so guardedConfirmFlexToConfirmed is a no-op when phase is already CONFIRMED.
+// Returning null is the typical two-phase flow state at accept-time — the
+// transporter has already flipped FLEX→CONFIRMED before drivers accept.
+// Tests that exercise the F12.3 guarded flip branch can override this per-test.
+const mockTxTruckHoldLedgerFindFirst = jest.fn().mockResolvedValue(null);
+const mockTxTruckHoldLedgerUpdateMany = jest.fn().mockResolvedValue({ count: 0 });
 
 const mockTx = {
   $executeRawUnsafe: jest.fn().mockResolvedValue(0),
@@ -182,6 +199,13 @@ const mockTx = {
   },
   vehicle: {
     updateMany: (...args: any[]) => mockTxVehicleUpdateMany(...args),
+    // P4 F12.1 (A6): in-tx pre-CAS vehicle read for VehicleTransitionOutbox payload.
+    findUnique: (...args: any[]) => mockTxVehicleFindUnique(...args),
+  },
+  truckHoldLedger: {
+    // P4 F12.3 (A8): in-tx ledger lookup for guarded FLEX→CONFIRMED flip.
+    findFirst: (...args: any[]) => mockTxTruckHoldLedgerFindFirst(...args),
+    updateMany: (...args: any[]) => mockTxTruckHoldLedgerUpdateMany(...args),
   },
   truckRequest: {
     updateMany: jest.fn().mockResolvedValue({ count: 1 }),
@@ -761,9 +785,11 @@ describe('Assignment Under Load', () => {
     });
 
     it('should reject accept if driver already has another active trip', async () => {
-      // Source code uses prismaClient.assignment.findFirst (outside tx) for driver busy check
-      const { prismaClient } = require('../shared/database/prisma.service');
-      prismaClient.assignment.findFirst.mockResolvedValueOnce(makeAssignment({ id: 'asgn-2', tripId: 'trip-2' }));
+      // P4 F12.4 (A7): driver busy check moved INSIDE withDbTimeout Serializable tx
+      // so we mock tx.assignment.findFirst (via mockTxAssignmentFindFirst) instead
+      // of the pre-P4 prismaClient.assignment.findFirst. Same TOCTOU-free semantics;
+      // mock now matches the MVCC-snapshot tx-scoped precheck the service performs.
+      mockTxAssignmentFindFirst.mockResolvedValueOnce(makeAssignment({ id: 'asgn-2', tripId: 'trip-2' }));
       await expect(
         assignmentResponseService.acceptAssignment('asgn-1', 'drv-1')
       ).rejects.toThrow(/already.*active/i);
@@ -797,6 +823,47 @@ describe('Assignment Under Load', () => {
         r => r.status === 'fulfilled' && !(r.value instanceof Error)
       );
       expect(successes.length).toBe(1);
+    });
+
+    it('10 parallel accepts on same assignment — 1 success + 9× VEHICLE_STATE_CHANGED (P4 F12.2)', async () => {
+      // P4 F12.1+F12.2 exercise: acceptAssignment now does a pre-CAS vehicle
+      // read INSIDE the Serializable tx, then a guarded updateMany with
+      // `status IN ('on_hold','available')`. When 10 concurrent accepts race,
+      // exactly 1 mutates the vehicle row; the other 9 hit the fail-closed
+      // branch (casResult.count === 0) and throw AppError 409
+      // 'VEHICLE_STATE_CHANGED'. Before P4 this was a silent-succeed
+      // double-accept — the 9 losers would also reach post-commit side
+      // effects. Assert on the error code name so the contract change is
+      // pinned, not just the count.
+      let winner = false;
+      mockTxVehicleUpdateMany.mockImplementation(async () => {
+        if (!winner) {
+          winner = true;
+          return { count: 1 };
+        }
+        return { count: 0 };
+      });
+      // Assignment CAS must succeed for all 10 so they all reach the vehicle CAS
+      // — this isolates the F12.2 vehicle-level guard.
+      mockTxAssignmentUpdateMany.mockResolvedValue({ count: 1 });
+
+      const results = await Promise.allSettled(
+        Array.from({ length: 10 }, () =>
+          assignmentResponseService.acceptAssignment('asgn-1', 'drv-1')
+        )
+      );
+
+      const successes = results.filter(r => r.status === 'fulfilled');
+      const failures = results.filter(r => r.status === 'rejected');
+      expect(successes).toHaveLength(1);
+      expect(failures).toHaveLength(9);
+      for (const f of failures) {
+        if (f.status === 'rejected') {
+          const err = f.reason as { code?: string; statusCode?: number };
+          expect(err.code).toBe('VEHICLE_STATE_CHANGED');
+          expect(err.statusCode).toBe(409);
+        }
+      }
     });
 
     it('should cancel Redis timeout after successful accept', async () => {
