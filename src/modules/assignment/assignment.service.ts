@@ -30,6 +30,10 @@ import { enqueueCompletionLifecycleOutbox } from '../order/order-lifecycle-outbo
 import type { TripCompletedOutboxPayload } from '../order/order-types';
 import { tryAutoRedispatch } from './auto-redispatch.service';
 import { completeTrip } from './completion-orchestrator';
+// P4 F12.7: lazy require for acquireAcceptLock/releaseAcceptLock to avoid eager
+// load of hold-state-machine via assignment-response.service.ts at module init,
+// which breaks tests that mock prisma client without a HoldPhase enum.
+import type { acquireAcceptLock as AcquireAcceptLock, releaseAcceptLock as ReleaseAcceptLock } from './assignment-response.service';
 import { FLAGS, isEnabled } from '../../shared/config/feature-flags';
 
 // =============================================================================
@@ -724,15 +728,23 @@ class AssignmentService {
     });
 
     // =====================================================================
-    // FIX C-11: Redis-based idempotency guard — prevents double side effects
-    // on mobile retries. CAS guard protects DB, this protects everything after.
-    // Pattern: assignment-response.service.ts:156
+    // FIX C-11 / P4 F12.7: Redis-based idempotency guard — prevents double
+    // side effects on mobile retries. CAS guard protects DB, this protects
+    // everything after. Unified with assignment-response.service.ts via
+    // acquireAcceptLock helper:
+    //   - 30s TTL bounds blast radius if process dies before release.
+    //   - try/finally guarantees release on success AND error.
     // =====================================================================
-    const sideEffectKey = `side-effect:accept:${assignmentId}`;
-    const sideEffectLock = await redisService.acquireLock(sideEffectKey, 'accept-guard', 300);
-    if (!sideEffectLock.acquired) {
+    // P4 F12.7: lazy require — see import-comment at top of file.
+    const acceptLockMod = require('./assignment-response.service') as {
+      acquireAcceptLock: typeof AcquireAcceptLock;
+      releaseAcceptLock: typeof ReleaseAcceptLock;
+    };
+    const acceptLockToken = await acceptLockMod.acquireAcceptLock(assignmentId);
+    if (acceptLockToken === null) {
       logger.info(`[ASSIGNMENT] Skipping duplicate side effects for ${assignmentId}`);
     } else {
+    try {
 
     // =====================================================================
     // Post-transaction: Update Redis availability (non-fatal)
@@ -912,6 +924,11 @@ class AssignmentService {
       }
     }
 
+    } finally {
+      // P4 F12.7: release lock on BOTH success and error paths so the next
+      // accept attempt for this assignment doesn't have to wait for TTL.
+      await acceptLockMod.releaseAcceptLock(assignmentId, acceptLockToken);
+    }
     } // end FIX C-11 side-effect idempotency guard
 
     logger.info(`Assignment accepted: ${assignmentId} by driver ${driverId}`);

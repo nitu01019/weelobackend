@@ -27,6 +27,52 @@ import { HOLD_CONFIG } from '../../core/config/hold-config';
 // RESPONSE SERVICE
 // =============================================================================
 
+/**
+ * P4 F12.7: unified accept-path Redis lock helper.
+ *
+ * Both accept paths (`AssignmentResponseService.acceptAssignment` here and
+ * `AssignmentService.acceptAssignment` in `assignment.service.ts`) acquire
+ * the same `side-effect:accept:{assignmentId}` lock so concurrent accepts
+ * are serialized at the app layer above the Serializable DB tx.
+ *
+ * TTL 30s bounds the leak window if the process dies between acquire and
+ * release. Callers MUST release in a `finally` block.
+ *
+ * @returns the lock holder token on success (pass back to releaseAcceptLock),
+ *          or `null` if the lock was already held by another path.
+ */
+export const ACCEPT_LOCK_TTL_SECONDS = 30;
+
+export async function acquireAcceptLock(
+  assignmentId: string,
+  ttlSeconds: number = ACCEPT_LOCK_TTL_SECONDS
+): Promise<string | null> {
+  const lockKey = `side-effect:accept:${assignmentId}`;
+  const holderToken = `accept:${assignmentId}:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
+  const result = await redisService.acquireLock(lockKey, holderToken, ttlSeconds);
+  return result.acquired ? holderToken : null;
+}
+
+export async function releaseAcceptLock(
+  assignmentId: string,
+  holderToken: string
+): Promise<void> {
+  const lockKey = `side-effect:accept:${assignmentId}`;
+  try {
+    await redisService.releaseLock(lockKey, holderToken);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.warn('redis_lock_release_failed', {
+      op: 'accept_lock_release',
+      assignmentId,
+      err: message,
+    });
+    metrics.incrementCounter('redis_lock_release_failed_total', {
+      op: 'accept_lock_release',
+    });
+  }
+}
+
 class AssignmentResponseService {
   private resolveAssignmentStreamId(assignment: AssignmentRecord): string | undefined {
     return assignment.bookingId || assignment.orderId;
@@ -277,17 +323,18 @@ class AssignmentResponseService {
     });
 
     // =====================================================================
-    // FIX C-10: Redis-based idempotency guard — prevents double side effects
-    // when both confirmed-hold.service and assignment-response.service
-    // process the same acceptance. The first path to acquire wins; the
-    // second path skips all post-accept side effects.
-    // Uses the same key pattern as confirmed-hold.service.ts.
+    // FIX C-10 / P4 F12.7: Redis-based idempotency guard — prevents double
+    // side effects when both confirmed-hold.service and this path process
+    // the same acceptance. First path to acquire wins; second path skips.
+    // Unified with assignment.service.ts via acquireAcceptLock helper:
+    //   - 30s TTL bounds blast radius if process dies before release.
+    //   - try/finally guarantees release on success AND error.
     // =====================================================================
-    const sideEffectKey = `side-effect:accept:${assignmentId}`;
-    const sideEffectLock = await redisService.acquireLock(sideEffectKey, 'assignment-response', 300);
-    if (!sideEffectLock.acquired) {
+    const acceptLockToken = await acquireAcceptLock(assignmentId);
+    if (acceptLockToken === null) {
       logger.info(`[ASSIGNMENT] Skipping duplicate side effects for assignment ${assignmentId} (already applied by another path)`);
     } else {
+    try {
 
     // =====================================================================
     // Post-transaction: Update Redis availability (non-fatal)
@@ -433,6 +480,11 @@ class AssignmentResponseService {
       });
     }
 
+    } finally {
+      // P4 F12.7: release lock on BOTH success and error paths so the next
+      // accept attempt for this assignment doesn't have to wait for TTL.
+      await releaseAcceptLock(assignmentId, acceptLockToken);
+    }
     } // end FIX C-10 idempotency guard
 
     logger.info(`Assignment accepted: ${assignmentId} by driver ${driverId}`);
