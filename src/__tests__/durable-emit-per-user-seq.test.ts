@@ -248,7 +248,11 @@ describe('F-B-26: Per-User Monotonic Sequence', () => {
   });
 
   it('with FF off, no per-user INCR calls are made — baseline preserved', () => {
-    delete process.env.FF_DURABLE_EMIT_ENABLED;
+    // P4 F2.1 follow-up (commit 4af3eb1f) flipped
+    // DURABLE_EMIT_ENABLED.defaultValue to true. Explicitly set to 'false'
+    // instead of `delete` so this assertion exercises the pre-F-B-26 legacy
+    // path (env-driven kill switch per feature-flags.ts:262-263).
+    process.env.FF_DURABLE_EMIT_ENABLED = 'false';
     const { fakeIo } = makeFakeIo(new Map());
     socketService.__setIoForTesting(fakeIo, new Map());
 

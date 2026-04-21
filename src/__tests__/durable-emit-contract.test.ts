@@ -155,7 +155,13 @@ describe('F-B-26: Durable Emit Contract', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockSeqByKey.clear();
-    delete process.env.FF_DURABLE_EMIT_ENABLED;
+    // P4 F2.1 follow-up (commit 4af3eb1f) flipped feature-flags.ts
+    // DURABLE_EMIT_ENABLED.defaultValue to true as part of the C-2 rollout
+    // decision. Explicitly disable the flag via the env var so the "off/unset"
+    // baseline assertions still exercise the pre-F-B-26 code path. Using the
+    // kill-switch env override (per feature-flags.ts:262-263) instead of
+    // `delete` because the default is now implicit-on.
+    process.env.FF_DURABLE_EMIT_ENABLED = 'false';
   });
 
   describe('FF_DURABLE_EMIT_ENABLED off/unset (baseline — pre-F-B-26 behaviour preserved)', () => {
