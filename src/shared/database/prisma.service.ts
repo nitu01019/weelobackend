@@ -304,10 +304,10 @@ function getPrismaClient(): PrismaClient {
     ].join('&');
     const pooledUrl = `${databaseUrl}${separator}connection_limit=${DB_POOL_CONFIG.connectionLimit}&pool_timeout=${DB_POOL_CONFIG.poolTimeout}${timeoutParams ? '&' + timeoutParams : ''}`;
 
+    // A12-006 P4-B: NEVER include 'query' in log — query logs contain PII/SQL.
+    // In production only 'error'; in non-production add 'warn' for diagnostics.
     prisma = new PrismaClient({
-      log: process.env.NODE_ENV === 'development'
-        ? ['query', 'error', 'warn']
-        : ['error', 'warn'],
+      log: process.env.NODE_ENV === 'production' ? ['error'] : ['error', 'warn'],
       datasources: {
         db: {
           url: pooledUrl,
@@ -2023,10 +2023,9 @@ function getReadReplicaClient(): PrismaClient {
   const separator = replicaUrl.includes('?') ? '&' : '?';
   const pooledReplicaUrl = `${replicaUrl}${separator}connection_limit=${readPoolLimit}&pool_timeout=${DB_POOL_CONFIG.poolTimeout}`;
 
+  // A12-006 P4-B: same guard as primary client — no 'query' logging ever.
   prismaRead = new PrismaClient({
-    log: process.env.NODE_ENV === 'development'
-      ? ['query', 'error', 'warn']
-      : ['error', 'warn'],
+    log: process.env.NODE_ENV === 'production' ? ['error'] : ['error', 'warn'],
     datasources: {
       db: {
         url: pooledReplicaUrl,

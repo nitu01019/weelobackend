@@ -2091,6 +2091,11 @@ export class QueueService {
     orderId?: string;      // Optional for multi-truck system
     truckRequestId?: string; // Optional for multi-truck system
   }, delayMs: number): Promise<string> {
+    // TODO A12-006 Part B §2.5 P4-D (Phase 7): Strip `driverName` from the
+    // Redis timer payload before setTimer() — it is a PII field that must not
+    // persist in Redis. The handleAssignmentTimeout() consumer must be updated
+    // to re-fetch the name from the DB on read rather than trusting the stored
+    // value. Deferred to Phase 7 which owns the timer-payload schema migration.
     const timerKey = `timer:assignment-timeout:${data.assignmentId}`;
     const expiresAt = new Date(Date.now() + delayMs);
 

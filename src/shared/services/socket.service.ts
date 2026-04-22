@@ -46,6 +46,7 @@ import {
   ONLINE_TRANSPORTERS_SET
 } from './transporter-online.service';
 import { z } from 'zod';
+import { maskPhoneForLog } from '../utils/pii.utils';
 
 // =============================================================================
 // A12-010 / A13-012: dispatch_ack Zod schema (P3-F / P3-E amend)
@@ -359,10 +360,13 @@ export function initializeSocket(server: HttpServer): Server {
     const role = socket.data.role;
     const phone = socket.data.phone;
 
-    logger.info(`🔌 Socket connected: ${socket.id}`);
-    logger.info(`   👤 User: ${userId}`);
-    logger.info(`   📱 Phone: ${phone}`);
-    logger.info(`   🏷️ Role: ${role}`);
+    // A12-006 P4-T09 + P4-T10: structured log, no raw PII, no emoji in message text
+    logger.info('Socket connected', {
+      socketId: socket.id,
+      userId,
+      role,
+      phoneLast4: maskPhoneForLog(phone),
+    });
 
     // Track user connection (with limit to prevent abuse)
     if (!userSockets.has(userId)) {

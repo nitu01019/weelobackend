@@ -631,4 +631,63 @@ describe('Socket Service Hardening Fixes', () => {
       expect(hists.has('driver_overlay_ack_latency_ms')).toBe(true);
     });
   });
+
+  // ===========================================================================
+  // P4-T41 (A12-006): Socket connect log must not expose raw phone number
+  // ===========================================================================
+  describe('P4-T41: Socket connect log PII scrub (A12-006)', () => {
+    it('socket.service.ts does not log raw phone in connection handler', () => {
+      const fs = require('fs');
+      const path = require('path');
+      const source: string = fs.readFileSync(
+        path.resolve(__dirname, '../shared/services/socket.service.ts'),
+        'utf-8'
+      );
+      // The old patterns that expose raw PII must not appear
+      expect(source).not.toContain('📱 Phone: ${phone}');
+      expect(source).not.toContain("Phone: `${phone}`");
+      expect(source).not.toContain('Phone: ${phone}');
+    });
+
+    it('socket.service.ts uses maskPhoneForLog in the connection handler', () => {
+      const fs = require('fs');
+      const path = require('path');
+      const source: string = fs.readFileSync(
+        path.resolve(__dirname, '../shared/services/socket.service.ts'),
+        'utf-8'
+      );
+      expect(source).toContain('maskPhoneForLog(phone)');
+    });
+
+    it('maskPhoneForLog at log-transport boundary emits only last-4 digits', () => {
+      const { maskPhoneForLog } = require('../shared/utils/pii.utils');
+      // Full phone — only last 4 chars must appear in the output
+      const fullPhone = '9876543210';
+      const masked = maskPhoneForLog(fullPhone);
+      // Must end with the last 4 digits
+      expect(masked).toMatch(/3210$/);
+      // Must NOT expose the full number verbatim
+      expect(masked).not.toBe(fullPhone);
+      // Must NOT be longer than the input without masking characters
+      expect(masked.replace(/\*/g, '').length).toBeLessThanOrEqual(4);
+    });
+
+    it('maskPhoneForLog returns empty string for null/undefined', () => {
+      const { maskPhoneForLog } = require('../shared/utils/pii.utils');
+      expect(maskPhoneForLog(null)).toBe('');
+      expect(maskPhoneForLog(undefined)).toBe('');
+    });
+
+    it('connection log uses structured meta object (not template-string message)', () => {
+      const fs = require('fs');
+      const path = require('path');
+      const source: string = fs.readFileSync(
+        path.resolve(__dirname, '../shared/services/socket.service.ts'),
+        'utf-8'
+      );
+      // Structured logging pattern must be present
+      expect(source).toContain("logger.info('Socket connected', {");
+      expect(source).toContain('phoneLast4: maskPhoneForLog(phone)');
+    });
+  });
 });
