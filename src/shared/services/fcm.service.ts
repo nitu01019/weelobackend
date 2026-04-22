@@ -1,3 +1,31 @@
+// =============================================================================
+// FCM SERVICE ROTATION RUNBOOK
+// =============================================================================
+//
+// CREDENTIAL ROTATION (perform during low-traffic window, ~03:00 IST):
+//   1. Generate new service-account key in Firebase Console (IAM → Service Accounts).
+//   2. Base64-encode: base64 -w0 new-key.json > new-key.b64
+//   3. Store in AWS Secrets Manager as FIREBASE_PRIVATE_KEY_B64 (new version).
+//   4. Update ECS Task Definition env with new secret version ARN — do NOT redeploy yet.
+//   5. Verify staging ECS task picks up new key (watch fcm_init_missing_config counter).
+//   6. Boot dry-run fires on startup — confirm fcm_boot_dry_run_latency_ms histogram
+//      has a new data point with no auth-error class in CloudWatch.
+//   7. Promote to production with blue-green swap. Old key still valid ~24h.
+//   8. After 24h with no fcm_init_missing_config events, revoke old key in Firebase Console.
+//
+// MONITORING ALERTS (CloudWatch / Datadog):
+//   - fcm_init_missing_config > 0 for 1 min   → CRITICAL: credential pipeline broken
+//   - fcm_egress_rate_limited_total > 0        → WARN: burst exceeds 8K/s token bucket
+//   - fcm_multicast_failure_ratio > 0.02       → AUTO-REVERT: set FF_FCM_MULTICAST_ENABLED=false
+//   - fcm_send_connection_reuse_ratio < 0.8    → WARN: HTTP keep-alive not working
+//   - fcm_dead_token_cleanup_total spike        → INFO: token churn expected after app update
+//
+// EMERGENCY KILL SWITCHES:
+//   FF_FCM_MULTICAST_ENABLED=false  → revert to per-user sendToUser path
+//   FF_FCM_DATA_ONLY_FULLSCREEN=false → revert to notification+data payload
+//   FCM_FAIL_FAST_IN_PROD=false     → allow mock mode if credentials unavailable
+// =============================================================================
+
 /**
  * =============================================================================
  * FCM SERVICE - Firebase Cloud Messaging for Push Notifications
@@ -27,6 +55,7 @@
  */
 
 import fs from 'fs';
+import * as https from 'https';
 import { createHash } from 'crypto';
 import { logger } from './logger.service';
 import { redisService } from './redis.service';
@@ -116,14 +145,66 @@ class FCMService {
   private admin: any = null;
   private mockModeReason?: string;
 
-  /** FCM error codes that should never be retried (token invalid, credential mismatch, etc.) */
+  /**
+   * FCM error codes that should never be retried.
+   * P7-T02 (A05-011): Added authentication-error, unauthorized, sender-id-mismatch.
+   * These indicate a permanent credential or project mismatch — retrying wastes
+   * ~450K API calls/day at Weelo's volume and never recovers without operator action.
+   */
   private static readonly NON_RETRYABLE_FCM_ERRORS = new Set([
     'messaging/registration-token-not-registered',
     'messaging/invalid-registration-token',
     'messaging/invalid-argument',
     'messaging/mismatched-credential',
     'messaging/third-party-auth-error',
+    // P7-T02 additions — credential/project mismatches are permanent errors
+    'messaging/authentication-error',
+    'messaging/unauthorized',
+    'messaging/sender-id-mismatch',
   ]);
+
+  // ===========================================================================
+  // P7-T01 (A05-002 / Part B P7-F): In-process egress token bucket for FCM.
+  // Google's FCM quota is 10K msgs/s per project. At 100 concurrent goroutines
+  // × 500 tokens = 50K msgs/s burst is possible without a gate.
+  // We gate at 8K/s (80% of Google's cap) to leave headroom for transient spikes.
+  //
+  // Implementation: lazy-refill token bucket (same pattern as rate-limiter.middleware.ts).
+  //   tokens       : number of tokens currently available (max = FCM_EGRESS_BUCKET_MAX)
+  //   lastRefill   : last refill timestamp (ms)
+  // Thread safety: JS is single-threaded — no CAS needed for in-process bucket.
+  // ===========================================================================
+  private _fcmEgressTokens = 8000;          // start full
+  private _fcmEgressLastRefill = Date.now();
+  /** Max tokens == rate per second == 8000 msgs/s */
+  private static readonly FCM_EGRESS_RATE_PER_SEC = 8000;
+
+  /**
+   * P7-T01: Consume `count` egress tokens. Returns true if allowed, false if
+   * rate-limited (caller should back off or drop the batch).
+   * Emits `fcm_egress_rate_limited_total` counter on reject.
+   */
+  private _consumeEgressTokens(count: number): boolean {
+    const now = Date.now();
+    const elapsedSec = (now - this._fcmEgressLastRefill) / 1000;
+    // Refill tokens proportional to elapsed time (capped at bucket max)
+    this._fcmEgressTokens = Math.min(
+      FCMService.FCM_EGRESS_RATE_PER_SEC,
+      this._fcmEgressTokens + elapsedSec * FCMService.FCM_EGRESS_RATE_PER_SEC
+    );
+    this._fcmEgressLastRefill = now;
+    if (this._fcmEgressTokens >= count) {
+      this._fcmEgressTokens -= count;
+      return true;
+    }
+    // Rate limited — emit metric and reject
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { metrics } = require('../monitoring/metrics.service');
+      metrics.incrementCounter('fcm_egress_rate_limited_total', { batch_size: count > 500 ? '>500' : String(count) });
+    } catch { /* non-fatal */ }
+    return false;
+  }
 
   /**
    * Initialize Firebase Admin SDK
@@ -186,8 +267,15 @@ class FCMService {
       try {
         const firebaseAdmin = await import('firebase-admin');
         const serviceAccount = JSON.parse(fs.readFileSync(serviceAccountPath, 'utf8'));
+        // P7-T03 (A13-003 / Part B P7-G): Top-level httpAgent with keep-alive and
+        // maxSockets:400 reduces connection-setup overhead by reusing TCP connections
+        // for messaging().send() calls. NOTE: credential-level httpAgent only covers
+        // token minting (OAuth2 token fetch), NOT the messaging send path.
+        // AppOptions.httpAgent covers the full Firebase Admin SDK HTTP transport.
+        const _httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 400, maxFreeSockets: 50 });
         firebaseAdmin.initializeApp({
-          credential: firebaseAdmin.credential.cert(serviceAccount)
+          credential: firebaseAdmin.credential.cert(serviceAccount),
+          httpAgent: _httpsAgent,
         });
         this.admin = firebaseAdmin;
         this.isInitialized = true;
@@ -207,12 +295,15 @@ class FCMService {
     if (hasInlineCreds) {
       try {
         const firebaseAdmin = await import('firebase-admin');
+        // P7-T03 (A13-003 / Part B P7-G): Top-level httpAgent — same as file-based path.
+        const _httpsAgent2 = new https.Agent({ keepAlive: true, maxSockets: 400, maxFreeSockets: 50 });
         firebaseAdmin.initializeApp({
           credential: firebaseAdmin.credential.cert({
             projectId: projectId!,
             privateKey: resolvedPrivateKey!,
             clientEmail: clientEmail!,
-          } as any)
+          } as any),
+          httpAgent: _httpsAgent2,
         });
         this.admin = firebaseAdmin;
         this.isInitialized = true;
@@ -498,8 +589,19 @@ class FCMService {
     // Fix H15: Fall back to PostgreSQL if Redis returned empty or is unavailable.
     // This recovers tokens after Redis restart/eviction without losing push capability.
     try {
+      // P7-T06 (A05-004): Filter revoked tokens and tokens unseen in 90 days.
+      // revokedAt IS NULL excludes tokens explicitly soft-revoked on UNREGISTERED errors.
+      // lastSeenAt > 90d excludes tokens not refreshed recently (token likely expired).
+      const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
       const dbTokens = await prismaClient.deviceToken.findMany({
-        where: { userId },
+        where: {
+          userId,
+          // P7-T06: revokedAt and lastSeenAt filters — column added via direct SQL (see schema.prisma).
+          // Cast to any because Prisma-generated types predate the direct-SQL column addition.
+          // CLAUDE.md DB rule: never use prisma migrate deploy / prisma db push on this DB.
+          revokedAt: null,
+          lastSeenAt: { gt: ninetyDaysAgo },
+        } as any,
         select: { token: true }
       });
       if (dbTokens.length > 0) {
@@ -685,6 +787,15 @@ class FCMService {
          error?.code === 'messaging/invalid-registration-token')
       ) {
         logger.info(`FCM: Removing dead token for user ${userId}`);
+        // P7-T06 (A05-004): Soft-revoke the token in DB so the revokedAt filter
+        // immediately excludes it from future getTokens() DB fallback calls.
+        // removeToken deletes the DB row; revokedAt update is belt-and-braces
+        // for any concurrent reader that obtained the token before the delete.
+        prismaClient.deviceToken.updateMany({
+          where: { userId, token: tokens[0] } as any,
+          // P7-T06: revokedAt column added via direct SQL — cast data as any (Prisma types predate column).
+          data: { revokedAt: new Date() } as any,
+        }).catch((err: Error) => logger.warn('[FCM] revokedAt update failed', { userId, error: err.message }));
         this.removeToken(userId, tokens[0]).catch((err) => logger.warn('[FCM] Token cleanup failed', { userId, error: err instanceof Error ? err.message : String(err) }));
       }
       logger.error('FCM: Failed to send notification', error);
@@ -1205,12 +1316,142 @@ class FCMService {
 
     return this.sendToUser(userId, notification);
   }
+  /**
+   * P7-T04 (A05-007 / Part B P7-F): Send notification to many users via
+   * sendEachForMulticast (batched at 500 tokens, gated at 8K/s).
+   *
+   * Canary rollout: controlled by FF_FCM_MULTICAST_ENABLED (default OFF).
+   *
+   * Algorithm:
+   *   1. Resolve FCM tokens for all userIds with concurrency limited to 20
+   *      (reduced from 100 per Part B P7-F to avoid 100×500=50K/s bursts).
+   *   2. Dedup tokens across users.
+   *   3. Check egress token bucket (8K/s). If rate-limited, log and return empty result.
+   *   4. Chunk deduped tokens at 500, call sendEachForMulticast per chunk.
+   *   5. Per-token error mapping: NON_RETRYABLE → soft-revoke (revokedAt update).
+   *
+   * Returns a MulticastResult summary for observability.
+   */
+  async sendToUsersMulticast(
+    userIds: string[],
+    notification: FCMNotification
+  ): Promise<MulticastResult> {
+    if (!this.isInitialized || !this.admin) {
+      this.logNotification(notification, []);
+      return { successCount: 0, failureCount: 0, revokedCount: 0, rateLimited: false };
+    }
+
+    if (userIds.length === 0) {
+      return { successCount: 0, failureCount: 0, revokedCount: 0, rateLimited: false };
+    }
+
+    // Step 1: Resolve tokens concurrently (pLimit-style, max 20 in-flight)
+    const CONCURRENCY = 20;
+    const tokensByUser: string[][] = [];
+    for (let i = 0; i < userIds.length; i += CONCURRENCY) {
+      const slice = userIds.slice(i, i + CONCURRENCY);
+      const resolved = await Promise.allSettled(slice.map(uid => this.getTokens(uid)));
+      for (const r of resolved) {
+        tokensByUser.push(r.status === 'fulfilled' ? r.value : []);
+      }
+    }
+
+    // Step 2: Dedup tokens across users, build token→userId mapping
+    const tokenToUser = new Map<string, string>();
+    for (let i = 0; i < userIds.length; i++) {
+      for (const t of (tokensByUser[i] ?? [])) {
+        if (!tokenToUser.has(t)) tokenToUser.set(t, userIds[i]);
+      }
+    }
+    const allTokens = Array.from(tokenToUser.keys());
+
+    if (allTokens.length === 0) {
+      return { successCount: 0, failureCount: 0, revokedCount: 0, rateLimited: false };
+    }
+
+    // Step 3: Egress token-bucket gate
+    if (!this._consumeEgressTokens(allTokens.length)) {
+      logger.warn('[FCM] sendToUsersMulticast rate-limited', {
+        userCount: userIds.length,
+        tokenCount: allTokens.length,
+      });
+      return { successCount: 0, failureCount: allTokens.length, revokedCount: 0, rateLimited: true };
+    }
+
+    // Step 4: Chunk at 500, call sendEachForMulticast per chunk
+    const CHUNK = 500;
+    let successCount = 0;
+    let failureCount = 0;
+    let revokedCount = 0;
+
+    const message = this.buildMessage(notification);
+
+    for (let i = 0; i < allTokens.length; i += CHUNK) {
+      const chunk = allTokens.slice(i, i + CHUNK);
+      try {
+        const result = await this.admin.messaging().sendEachForMulticast({ ...message, tokens: chunk });
+        successCount += result.successCount ?? 0;
+        failureCount += result.failureCount ?? 0;
+
+        // Step 5: Per-token error handling
+        if (result.failureCount > 0 && result.responses) {
+          for (let j = 0; j < chunk.length; j++) {
+            const resp = result.responses[j];
+            if (!resp?.error) continue;
+            const code: string = resp.error.code ?? '';
+            if (FCMService.NON_RETRYABLE_FCM_ERRORS.has(code)) {
+              const userId = tokenToUser.get(chunk[j]);
+              // Soft-revoke in DB — excludes from next getTokens() DB fallback
+              prismaClient.deviceToken.updateMany({
+                where: { token: chunk[j] } as any,
+                // P7-T06: revokedAt column added via direct SQL — cast data as any (Prisma types predate column).
+                data: { revokedAt: new Date() } as any,
+              }).catch((err: Error) => logger.warn('[FCM] multicast revokedAt update failed', { error: err.message }));
+              if (userId) {
+                this.removeToken(userId, chunk[j]).catch((err) =>
+                  logger.warn('[FCM] multicast token cleanup failed', { error: err instanceof Error ? err.message : String(err) })
+                );
+              }
+              revokedCount++;
+            }
+          }
+        }
+      } catch (chunkErr: any) {
+        const code = chunkErr?.code ?? chunkErr?.errorInfo?.code ?? '';
+        logger.error('[FCM] sendToUsersMulticast chunk error', { chunkIndex: i, code });
+        failureCount += chunk.length;
+      }
+    }
+
+    // Observability
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { metrics } = require('../monitoring/metrics.service');
+      if (successCount > 0) metrics.incrementCounter('fcm_send_success_total', { type: notification.type, tokens_bucket: 'multicast' }, successCount);
+      if (failureCount > 0) metrics.incrementCounter('fcm_send_failure_total', { type: notification.type, error_code: 'multicast_chunk' }, failureCount);
+      if (revokedCount > 0) metrics.incrementCounter('fcm_dead_token_cleanup_total', {}, revokedCount);
+    } catch { /* non-fatal */ }
+
+    logger.info('[FCM] sendToUsersMulticast complete', { userCount: userIds.length, tokenCount: allTokens.length, successCount, failureCount, revokedCount });
+    return { successCount, failureCount, revokedCount, rateLimited: false };
+  }
+
 }
 
 // Singleton instance
 export const fcmService = new FCMService();
 
 // Types
+/**
+ * P7-T04: Result from sendToUsersMulticast.
+ */
+export interface MulticastResult {
+  successCount: number;
+  failureCount: number;
+  revokedCount: number;
+  rateLimited: boolean;
+}
+
 export interface FCMNotification {
   type: string;
   title: string;

@@ -619,6 +619,23 @@ export const FLAGS = {
     defaultValue: false,
   },
 
+
+  // --- P7-T08 (A05-007): FCM multicast helper ---
+  // When ON, queueBatchPush processor calls sendToUsersMulticast (chunked
+  // sendEachForMulticast with rate-limit gate at 8K/s) instead of the legacy
+  // per-token loop. Canary schedule: 5%→25%→100%.
+  //   Stage 1 —  5%: 24h staging soak gate (REQUIRED before prod flip)
+  //   Stage 2 — 25%: hold 24h, confirm fcm_multicast_failure_ratio < 0.02 for 3 min
+  //   Stage 3 — 100%: full rollout after 72h green soak
+  // AUTO-REVERT: fcm_multicast_failure_ratio > 0.02 for 3 consecutive minutes
+  //   → set FF_FCM_MULTICAST_ENABLED=false + redeploy
+  // Default OFF for soak-safe rollout — legacy per-user fallback when flag off.
+  FCM_MULTICAST_ENABLED: {
+    env: 'FF_FCM_MULTICAST_ENABLED',
+    category: 'release' as const,
+    description: 'Route queueBatchPush through sendToUsersMulticast (chunked sendEachForMulticast + 8K/s token bucket) (A05-007)',
+    defaultValue: false,
+  },
   // --- P5-01/P5-04: Socket upgrade limiter (sibling agent gate) ---
   // Default OFF until the socket upgrade rate-limiter implementation lands.
   SOCKET_UPGRADE_LIMITER_ENABLED: {
