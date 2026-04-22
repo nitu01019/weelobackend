@@ -49,6 +49,7 @@ import { socketService } from '../../shared/services/socket.service';
 import { holdExpiryCleanupService } from '../hold-expiry/hold-expiry-cleanup.service';
 import { validateActorEligibility, HoldEligibilityError } from './hold-eligibility';
 import { metrics } from '../../shared/monitoring/metrics.service';
+import { guardedConfirmFlexToConfirmed } from './hold-state-machine';
 
 // =============================================================================
 // TYPES & INTERFACES
@@ -727,9 +728,19 @@ class FlexHoldService {
     logger.info('[FLEX HOLD] Transitioning to confirmed phase', { holdId, transporterId });
 
     try {
-      // F-M12 FIX: Atomic read-then-write in $transaction with phase guard
-      const result = await prismaClient.$transaction(async (tx) => {
-        const hold = await tx.truckHoldLedger.findUnique({ where: { holdId } });
+      // A10-005 + A02-001: withDbTimeout (Serializable, bounded wait) + FOR UPDATE row-lock
+      // serialises concurrent transitioners, and guardedConfirmFlexToConfirmed CAS ensures
+      // exactly one winner on the phase flip — eliminates the double-confirm race.
+      const result = await withDbTimeout(async (tx) => {
+        const rows = await tx.$queryRaw<Array<{
+          holdId: string; phase: string; transporterId: string; orderId: string;
+        }>>`
+          SELECT "holdId", "phase", "transporterId", "orderId"
+          FROM "TruckHoldLedger"
+          WHERE "holdId" = ${holdId}
+          FOR UPDATE
+        `;
+        const hold = rows[0];
         if (!hold) {
           return { success: false, message: 'Hold not found' };
         }
@@ -739,7 +750,7 @@ class FlexHoldService {
           });
           return { success: false, message: 'Not your hold' };
         }
-        // F-M12 FIX: Phase guard — only FLEX can transition to CONFIRMED
+        // Phase guard — only FLEX can transition to CONFIRMED
         if (hold.phase !== HoldPhase.FLEX) {
           logger.warn('[FLEX HOLD] Phase guard — cannot transition from non-FLEX phase', {
             holdId, currentPhase: hold.phase,
@@ -763,19 +774,24 @@ class FlexHoldService {
           }
         }
 
-        await tx.truckHoldLedger.update({
-          where: { holdId },
-          data: {
-            phase: HoldPhase.CONFIRMED,
-            phaseChangedAt: now,
-            status: 'confirmed',
-            confirmedAt: now,
-            confirmedExpiresAt,
-            updatedAt: now,
-          },
+        const flip = await guardedConfirmFlexToConfirmed(tx, holdId, {
+          confirmedExpiresAt,
+          confirmedAt: now,
+          phaseChangedAt: now,
         });
+        if (!flip.updated) {
+          return {
+            success: false,
+            message: 'Hold state changed — already confirmed, expired or released',
+          };
+        }
 
         return { success: true, message: 'Hold transitioned to confirmed phase' };
+      }, {
+        isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+        timeoutMs: 8000,
+        maxWait: 5_000,
+        site: 'flex_transition_to_confirmed',
       });
 
       if (!result.success) {
