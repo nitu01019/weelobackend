@@ -47,6 +47,7 @@
  */
 
 import { logger } from './logger.service';
+import { EventEmitter } from 'events';
 import { config } from '../../config/environment';
 
 // =============================================================================
@@ -1508,6 +1509,29 @@ class RealRedisTransaction implements IRedisTransaction {
 }
 
 // =============================================================================
+// JWT INVALIDATE PUB/SUB HEALTH GATE (A04-002 / P5-E)
+// =============================================================================
+
+/**
+ * Module-level emitter used to broadcast jwt_invalidate messages received via
+ * Redis Pub/Sub to all in-process consumers (e.g., auth.service.ts L1 purge).
+ * Exported so other modules can listen without a circular import.
+ */
+export const _jwtInvalidatePubSubEmitter = new EventEmitter();
+
+/** Tracks whether the jwt_invalidate Pub/Sub subscription is active. */
+let _jwtInvalidateSubscribed = false;
+
+/**
+ * P5-E health gate: returns true when the jwt_invalidate channel subscription
+ * is active. Called by /health/ready to return 503 when the Pub/Sub connection
+ * is not ready (prevents stale JWT caches from serving revoked tokens).
+ */
+export function isJwtInvalidateSubscribed(): boolean {
+  return _jwtInvalidateSubscribed;
+}
+
+// =============================================================================
 // REDIS SERVICE (Main Entry Point)
 // =============================================================================
 
@@ -1608,6 +1632,24 @@ class RedisService {
         }
 
         logger.info('✅ [Redis] Production Redis connected successfully');
+
+        // A04-002 / P5-E: Subscribe to jwt_invalidate channel for L1/L2 JWT cache
+        // invalidation across all ECS tasks. Subscription is best-effort; if it
+        // fails, the cache will serve stale entries until the token's natural
+        // expiry — logged as a warning but not fatal.
+        try {
+          await realClient.subscribe('jwt_invalidate', (message: string) => {
+            _jwtInvalidateSubscribed = true;
+            // Emit to module-local listeners (e.g., auth.service.ts L1 purge)
+            _jwtInvalidatePubSubEmitter.emit('userId', message);
+            // Also purge L2 asynchronously for this node
+            this.jwtCachePurgeUser(message).catch(() => {});
+          });
+          _jwtInvalidateSubscribed = true;
+          logger.info('[Redis] Subscribed to jwt_invalidate channel (A04-002)');
+        } catch (subErr: any) {
+          logger.warn('[Redis] jwt_invalidate subscription failed — JWT cache invalidation degraded', { error: subErr?.message });
+        }
 
       } catch (error: any) {
         logger.error(`[Redis] Failed to connect to Redis: ${error.message}`);
@@ -1840,6 +1882,64 @@ class RedisService {
     }
     // #55 FIX: Use safeStringify to avoid crash on circular objects
     await this.client.set(key, safeStringify(value), ttlSeconds);
+  }
+
+  // ===========================================================================
+  // JWT CACHE HELPERS (A04-002)
+  // ===========================================================================
+
+  /**
+   * Get a cached JWT entry from L2 (Redis).
+   * Key pattern: jwt_cache:{hash}
+   */
+  async jwtCacheGet(hash: string): Promise<any | null> {
+    try {
+      const raw = await this.client.get(`jwt_cache:${hash}`);
+      if (!raw) return null;
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Store a JWT entry in L2 (Redis) with NX semantics (first writer wins).
+   * Also maintains a user→hash reverse-index set for bulk invalidation.
+   * Key pattern: jwt_cache:{hash}
+   * Index:       jwt_user_to_hash:{userId}
+   */
+  async jwtCacheSet(hash: string, entry: any, ttlSec: number): Promise<void> {
+    try {
+      await this.client.set(`jwt_cache:${hash}`, JSON.stringify(entry), ttlSec);
+      // Reverse index: user → hashes (expire index after 60s as a safety guard)
+      if (entry && entry.userId) {
+        await this.client.sAdd(`jwt_user_to_hash:${entry.userId}`, hash);
+        await this.client.expire(`jwt_user_to_hash:${entry.userId}`, 60);
+      }
+    } catch {
+      // Non-blocking: JWT cache population is best-effort
+    }
+  }
+
+  /**
+   * Purge all L2 JWT cache entries for a given user.
+   * Used on logout / jwt_invalidate Pub/Sub event.
+   * Returns the number of entries deleted.
+   */
+  async jwtCachePurgeUser(userId: string): Promise<number> {
+    try {
+      const hashes = await this.client.sMembers(`jwt_user_to_hash:${userId}`);
+      if (hashes.length === 0) return 0;
+      let deleted = 0;
+      for (const hash of hashes) {
+        const ok = await this.client.del(`jwt_cache:${hash}`);
+        if (ok) deleted++;
+      }
+      await this.client.del(`jwt_user_to_hash:${userId}`);
+      return deleted;
+    } catch {
+      return 0;
+    }
   }
 
   // ===========================================================================

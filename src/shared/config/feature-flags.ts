@@ -569,6 +569,58 @@ export const FLAGS = {
     category: 'release' as const,
     description: 'Legacy avoid=highways|tolls for truckMode routes (F-A-40)',
   },
+
+  // --- A04-002: Two-tier JWT cache (P5-02/P5-03) ---
+  // Enables the LRU L1 in-process cache + Redis L2 cache for JWT verification.
+  // Canary schedule: 5% → 25% → 100% (auto-revert if socket_auth_latency_p99_ms > 15ms for 2 min).
+  //
+  // ROLLOUT PHASES:
+  //   Phase 1 — 5%   traffic: verify latency p99 < 5ms, cache hit rate > 80%
+  //   Phase 2 — 25%  traffic: hold for 24h, check jwt_cache_hits_total{tier='l1'} ratio
+  //   Phase 3 — 100% traffic: full canary after 72h green soak
+  //
+  // AUTO-REVERT condition: socket_auth_latency_p99_ms > 15 for 2 consecutive minutes
+  //   → flip FF_JWT_CACHE_ENABLED=false in env and redeploy immediately.
+  //
+  // Do NOT enable FF_JWT_CACHE_SKIP_BLACKLIST during this rollout — see that flag below.
+  JWT_CACHE_ENABLED: {
+    env: 'FF_JWT_CACHE_ENABLED',
+    category: 'release' as const,
+    description: 'Two-tier JWT cache: LRU L1 (in-process) + Redis L2, gated behind feature flag (A04-002)',
+    defaultValue: false,
+  },
+
+  // --- A04-002: JWT cache blacklist bypass gate (P5-C CRITICAL — SECURITY) ---
+  //
+  // ===========================  SECURITY CRITICAL  ===========================
+  // DO NOT ENABLE IN PRODUCTION without Bloom-filter-backed blacklist.
+  //
+  // When ON, the JWT cache skips the JTI blacklist Redis lookup.
+  // A revoked token will remain valid for up to 60s (the L2 TTL window)
+  // after the blacklist entry is written. This is a known security regression.
+  //
+  // This flag exists ONLY for a future phase that will add a Bloom filter
+  // layer to replace the point-lookup blacklist with a sub-millisecond
+  // probabilistic check, eliminating the TTL window entirely.
+  //
+  // ANY canary to 25%+ of traffic with this flag ON is a SECURITY INCIDENT.
+  // Compromised tokens could be used for up to 60 seconds after revocation.
+  // ===========================  SECURITY CRITICAL  ===========================
+  JWT_CACHE_SKIP_BLACKLIST: {
+    env: 'FF_JWT_CACHE_SKIP_BLACKLIST',
+    category: 'release' as const,
+    description: 'SECURITY CRITICAL — skip JTI blacklist in JWT cache path (DO NOT ENABLE without Bloom-filter blacklist)',
+    defaultValue: false,
+  },
+
+  // --- P5-01/P5-04: Socket upgrade limiter (sibling agent gate) ---
+  // Default OFF until the socket upgrade rate-limiter implementation lands.
+  SOCKET_UPGRADE_LIMITER_ENABLED: {
+    env: 'FF_SOCKET_UPGRADE_LIMITER_ENABLED',
+    category: 'release' as const,
+    description: 'Socket.IO upgrade rate limiter (P5-01/P5-04 sibling agent)',
+    defaultValue: false,
+  },
 } as const;
 
 // ---------------------------------------------------------------------------

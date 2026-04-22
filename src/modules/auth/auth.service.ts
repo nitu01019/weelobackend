@@ -27,6 +27,7 @@
  */
 
 import crypto from 'crypto';
+import { EventEmitter } from 'events';
 import jwt from 'jsonwebtoken';
 // REMOVED: bcrypt (unnecessary for OTPs, was causing 5-second delay)
 // OTPs are temporary (5min auto-delete) + max 3 attempts = secure without hashing
@@ -38,11 +39,95 @@ import { UserRole } from '../../shared/types/api.types';
 import { db } from '../../shared/database/db';
 import { generateSecureOTP, maskForLogging } from '../../shared/utils/crypto.utils';
 import { redisService } from '../../shared/services/redis.service';
+import { isEnabled, FLAGS } from '../../shared/config/feature-flags';
 import { smsService } from './sms.service';
 import { otpChallengeService } from './otp-challenge.service';
 import { fcmService } from '../../shared/services/fcm.service';
 import { availabilityService } from '../../shared/services/availability.service';
 import { ONLINE_TRANSPORTERS_SET, TRANSPORTER_PRESENCE_KEY } from '../../shared/services/transporter-online.service';
+
+// =============================================================================
+// TWO-TIER JWT CACHE (A04-002)
+// =============================================================================
+
+interface JwtCacheEntry {
+  userId: string;
+  role: string;
+  transporterId?: string;
+  decodedExp: number;
+  cachedAt: number;
+}
+
+// Represents the minimal decoded JWT fields that callers need after verification.
+interface DecodedJwt {
+  userId: string;
+  role: string;
+  phone?: string;
+  jti?: string;
+  deviceId?: string;
+  exp?: number;
+}
+
+/**
+ * Hand-rolled LRU cache (~40 lines) backed by a Map.
+ * Map preserves insertion order; oldest key = first key in iteration.
+ * On every `get` hit the entry is deleted and re-inserted so it becomes
+ * the most-recently-used. Eviction removes the first key when max is reached.
+ *
+ * Do NOT install `lru-cache` package — user rule forbids new dependencies.
+ */
+class LruCache<K, V> {
+  private readonly map = new Map<K, V>();
+
+  constructor(private readonly maxSize: number) {}
+
+  get(key: K): V | undefined {
+    if (!this.map.has(key)) return undefined;
+    // Move to tail (most-recently-used)
+    const value = this.map.get(key)!;
+    this.map.delete(key);
+    this.map.set(key, value);
+    return value;
+  }
+
+  set(key: K, value: V): void {
+    if (this.map.has(key)) {
+      this.map.delete(key);
+    } else if (this.map.size >= this.maxSize) {
+      // Evict oldest (first inserted key still in map)
+      const oldestKey = this.map.keys().next().value;
+      if (oldestKey !== undefined) this.map.delete(oldestKey);
+    }
+    this.map.set(key, value);
+  }
+
+  delete(key: K): void {
+    this.map.delete(key);
+  }
+
+  entries(): IterableIterator<[K, V]> {
+    return this.map.entries();
+  }
+}
+
+/** Module-level L1 in-process JWT cache. Max 1000 entries. */
+const jwtL1Cache = new LruCache<string, JwtCacheEntry>(1000);
+
+/**
+ * Module-level EventEmitter for cross-service jwt_invalidate signals.
+ * redis.service.ts emits `userId` events on this emitter when the
+ * jwt_invalidate Pub/Sub message arrives; auth.service.ts purges L1.
+ */
+export const jwtInvalidateEmitter = new EventEmitter();
+
+// Purge L1 on jwt_invalidate Pub/Sub events from redis.service.ts
+jwtInvalidateEmitter.on('userId', (invalidatedUserId: string) => {
+  for (const [hash, entry] of jwtL1Cache.entries()) {
+    if (entry.userId === invalidatedUserId) {
+      jwtL1Cache.delete(hash);
+    }
+  }
+});
 
 // =============================================================================
 // REDIS KEY PATTERNS
@@ -459,6 +544,19 @@ class AuthService {
     // Delete the user tokens set
     await redisService.del(userTokensKey);
 
+    // Publish jwt_invalidate so all ECS tasks purge their L1/L2 JWT caches for
+    // this user. Graceful: a publish failure must NOT cause logout to fail.
+    try {
+      await redisService.publish('jwt_invalidate', userId);
+    } catch (pubErr: unknown) {
+      const pubMsg = pubErr instanceof Error ? pubErr.message : String(pubErr);
+      logger.warn('[Auth] jwt_invalidate publish failed', { userId, error: pubMsg });
+      try {
+        const { metrics } = require('../../shared/monitoring/metrics.service');
+        metrics.incrementCounter('jwt_invalidate_publish_failed_total');
+      } catch { /* metrics optional */ }
+    }
+
     // Best-effort hard cleanup for logout correctness across app restarts/retries.
     // Keeps behavior additive and idempotent.
     const userRole = await db.getUserById(userId)
@@ -499,6 +597,91 @@ class AuthService {
       createdAt: new Date(dbUser.createdAt),
       updatedAt: new Date(dbUser.updatedAt)
     };
+  }
+
+  /**
+   * Two-tier JWT verification cache (A04-002).
+   *
+   * Tier hierarchy when FF_JWT_CACHE_ENABLED=ON:
+   *   L1 (in-process LRU)  → near-zero latency, max 1000 entries
+   *   L2 (Redis)           → shared across ECS tasks, TTL-backed
+   *   Full verify          → jsonwebtoken + blacklist check; populates L1+L2
+   *
+   * P5-D: Admin or transporter-owner tokens get a 5s L1 TTL (vs 30s default)
+   *       to narrow the blacklist propagation window for high-privilege tokens.
+   *
+   * When the flag is OFF the method falls through immediately to full verify
+   * so the cache is a pure no-op during staged rollout.
+   */
+  async verifyAccessTokenCached(token: string): Promise<DecodedJwt> {
+    if (!isEnabled(FLAGS.JWT_CACHE_ENABLED)) {
+      // Flag OFF: bypass cache, full verify always
+      const decoded = jwt.verify(token, config.jwt.secret, { algorithms: ['HS256'] }) as DecodedJwt;
+      return decoded;
+    }
+
+    const hash = this.hashTokenShort(token);
+    const nowSec = Math.floor(Date.now() / 1000);
+
+    // ── L1 check ──────────────────────────────────────────────────────────────
+    const l1Entry = jwtL1Cache.get(hash);
+    if (l1Entry) {
+      const isAdmin = l1Entry.role === 'admin';
+      // P5-D: elevated tokens use 5s L1 TTL; standard tokens use 30s
+      const l1TtlSec = isAdmin ? 5 : 30;
+      const l1ExpiresAtSec = Math.floor(l1Entry.cachedAt / 1000) + l1TtlSec;
+      if (l1Entry.decodedExp > nowSec + 5 && nowSec < l1ExpiresAtSec) {
+        try {
+          const { metrics } = require('../shared/monitoring/metrics.service');
+          metrics.incrementCounter('jwt_cache_hits_total', { tier: 'l1' });
+        } catch { /* metrics optional */ }
+        return { userId: l1Entry.userId, role: l1Entry.role };
+      }
+      // L1 entry expired — evict and continue to L2
+      jwtL1Cache.delete(hash);
+    }
+
+    // ── L2 check ──────────────────────────────────────────────────────────────
+    try {
+      const l2Entry = await redisService.jwtCacheGet(hash);
+      if (l2Entry && l2Entry.decodedExp > nowSec + 5) {
+        // Warm L1 from L2
+        jwtL1Cache.set(hash, l2Entry);
+        try {
+          const { metrics } = require('../shared/monitoring/metrics.service');
+          metrics.incrementCounter('jwt_cache_hits_total', { tier: 'l2' });
+        } catch { /* metrics optional */ }
+        return { userId: l2Entry.userId, role: l2Entry.role };
+      }
+    } catch {
+      // Redis unavailable — fall through to full verify
+    }
+
+    // ── Full verify ───────────────────────────────────────────────────────────
+    const decoded = jwt.verify(token, config.jwt.secret, { algorithms: ['HS256'] }) as DecodedJwt;
+
+    const entry: JwtCacheEntry = {
+      userId: decoded.userId,
+      role: decoded.role,
+      decodedExp: decoded.exp ?? (nowSec + 3600),
+      cachedAt: Date.now(),
+    };
+
+    // Populate L1
+    jwtL1Cache.set(hash, entry);
+
+    // Populate L2 — non-blocking; Redis write failure must not block auth
+    const remainingSec = entry.decodedExp - nowSec;
+    if (remainingSec > 5) {
+      Promise.allSettled([redisService.jwtCacheSet(hash, entry, remainingSec)]).catch(() => {});
+    }
+
+    try {
+      const { metrics } = require('../shared/monitoring/metrics.service');
+      metrics.incrementCounter('jwt_cache_hits_total', { tier: 'full' });
+    } catch { /* metrics optional */ }
+
+    return decoded;
   }
 
   // ============================================================
@@ -558,6 +741,14 @@ class AuthService {
    */
   private hashToken(token: string): string {
     return crypto.createHash('sha256').update(token).digest('hex').substring(0, 32);
+  }
+
+  /**
+   * Hash token to a 24-char hex prefix for L1/L2 JWT cache keys (A04-002).
+   * Shorter than hashToken (32 chars) to minimize Redis key overhead.
+   */
+  private hashTokenShort(token: string): string {
+    return crypto.createHash('sha256').update(token).digest('hex').slice(0, 24);
   }
 
   private getExpirySeconds(duration: string): number {

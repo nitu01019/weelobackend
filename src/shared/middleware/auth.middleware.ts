@@ -19,6 +19,7 @@ import { AppError } from '../types/error.types';
 import { logger } from '../services/logger.service';
 import { redisService } from '../services/redis.service';
 import { prismaClient } from '../database/prisma.service';
+import { authService } from '../../modules/auth/auth.service';
 import { metrics } from '../monitoring/metrics.service';
 import { adminSuspensionService } from '../../modules/admin/admin-suspension.service';
 
@@ -93,8 +94,9 @@ export async function authMiddleware(
 
     const token = authHeader.substring(7); // Remove 'Bearer '
 
-    // Verify token with algorithm restriction to prevent algorithm confusion attacks
-    const decoded = jwt.verify(token, config.jwt.secret, { algorithms: ['HS256'] });
+    // Verify token — uses two-tier JWT cache (A04-002) when FF_JWT_CACHE_ENABLED=ON,
+    // otherwise falls through to the existing full jwt.verify path.
+    const decoded = await authService.verifyAccessTokenCached(token);
 
     // Runtime validation of JWT payload shape
     if (!isValidJwtPayload(decoded)) {
