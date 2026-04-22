@@ -289,6 +289,24 @@ export function initializeSocket(server: HttpServer): Server {
         }
       }
 
+      // P2-T27 — Reject role-spoofing at handshake time.
+      // If the client supplies a role claim in socket.handshake.auth that
+      // differs from the role encoded in the JWT, it is a spoofing attempt:
+      // reject the connection before any state is written.
+      const claimedRole = socket.handshake.auth?.role;
+      if (claimedRole && claimedRole !== decoded.role) {
+        logger.warn('[SocketAuth] Role-spoofing rejected at handshake', {
+          userId: decoded.userId,
+          jwtRole: decoded.role,
+          claimedRole,
+        });
+        try {
+          const { metrics } = require('../monitoring/metrics.service');
+          metrics.incrementCounter('socket_auth_role_spoof_rejected_total', { jwtRole: decoded.role });
+        } catch { /* metrics unavailable — non-critical */ }
+        return next(new Error('SOCKET_AUTH_ROLE_MISMATCH'));
+      }
+
       socket.data.userId = decoded.userId;
       socket.data.role = decoded.role;
       socket.data.phone = decoded.phone;
@@ -1260,20 +1278,41 @@ export function initializeSocket(server: HttpServer): Server {
               for (const msgStr of messages) {
                 try {
                   const envelope = JSON.parse(msgStr);
-                  // A09-002 / A12-009 Phase 2 — drop cross-role envelopes.
-                  // Any envelope whose `role` tag mismatches the reconnecting
-                  // socket's role is dropped pre-emit (DPDP filter). Counter
-                  // socket_replay_dropped_cross_role_total fires per drop.
-                  if (
-                    roleScopedEnabled &&
-                    envelope.role &&
-                    envelope.role !== socketRole
-                  ) {
+                  // P2-T28 — Role-scoped envelope drop (ALWAYS-ON read filter).
+                  // ---------------------------------------------------------------
+                  // Drop-on-read executes unconditionally (zero flag cost):
+                  //   Any envelope whose `role` tag mismatches the reconnecting
+                  //   socket's role is dropped here — regardless of the state of
+                  //   FF_ROLE_SCOPED_DURABLE_EMIT (which gates WRITE-side only).
+                  // ZSET-write role-scoping remains gated by FF_ROLE_SCOPED_DURABLE_EMIT
+                  //   (see `unackedKeyForSocket` assignment above).
+                  // Flip contract:
+                  //   (1) Phase 6 task P6-T54: migrate legacy `socket:unacked:{userId}`
+                  //       ZSETs → role-scoped `socket:unacked:{userId}:{role}` keys.
+                  //   (2) 24h staging soak after migration completes.
+                  //   (3) Flip write side: enable FF_ROLE_SCOPED_DURABLE_EMIT in prod.
+                  // Legacy-envelope tolerance window = 24h ZSET TTL (envelopes
+                  //   written without a role tag will expire naturally).
+                  // ---------------------------------------------------------------
+                  //
+                  // Part B §2.3 P2-E amendment — legacy envelope tolerance:
+                  // Envelopes written before Phase 1 role-tagging (role === undefined,
+                  // 'unknown', or 'ROLE_UNKNOWN') are TOLERATED — do not drop them.
+                  // They will TTL out within 24h. Phase 6 migration (P6-T54) will
+                  // formally clean up residual legacy ZSETs.
+                  const eventType = envelope.event ?? 'unknown';
+                  if (!envelope.role || envelope.role === 'unknown' || envelope.role === 'ROLE_UNKNOWN') {
+                    try {
+                      const { metrics } = require('../monitoring/metrics.service');
+                      metrics.incrementCounter('socket_envelope_legacy_tolerated_total', { eventType });
+                    } catch { /* metrics optional */ }
+                    // Fall through — do not drop legacy-shape envelopes; they will TTL out over 24h.
+                  } else if (envelope.role !== socketRole) {
                     try {
                       const { metrics } = require('../monitoring/metrics.service');
                       metrics.incrementCounter(
-                        'socket_replay_dropped_cross_role_total',
-                        { role: socketRole }
+                        'socket_envelope_dropped_role_mismatch',
+                        { eventType }
                       );
                     } catch { /* metrics optional */ }
                     continue;
