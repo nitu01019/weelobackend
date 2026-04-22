@@ -31,6 +31,7 @@ import { logger } from './logger.service';
 import { redisService } from './redis.service';
 import { prismaClient } from '../database/prisma.service';
 import { HOLD_CONFIG } from '../../core/config/hold-config';
+import { FLAGS, isEnabled } from '../config/feature-flags';
 
 // Notification types - must match mobile apps
 export const NotificationType = {
@@ -821,13 +822,30 @@ class FCMService {
       (notification.data?.assignmentId as string | undefined) ??
       undefined;
 
+    // A03-002 / A05-001 / A13-004: When FF_FCM_DATA_ONLY_FULLSCREEN is ON AND the
+    // notification type is in FULLSCREEN_TYPES, omit the top-level `notification:`
+    // AND `android.notification:` blocks so Android Doze delivers via
+    // onMessageReceived (not tray-only). Captain then launches its full-screen
+    // overlay via BroadcastFullScreenNotifier. Title/body are mirrored into the
+    // `data` bag for the client to render. APNs path is preserved unchanged —
+    // iOS wakes via `notification` + background-mode. Default OFF until Captain
+    // bbc22c9+ at ≥90% DAU.
+    const dataOnlyFullscreen = isFullScreen && isEnabled(FLAGS.FCM_DATA_ONLY_FULLSCREEN);
+
+    const titleTruncated = truncate(notification.title, 100) || '';
+    const bodyTruncated = truncate(notification.body, 200) || '';
+
     return {
-      notification: {
-        title: truncate(notification.title, 100) || '',
-        body: truncate(notification.body, 200) || ''
-      },
+      ...(dataOnlyFullscreen ? {} : {
+        notification: {
+          title: titleTruncated,
+          body: bodyTruncated,
+        },
+      }),
       data: {
         type: notification.type,
+        // A03-002: mirror title/body inside data so data-only clients can render.
+        ...(dataOnlyFullscreen ? { title: titleTruncated, body: bodyTruncated } : {}),
         ...truncatedData,
         ...(isFullScreen ? { fullScreen: 'true' } : {}),
       },
@@ -835,13 +853,16 @@ class FCMService {
         priority: notification.priority === 'high' ? 'high' : 'normal',
         ttl: `${ttlSeconds}s`,
         ...(collapseKey ? { collapseKey } : {}),
-        notification: {
-          channelId: this.getChannelId(notification.type),
-          sound: 'default',
-          clickAction: 'FLUTTER_NOTIFICATION_CLICK',
-          // H11: Lock-screen visibility for driver notifications
-          ...(isFullScreen ? { visibility: 'public' as const } : {}),
-        }
+        // A03-002: Android data-only payloads must not include android.notification.
+        ...(dataOnlyFullscreen ? {} : {
+          notification: {
+            channelId: this.getChannelId(notification.type),
+            sound: 'default',
+            clickAction: 'FLUTTER_NOTIFICATION_CLICK',
+            // H11: Lock-screen visibility for driver notifications
+            ...(isFullScreen ? { visibility: 'public' as const } : {}),
+          },
+        }),
       },
       apns: {
         headers: {

@@ -301,6 +301,19 @@ export const FLAGS = {
     defaultValue: false,
   },
 
+  // A03-002 / A05-001 / A13-004: FCM data-only payload for driver FULLSCREEN_TYPES.
+  // When ON (plus FULLSCREEN_TYPES.has(type)), strips top-level `notification:` and
+  // `android.notification:` so Android Doze delivers via onMessageReceived; Captain
+  // launches full-screen overlay via BroadcastFullScreenNotifier. APNs path preserved
+  // unchanged (iOS uses notification block). Default OFF until Captain bbc22c9+ at
+  // ≥90% DAU (BroadcastFullScreenNotifier + BroadcastExpediteWorker both require it).
+  FCM_DATA_ONLY_FULLSCREEN: {
+    env: 'FF_FCM_DATA_ONLY_FULLSCREEN',
+    category: 'release' as const,
+    description: 'Strip FCM notification block for FULLSCREEN_TYPES (Android Doze overlay)',
+    defaultValue: false,
+  },
+
   // --- Dual channel delivery (queue.service.ts:81) ---
   // F-B-53: Safe default flipped ON. LaunchDarkly guidance: for a dual-write
   // safety net, over-delivery is safe and under-delivery is not. Explicit
