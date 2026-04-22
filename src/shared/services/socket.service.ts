@@ -45,6 +45,19 @@ import {
   PRESENCE_TTL_SECONDS as TRANSPORTER_PRESENCE_TTL,
   ONLINE_TRANSPORTERS_SET
 } from './transporter-online.service';
+import { z } from 'zod';
+
+// =============================================================================
+// A12-010 / A13-012: dispatch_ack Zod schema (P3-F / P3-E amend)
+// payloadVersion: forward-compat field (Part B §2.4 P3-E)
+// =============================================================================
+const dispatchAckSchema = z.object({
+  assignmentId: z.string().min(1),
+  renderedAt: z.number().int().positive(),
+  source: z.string().max(64),
+  type: z.string().max(64).optional(),
+  payloadVersion: z.number().int().min(1).optional(),
+});
 
 // Lazy import to avoid circular dependency (socket.service ↔ driver.service)
 // H18 FIX: Add type annotation to preserve type safety across lazy require()
@@ -1353,6 +1366,85 @@ export function initializeSocket(server: HttpServer): Server {
         });
       });
     }
+
+    // ================================================================
+    // A12-010 / A13-012 (P3-F): dispatch_ack handler
+    // ================================================================
+    // Driver app emits dispatch_ack after rendering the overlay.
+    // Guards (Part B §2.4 P3-E amend):
+    //   1. 1 KB pre-parse DoS guard — reject oversized payloads before Zod.
+    //   2. Per-socket 10/s rate limit — prevent event-storm from buggy clients.
+    //   3. Zod parse — structured log on failure (never logs raw payload).
+    //   4. Latency histogram via ZSET dispatchedAt lookup.
+    // ================================================================
+    const ackRateState = { count: 0, windowStart: Date.now() };
+    socket.on('dispatch_ack', async (rawPayload: unknown) => {
+      try {
+        // 1KB pre-parse DoS guard
+        const rawLen = typeof rawPayload === 'string'
+          ? rawPayload.length
+          : JSON.stringify(rawPayload).length;
+        if (rawLen > 1024) {
+          try {
+            const { metrics } = require('../monitoring/metrics.service');
+            metrics.incrementCounter('dispatch_ack_oversized_total');
+          } catch { /* metrics optional */ }
+          return;
+        }
+        // Per-socket rate limit: 10 events per second
+        const now = Date.now();
+        if (now - ackRateState.windowStart > 1000) {
+          ackRateState.count = 0;
+          ackRateState.windowStart = now;
+        }
+        ackRateState.count += 1;
+        if (ackRateState.count > 10) {
+          try {
+            const { metrics } = require('../monitoring/metrics.service');
+            metrics.incrementCounter('dispatch_ack_rate_limited_total');
+          } catch { /* metrics optional */ }
+          return;
+        }
+        // Zod parse
+        const parsed = dispatchAckSchema.safeParse(rawPayload);
+        if (!parsed.success) {
+          const p = rawPayload as Record<string, unknown> | null | undefined;
+          logger.warn('dispatch_ack malformed', {
+            assignmentId: p?.assignmentId,
+            source: p?.source,
+            reason: parsed.error.issues[0]?.message,
+          });
+          try {
+            const { metrics } = require('../monitoring/metrics.service');
+            const typeLabel = (typeof p?.type === 'string' ? p.type : 'unknown');
+            metrics.incrementCounter('driver_overlay_rendered_total', { type: typeLabel, result: 'fail', reason: 'malformed' });
+          } catch { /* metrics optional */ }
+          return;
+        }
+        // Success path — increment overlay rendered counter
+        try {
+          const { metrics } = require('../monitoring/metrics.service');
+          metrics.incrementCounter('driver_overlay_rendered_total', {
+            type: parsed.data.type ?? 'trip_assigned',
+            result: 'ok',
+            reason: '',
+          });
+          // P3-T25: render latency histogram — look up dispatchedAt from ZSET tracking key
+          const dispatchZsetKey = `dispatch:sent:${parsed.data.assignmentId}`;
+          const dispatchedAtStr = await redisService.get(dispatchZsetKey).catch(() => null);
+          const dispatchedAtMs = dispatchedAtStr ? Number(dispatchedAtStr) : 0;
+          if (dispatchedAtMs > 0 && parsed.data.renderedAt > dispatchedAtMs) {
+            metrics.observeHistogram('driver_overlay_ack_latency_ms', parsed.data.renderedAt - dispatchedAtMs);
+          }
+        } catch { /* metrics optional */ }
+      } catch (err: unknown) {
+        const p = rawPayload as Record<string, unknown> | null | undefined;
+        logger.error('dispatch_ack handler error', {
+          assignmentId: p?.assignmentId,
+          err,
+        });
+      }
+    });
   });
 
   logger.info('Socket.IO initialized with optimized settings');
@@ -1451,6 +1543,35 @@ export function initializeSocket(server: HttpServer): Server {
 //      reconnects (streams persist, unlike pub/sub fire-and-forget).
 // =============================================================================
 
+// =============================================================================
+// A04-006 (P3-C / P3-T18): InstrumentedRedisClient — thin Proxy wrapper that
+// observes XADD latency for the Redis Streams adapter without patching the raw
+// node-redis client.  Passed to createAdapter() in setupRedisAdapter.
+// NOTE: node-redis has no commandStart/commandEnd hooks — use a Proxy instead.
+//       Reference: opentelemetry-instrumentation-redis-4 wrapping strategy.
+// =============================================================================
+function wrapRedisClientForAdapter(client: any): any {
+  return new Proxy(client, {
+    get(target: any, prop: string | symbol) {
+      // Intercept xAdd (node-redis v4 camelCase) and xadd (v3 lowercase) calls
+      if (prop === 'xAdd' || prop === 'xadd') {
+        return (...args: any[]) => {
+          const t0 = Date.now();
+          return (target[prop] as (...a: any[]) => Promise<any>)(...args).finally(() => {
+            try {
+              const { metrics } = require('../monitoring/metrics.service');
+              metrics.observeHistogram('socket_adapter_xadd_ms', Date.now() - t0);
+            } catch { /* metrics optional */ }
+          });
+        };
+      }
+      const val = target[prop];
+      // Preserve correct `this` binding for non-intercepted methods
+      return typeof val === 'function' ? val.bind(target) : val;
+    },
+  });
+}
+
 async function setupRedisAdapter(socketServer: Server): Promise<void> {
   if (process.env.REDIS_ENABLED !== 'true') {
     redisPubSubInitialized = false;
@@ -1492,11 +1613,45 @@ async function setupRedisAdapter(socketServer: Server): Promise<void> {
       // maxLen:100_000 (~8 min retention) survives task pause/partition without
       // silent cross-instance message loss. readCount:100 is the maximum
       // per-read batch so lagging tasks catch up quickly.
-      socketServer.adapter(createAdapter(client, {
-        streamCount: parseInt(process.env.SOCKET_STREAM_COUNT || '16', 10),
+      // A04-006 (P3-T18): wrap client so XADD calls emit socket_adapter_xadd_ms histogram.
+      const streamCount = parseInt(process.env.SOCKET_STREAM_COUNT || '16', 10);
+      socketServer.adapter(createAdapter(wrapRedisClientForAdapter(client), {
+        streamCount,
         maxLen: 100_000,
         readCount: 100,
       }));
+      // A04-006 (P3-T19 + P3-T20): XLEN sweep — pipelined, one round-trip per 5s.
+      // Guards against test pollution with NODE_ENV check.
+      if (process.env.NODE_ENV !== 'test') {
+        setInterval(async () => {
+          try {
+            const rawClient = redisService.getClient();
+            if (!rawClient) return;
+            const partitionCount = parseInt(process.env.SOCKET_STREAM_COUNT || '16', 10);
+            const depths = await Promise.all(
+              Array.from({ length: partitionCount }, (_, i) =>
+                (rawClient.xLen ? rawClient.xLen(`socket.io-${i}`) : Promise.resolve(0)) as Promise<number>
+              )
+            );
+            const { metrics } = require('../monitoring/metrics.service');
+            depths.forEach((d, i) => {
+              metrics.setGauge(`socket_stream_partition_depth_${i}`, d ?? 0);
+            });
+            // P3-T20: partition-depth skew metric (stddev / mean)
+            const n = depths.length;
+            if (n > 0) {
+              const mean = depths.reduce((s, v) => s + (v ?? 0), 0) / n;
+              if (mean > 0) {
+                const variance = depths.reduce((s, v) => s + ((v ?? 0) - mean) ** 2, 0) / n;
+                const stddev = Math.sqrt(variance);
+                metrics.setGauge('socket_stream_partition_depth_skew_ratio', stddev / mean);
+              } else {
+                metrics.setGauge('socket_stream_partition_depth_skew_ratio', 0);
+              }
+            }
+          } catch { /* sweep is best-effort — never block the event loop */ }
+        }, 5000).unref();
+      }
 
       redisPubSubInitialized = true;
       redisAdapterMode = 'enabled';
@@ -1552,7 +1707,8 @@ async function setupRedisAdapter(socketServer: Server): Promise<void> {
       const client = redisService.getClient();
       if (!client || !io) return;
       // H-16 (Phase 3): same explicit adapter options on the retry path.
-      io.adapter(createAdapter(client, {
+      // A04-006 (P3-T18): wrap client for XADD instrumentation on recovery path too.
+      io.adapter(createAdapter(wrapRedisClientForAdapter(client), {
         streamCount: parseInt(process.env.SOCKET_STREAM_COUNT || '16', 10),
         maxLen: 100_000,
         readCount: 100,

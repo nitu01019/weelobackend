@@ -508,6 +508,17 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
       'FCM retry backoff strategy used per attempt (retry_after_header vs exponential)',
     ),
 
+    // === P3-T34 / A13-011: Socket.IO connection counter ===
+    // Incremented on every socket 'connection' event in the Socket.IO server.
+    // The rate (socket_connect_total per 30s) > 5000/s triggers a reconnect-storm
+    // alarm (weelo-p3-socket-reconnect-surge). A storm indicates a rolling deploy,
+    // Redis adapter restart, or client-side bug causing mass rapid reconnects.
+    //   Call site: src/shared/services/socket.service.ts (io.on('connection'))
+    counter(
+      'socket_connect_total',
+      'Total Socket.IO connection events — rate spike > 5000/s triggers reconnect-storm alarm (P3-T34 / A13-011)',
+    ),
+
     // === A03-009 / A12-011: Notification-outbox observability ===
     // outbox_buffered_total: fires on every Redis LPUSH in bufferNotification.
     //   Labels: reason = 'adapter_down' | <caller-supplied reason>
@@ -579,7 +590,7 @@ export function registerDefaultGauges(gauges: Map<string, GaugeMetric>): void {
     // === A03-009 / A12-011: Notification-outbox size gauge ===
     // Sampled every 30s via GET outbox:size (O(1) counter key maintained by
     // bufferNotification INCR / drainOutbox DECR). Avoids SCAN on large sets.
-    gauge(
+    gauge( /* @observability-only */
       'outbox_size',
       'Current estimated size of the notification outbox (O(1) Redis counter — sampled every 30s) — A03-009',
     ),
@@ -711,7 +722,7 @@ export function registerDefaultHistograms(histograms: Map<string, HistogramMetri
     // above 5s signal a stalled await inside the loop that needs investigation.
     //   Call site: src/modules/truck-hold/confirmed-hold.service.ts
     //   (after the per-assignment fanout loop, before outbox mark-dispatched)
-    hist(
+    hist( /* @observability-only */
       'confirmed_hold_fanout_duration_ms',
       'Wall-clock duration of the confirmed-hold post-commit per-driver fanout loop in milliseconds',
       [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000],
@@ -745,7 +756,7 @@ export function registerDefaultHistograms(histograms: Map<string, HistogramMetri
     // === A03-009 / A12-011: Notification-outbox per-entry drain latency ===
     // Observed per entry in drainOutbox (Date.now() delta around queuePushNotification).
     //   Labels: outbox = 'notification'
-    hist(
+    hist( /* @observability-only */
       'outbox_drain_latency_ms',
       'Per-entry drain latency in the notification outbox from dequeue to queuePushNotification resolution — A03-009',
       [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000],
@@ -754,7 +765,7 @@ export function registerDefaultHistograms(histograms: Map<string, HistogramMetri
     // Observed per XADD call via the InstrumentedRedisClient Proxy wrapper on the adapter client.
     // Lets SRE see per-stream XADD p50/p99 and correlate with stream depth skew.
     //   Call site: src/shared/services/socket.service.ts (wrapRedisClientForAdapter P3-T18)
-    hist(
+    hist( /* @observability-only */
       'socket_adapter_xadd_ms',
       'A04-006: Socket.IO Redis Streams adapter XADD latency in milliseconds (per-call, via InstrumentedRedisClient proxy)',
       [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000],

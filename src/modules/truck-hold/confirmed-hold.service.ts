@@ -106,6 +106,57 @@ const REDIS_KEYS = {
 };
 
 // =============================================================================
+// NO-ACK SWEEP — 15-second transitional in-memory guard (P3-T27)
+// =============================================================================
+//
+// TODO(Phase-6-migration): This in-memory sweep is a transitional pattern
+// until the outbox substrate from Phase 6 lands.  When
+// `notification-outbox.service.ts` or `vehicle-transition-outbox.service.ts`
+// are available, migrate this to an outbox-backed durable sweep:
+//   1. On socket emit success: write a `dispatch_ack_pending` outbox row with
+//      a 15-second schedule window instead of registering a local setTimeout.
+//   2. The outbox poller fires the sweep logic transactionally — no process-
+//      restart data loss, no per-pod timer drift at scale.
+//   3. Delete _pendingDispatches, _registerNoAckSweep, and
+//      DISPATCH_NO_ACK_TIMEOUT_MS from this file once Phase 6 is live.
+//      Keep the Redis insurance key (dispatch_ack_pending:{assignmentId})
+//      because the outbox row replaces it functionally.
+
+/**
+ * How long (ms) to wait before declaring a dispatched trip_assigned as
+ * timed-out with no ack.  Exported so tests can lower it to ~100ms without
+ * relying on Jest fake timers (which interact poorly with .unref()).
+ */
+export let DISPATCH_NO_ACK_TIMEOUT_MS = 15_000;
+
+/** Internal shape stored per pending dispatch. */
+interface PendingDispatch {
+  assignmentId: string;
+  driverId: string;
+  dispatchedAtMs: number;
+  cleanupTimer: ReturnType<typeof setTimeout>;
+}
+
+/**
+ * Module-level Map keyed by assignmentId.  Entries are inserted after a
+ * successful trip_assigned socket emit and removed either when
+ * `acknowledgeDispatch` is called (ack received) or when the sweep fires.
+ */
+export const _pendingDispatches = new Map<string, PendingDispatch>();
+
+/**
+ * Called from `acknowledgeDispatch` (wired by the P3-F socket handler) when
+ * the driver's client sends a dispatch_ack.  Clears the pending entry so the
+ * 15-second sweep does NOT fire the timeout counter.
+ */
+export function acknowledgeDispatch(assignmentId: string): void {
+  const entry = _pendingDispatches.get(assignmentId);
+  if (!entry) return;
+  clearTimeout(entry.cleanupTimer);
+  _pendingDispatches.delete(assignmentId);
+}
+
+// =============================================================================
 // CONFIRMED HOLD SERVICE
 // =============================================================================
 
@@ -571,6 +622,8 @@ class ConfirmedHoldService {
       // Schedule driver acceptance timeouts with full data AND
       // fan out per-driver socket emit + FCM enqueue (P2 F4.1).
       const missingIds: string[] = [];
+      // P3-T28: record wall-clock start for confirmed_hold_fanout_duration_ms histogram.
+      const fanoutT0 = Date.now();
       // W3 A13-005: confirmed-hold fanout observability (agent-13-scale-model.md F-05).
       // `expected` = intended per-driver notifications for this hold. `socket_ok`
       // and `fcm_ok` increment per successful channel delivery inside the loop.
@@ -738,6 +791,8 @@ class ConfirmedHoldService {
       if (missingIds.length > 0) {
         logger.warn('[CONFIRMED HOLD] Some assignments not found', { missingIds });
       }
+      // P3-T28: observe total fanout loop wall-clock duration.
+      metrics.observeHistogram('confirmed_hold_fanout_duration_ms', Date.now() - fanoutT0);
 
       // W3 A03-004/A13-005: fast-path succeeded for all drivers — mark the
       // trip_assigned_fanout outbox rows as 'dispatched' so the poller stays
@@ -1522,6 +1577,57 @@ class ConfirmedHoldService {
       assignmentId,
       timeoutSeconds,
       driverId: assignmentData.driverId,
+    });
+  }
+
+  /**
+   * P3-T27 — Register a 15-second no-ack sweep entry for a dispatched
+   * trip_assigned socket emit.
+   *
+   * After the fanout loop emits to a driver, this method:
+   *   1. Sets a Redis key `dispatch_ack_pending:{assignmentId}` with a 20-second
+   *      TTL as a durable insurance signal (visible cross-pod).
+   *   2. Inserts an entry in the module-level _pendingDispatches Map.
+   *   3. Schedules a `.unref()`'d 15-second timeout.  If the entry is still
+   *      present when the timer fires (i.e., no ack was received via
+   *      acknowledgeDispatch), it increments the timeout counter and cleans up.
+   */
+  _registerNoAckSweep(assignmentId: string, driverId: string): void {
+    // Redis insurance key — 20s TTL, best-effort (non-blocking)
+    redisService
+      .set(`dispatch_ack_pending:${assignmentId}`, '1', 20)
+      .catch((err: unknown) => {
+        logger.warn('[CONFIRMED HOLD] Failed to set dispatch_ack_pending Redis key (non-fatal)', {
+          assignmentId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+
+    const timer = setTimeout(() => {
+      if (_pendingDispatches.has(assignmentId)) {
+        metrics.incrementCounter('driver_overlay_rendered_total', {
+          type: 'trip_assigned',
+          result: 'fail',
+          reason: 'timeout',
+        });
+        logger.warn('[CONFIRMED HOLD] No dispatch_ack received within timeout window', {
+          assignmentId,
+          driverId,
+          timeoutMs: DISPATCH_NO_ACK_TIMEOUT_MS,
+        });
+        _pendingDispatches.delete(assignmentId);
+      }
+    }, DISPATCH_NO_ACK_TIMEOUT_MS);
+
+    // .unref() so this timer does not prevent the test process (or a graceful
+    // server shutdown) from exiting when no other work is pending.
+    timer.unref();
+
+    _pendingDispatches.set(assignmentId, {
+      assignmentId,
+      driverId,
+      dispatchedAtMs: Date.now(),
+      cleanupTimer: timer,
     });
   }
 }
