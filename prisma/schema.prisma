@@ -1376,6 +1376,11 @@ model Rating {
 // This table is a durable fallback: if Redis loses data (restart, eviction),
 // tokens can be recovered from here so push notifications keep working.
 //
+// P7-T05 (A05-004 / Part B P7-E): Added `revokedAt` soft-delete column.
+// When FCM returns messaging/registration-token-not-registered, we set
+// revokedAt=now() instead of (or in addition to) deleting the row.
+// getTokens() DB fallback filters WHERE revokedAt IS NULL AND lastSeenAt > 90d.
+//
 // NOTE: Table must be created via direct SQL (per CLAUDE.md rules — no prisma migrate).
 // CREATE TABLE "DeviceToken" (
 //   "id" TEXT NOT NULL DEFAULT gen_random_uuid(),
@@ -1388,15 +1393,39 @@ model Rating {
 // );
 // CREATE UNIQUE INDEX "DeviceToken_userId_token_key" ON "DeviceToken"("userId", "token");
 // CREATE INDEX "DeviceToken_userId_idx" ON "DeviceToken"("userId");
+//
+// ===== OPERATOR STEPS (run once on staging, then prod — NEVER prisma migrate) =====
+//
+// Step 1 — Add revokedAt column (idempotent):
+//   ALTER TABLE "DeviceToken"
+//     ADD COLUMN IF NOT EXISTS "revokedAt" TIMESTAMP(3) NULL;
+//
+// Step 2 — Partial index for active-token queries (WHERE revokedAt IS NULL):
+//   CREATE INDEX CONCURRENTLY IF NOT EXISTS "DeviceToken_userId_lastSeenAt_active_idx"
+//     ON "DeviceToken" ("userId", "lastSeenAt" DESC)
+//     WHERE "revokedAt" IS NULL;
+//
+// Verification:
+//   SELECT indexname, indexdef FROM pg_indexes
+//     WHERE tablename='DeviceToken'
+//       AND indexname='DeviceToken_userId_lastSeenAt_active_idx';
+//   Expected: row present with "WHERE ("revokedAt" IS NULL)"
+//
+// IMPORTANT: NEVER run prisma migrate deploy / prisma db push on this DB
+//            (no _prisma_migrations table — see CLAUDE.md DB rules).
 // =============================================================================
 
 model DeviceToken {
-  id         String   @id @default(uuid())
+  id         String    @id @default(uuid())
   userId     String
   token      String
-  platform   String   @default("android")
-  lastSeenAt DateTime @default(now())
-  createdAt  DateTime @default(now())
+  platform   String    @default("android")
+  lastSeenAt DateTime  @default(now())
+  // P7-T05 (A05-004): Soft-revoke timestamp. Set when FCM returns UNREGISTERED
+  // so getTokens() DB fallback excludes this token immediately. NULL = active.
+  // Operator step above adds this column — see CLAUDE.md DB rules.
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
 
   @@unique([userId, token])
   @@index([userId])
