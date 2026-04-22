@@ -35,7 +35,7 @@ jest.mock('../shared/database/prisma.service', () => ({
     vehicle: { updateMany: jest.fn() },
     order: { update: jest.fn(), updateMany: jest.fn() },
     booking: { updateMany: jest.fn() },
-    deviceToken: { upsert: jest.fn(), findMany: jest.fn().mockResolvedValue([]), deleteMany: jest.fn() },
+    deviceToken: { upsert: jest.fn(), findMany: jest.fn().mockResolvedValue([]), deleteMany: jest.fn(), updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
     $transaction: jest.fn(),
   },
 }));
@@ -277,4 +277,266 @@ describe('H-20: POD in trip flow', () => {
     expect(rds.set).toHaveBeenCalledWith('pod:otp:tp', expect.stringMatching(/^\d{4}$/), 3600);
     delete process.env.FF_POD_OTP_REQUIRED;
   });
+});
+
+// =============================================================================
+// P7-T55 / P7-T56 — Phase 7 FCM reliability tests
+// =============================================================================
+
+// -- P7-T55a: NON_RETRYABLE expansion (messaging/authentication-error etc.) ---
+describe('P7-T55: NON_RETRYABLE_FCM_ERRORS expansion (A05-011)', () => {
+  let fcm: any;
+
+  beforeEach(() => {
+    jest.resetModules();
+    jest.isolateModules(() => { fcm = require('../shared/services/fcm.service').fcmService; });
+  });
+
+  const NEW_NON_RETRYABLE = [
+    'messaging/authentication-error',
+    'messaging/unauthorized',
+    'messaging/sender-id-mismatch',
+  ];
+
+  test.each(NEW_NON_RETRYABLE)(
+    'executeWithRetry does not retry on %s (throws immediately)',
+    async (errorCode) => {
+      // Access the private method via any cast
+      const service = fcm as any;
+      let callCount = 0;
+      const fn = async () => {
+        callCount++;
+        const err: any = new Error(`FCM error: ${errorCode}`);
+        err.code = errorCode;
+        throw err;
+      };
+      await expect(service.executeWithRetry(fn, 2)).rejects.toMatchObject({ code: errorCode });
+      // Should only be called once — no retries for non-retryable codes
+      expect(callCount).toBe(1);
+    }
+  );
+
+  test('legacy non-retryable code still short-circuits (messaging/invalid-registration-token)', async () => {
+    const service = fcm as any;
+    let callCount = 0;
+    const fn = async () => {
+      callCount++;
+      const err: any = new Error('FCM: invalid-registration-token');
+      err.code = 'messaging/invalid-registration-token';
+      throw err;
+    };
+    await expect(service.executeWithRetry(fn, 2)).rejects.toMatchObject({ code: 'messaging/invalid-registration-token' });
+    expect(callCount).toBe(1);
+  });
+
+  test('retryable code IS retried (messaging/server-unavailable)', async () => {
+    const service = fcm as any;
+    let callCount = 0;
+    const fn = async () => {
+      callCount++;
+      const err: any = new Error('FCM: server-unavailable');
+      err.code = 'messaging/server-unavailable';
+      throw err;
+    };
+    // maxRetries=1 → 2 attempts total
+    await expect(service.executeWithRetry(fn, 1)).rejects.toMatchObject({ code: 'messaging/server-unavailable' });
+    expect(callCount).toBe(2);
+  });
+});
+
+// -- P7-T55b: revokedAt filter excludes stale tokens ---
+describe('P7-T55: revokedAt filter excludes revoked/stale tokens from getTokens() DB fallback (A05-004)', () => {
+  // Use module-level mocks (established at top of file via jest.mock calls).
+  // Do NOT use jest.resetModules()/isolateModules here — it re-creates the mock objects
+  // and the redis/prisma references inside the FCM module would point to new instances
+  // while our local mockRedis/mockPrisma variables point to the original stubs.
+
+  let fcm: any;
+  let mockPrisma: any;
+  let mockRedis: any;
+
+  beforeAll(() => {
+    fcm = require('../shared/services/fcm.service').fcmService;
+    mockPrisma = require('../shared/database/prisma.service').prismaClient;
+    mockRedis = require('../shared/services/redis.service').redisService;
+  });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    // Force Redis to appear unavailable so getTokens falls through to DB
+    mockRedis.isRedisEnabled.mockReturnValue(false);
+    mockRedis.isConnected.mockReturnValue(false);
+    // Return empty Redis set (sMembers not called, but set it anyway)
+    mockRedis.sMembers.mockResolvedValue([]);
+  });
+
+  afterEach(() => {
+    // Restore Redis availability for other tests
+    mockRedis.isRedisEnabled.mockReturnValue(false);
+    mockRedis.isConnected.mockReturnValue(false);
+  });
+
+  test('findMany is called with revokedAt: null filter when Redis is unavailable', async () => {
+    mockPrisma.deviceToken.findMany.mockResolvedValue([{ token: 'tok-abc' }]);
+
+    const tokens = await fcm.getTokens('user-123');
+
+    expect(mockPrisma.deviceToken.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          userId: 'user-123',
+          revokedAt: null,
+          lastSeenAt: expect.objectContaining({ gt: expect.any(Date) }),
+        }),
+      })
+    );
+    expect(tokens).toEqual(['tok-abc']);
+  });
+
+  test('lastSeenAt gt filter window is approximately 90 days', async () => {
+    mockPrisma.deviceToken.findMany.mockResolvedValue([]);
+    await fcm.getTokens('user-456');
+
+    const calls = mockPrisma.deviceToken.findMany.mock.calls;
+    expect(calls.length).toBeGreaterThan(0);
+    const callArg = calls[calls.length - 1][0];
+    const gtDate: Date = callArg.where.lastSeenAt.gt;
+    const expectedMs = 90 * 24 * 60 * 60 * 1000;
+    const diff = Date.now() - gtDate.getTime();
+    // Allow 5s of test execution slack
+    expect(diff).toBeGreaterThan(expectedMs - 5000);
+    expect(diff).toBeLessThan(expectedMs + 5000);
+  });
+});
+
+// -- P7-T56a: UNREGISTERED token sets revokedAt ---
+describe('P7-T56: UNREGISTERED token is soft-revoked via revokedAt update (A05-004)', () => {
+  let fcm: any;
+  let mockPrisma: any;
+
+  beforeEach(() => {
+    // Use the module mock as-is (jest.mock at top already stubs deviceToken.updateMany)
+    fcm = require('../shared/services/fcm.service').fcmService;
+    mockPrisma = require('../shared/database/prisma.service').prismaClient;
+    // Ensure updateMany is a mock function (may have been cleared by other tests)
+    if (typeof mockPrisma.deviceToken.updateMany?.mockResolvedValue === 'function') {
+      mockPrisma.deviceToken.updateMany.mockResolvedValue({ count: 1 });
+    }
+    if (typeof mockPrisma.deviceToken.deleteMany?.mockResolvedValue === 'function') {
+      mockPrisma.deviceToken.deleteMany.mockResolvedValue({ count: 1 });
+    }
+  });
+
+  test('sendToTokens triggers revokedAt update on UNREGISTERED error for userId', async () => {
+    // Override sendWithRetry to inject the UNREGISTERED error directly into sendToTokens
+    const service = fcm as any;
+    service.isInitialized = false; // force mock path — revokedAt path is in the catch of real sends
+    // We need to test the catch path — make executeWithRetry throw UNREGISTERED
+    jest.spyOn(service, 'executeWithRetry').mockRejectedValueOnce(
+      Object.assign(new Error('token not registered'), { code: 'messaging/registration-token-not-registered' })
+    );
+    service.isInitialized = true;
+    service.admin = { messaging: () => ({ send: jest.fn() }) };
+
+    await service.sendToTokens(['dead-token'], { type: 'test', title: 'T', body: 'B' }, 'user-999');
+
+    // revokedAt update should be called
+    expect(mockPrisma.deviceToken.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ userId: 'user-999', token: 'dead-token' }),
+        data: expect.objectContaining({ revokedAt: expect.any(Date) }),
+      })
+    );
+  });
+});
+
+// -- P7-T56b: sendToUsersMulticast rate-limit gate fires ---
+describe('P7-T56: sendToUsersMulticast rate-limit gate prevents burst (A05-007 / Part B P7-F)', () => {
+  let fcm: any;
+
+  beforeEach(() => {
+    jest.resetModules();
+    jest.isolateModules(() => { fcm = require('../shared/services/fcm.service').fcmService; });
+    // Force initialized so sendToUsersMulticast runs the real path
+    (fcm as any).isInitialized = true;
+    const sendEachForMulticast = jest.fn().mockResolvedValue({ successCount: 0, failureCount: 0, responses: [] });
+    (fcm as any).admin = {
+      messaging: () => ({ sendEachForMulticast }),
+    };
+  });
+
+  test('sendToUsersMulticast returns rateLimited=true when bucket is exhausted', async () => {
+    const service = fcm as any;
+    // Drain the bucket to zero and set lastRefill to far in the future to prevent any refill
+    service._fcmEgressTokens = 0;
+    service._fcmEgressLastRefill = Date.now() + 1_000_000; // future → elapsedSec is negative → no refill
+
+    // Mock getTokens to return one token per user
+    jest.spyOn(service, 'getTokens').mockResolvedValue(['tok-1']);
+
+    const result = await service.sendToUsersMulticast(
+      ['user-a'],
+      { type: 'new_broadcast', title: 'T', body: 'B', priority: 'high' }
+    );
+
+    expect(result.rateLimited).toBe(true);
+    expect(result.successCount).toBe(0);
+  });
+
+  test('sendToUsersMulticast succeeds when bucket has tokens', async () => {
+    const service = fcm as any;
+    service._fcmEgressTokens = 8000;
+    service._fcmEgressLastRefill = Date.now();
+
+    jest.spyOn(service, 'getTokens').mockResolvedValue(['tok-2']);
+    service.admin.messaging = () => ({
+      sendEachForMulticast: jest.fn().mockResolvedValue({
+        successCount: 1,
+        failureCount: 0,
+        responses: [{ success: true }],
+      }),
+    });
+
+    const result = await service.sendToUsersMulticast(
+      ['user-b'],
+      { type: 'new_broadcast', title: 'T', body: 'B', priority: 'high' }
+    );
+
+    expect(result.rateLimited).toBe(false);
+    expect(result.successCount).toBe(1);
+  });
+
+  test('sendToUsersMulticast with 150K user IDs: rate-limit gate fires (burst guard)', async () => {
+    // This test verifies that a burst of 150K users (each with 1 token = 150K tokens)
+    // is correctly rate-limited by the 8K/s token bucket.
+    const service = fcm as any;
+    // Set bucket to only 100 tokens so the 150K batch is rejected immediately.
+    // Set lastRefill far in the future to prevent lazy refill during token resolution.
+    service._fcmEgressTokens = 100;
+    service._fcmEgressLastRefill = Date.now() + 1_000_000;
+
+    // Mock getTokens to return unique token per user — forces 150K deduped tokens
+    let tokenIdx = 0;
+    jest.spyOn(service, 'getTokens').mockImplementation(() =>
+      Promise.resolve([`tok-unique-${tokenIdx++}`])
+    );
+
+    // Track sendEachForMulticast calls
+    const sendEachMock = jest.fn().mockResolvedValue({ successCount: 0, failureCount: 0, responses: [] });
+    service.admin = { messaging: () => ({ sendEachForMulticast: sendEachMock }) };
+
+    const LARGE_USER_COUNT = 150_000;
+    const userIds = Array.from({ length: LARGE_USER_COUNT }, (_, i) => `user-${i}`);
+
+    const result = await service.sendToUsersMulticast(
+      userIds,
+      { type: 'new_broadcast', title: 'Broadcast', body: 'New booking', priority: 'high' }
+    );
+
+    // The bucket has only 100 tokens, 150K requested → rate limited
+    expect(result.rateLimited).toBe(true);
+    expect(result.successCount).toBe(0);
+    // No burst > 8K/s — the gate fired before any sendEachForMulticast call
+    expect(sendEachMock).not.toHaveBeenCalled();
+  }, 30000); // 150K users takes up to 30s to resolve tokens (20 concurrent)
 });

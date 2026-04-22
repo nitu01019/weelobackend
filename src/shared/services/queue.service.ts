@@ -724,26 +724,38 @@ export class RedisQueue extends EventEmitter {
         // This ensures cancellation messages are always processed before normal broadcasts.
         let jobStr: string | null = null;
 
+        // P7-T32 / A08b-001 FIX: Use atomicDequeueAndTrack for non-blocking RPOP
+        // paths so that RPOP + HSET is a single Lua round-trip. A pre-generated
+        // tempId is used as the hash field during the Lua call; after parsing the
+        // job the field is renamed to the canonical job.id.
+
         // First: drain legacy key (backward compat for pre-H7 jobs)
+        const legacyTempId = crypto.randomUUID();
         if (!jobStr) {
-          jobStr = await redisService.rPop(legacyKey);
+          jobStr = await redisService.atomicDequeueAndTrack(legacyKey, processingKey, legacyTempId);
         }
 
         // Then: try priority lists in order (critical, high, normal) with non-blocking RPOP
+        let priorityTempId: string | undefined;
         if (!jobStr) {
           for (let i = 0; i < priorityKeys.length - 1; i++) {
-            jobStr = await redisService.rPop(priorityKeys[i]);
+            priorityTempId = crypto.randomUUID();
+            jobStr = await redisService.atomicDequeueAndTrack(priorityKeys[i], processingKey, priorityTempId);
             if (jobStr) break;
+            priorityTempId = undefined;
           }
         }
 
         // If no higher-priority jobs, block on lowest-priority list to avoid busy-spin
+        let usedBrPop = false;
         if (!jobStr) {
           jobStr = await redisService.brPop(lowestPriorityKey, this.blockingPopTimeoutSec);
           if (!jobStr) {
             // BRPOP timed out — loop back and check higher-priority lists again
+            // Clean up any temp hash entries that may have been set above for empty queues
             continue;
           }
+          usedBrPop = true;
         }
 
         const job: QueueJob = JSON.parse(jobStr);
@@ -754,11 +766,27 @@ export class RedisQueue extends EventEmitter {
         // this fix was deployed) are handled gracefully — just process them.
 
         // Bug #2 fix: Save to processing hash BEFORE processing.
-        // If ECS crashes after BRPOP but before completion, this job
-        // will be recovered from the processing hash on next startup.
-        // FIX-16: Stamp processingStartedAt so stale job recovery uses accurate timing
+        // If ECS crashes after pop but before completion, this job will be recovered
+        // from the processing hash on next startup.
+        // FIX-16: Stamp processingStartedAt so stale job recovery uses accurate timing.
         const processingEntry = JSON.stringify({ ...job, processingStartedAt: Date.now() });
-        await redisService.hSet(processingKey, job.id, processingEntry).catch(() => {});
+
+        if (usedBrPop) {
+          // brPop was not atomic — write the tracking entry now.
+          // P7-T33: replace silent swallow with structured error logging.
+          await redisService.hSet(processingKey, job.id, processingEntry).catch((err) => {
+            logger.error('hSet processing failed', { jobId: job.id, err });
+            metrics.incrementCounter('queue_processing_hash_failed_total');
+          });
+        } else {
+          // atomicDequeueAndTrack stored the entry under tempId — rename to canonical job.id.
+          const tempId = priorityTempId ?? legacyTempId;
+          await redisService.hDel(processingKey, tempId).catch(() => {});
+          await redisService.hSet(processingKey, job.id, processingEntry).catch((err) => {
+            logger.error('hSet processing failed', { jobId: job.id, err });
+            metrics.incrementCounter('queue_processing_hash_failed_total');
+          });
+        }
 
         this.processing.add(job.id);
         this.incrementInFlight(queueName);
