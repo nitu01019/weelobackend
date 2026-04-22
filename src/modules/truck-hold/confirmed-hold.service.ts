@@ -464,6 +464,11 @@ class ConfirmedHoldService {
       });
       const pickup = (parentOrder?.pickup as any) || {};
       const drop = (parentOrder?.drop as any) || {};
+      // A13-013: expose both lat/lng and latitude/longitude key shapes to the
+      // socket payload so captain clients keyed on either convention resolve
+      // coordinates without a silent zero-fallback.
+      const socketPickup = { ...pickup, lat: pickup?.latitude ?? pickup?.lat ?? 0, lng: pickup?.longitude ?? pickup?.lng ?? 0 };
+      const socketDrop = { ...drop, lat: drop?.latitude ?? drop?.lat ?? 0, lng: drop?.longitude ?? drop?.lng ?? 0 };
       const expiresAtIso = new Date(
         now.getTime() + this.config.driverAcceptTimeoutSeconds * 1000
       ).toISOString();
@@ -503,8 +508,8 @@ class ConfirmedHoldService {
             orderId: fullData.orderId,
             bookingId: fullData.bookingId,
             truckRequestId: fullData.truckRequestId,
-            pickup,
-            drop,
+            pickup: socketPickup,
+            drop: socketDrop,
             vehicleNumber: fullData.vehicleNumber,
             vehicleType: fullData.vehicleType,
             distanceKm: parentOrder?.distanceKm,
