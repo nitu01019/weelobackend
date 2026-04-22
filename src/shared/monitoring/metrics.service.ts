@@ -420,6 +420,15 @@ class MetricsService {
       help: 'Current tracking queue in-flight workers/jobs',
       value: 0
     });
+
+    // A01-005 (T49): Boot-time invariant gauge.
+    // 1 = rateLimiter registered before express.json (ordering invariant holds).
+    // Alert if this gauge is 0 or absent.
+    this.gauges.set('middleware_order_rate_limiter_before_json_parser', {
+      name: 'middleware_order_rate_limiter_before_json_parser',
+      help: 'Boot-time invariant: 1 = rateLimiter precedes express.json (A01-005)',
+      value: 0
+    });
   }
 
   /**

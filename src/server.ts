@@ -324,28 +324,6 @@ app.use(cors({
   maxAge: 86400 // 24 hours preflight cache
 }));
 
-// Parse JSON bodies with size limit
-app.use(express.json({ limit: '1mb' }));
-
-// Block suspicious requests (XSS, SQL injection, etc.)
-app.use(blockSuspiciousRequests);
-
-// Sanitize all input
-app.use(sanitizeInput);
-
-// Prevent parameter pollution
-app.use(preventParamPollution);
-
-// Backward compatibility: rewrite legacy Captain app paths to canonical routes
-// Fixes BRK-4 (/trips/*), BRK-2 (plural /tracking/trips/), and general path normalization
-app.use(backwardCompatMiddleware);
-
-// Request logging
-app.use(requestLogger);
-
-// Metrics collection middleware (track request duration, counts)
-app.use(metricsMiddleware);
-
 // =============================================================================
 // HEALTH & MONITORING ROUTES - BEFORE rate limiter so ALB health checks never get throttled
 // =============================================================================
@@ -399,8 +377,69 @@ app.get('/health/runtime', authMiddleware, roleGuard(['admin']), async (_req, re
   }
 });
 
-// Rate limiting - AFTER health routes so ALB health checks are never throttled
+// =============================================================================
+// A01-005 PRE-FLIGHT AUDIT — middleware between old JSON parser position and
+// the rate-limiter (all confirmed safe to sit BEFORE express.json — none reads
+// req.body):
+//
+//   requestIdMiddleware     — assigns X-Request-ID from header; reads no body
+//   correlationMiddleware   — wraps AsyncLocalStorage context; reads no body
+//   compression             — streams response; reads no body
+//   securityHeaders         — sets Helmet response headers; reads no body
+//   securityResponseHeaders — sets additional security headers; reads no body
+//   cors                    — sets CORS response headers + preflight; reads no body
+//   healthRoutes / flagHealthRouter / /health/runtime — route handlers; bypass RL
+//
+// Body-reading middleware (blockSuspiciousRequests, sanitizeInput,
+// preventParamPollution) remain registered AFTER express.json below — unchanged.
+//
+// No webhook raw-body parser exists in this codebase (no Stripe/payment webhooks).
+// No body-parser, csurf, or other body-dependent middleware sits between the
+// old JSON parser position and the rate-limiter position.
+//
+// ORDERING AFTER THIS REORDER (A01-005 T10):
+//   1. trust proxy
+//   2. ip-source metric
+//   3. requestIdMiddleware
+//   4. correlationMiddleware
+//   5. compression
+//   6. securityHeaders (Helmet)
+//   7. securityResponseHeaders
+//   8. cors
+//   9. healthRoutes / flagHealthRouter / /health/runtime  <- ALB health bypass
+//  10. rateLimiter                                        <- BLOCKS HERE first
+//  11. express.json({ limit: '32kb' })                   <- heap only for passing IPs
+//  12. blockSuspiciousRequests / sanitizeInput / preventParamPollution
+//  13. backwardCompatMiddleware / requestLogger / metricsMiddleware
+// =============================================================================
+
+// A01-005 (T10): Rate limiting BEFORE JSON parser — blocked IPs never allocate
+// the JSON heap. Envoy pre-filter pattern.
 app.use(rateLimiter);
+
+// A01-005 (T09): Tightened JSON body limit from 1mb to 32kb.
+// Only reached by IPs that pass the rate-limiter above.
+// No webhook raw-body parser exists in this codebase — no bypass needed.
+app.use(express.json({ limit: '32kb' }));
+
+// Block suspicious requests (XSS, SQL injection, etc.)
+app.use(blockSuspiciousRequests);
+
+// Sanitize all input
+app.use(sanitizeInput);
+
+// Prevent parameter pollution
+app.use(preventParamPollution);
+
+// Backward compatibility: rewrite legacy Captain app paths to canonical routes
+// Fixes BRK-4 (/trips/*), BRK-2 (plural /tracking/trips/), and general path normalization
+app.use(backwardCompatMiddleware);
+
+// Request logging
+app.use(requestLogger);
+
+// Metrics collection middleware (track request duration, counts)
+app.use(metricsMiddleware);
 
 // =============================================================================
 // API ROUTES
@@ -486,6 +525,155 @@ app.use((_req, res) => {
 
 // Global error handler
 app.use(errorHandler);
+
+// =============================================================================
+// A01-005 (T11): BOOT-TIME MIDDLEWARE ORDER INVARIANT ASSERTION
+// Reads app._router.stack after all app.use() calls are complete.
+// Asserts that rateLimiter is registered at a lower stack index than
+// express.json so blocked IPs never reach the JSON parser heap.
+// Fails fast on boot if the ordering invariant is broken.
+// =============================================================================
+{
+  const stack: any[] = (app as any)._router?.stack ?? [];
+  let rateLimiterIdx = -1;
+  let jsonParserIdx = -1;
+  for (let i = 0; i < stack.length; i++) {
+    const layer = stack[i];
+    const handleName: string = layer?.handle?.name ?? '';
+    if (rateLimiterIdx === -1 && (handleName === 'rateLimit' || layer?.handle === rateLimiter)) {
+      rateLimiterIdx = i;
+    }
+    if (jsonParserIdx === -1 && handleName === 'jsonParser') {
+      jsonParserIdx = i;
+    }
+  }
+  if (rateLimiterIdx === -1 || jsonParserIdx === -1 || rateLimiterIdx >= jsonParserIdx) {
+    throw new Error(
+      `middleware order invariant broken — rate limiter must precede json parser (A01-005). ` +
+      `rateLimiterIdx=${rateLimiterIdx} jsonParserIdx=${jsonParserIdx}`
+    );
+  }
+  logger.info(`[A01-005] Middleware order invariant OK: rateLimiter(${rateLimiterIdx}) < jsonParser(${jsonParserIdx})`);
+
+  // A01-005 (T49): Boot-time gauge — value 1 signals the invariant holds.
+  // Alert on middleware_order_rate_limiter_before_json_parser != 1.
+  try {
+    metrics.setGauge('middleware_order_rate_limiter_before_json_parser', 1);
+  } catch {
+    logger.warn('[A01-005] Could not set middleware_order gauge — metric may not be registered');
+  }
+}
+
+// =============================================================================
+// A01-005 (P1-T-NEW / Part B §2.2 P1-F): validateProductionConfig
+// Pre-flight validation gate — called inside bootstrap() BEFORE server.listen.
+// On any failure in production: logs structured error + process.exit(1).
+// In non-production: logs warning only and continues.
+// =============================================================================
+async function validateProductionConfig(): Promise<void> {
+  const isProduction = process.env.NODE_ENV === 'production';
+  const failures: string[] = [];
+
+  // 1. JWT secret length >= 32 bytes
+  try {
+    const jwtSecret = process.env.JWT_SECRET ?? '';
+    if (Buffer.byteLength(jwtSecret, 'utf8') < 32) {
+      failures.push(`JWT_SECRET is too short (< 32 bytes) — use a cryptographically random secret`);
+    }
+  } catch (err: unknown) {
+    failures.push(`JWT_SECRET validation threw: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // 2. DB_CONNECTION_LIMIT is a positive integer
+  try {
+    const rawLimit = process.env.DB_CONNECTION_LIMIT;
+    if (rawLimit !== undefined) {
+      const limit = parseInt(rawLimit, 10);
+      if (!Number.isFinite(limit) || limit <= 0) {
+        failures.push(`DB_CONNECTION_LIMIT="${rawLimit}" is not a positive integer`);
+      }
+    }
+  } catch (err: unknown) {
+    failures.push(`DB_CONNECTION_LIMIT validation threw: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // 3. Redis reachability via healthCheck
+  try {
+    if (redisService.isRedisEnabled()) {
+      const health = await redisService.healthCheck();
+      if (health.status === 'unhealthy') {
+        failures.push(`Redis healthCheck returned status="unhealthy" — check REDIS_URL and connectivity`);
+      } else {
+        logger.info(`[validateProductionConfig] Redis health: ${health.status} (${health.latencyMs ?? 'N/A'}ms)`);
+      }
+    } else {
+      logger.info('[validateProductionConfig] Redis not enabled — skipping reachability check');
+    }
+  } catch (err: unknown) {
+    failures.push(`Redis healthCheck threw: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // 4. FF_* invariants — pass-through; validateFeatureFlags() handles this at banner stage.
+
+  // 5. Redis server version >= 7.4, or 7.1 with USE_PEXPIRE_FALLBACK=true (Part B CC-7)
+  try {
+    if (redisService.isRedisEnabled()) {
+      const rawClient = redisService.getClient();
+      let infoStr: string | null = null;
+      if (rawClient && typeof rawClient.info === 'function') {
+        infoStr = await rawClient.info('server');
+      } else if (rawClient && typeof rawClient.call === 'function') {
+        infoStr = await rawClient.call('INFO', 'server');
+      }
+      if (infoStr) {
+        const versionMatch = /redis_version:(\d+)\.(\d+)/.exec(infoStr);
+        if (versionMatch) {
+          const major = parseInt(versionMatch[1], 10);
+          const minor = parseInt(versionMatch[2], 10);
+          const isPexpireFallbackSet = process.env.USE_PEXPIRE_FALLBACK === 'true';
+          const meetsMinimum = major > 7 || (major === 7 && minor >= 4);
+          const meets71Fallback = major === 7 && minor === 1 && isPexpireFallbackSet;
+          if (!meetsMinimum && !meets71Fallback) {
+            failures.push(
+              `Redis version ${major}.${minor} does not meet minimum requirement. ` +
+              `Require >= 7.4, or 7.1 with USE_PEXPIRE_FALLBACK=true (Part B CC-7).`
+            );
+          } else {
+            logger.info(`[validateProductionConfig] Redis version ok: ${versionMatch[0]}`);
+          }
+        } else {
+          logger.warn('[validateProductionConfig] Could not parse redis_version from INFO server output');
+        }
+      } else {
+        logger.warn('[validateProductionConfig] Redis client lacks .info() and .call() — skipping version check');
+      }
+    }
+  } catch (err: unknown) {
+    const msg = `Redis version check threw: ${err instanceof Error ? err.message : String(err)}`;
+    if (isProduction) {
+      failures.push(msg);
+    } else {
+      logger.warn(`[validateProductionConfig] ${msg}`);
+    }
+  }
+
+  // Emit results
+  if (failures.length > 0) {
+    const summary = failures.map((f, i) => `  ${i + 1}. ${f}`).join('\n');
+    if (isProduction) {
+      logger.error(
+        `[validateProductionConfig] FATAL: ${failures.length} production config check(s) failed:\n${summary}`
+      );
+      process.exit(1);
+    } else {
+      logger.warn(
+        `[validateProductionConfig] ${failures.length} config check(s) failed (non-production — continuing):\n${summary}`
+      );
+    }
+  } else {
+    logger.info('[validateProductionConfig] All production config checks passed');
+  }
+}
 
 // =============================================================================
 // START SERVER (via async bootstrap)
@@ -778,6 +966,11 @@ async function bootstrap(): Promise<void> {
     logger.info(`[Startup] F-B-03 prefix-assertion ok (${prefixOwners.length} owners, no overlaps)`);
   }
   // END prefix-overlap assertion (F-B-03)
+
+  // -------------------------------------------------------------------------
+  // P1-T-NEW (Part B §2.2 P1-F): validateProductionConfig pre-flight checks
+  // -------------------------------------------------------------------------
+  await validateProductionConfig();
 
   // -------------------------------------------------------------------------
   // 4. Start listening for HTTP traffic

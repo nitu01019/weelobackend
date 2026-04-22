@@ -1,6 +1,7 @@
 /**
  * =============================================================================
  * FIX-24/25/26/50/51 — Production Hardening Tests
+ * A01-005 (T42/T43) — 32 kB JSON limit + rate-limiter-before-parser ordering
  * =============================================================================
  *
  * Covers:
@@ -8,6 +9,8 @@
  * FIX-26: Phone numbers masked in health/websocket endpoint
  * FIX-50: Error details hidden when isDevelopment is false
  * FIX-51: IP budget map clears when exceeding 10000 entries
+ * A01-005 T42: 64 kB body rejected with 413 (32 kb limit enforced)
+ * A01-005 T43: rate-limiter fires 429 before JSON parser allocates heap
  * =============================================================================
  */
 
@@ -234,5 +237,138 @@ describe('FIX-25: Debug routes removed from server.ts', () => {
     // Health routes should still be present
     expect(serverSource).toContain("app.use('/', healthRoutes)");
     expect(serverSource).toContain('/health/runtime');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A01-005 T42: 64 kB body rejected with 413 (32 kB limit enforced)
+// ---------------------------------------------------------------------------
+
+import * as http from 'http';
+import express from 'express';
+import rateLimit from 'express-rate-limit';
+
+/** Start a minimal Express app on an ephemeral port. */
+function startTestApp(app: express.Application): Promise<{ server: http.Server; port: number }> {
+  return new Promise((resolve, reject) => {
+    const server = app.listen(0, '127.0.0.1', () => {
+      const addr = server.address();
+      if (!addr || typeof addr === 'string') return reject(new Error('No address'));
+      resolve({ server, port: (addr as { port: number }).port });
+    });
+    server.on('error', reject);
+  });
+}
+
+/** Send a raw HTTP POST and return the HTTP status code. */
+function rawPost(
+  port: number,
+  path: string,
+  body: Buffer | string,
+  headers: Record<string, string> = {}
+): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const buf = Buffer.isBuffer(body) ? body : Buffer.from(body);
+    const req = http.request(
+      {
+        hostname: '127.0.0.1',
+        port,
+        path,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': String(buf.byteLength),
+          ...headers,
+        },
+      },
+      (res) => {
+        res.resume();
+        res.on('end', () => resolve(res.statusCode ?? 0));
+      }
+    );
+    req.on('error', reject);
+    req.write(buf);
+    req.end();
+  });
+}
+
+describe('A01-005 T42: express.json 32 kb limit — 64 kB body returns 413', () => {
+  let server: http.Server;
+  let port: number;
+
+  beforeAll(async () => {
+    const app = express();
+    app.use(express.json({ limit: '32kb' }));
+    app.post('/echo', (_req, res) => res.json({ received: true }));
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+      if (err?.status === 413 || err?.type === 'entity.too.large') {
+        return res.status(413).json({ error: 'payload too large' });
+      }
+      res.status(500).json({ error: 'internal' });
+    });
+    ({ server, port } = await startTestApp(app));
+  });
+
+  afterAll((done) => { server.close(() => done()); });
+
+  it('rejects a 64 kB JSON body with 413', async () => {
+    const payload = JSON.stringify({ data: 'x'.repeat(65 * 1024) });
+    const status = await rawPost(port, '/echo', payload);
+    expect(status).toBe(413);
+  });
+
+  it('accepts a 1 kB JSON body with 200', async () => {
+    const payload = JSON.stringify({ data: 'x'.repeat(1024) });
+    const status = await rawPost(port, '/echo', payload);
+    expect(status).toBe(200);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A01-005 T43: rate-limiter fires 429 before JSON parser runs (ordering proof)
+// ---------------------------------------------------------------------------
+describe('A01-005 T43: rate-limiter fires 429 before JSON parser heap (ordering)', () => {
+  let server: http.Server;
+  let port: number;
+
+  beforeAll(async () => {
+    const testLimiter = rateLimit({
+      windowMs: 60_000,
+      max: 1,
+      keyGenerator: () => 'test-ip',
+      standardHeaders: false,
+      legacyHeaders: false,
+    });
+
+    const app = express();
+    // Mirrors the A01-005 production ordering: rate-limiter BEFORE json parser.
+    app.use(testLimiter);
+    app.use(express.json({ limit: '32kb' }));
+    app.post('/probe', (_req, res) => res.json({ received: true }));
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+      if (err?.status === 413 || err?.type === 'entity.too.large') {
+        return res.status(413).json({ error: 'payload too large' });
+      }
+      res.status(500).json({ error: 'internal' });
+    });
+
+    ({ server, port } = await startTestApp(app));
+  });
+
+  afterAll((done) => { server.close(() => done()); });
+
+  it('first request (small body) succeeds with 200', async () => {
+    const payload = JSON.stringify({ x: 1 });
+    const status = await rawPost(port, '/probe', payload);
+    expect(status).toBe(200);
+  });
+
+  it('second request with a 50 kB body gets 429 (not 413) — rate limiter fires first', async () => {
+    // 50 kB exceeds the 32 kB limit, but rate limiter must fire FIRST: expect 429, not 413.
+    const largePayload = JSON.stringify({ data: 'x'.repeat(50 * 1024) });
+    const status = await rawPost(port, '/probe', largePayload);
+    expect(status).toBe(429);
   });
 });
