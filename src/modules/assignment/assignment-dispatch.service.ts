@@ -17,6 +17,8 @@ import { emitToUser, emitToBooking, SocketEvent } from '../../shared/services/so
 import { queueService } from '../../shared/services/queue.service';
 import { CreateAssignmentInput } from './assignment.schema';
 import { ASSIGNMENT_CONFIG, AssignmentTimerData } from './assignment.types';
+import { HOLD_CONFIG } from '../../core/config/hold-config';
+import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
 
 // =============================================================================
 // DISPATCH SERVICE
@@ -218,16 +220,62 @@ class AssignmentDispatchService {
     // Industry (Uber CCG): Every critical notification via Socket + FCM
     // for at-least-once delivery. Dedup handled by SocketIOService.kt
     // seenBroadcastIds LRU cache (2048 entries).
+    // A05-003: nested pickup/drop + `payload` JSON blob for Captain parser.
+    // A09-001: pre-accept producer site — customerName omitted (DPDP data minimisation).
     // =====================================================================
+    const pickup = booking.pickup || { address: '', city: '', latitude: 0, longitude: 0 };
+    const drop = booking.drop || { address: '', city: '', latitude: 0, longitude: 0 };
+    const fcmPickup = {
+      address: pickup.address ?? '',
+      city: pickup.city ?? '',
+      latitude: pickup.latitude ?? 0,
+      longitude: pickup.longitude ?? 0,
+    };
+    const fcmDrop = {
+      address: drop.address ?? '',
+      city: drop.city ?? '',
+      latitude: drop.latitude ?? 0,
+      longitude: drop.longitude ?? 0,
+    };
+    const assignedAtIso = new Date().toISOString();
+    const expiresAtIso = new Date(Date.now() + HOLD_CONFIG.driverAcceptTimeoutSeconds * 1000).toISOString();
+    const fcmPayloadObj = {
+      type: 'trip_assigned',
+      assignmentId: assignment.id,
+      tripId,
+      orderId: '',
+      truckRequestId: '',
+      bookingId: data.bookingId,
+      pickup: fcmPickup,
+      drop: fcmDrop,
+      vehicleNumber: vehicle.vehicleNumber,
+      farePerTruck: Number(booking.pricePerTruck ?? 0),
+      distanceKm: Number(booking.distanceKm ?? 0),
+      customerPhone: maskPhoneForExternal(booking.customerPhone || ''),
+      assignedAt: assignedAtIso,
+      expiresAt: expiresAtIso,
+      message: `New trip assigned! ${fcmPickup.address || 'Pickup'} → ${fcmDrop.address || 'Drop'}`,
+    };
     queueService.queuePushNotification(data.driverId, {
       title: '🚛 New Trip Assigned!',
       body: `Trip for ${vehicle.vehicleNumber}. Accept within ${ASSIGNMENT_CONFIG.TIMEOUT_MS / 1000} seconds.`,
       data: {
+        payload: JSON.stringify(fcmPayloadObj),
         type: 'trip_assigned',
         assignmentId: assignment.id,
         tripId,
         bookingId: data.bookingId,
-        vehicleNumber: vehicle.vehicleNumber
+        pickup: JSON.stringify(fcmPickup),
+        drop: JSON.stringify(fcmDrop),
+        vehicleNumber: vehicle.vehicleNumber,
+        vehicleType: vehicle.vehicleType || '',
+        driverName: driver.name || '',
+        farePerTruck: String(fcmPayloadObj.farePerTruck),
+        distanceKm: String(fcmPayloadObj.distanceKm),
+        customerPhone: fcmPayloadObj.customerPhone,
+        assignedAt: assignedAtIso,
+        expiresAt: expiresAtIso,
+        status: 'trip_assigned',
       }
     }).catch(err => {
       logger.warn(`FCM: Failed to queue assignment push for driver ${data.driverId}`, err);
