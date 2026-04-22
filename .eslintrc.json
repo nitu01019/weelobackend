@@ -31,6 +31,10 @@
       {
         "selector": "CallExpression[callee.object.name='logger'] TemplateLiteral > Identifier[name=/^(phone|name|customerName|driverName|customerPhone|driverPhone)$/]",
         "message": "DPDP §5(b): PII must be in structured meta, not template-literal message. Use phoneLast4 + maskPhoneForLog. (A12-003/004/005/006)"
+      },
+      {
+        "selector": "VariableDeclarator[id.name='LIFECYCLE_EMIT_EVENTS'] ArrayExpression > Literal",
+        "message": "A03-007/P6-T06: Every entry in LIFECYCLE_EMIT_EVENTS must have an adjacent '// ADR:' comment. Add '// ADR: <reason>' on the line above the new entry."
       }
     ]
   },

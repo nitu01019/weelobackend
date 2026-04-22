@@ -1814,7 +1814,12 @@ const LIFECYCLE_EMIT_EVENTS: ReadonlySet<string> = new Set([
   'trip_assigned',
   'truck_confirmed',
   'driver_accepted',
+  // ADR: A03-007 P6-T05 — trucks_remaining_update carries the authoritative
+  // remaining-truck count after each driver assignment; clients use it to
+  // display real-time hold progress. Missing from LIFECYCLE set caused count
+  // drops to be un-replayable on reconnect. Added 2026-04-23.
   'driver_declined',
+  'trucks_remaining_update',
   'booking_updated',
   'booking_expired',
   'booking_cancelled',
@@ -1918,10 +1923,12 @@ async function durableEmit(userId: string, event: string, data: any, deadlineMs?
       }
     } else {
       // Legacy single-key path (flag OFF) — exact pre-F-B-26 + W3-T10 behaviour.
-      await Promise.all([
-        redisService.zAdd(oldKey, seq, envelope),
-        redisService.expire(oldKey, DURABLE_EMIT_TTL_SECONDS)
-      ]);
+      // P6-T22 (A13-002): pipelined ZADD+EXPIRE in one multi().exec() round-trip
+      // instead of Promise.all([zAdd, expire]) — saves one Redis RTT per emit.
+      await redisService.multi()
+        .zAdd(oldKey, seq, envelope)
+        .expire(oldKey, DURABLE_EMIT_TTL_SECONDS)
+        .exec();
       try {
         const { metrics } = require('../monitoring/metrics.service');
         metrics.incrementCounter('socket_unacked_key_version', { version: 'v1' });
@@ -2045,10 +2052,11 @@ async function persistRoomEnvelopes(userIds: string[], event: string, data: any)
           );
         }
       } else {
-        await Promise.all([
-          redisService.zAdd(oldKey, seq, envelope),
-          redisService.expire(oldKey, DURABLE_EMIT_TTL_SECONDS)
-        ]);
+        // P6-T22 (A13-002): pipelined ZADD+EXPIRE in one multi().exec() round-trip.
+        await redisService.multi()
+          .zAdd(oldKey, seq, envelope)
+          .expire(oldKey, DURABLE_EMIT_TTL_SECONDS)
+          .exec();
         try {
           const { metrics } = require('../monitoring/metrics.service');
           metrics.incrementCounter('socket_unacked_key_version', { version: 'v1' });
@@ -2592,3 +2600,7 @@ export function __clearUserRoleCacheForTesting(): void {
   if (process.env.NODE_ENV !== 'test') return;
   userRoleCache.clear();
 }
+
+/** Test-only: expose LIFECYCLE_EMIT_EVENTS for set-membership assertions.
+ * P6-T05: verifies trucks_remaining_update is present. */
+export const LIFECYCLE_EMIT_EVENTS_FOR_TEST: ReadonlySet<string> = LIFECYCLE_EMIT_EVENTS;
