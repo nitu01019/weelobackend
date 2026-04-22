@@ -29,7 +29,7 @@ import express from 'express';
 // Types
 // ---------------------------------------------------------------------------
 
-type FlagCategory = 'ops' | 'release';
+type FlagCategory = 'ops' | 'release' | 'placeholder';
 
 interface FlagDefinition {
   readonly env: string;
@@ -274,9 +274,16 @@ export const FLAGS = {
   // in ~10s after flag flip. Defaults OFF until the 8 cut-over sites are
   // wired and staging soak is green. See IMPLEMENTATION_PLAN.md Phase 3
   // Teammate 7 for the full site list.
+  //
+  // A12-013 PLACEHOLDER: namespace reserved; writer not yet built.
+  // category='placeholder' means flipping this ON crashes isEnabled() by design
+  // so no half-wired code can silently enable a path with no writer behind it.
+  // Future contributors must either build all 8 cut-over site writers
+  // OR demote category from 'placeholder' BEFORE flipping FF_GEO_H3_SHARD_ENABLED=true.
+  // See finding A12-013 in the master fix plan. (LaunchDarkly killswitch pattern.)
   GEO_H3_SHARD_ENABLED: {
     env: 'FF_GEO_H3_SHARD_ENABLED',
-    category: 'release' as const,
+    category: 'placeholder' as const,
     description: 'Dual-read GEORADIUS keys from H3-res5 sharded namespace + flat legacy keys',
     defaultValue: false,
   },
@@ -630,15 +637,33 @@ export type NumericFlagKey = keyof typeof NUMERIC_FLAGS;
  */
 export function isEnabled(flag: FlagDefinition): boolean {
   const value = process.env[flag.env];
-  // Explicit env override wins.
-  if (value === 'true') return true;
-  if (value === 'false') return false;
-  // No env setting — honor explicit defaultValue if declared.
-  if (typeof flag.defaultValue === 'boolean') {
-    return flag.defaultValue;
+
+  // Resolve what the effective boolean would be before checking category.
+  let resolved: boolean;
+  if (value === 'true') {
+    resolved = true;
+  } else if (value === 'false') {
+    resolved = false;
+  } else if (typeof flag.defaultValue === 'boolean') {
+    // No env setting — honor explicit defaultValue if declared.
+    resolved = flag.defaultValue;
+  } else {
+    // Fall back to category implicit default (ops=ON, release/placeholder=OFF).
+    resolved = flag.category === 'ops';
   }
-  // Fall back to category implicit default.
-  return flag.category === 'ops';
+
+  // T28 (A12-013): Placeholder flags — namespace reserved, writer not built.
+  // Flipping ON crashes fast by design (LaunchDarkly killswitch pattern).
+  // When the resolved value is false (default), returns normally so callers
+  // that read the flag to branch safely see OFF and continue. Only a true
+  // env-var flip (or a defaultValue: true edit) reaches the throw.
+  if (flag.category === 'placeholder' && resolved === true) {
+    throw new Error(
+      `GEO_H3_SHARD_ENABLED flipped ON but no writer implemented — see A12-013`
+    );
+  }
+
+  return resolved;
 }
 
 /**

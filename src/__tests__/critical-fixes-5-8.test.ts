@@ -712,7 +712,7 @@ describe('Fix 8: Feature Flags Registry', () => {
         expect(flag.env).toBeDefined();
         expect(typeof flag.env).toBe('string');
         expect(flag.env.startsWith('FF_')).toBe(true);
-        expect(['ops', 'release']).toContain(flag.category);
+        expect(['ops', 'release', 'placeholder']).toContain(flag.category);
         expect(flag.description).toBeDefined();
         expect(typeof flag.description).toBe('string');
         expect(flag.description.length).toBeGreaterThan(0);
@@ -863,6 +863,43 @@ describe('Fix 8: Feature Flags Registry', () => {
       // Consumer migration has started — broadcast.processor.ts and queue.types.ts now import feature-flags
       // This is expected behavior after Fix #24 centralized feature flags
       expect(importingFiles.length).toBeGreaterThanOrEqual(0);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // A12-013: FF_GEO_H3_SHARD_ENABLED placeholder fail-fast invariant
+  // -----------------------------------------------------------------------
+  describe('A12-013 FF_GEO_H3_SHARD_ENABLED placeholder', () => {
+    const savedEnv: Record<string, string | undefined> = {};
+
+    afterEach(() => {
+      for (const [key, val] of Object.entries(savedEnv)) {
+        if (val === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = val;
+        }
+      }
+    });
+
+    test('isEnabled returns false by default (env unset)', () => {
+      const flag = FLAGS.GEO_H3_SHARD_ENABLED;
+      savedEnv[flag.env] = process.env[flag.env];
+      delete process.env[flag.env];
+
+      expect(isEnabled(flag)).toBe(false);
+    });
+
+    test('isEnabled throws with /A12-013/ when forced ON via env', () => {
+      const flag = FLAGS.GEO_H3_SHARD_ENABLED;
+      savedEnv[flag.env] = process.env[flag.env];
+      process.env[flag.env] = 'true';
+
+      expect(() => isEnabled(flag)).toThrow(/A12-013/);
+    });
+
+    test('GEO_H3_SHARD_ENABLED flag has category placeholder', () => {
+      expect(FLAGS.GEO_H3_SHARD_ENABLED.category).toBe('placeholder');
     });
   });
 });
