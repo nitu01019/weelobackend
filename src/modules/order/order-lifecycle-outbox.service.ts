@@ -38,6 +38,7 @@ import type {
   TripCompletedOutboxPayload,
   AssignmentTimerSchedulePayload,
   AssignmentCacheRefreshPayload,
+  TripAssignedFanoutPayload,
   LifecycleOutboxRow,
 } from './order-types';
 import { fleetCacheService } from '../../shared/services/fleet-cache.service';
@@ -84,6 +85,11 @@ export function parseLifecycleOutboxPayload(payload: Prisma.JsonValue): OrderLif
   }
   if (type === 'assignment_cache_refresh') {
     return parseAssignmentCacheRefreshPayload(raw);
+  }
+
+  // W3 A03-004/A13-005: durable post-commit trip_assigned fan-out.
+  if (type === 'trip_assigned_fanout') {
+    return parseTripAssignedFanoutPayload(raw);
   }
 
   if (type !== 'order_cancelled') return null;
@@ -254,6 +260,83 @@ function parseAssignmentCacheRefreshPayload(raw: Record<string, unknown>): Assig
   };
 }
 
+// W3 A03-004/A13-005: parser for durable post-commit trip_assigned fan-out rows.
+// Accepts payloads written by the producer (confirmed-hold.service.ts W3-T08)
+// and coerces them to TripAssignedFanoutPayload with strict-required-field
+// validation. Returns null on missing required fields so the row is DLQed
+// by processLifecycleOutboxRow (same failure mode as the four legacy types).
+// customerPhone is NOT re-masked here — the producer already called
+// maskPhoneForExternal before persisting (see order-types.ts comment).
+function parseTripAssignedFanoutPayload(raw: Record<string, unknown>): TripAssignedFanoutPayload | null {
+  const orderId = typeof raw.orderId === 'string' ? raw.orderId.trim() : '';
+  const assignmentId = typeof raw.assignmentId === 'string' ? raw.assignmentId.trim() : '';
+  const driverId = typeof raw.driverId === 'string' ? raw.driverId.trim() : '';
+  const transporterId = typeof raw.transporterId === 'string' ? raw.transporterId.trim() : '';
+  if (!orderId || !assignmentId || !driverId || !transporterId) return null;
+
+  const tripId = typeof raw.tripId === 'string' && raw.tripId.length > 0 ? raw.tripId : null;
+  const bookingId = typeof raw.bookingId === 'string' && raw.bookingId.length > 0 ? raw.bookingId : null;
+  const truckRequestId = typeof raw.truckRequestId === 'string' && raw.truckRequestId.length > 0 ? raw.truckRequestId : null;
+
+  const pickupRaw = raw.pickup && typeof raw.pickup === 'object' && !Array.isArray(raw.pickup) ? raw.pickup as Record<string, unknown> : {};
+  const dropRaw = raw.drop && typeof raw.drop === 'object' && !Array.isArray(raw.drop) ? raw.drop as Record<string, unknown> : {};
+  const pickup = {
+    latitude: Number(pickupRaw.latitude ?? 0) || 0,
+    longitude: Number(pickupRaw.longitude ?? 0) || 0,
+    address: typeof pickupRaw.address === 'string' ? pickupRaw.address : '',
+    city: typeof pickupRaw.city === 'string' ? pickupRaw.city : undefined,
+  };
+  const drop = {
+    latitude: Number(dropRaw.latitude ?? 0) || 0,
+    longitude: Number(dropRaw.longitude ?? 0) || 0,
+    address: typeof dropRaw.address === 'string' ? dropRaw.address : '',
+    city: typeof dropRaw.city === 'string' ? dropRaw.city : undefined,
+  };
+
+  const farePerTruck = Number(raw.farePerTruck ?? 0) || 0;
+  const distanceKmNum = Number(raw.distanceKm);
+  const distanceKm = Number.isFinite(distanceKmNum) ? distanceKmNum : null;
+  const vehicleNumber = typeof raw.vehicleNumber === 'string' && raw.vehicleNumber.length > 0 ? raw.vehicleNumber : null;
+  const vehicleType = typeof raw.vehicleType === 'string' && raw.vehicleType.length > 0 ? raw.vehicleType : null;
+  const customerName = typeof raw.customerName === 'string' ? raw.customerName : '';
+  const customerPhone = typeof raw.customerPhone === 'string' ? raw.customerPhone : '';
+  const assignedAt = typeof raw.assignedAt === 'string' && raw.assignedAt.trim().length > 0
+    ? raw.assignedAt
+    : new Date().toISOString();
+  const expiresAt = typeof raw.expiresAt === 'string' && raw.expiresAt.trim().length > 0
+    ? raw.expiresAt
+    : new Date().toISOString();
+  const message = typeof raw.message === 'string' ? raw.message : '';
+  const eventId = typeof raw.eventId === 'string' && raw.eventId.trim().length > 0 ? raw.eventId : uuidv4();
+  const eventVersion = Number(raw.eventVersion || 1);
+  const serverTimeMs = Number(raw.serverTimeMs || Date.now());
+
+  return {
+    type: 'trip_assigned_fanout',
+    orderId,
+    tripId,
+    assignmentId,
+    driverId,
+    transporterId,
+    bookingId,
+    truckRequestId,
+    pickup,
+    drop,
+    farePerTruck,
+    distanceKm,
+    vehicleNumber,
+    vehicleType,
+    customerName,
+    customerPhone,
+    assignedAt,
+    expiresAt,
+    message,
+    eventId,
+    eventVersion: Number.isFinite(eventVersion) && eventVersion > 0 ? Math.floor(eventVersion) : 1,
+    serverTimeMs: Number.isFinite(serverTimeMs) && serverTimeMs > 0 ? Math.floor(serverTimeMs) : Date.now(),
+  };
+}
+
 export function calculateLifecycleRetryDelayMs(attempt: number): number {
   const scheduleMs = [1000, 2000, 4000, 8000, 16000, 30000, 60000];
   const base = scheduleMs[Math.max(0, Math.min(scheduleMs.length - 1, attempt - 1))];
@@ -302,7 +385,12 @@ export function startLifecycleOutboxWorker(state: {
 }
 
 function resolveOutboxOrderId(payload: OrderLifecycleOutboxPayload): string {
-  if (payload.type === 'order_cancelled' || payload.type === 'trip_completed' || payload.type === 'assignment_timer_schedule') {
+  if (
+    payload.type === 'order_cancelled' ||
+    payload.type === 'trip_completed' ||
+    payload.type === 'assignment_timer_schedule' ||
+    payload.type === 'trip_assigned_fanout'
+  ) {
     return payload.orderId;
   }
   // assignment_cache_refresh has no orderId — use transporterId as the partition
@@ -638,6 +726,154 @@ export async function invalidateFleetCacheFromOutbox(payload: AssignmentCacheRef
   });
 }
 
+// W3 A03-004/A13-005: replay the trip_assigned fan-out from outbox payload.
+// Mirrors the fast-path emission at confirmed-hold.service.ts:504-624 so the
+// socket + FCM delivery is byte-identical between fast path and crash-recovery
+// replay. Idempotency on retry:
+// - Socket: durableEmit dedups at the Captain via `_seq` ZSET (envelope
+//   contains a monotonic seq per userId).
+// - FCM:    collapseKey (`${notification.type}:${orderId ?? assignmentId}`)
+//   dedups at the Android system tray (single entry per key, latest wins).
+// So a double-delivery (fast path commits post-commit, poller replays after
+// restart) surfaces as at most one extra wire message; both systems collapse
+// duplicates client-side.
+export async function dispatchTripAssignedFanoutFromOutbox(payload: TripAssignedFanoutPayload): Promise<void> {
+  const pickup = payload.pickup;
+  const drop = payload.drop;
+
+  // A13-013: socket payload exposes both { latitude, longitude } and { lat, lng }
+  // aliases so Captain clients keyed on either convention resolve coordinates
+  // without silent-zero fallback.
+  const socketPickup = {
+    ...pickup,
+    lat: pickup.latitude ?? 0,
+    lng: pickup.longitude ?? 0,
+  };
+  const socketDrop = {
+    ...drop,
+    lat: drop.latitude ?? 0,
+    lng: drop.longitude ?? 0,
+  };
+
+  const driverNotification = {
+    type: 'trip_assigned',
+    assignmentId: payload.assignmentId,
+    tripId: payload.tripId,
+    orderId: payload.orderId,
+    bookingId: payload.bookingId,
+    truckRequestId: payload.truckRequestId,
+    pickup: socketPickup,
+    drop: socketDrop,
+    vehicleNumber: payload.vehicleNumber,
+    vehicleType: payload.vehicleType,
+    distanceKm: payload.distanceKm,
+    farePerTruck: payload.farePerTruck,
+    customerName: payload.customerName,
+    customerPhone: payload.customerPhone, // producer already masked
+    assignedAt: payload.assignedAt,
+    expiresAt: payload.expiresAt,
+    message: payload.message,
+  };
+
+  // Socket emit. emitToUser returns boolean (false if io null or event empty),
+  // does NOT throw on adapter issues — durableEmit inside buffers to outbox for
+  // reconnect replay. Success=true covers both live-delivered and durably-buffered
+  // envelopes; the FCM enqueue below is the offline fallback regardless.
+  try {
+    const socketOk = emitToUser(payload.driverId, 'trip_assigned', driverNotification);
+    metrics.incrementCounter('new_assignment_socket_emit_total', {
+      result: socketOk ? 'success' : 'fail',
+      source: 'outbox_replay',
+    });
+    if (!socketOk) {
+      logger.warn('[LIFECYCLE OUTBOX] trip_assigned socket emit returned false', {
+        assignmentId: payload.assignmentId,
+        driverId: payload.driverId,
+      });
+    }
+  } catch (sockErr: unknown) {
+    metrics.incrementCounter('new_assignment_socket_emit_total', { result: 'fail', source: 'outbox_replay' });
+    const errorMessage = sockErr instanceof Error ? sockErr.message : String(sockErr);
+    logger.warn('[LIFECYCLE OUTBOX] trip_assigned socket emit threw', {
+      assignmentId: payload.assignmentId,
+      driverId: payload.driverId,
+      error: errorMessage,
+    });
+    // Fall through to FCM enqueue — FCM is the offline fallback.
+  }
+
+  // FCM enqueue — flatten per FCM data constraints + nested pickup/drop + `payload`
+  // blob (A05-003). Mirrors confirmed-hold.service.ts:559-600 shape.
+  const fcmPickupNested = {
+    address: pickup.address ?? '',
+    city: pickup.city ?? '',
+    latitude: pickup.latitude ?? 0,
+    longitude: pickup.longitude ?? 0,
+  };
+  const fcmDropNested = {
+    address: drop.address ?? '',
+    city: drop.city ?? '',
+    latitude: drop.latitude ?? 0,
+    longitude: drop.longitude ?? 0,
+  };
+  const fcmPayloadObj = {
+    type: 'trip_assigned',
+    assignmentId: payload.assignmentId,
+    tripId: payload.tripId,
+    orderId: payload.orderId,
+    truckRequestId: payload.truckRequestId ?? '',
+    pickup: fcmPickupNested,
+    drop: fcmDropNested,
+    vehicleNumber: payload.vehicleNumber ?? '',
+    farePerTruck: Number(payload.farePerTruck ?? 0),
+    distanceKm: Number(payload.distanceKm ?? 0),
+    customerName: payload.customerName ?? '',
+    customerPhone: payload.customerPhone ?? '',
+    assignedAt: payload.assignedAt,
+    expiresAt: payload.expiresAt,
+    message: payload.message || `New trip assigned! ${fcmPickupNested.address || 'Pickup'} → ${fcmDropNested.address || 'Drop'}`,
+  };
+  const fcmData: Record<string, string> = {
+    payload: JSON.stringify(fcmPayloadObj),
+    type: 'trip_assigned',
+    assignmentId: payload.assignmentId,
+    tripId: payload.tripId ?? '',
+    orderId: payload.orderId,
+    truckRequestId: payload.truckRequestId ?? '',
+    pickup: JSON.stringify(fcmPickupNested),
+    drop: JSON.stringify(fcmDropNested),
+    pickupAddress: pickup.address ?? '',
+    pickupCity: pickup.city ?? '',
+    pickupLat: String(pickup.latitude ?? 0),
+    pickupLng: String(pickup.longitude ?? 0),
+    dropAddress: drop.address ?? '',
+    dropCity: drop.city ?? '',
+    dropLat: String(drop.latitude ?? 0),
+    dropLng: String(drop.longitude ?? 0),
+    vehicleNumber: payload.vehicleNumber ?? '',
+    farePerTruck: String(fcmPayloadObj.farePerTruck),
+    distanceKm: String(payload.distanceKm ?? 0),
+    customerName: payload.customerName ?? '',
+    customerPhone: payload.customerPhone ?? '',
+    assignedAt: payload.assignedAt,
+    expiresAt: payload.expiresAt,
+  };
+
+  await queueService.queuePushNotification(payload.driverId, {
+    title: '🚛 New Trip Assigned!',
+    body: `${pickup.address || 'Pickup'} → ${drop.address || 'Drop'}`,
+    data: fcmData,
+  });
+  metrics.incrementCounter('new_assignment_fcm_enqueue_total', { result: 'success', source: 'outbox_replay' });
+
+  logger.info('[LIFECYCLE OUTBOX] trip_assigned fan-out replayed from outbox', {
+    assignmentId: payload.assignmentId,
+    driverId: payload.driverId,
+    orderId: payload.orderId,
+    eventId: payload.eventId,
+  });
+}
+
 export async function processLifecycleOutboxRow(row: LifecycleOutboxRow): Promise<void> {
   const payload = parseLifecycleOutboxPayload(row.payload);
   const nextAttempt = Math.max(1, row.attempts + 1);
@@ -664,6 +900,9 @@ export async function processLifecycleOutboxRow(row: LifecycleOutboxRow): Promis
       await scheduleAssignmentTimerFromOutbox(payload);
     } else if (payload.type === 'assignment_cache_refresh') {
       await invalidateFleetCacheFromOutbox(payload);
+    } else if (payload.type === 'trip_assigned_fanout') {
+      // W3 A03-004/A13-005: durable post-commit trip_assigned fan-out replay.
+      await dispatchTripAssignedFanoutFromOutbox(payload);
     } else {
       await emitCancellationLifecycle(payload);
     }
@@ -685,7 +924,9 @@ export async function processLifecycleOutboxRow(row: LifecycleOutboxRow): Promis
         ? 'ASSIGNMENT_TIMER_SCHEDULE_FAILED'
         : payload.type === 'assignment_cache_refresh'
           ? 'ASSIGNMENT_CACHE_REFRESH_FAILED'
-          : 'CANCEL_LIFECYCLE_EMIT_FAILED';
+          : payload.type === 'trip_assigned_fanout'
+            ? 'TRIP_ASSIGNED_FANOUT_EMIT_FAILED'
+            : 'CANCEL_LIFECYCLE_EMIT_FAILED';
     const message = error instanceof Error ? error.message : errorLabel;
     const retryable = nextAttempt < row.maxAttempts;
     metrics.incrementCounter('cancel_emit_retry_total', {
