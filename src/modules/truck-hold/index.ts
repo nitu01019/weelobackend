@@ -44,3 +44,9 @@ export type {
 //   never be mounted. Importing IS_ORPHAN_ROUTER here lets a Jest test
 //   assert that this module does not re-export the lifecycle router.
 export { IS_ORPHAN_ROUTER as _TRUCK_HOLD_LIFECYCLE_IS_ORPHAN } from './truck-hold-lifecycle.routes';
+
+// P6-E (A03-011/A03-012): re-export helper and payload types from the canonical
+// definition site (confirmed-hold.service.ts). Consumers that import from the
+// barrel get the same symbol without cyclic-import risk.
+export { buildTripAssignedDriverNotification } from './confirmed-hold.service';
+export type { TripAssignedPayload, TripAssignedFcmData } from './confirmed-hold.service';
