@@ -33,9 +33,13 @@ jest.mock('../shared/services/logger.service', () => ({
   },
 }));
 
+// A09-002 / A12-009 remediation: expose the incrementCounter spy so the
+// ported Phase-1 atomicity suite can assert metric emission (kept shared here
+// — single source of truth for metrics in this file).
+const mockIncrementCounter = jest.fn();
 jest.mock('../shared/monitoring/metrics.service', () => ({
   metrics: {
-    incrementCounter: jest.fn(),
+    incrementCounter: (...args: unknown[]) => mockIncrementCounter(...args),
     recordHistogram: jest.fn(),
     observeHistogram: jest.fn(),
     setGauge: jest.fn(),
@@ -54,6 +58,50 @@ const mockRedisExpire = jest.fn().mockResolvedValue(true);
 const mockRedisIncrBy = jest.fn().mockResolvedValue(1);
 const mockRedisZRangeByScore = jest.fn().mockResolvedValue([]);
 const mockRedisZRemRangeByScore = jest.fn().mockResolvedValue(0);
+
+// A09-002 / A12-009 Phase-1 atomicity — in-memory ZSET tracker + MULTI/EXEC
+// pipeline mock. The Phase-1 atomic dual-write in durableEmit uses
+// redisService.multi().zAdd().expire().zAdd().expire().exec(); this mock
+// chains ops, applies them against mockZSets on success, and lets a test
+// override mockMultiExecImpl to exercise the abort path (Arch 1B MUST).
+interface MockZSetEntry { score: number; member: string }
+const mockZSets = new Map<string, MockZSetEntry[]>();
+type MultiQueuedOp = { type: 'zAdd' | 'expire'; args: any[] };
+let mockMultiExecImpl: (ops: MultiQueuedOp[]) => Promise<any[]> = async (ops) => {
+  const results: any[] = [];
+  for (const op of ops) {
+    if (op.type === 'zAdd') {
+      const [key, score, member] = op.args;
+      const arr = mockZSets.get(key) ?? [];
+      arr.push({ score, member });
+      mockZSets.set(key, arr);
+      results.push(1);
+    } else {
+      results.push(1);
+    }
+  }
+  return results;
+};
+const mockRedisMulti = jest.fn(() => {
+  const ops: MultiQueuedOp[] = [];
+  const tx: any = {
+    zAdd(key: string, score: number, member: string) {
+      ops.push({ type: 'zAdd', args: [key, score, member] });
+      return tx;
+    },
+    expire(key: string, ttl: number) {
+      ops.push({ type: 'expire', args: [key, ttl] });
+      return tx;
+    },
+    set() { return tx; },
+    del() { return tx; },
+    sAdd() { return tx; },
+    sRem() { return tx; },
+    incr() { return tx; },
+    exec: () => mockMultiExecImpl(ops),
+  };
+  return tx;
+});
 
 jest.mock('../shared/services/redis.service', () => ({
   redisService: {
@@ -74,6 +122,7 @@ jest.mock('../shared/services/redis.service', () => ({
     zAdd: (...args: unknown[]) => mockRedisZAdd(...args),
     zRangeByScore: (...args: unknown[]) => mockRedisZRangeByScore(...args),
     zRemRangeByScore: (...args: unknown[]) => mockRedisZRemRangeByScore(...args),
+    multi: () => mockRedisMulti(),
     setTimer: jest.fn(),
     cancelTimer: jest.fn(),
     getExpiredTimers: jest.fn(),
@@ -346,6 +395,199 @@ describe('F-B-26: Durable Emit Contract', () => {
       // Emit still fires even after ZADD rejects
       expect(emits.some((e) => e.event === 'trip_assigned' && e.room === 'user:user-1')).toBe(true);
       expect(mockLoggerWarn).toHaveBeenCalled();
+    });
+  });
+
+  // ===========================================================================
+  // A09-002 / A12-009 — Phase 1 role-scoped ZSET atomicity (MULTI/EXEC dual-write)
+  // ===========================================================================
+  // Ported from src/__tests__/role-scoped-zset-phase1-atomicity.test.ts per
+  // Guard Rail #1 (no new test files). Same 5 cases; same assertions; same
+  // mock harness. Exercises FLAGS.ROLE_SCOPED_DURABLE_EMIT flag-gated behaviour.
+  //
+  // Ref: master-file §A09-002/§A12-009, plan §7.3.2 W3-T10, Arch 1B amendment,
+  // remediation commit sha noted in FIXES_APPLIED.md.
+  // ===========================================================================
+  describe('A09-002 + A12-009 — Phase 1 role-scoped ZSET atomicity (MULTI/EXEC dual-write)', () => {
+    beforeEach(() => {
+      mockZSets.clear();
+      mockMultiExecImpl = async (ops) => {
+        const results: any[] = [];
+        for (const op of ops) {
+          if (op.type === 'zAdd') {
+            const [key, score, member] = op.args;
+            const arr = mockZSets.get(key) ?? [];
+            arr.push({ score, member });
+            mockZSets.set(key, arr);
+            results.push(1);
+          } else {
+            results.push(1);
+          }
+        }
+        return results;
+      };
+      socketService.__clearUserRoleCacheForTesting();
+      // DURABLE_EMIT_ENABLED explicit ON for this suite (Phase-1 writes only
+      // fire when durable-emit routing is active). Parent suite already flips
+      // it per-describe, but be explicit so this block is self-contained.
+      process.env.FF_DURABLE_EMIT_ENABLED = 'true';
+    });
+
+    afterEach(() => {
+      delete process.env.FF_ROLE_SCOPED_DURABLE_EMIT;
+    });
+
+    describe('flag OFF (baseline — legacy single-key write preserved)', () => {
+      it('emits to OLD key only and never calls redisService.multi()', async () => {
+        process.env.FF_ROLE_SCOPED_DURABLE_EMIT = 'false';
+        const { fakeIo } = makeFakeIo(new Map());
+        socketService.__setIoForTesting(fakeIo, new Map());
+        socketService.__setUserRoleForTesting('u-base', 'transporter');
+
+        socketService.emitToUser('u-base', 'trip_assigned', { id: 't1' });
+        await new Promise((r) => setImmediate(r));
+
+        expect(mockRedisMulti).not.toHaveBeenCalled();
+        expect(mockRedisZAdd).toHaveBeenCalledTimes(1);
+        expect(mockRedisZAdd.mock.calls[0][0]).toBe('socket:unacked:u-base');
+        expect(mockZSets.has('socket:unacked:u-base:transporter')).toBe(false);
+        expect(mockIncrementCounter).toHaveBeenCalledWith('socket_unacked_key_version', { version: 'v1' });
+        expect(mockIncrementCounter).not.toHaveBeenCalledWith('socket_unacked_key_version', { version: 'v2' });
+      });
+    });
+
+    describe('flag ON — happy path (atomic dual-write succeeds)', () => {
+      beforeEach(() => {
+        process.env.FF_ROLE_SCOPED_DURABLE_EMIT = 'true';
+      });
+
+      it('writes envelope to BOTH OLD and NEW keys via a single MULTI/EXEC pipeline', async () => {
+        const { fakeIo, emits } = makeFakeIo(new Map());
+        socketService.__setIoForTesting(fakeIo, new Map());
+        socketService.__setUserRoleForTesting('u-42', 'transporter');
+
+        socketService.emitToUser('u-42', 'trip_assigned', { tripId: 't42' });
+        await new Promise((r) => setImmediate(r));
+
+        // Exactly one MULTI pipeline used.
+        expect(mockRedisMulti).toHaveBeenCalledTimes(1);
+        // Direct zAdd() not called (all writes go through the pipeline).
+        expect(mockRedisZAdd).not.toHaveBeenCalled();
+
+        // Both keys populated by the pipeline.
+        const oldKey = 'socket:unacked:u-42';
+        const newKey = 'socket:unacked:u-42:transporter';
+        expect(mockZSets.get(oldKey)?.length).toBe(1);
+        expect(mockZSets.get(newKey)?.length).toBe(1);
+
+        // Envelope carries role tag.
+        const envelope = mockZSets.get(newKey)![0].member;
+        const parsed = JSON.parse(envelope);
+        expect(parsed).toMatchObject({
+          seq: 1,
+          event: 'trip_assigned',
+          payload: { tripId: 't42' },
+          role: 'transporter',
+        });
+
+        // Both key-version metrics incremented exactly once.
+        expect(mockIncrementCounter).toHaveBeenCalledWith('socket_unacked_key_version', { version: 'v1' });
+        expect(mockIncrementCounter).toHaveBeenCalledWith('socket_unacked_key_version', { version: 'v2' });
+        // No failure metric on success.
+        expect(mockIncrementCounter).not.toHaveBeenCalledWith('socket_unacked_dual_write_fail_total', expect.anything());
+
+        // Emit still fires (outer path unaffected).
+        expect(emits.length).toBe(1);
+        expect(emits[0]).toMatchObject({ room: 'user:u-42', event: 'trip_assigned' });
+      });
+
+      it('falls back to ROLE_UNKNOWN when userRoleCache has no entry', async () => {
+        const { fakeIo } = makeFakeIo(new Map());
+        socketService.__setIoForTesting(fakeIo, new Map());
+        // NOTE: no __setUserRoleForTesting call → cache miss.
+
+        socketService.emitToUser('u-miss', 'new_broadcast', { id: 'b1' });
+        await new Promise((r) => setImmediate(r));
+
+        expect(mockZSets.get('socket:unacked:u-miss:unknown')?.length).toBe(1);
+        const envelope = mockZSets.get('socket:unacked:u-miss:unknown')![0].member;
+        expect(JSON.parse(envelope).role).toBe('unknown');
+      });
+    });
+
+    describe('flag ON — atomicity abort (MUST per Arch 1B)', () => {
+      beforeEach(() => {
+        process.env.FF_ROLE_SCOPED_DURABLE_EMIT = 'true';
+      });
+
+      it('throws DURABLE_EMIT_DUAL_WRITE_FAILED when pipeline exec rejects; neither key persisted', async () => {
+        // Mock pipeline exec to reject. Matches ioredis MULTI/EXEC abort semantics.
+        mockMultiExecImpl = async (_ops) => {
+          throw new Error('mock ZADD fail on second write');
+        };
+
+        const { fakeIo, emits } = makeFakeIo(new Map());
+        socketService.__setIoForTesting(fakeIo, new Map());
+        socketService.__setUserRoleForTesting('u-abort', 'driver');
+
+        socketService.emitToUser('u-abort', 'hold_expired', { holdId: 'h1' });
+        await new Promise((r) => setImmediate(r));
+
+        // Neither OLD nor NEW key received the envelope — atomicity preserved.
+        expect(mockZSets.has('socket:unacked:u-abort')).toBe(false);
+        expect(mockZSets.has('socket:unacked:u-abort:driver')).toBe(false);
+
+        // Failure metric incremented exactly once.
+        expect(mockIncrementCounter).toHaveBeenCalledWith(
+          'socket_unacked_dual_write_fail_total',
+          { phase: '1' }
+        );
+        // No successful key-version metric emitted on abort.
+        expect(mockIncrementCounter).not.toHaveBeenCalledWith('socket_unacked_key_version', { version: 'v1' });
+        expect(mockIncrementCounter).not.toHaveBeenCalledWith('socket_unacked_key_version', { version: 'v2' });
+
+        // Structured error log emitted with sanitized message.
+        const errorLog = mockLoggerError.mock.calls.find((c) => c[0] === 'durable_emit_dual_write_failed');
+        expect(errorLog).toBeDefined();
+        expect(errorLog![1]).toMatchObject({
+          userId: 'u-abort',
+          role: 'driver',
+          event: 'hold_expired',
+          errMessage: expect.stringContaining('mock ZADD fail'),
+        });
+
+        // Outer try/catch caught the thrown AppError → warn log from the legacy
+        // "ZSET write failed" branch fires; emit still fires degraded.
+        expect(mockLoggerWarn).toHaveBeenCalledWith(
+          '[durableEmit] ZSET write failed, emitting without durable persistence',
+          expect.objectContaining({ userId: 'u-abort', event: 'hold_expired' })
+        );
+        expect(emits.length).toBe(1);
+      });
+    });
+
+    describe('persistRoomEnvelopes — same atomicity contract per user', () => {
+      beforeEach(() => {
+        process.env.FF_ROLE_SCOPED_DURABLE_EMIT = 'true';
+      });
+
+      it('dual-writes per-user inside the room fan-out map', async () => {
+        const { fakeIo } = makeFakeIo(new Map([['booking:b1', new Set(['s1', 's2'])]]));
+        socketService.__setIoForTesting(fakeIo, new Map([
+          ['s1', 'room-u-1'],
+          ['s2', 'room-u-2'],
+        ]));
+        socketService.__setUserRoleForTesting('room-u-1', 'transporter');
+        socketService.__setUserRoleForTesting('room-u-2', 'driver');
+
+        socketService.emitToBooking('b1', 'booking_updated', { id: 'b1' });
+        await new Promise((r) => setImmediate(r));
+
+        // Two users → two MULTI pipelines (one each).
+        expect(mockRedisMulti).toHaveBeenCalledTimes(2);
+        expect(mockZSets.has('socket:unacked:room-u-1:transporter')).toBe(true);
+        expect(mockZSets.has('socket:unacked:room-u-2:driver')).toBe(true);
+      });
     });
   });
 });
