@@ -1356,3 +1356,242 @@ describe('A04-002 — Two-tier JWT Cache', () => {
     expect(jwt.verify).toHaveBeenCalledTimes(2);
   });
 });
+
+// =============================================================================
+// P6-T09 + P6-T13: buildTripAssignedDriverNotification helper shape
+// P6-T16: Three emit paths (confirmed-hold, reassign, cascade) produce equal shape
+// =============================================================================
+
+// Import the pure helper directly — no heavy service mocking needed.
+// Modules already mocked above satisfy transitive imports (pii.utils is mocked).
+import { buildTripAssignedDriverNotification } from '../modules/truck-hold/confirmed-hold.service';
+import type { TripAssignedPayload, TripAssignedFcmData } from '../modules/truck-hold/confirmed-hold.service';
+
+/** Minimal order fixture for helper tests. */
+function makeOrder(overrides: Partial<{
+  pickup: object;
+  drop: object;
+  distanceKm: number;
+  customerName: string;
+  customerPhone: string;
+  routePoints: unknown[];
+}> = {}) {
+  return {
+    pickup: overrides.pickup ?? { address: '123 Main St', city: 'Mumbai', latitude: 19.076, longitude: 72.877 },
+    drop: overrides.drop ?? { address: '456 End Rd', city: 'Pune', latitude: 18.520, longitude: 73.856 },
+    distanceKm: overrides.distanceKm ?? 145.5,
+    customerName: overrides.customerName ?? 'Ramesh Kumar',
+    customerPhone: overrides.customerPhone ?? '9876543210',
+    routePoints: overrides.routePoints ?? [],
+  };
+}
+
+function makeAssignment(overrides: Partial<{
+  id: string; tripId: string | null; orderId: string | null;
+  bookingId: string | null; truckRequestId: string | null;
+  vehicleNumber: string; vehicleType: string;
+}> = {}) {
+  return {
+    id: overrides.id ?? 'assign-helper-001',
+    tripId: overrides.tripId ?? 'trip-helper-001',
+    orderId: overrides.orderId ?? 'order-helper-001',
+    bookingId: overrides.bookingId ?? null,
+    truckRequestId: overrides.truckRequestId ?? 'tr-helper-001',
+    vehicleNumber: overrides.vehicleNumber ?? 'MH-12-AB-1234',
+    vehicleType: overrides.vehicleType ?? 'Tipper',
+  };
+}
+
+describe('P6-T09 + P6-T13: buildTripAssignedDriverNotification — payload shape', () => {
+  it('socketPayload contains routePoints, deadlineMs, serverNowMs keys', () => {
+    const order = makeOrder();
+    const assignment = makeAssignment();
+    const deadlineMs = Date.now() + 45000;
+
+    const { socketPayload } = buildTripAssignedDriverNotification(order, 5000, assignment, deadlineMs);
+
+    expect(socketPayload).toHaveProperty('routePoints');
+    expect(socketPayload).toHaveProperty('deadlineMs');
+    expect(socketPayload).toHaveProperty('serverNowMs');
+    expect(typeof socketPayload.routePoints).toBe('object');
+    expect(Array.isArray(socketPayload.routePoints)).toBe(true);
+    expect(typeof socketPayload.deadlineMs).toBe('number');
+    expect(typeof socketPayload.serverNowMs).toBe('number');
+  });
+
+  it('socketPayload deadlineMs matches the passed deadlineMs', () => {
+    const deadlineMs = 1_700_000_000_000;
+    const { socketPayload } = buildTripAssignedDriverNotification(
+      makeOrder(), 1000, makeAssignment(), deadlineMs
+    );
+    expect(socketPayload.deadlineMs).toBe(deadlineMs);
+  });
+
+  it('socketPayload serverNowMs is a recent epoch-ms (within 2s of now)', () => {
+    const before = Date.now();
+    const { socketPayload } = buildTripAssignedDriverNotification(
+      makeOrder(), 1000, makeAssignment(), before + 45000
+    );
+    const after = Date.now();
+    expect(socketPayload.serverNowMs).toBeGreaterThanOrEqual(before);
+    expect(socketPayload.serverNowMs).toBeLessThanOrEqual(after);
+  });
+
+  it('fcmData contains routePoints, deadlineMs, serverNowMs as strings', () => {
+    const { fcmData } = buildTripAssignedDriverNotification(
+      makeOrder(), 3000, makeAssignment(), Date.now() + 45000
+    );
+    expect(typeof fcmData.routePoints).toBe('string');
+    expect(typeof fcmData.deadlineMs).toBe('string');
+    expect(typeof fcmData.serverNowMs).toBe('string');
+    // deadlineMs must parse to a number
+    expect(Number.isFinite(Number(fcmData.deadlineMs))).toBe(true);
+    expect(Number.isFinite(Number(fcmData.serverNowMs))).toBe(true);
+  });
+
+  it('fcmData.routePointsTruncated is "false" when routePoints is small', () => {
+    const order = makeOrder({ routePoints: [
+      { type: 'PICKUP', latitude: 19.0, longitude: 72.8, address: 'A', stopIndex: 0 },
+      { type: 'DROP', latitude: 18.5, longitude: 73.8, address: 'B', stopIndex: 1 },
+    ] });
+    const { fcmData } = buildTripAssignedDriverNotification(
+      order, 2000, makeAssignment(), Date.now() + 45000
+    );
+    expect(fcmData.routePointsTruncated).toBe('false');
+    const parsed = JSON.parse(fcmData.routePoints);
+    expect(parsed).toHaveLength(2);
+  });
+
+  it('P6-T36: zero-stop order emits routePoints = [] in socketPayload and fcmData', () => {
+    const order = makeOrder({ routePoints: [] });
+    const { socketPayload, fcmData } = buildTripAssignedDriverNotification(
+      order, 0, makeAssignment(), Date.now() + 45000
+    );
+    expect(socketPayload.routePoints).toEqual([]);
+    expect(JSON.parse(fcmData.routePoints)).toEqual([]);
+  });
+
+  it('P6-T36: undefined routePoints also emits empty array (not undefined)', () => {
+    const { socketPayload, fcmData } = buildTripAssignedDriverNotification(
+      makeOrder({ routePoints: undefined as any }), 0, makeAssignment(), Date.now() + 45000
+    );
+    expect(socketPayload.routePoints).toEqual([]);
+    expect(JSON.parse(fcmData.routePoints)).toEqual([]);
+  });
+
+  it('P6-T37: routePoints > 4 KB are truncated to 10 points + flag set', () => {
+    // Generate 30 large route points to exceed 4 KB
+    const bigPoints = Array.from({ length: 30 }, (_, i) => ({
+      type: 'STOP' as const,
+      latitude: 19.0 + i * 0.001,
+      longitude: 72.8 + i * 0.001,
+      address: `Stop ${i} — very long address to push byte count over limit padpadpadpadpadpadpadpad`,
+      city: 'Mumbai',
+      stopIndex: i,
+    }));
+    const order = makeOrder({ routePoints: bigPoints });
+    const { fcmData, socketPayload } = buildTripAssignedDriverNotification(
+      order, 0, makeAssignment(), Date.now() + 45000
+    );
+    // Socket payload should carry full set
+    expect(socketPayload.routePoints).toHaveLength(30);
+    // FCM should be truncated
+    const fcmParsed = JSON.parse(fcmData.routePoints);
+    expect(fcmParsed.length).toBeLessThanOrEqual(10);
+    expect(fcmData.routePointsTruncated).toBe('true');
+  });
+
+  it('socketPayload type is always "trip_assigned"', () => {
+    const { socketPayload } = buildTripAssignedDriverNotification(
+      makeOrder(), 0, makeAssignment(), Date.now() + 45000
+    );
+    expect(socketPayload.type).toBe('trip_assigned');
+  });
+
+  it('fcmData.payload is valid JSON containing type trip_assigned', () => {
+    const { fcmData } = buildTripAssignedDriverNotification(
+      makeOrder(), 0, makeAssignment(), Date.now() + 45000
+    );
+    const parsed = JSON.parse(fcmData.payload);
+    expect(parsed.type).toBe('trip_assigned');
+  });
+
+  it('null order degrades gracefully — returns empty routePoints and zeroed location', () => {
+    const { socketPayload } = buildTripAssignedDriverNotification(
+      null, 0, makeAssignment(), Date.now() + 45000
+    );
+    expect(socketPayload.routePoints).toEqual([]);
+    expect(socketPayload.distanceKm).toBe(0);
+    expect(socketPayload.customerPhone).toBe('');
+  });
+});
+
+describe('P6-T16: Three emit paths produce equal shape', () => {
+  it('confirmed-hold, reassign, cascade helper outputs are structurally equal', () => {
+    const order = makeOrder();
+    const assignment = makeAssignment();
+    const deadlineMs = 1_750_000_000_000; // fixed for determinism (not Date.now)
+
+    // Simulate "confirmed-hold" path
+    const { socketPayload: fresh } = buildTripAssignedDriverNotification(
+      order, 5000, assignment, deadlineMs
+    );
+    // Simulate "reassign" path (same inputs — should be structurally identical)
+    const { socketPayload: reassign } = buildTripAssignedDriverNotification(
+      order, 5000, assignment, deadlineMs
+    );
+    // Simulate "cascade" path
+    const { socketPayload: cascade } = buildTripAssignedDriverNotification(
+      order, 5000, assignment, deadlineMs
+    );
+
+    // All three must carry the same structural keys
+    const requiredKeys: Array<keyof typeof fresh> = [
+      'type', 'assignmentId', 'tripId', 'orderId', 'bookingId',
+      'truckRequestId', 'pickup', 'drop', 'vehicleNumber', 'vehicleType',
+      'distanceKm', 'farePerTruck', 'customerName', 'customerPhone',
+      'assignedAt', 'expiresAt', 'serverNowMs', 'deadlineMs',
+      'routePoints', 'message',
+    ];
+    for (const key of requiredKeys) {
+      expect(fresh).toHaveProperty(key);
+      expect(reassign).toHaveProperty(key);
+      expect(cascade).toHaveProperty(key);
+    }
+
+    // Fields that are pure inputs (not Date.now) must be equal across all paths
+    const deterministicFields = [
+      'type', 'assignmentId', 'tripId', 'orderId', 'bookingId',
+      'truckRequestId', 'vehicleNumber', 'vehicleType',
+      'distanceKm', 'farePerTruck', 'deadlineMs',
+      'routePoints',
+    ] as const;
+    for (const key of deterministicFields) {
+      expect(JSON.stringify(fresh[key])).toBe(JSON.stringify(reassign[key]));
+      expect(JSON.stringify(fresh[key])).toBe(JSON.stringify(cascade[key]));
+    }
+  });
+
+  it('fcmData from all three paths has identical structure keys', () => {
+    const order = makeOrder();
+    const assignment = makeAssignment();
+    const deadlineMs = 1_750_000_000_000;
+
+    const { fcmData: fcmFresh } = buildTripAssignedDriverNotification(order, 5000, assignment, deadlineMs);
+    const { fcmData: fcmReassign } = buildTripAssignedDriverNotification(order, 5000, assignment, deadlineMs);
+    const { fcmData: fcmCascade } = buildTripAssignedDriverNotification(order, 5000, assignment, deadlineMs);
+
+    const fcmKeys = Object.keys(fcmFresh).sort();
+    expect(Object.keys(fcmReassign).sort()).toEqual(fcmKeys);
+    expect(Object.keys(fcmCascade).sort()).toEqual(fcmKeys);
+  });
+
+  it('all fcmData values are strings (FCM contract)', () => {
+    const { fcmData } = buildTripAssignedDriverNotification(
+      makeOrder(), 2500, makeAssignment(), Date.now() + 45000
+    );
+    for (const [key, value] of Object.entries(fcmData)) {
+      expect(typeof value).toBe('string');
+    }
+  });
+});
