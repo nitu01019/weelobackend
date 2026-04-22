@@ -29,6 +29,7 @@
  */
 
 import { v4 as uuidv4 } from 'uuid';
+import { createHash } from 'crypto';
 import { Prisma } from '@prisma/client';
 import { prismaClient, withDbTimeout, HoldPhase, AssignmentStatus } from '../../shared/database/prisma.service';
 import { AppError } from '../../shared/types/error.types';
@@ -44,7 +45,242 @@ import { tryAutoRedispatch } from '../assignment/auto-redispatch.service';
 import { validateActorEligibility, HoldEligibilityError } from './hold-eligibility';
 import { metrics } from '../../shared/monitoring/metrics.service';
 import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
-import { FLAGS, isEnabled } from '../../shared/config/feature-flags';
+import { FLAGS, NUMERIC_FLAGS, isEnabled, getNumericFlag } from '../../shared/config/feature-flags';
+import type { RoutePointRecord } from '../../shared/database/record-types';
+
+// =============================================================================
+// P6-E: buildTripAssignedDriverNotification — single-source-of-truth helper
+// =============================================================================
+// ADR A03-011/A03-012: All three trip_assigned emit paths (confirmed-hold,
+// reassign-driver, cascade-dispatch) MUST call this helper so the socket and
+// FCM payloads are byte-equal regardless of the code path that triggers the
+// notification. Defined here to avoid the circular import that would arise if
+// the helper lived in index.ts (index.ts re-exports confirmed-hold.service.ts,
+// creating a cycle). reassign-driver and cascade-dispatch import this symbol
+// directly from ./confirmed-hold.service — NOT through the barrel.
+// =============================================================================
+
+/** Maximum FCM data-field size before routePoints is truncated (bytes). */
+const ROUTE_POINTS_FCM_BYTE_LIMIT = 4096;
+/** Maximum number of route points kept when payload exceeds FCM limit. */
+const ROUTE_POINTS_FCM_MAX_COUNT = 10;
+
+/** Shape of the trip_assigned socket payload. */
+export interface TripAssignedPayload {
+  type: 'trip_assigned';
+  assignmentId: string;
+  tripId: string | null;
+  orderId: string | null;
+  bookingId: string | null;
+  truckRequestId: string | null;
+  pickup: Record<string, unknown>;
+  drop: Record<string, unknown>;
+  vehicleNumber: string;
+  vehicleType: string;
+  distanceKm: number;
+  farePerTruck: number;
+  customerName: string;
+  customerPhone: string;
+  assignedAt: string;
+  expiresAt: string;
+  /** Server-epoch ms anchor (A03-003): Captain offset-corrects countdown using this. */
+  serverNowMs: number;
+  /** Absolute ms deadline for driver accept window (A03-003). */
+  deadlineMs: number;
+  routePoints: RoutePointRecord[];
+  message: string;
+}
+
+/** FCM data map — all values MUST be strings per FCM contract. */
+export interface TripAssignedFcmData extends Record<string, string> {
+  payload: string;
+  type: string;
+  assignmentId: string;
+  tripId: string;
+  orderId: string;
+  truckRequestId: string;
+  pickup: string;
+  drop: string;
+  pickupAddress: string;
+  pickupCity: string;
+  pickupLat: string;
+  pickupLng: string;
+  dropAddress: string;
+  dropCity: string;
+  dropLat: string;
+  dropLng: string;
+  vehicleNumber: string;
+  farePerTruck: string;
+  distanceKm: string;
+  customerName: string;
+  customerPhone: string;
+  assignedAt: string;
+  expiresAt: string;
+  serverNowMs: string;
+  deadlineMs: string;
+  routePoints: string;
+  routePointsTruncated: string;
+}
+
+/**
+ * Build the canonical trip_assigned driver notification payload.
+ *
+ * Pure function (no side effects). All three emit paths call this so the
+ * socket and FCM payloads are structurally identical (A03-011 / A03-012).
+ *
+ * P6-T09 contract: output always includes `routePoints`, `deadlineMs`, `serverNowMs`.
+ *
+ * @param order       - Order row with pickup/drop/distanceKm/customerName/customerPhone/routePoints.
+ * @param farePerTruck - TruckRequest.pricePerTruck (0 fallback).
+ * @param assignment  - Assignment fields for the payload.
+ * @param deadlineMs  - Absolute server epoch-ms deadline for driver accept window.
+ */
+export function buildTripAssignedDriverNotification(
+  order: {
+    pickup: unknown;
+    drop: unknown;
+    distanceKm: number | null | undefined;
+    customerName: string | null | undefined;
+    customerPhone: string | null | undefined;
+    routePoints?: unknown;
+  } | null | undefined,
+  farePerTruck: number,
+  assignment: {
+    id: string;
+    tripId: string | null;
+    orderId: string | null;
+    bookingId: string | null;
+    truckRequestId: string | null;
+    vehicleNumber: string;
+    vehicleType: string;
+  },
+  deadlineMs: number,
+): { socketPayload: TripAssignedPayload; fcmData: TripAssignedFcmData } {
+  const serverNowMs = Date.now();
+
+  // Dual lat/lng + latitude/longitude keys for cross-convention client compat.
+  const pickupRaw = (order?.pickup as Record<string, unknown>) || {};
+  const dropRaw = (order?.drop as Record<string, unknown>) || {};
+
+  const socketPickup: Record<string, unknown> = {
+    ...pickupRaw,
+    lat: pickupRaw.latitude ?? pickupRaw.lat ?? 0,
+    lng: pickupRaw.longitude ?? pickupRaw.lng ?? 0,
+  };
+  const socketDrop: Record<string, unknown> = {
+    ...dropRaw,
+    lat: dropRaw.latitude ?? dropRaw.lat ?? 0,
+    lng: dropRaw.longitude ?? dropRaw.lng ?? 0,
+  };
+  const fcmPickup = {
+    address: (pickupRaw.address as string) ?? '',
+    city: (pickupRaw.city as string) ?? '',
+    latitude: (pickupRaw.latitude as number) ?? (pickupRaw.lat as number) ?? 0,
+    longitude: (pickupRaw.longitude as number) ?? (pickupRaw.lng as number) ?? 0,
+  };
+  const fcmDrop = {
+    address: (dropRaw.address as string) ?? '',
+    city: (dropRaw.city as string) ?? '',
+    latitude: (dropRaw.latitude as number) ?? (dropRaw.lat as number) ?? 0,
+    longitude: (dropRaw.longitude as number) ?? (dropRaw.lng as number) ?? 0,
+  };
+
+  const expiresAtIso = new Date(deadlineMs).toISOString();
+  const assignedAtIso = new Date(serverNowMs).toISOString();
+  const maskedPhone = maskPhoneForExternal(order?.customerPhone || '');
+  const distanceKm = Number(order?.distanceKm ?? 0);
+  const customerName = order?.customerName ?? '';
+
+  // P6-T36: zero-stop orders → emit [] not undefined.
+  const rawRoutePoints: unknown = order?.routePoints;
+  const routePoints: RoutePointRecord[] = Array.isArray(rawRoutePoints) ? rawRoutePoints : [];
+
+  // P6-T37: truncate when JSON > 4 KB. Captain fetches full list via REST
+  // when fcmData.routePointsTruncated === 'true'.
+  let routePointsForFcm = routePoints;
+  let routePointsTruncated = false;
+  if (Buffer.byteLength(JSON.stringify(routePoints), 'utf8') > ROUTE_POINTS_FCM_BYTE_LIMIT) {
+    routePointsForFcm = routePoints.slice(0, ROUTE_POINTS_FCM_MAX_COUNT);
+    routePointsTruncated = true;
+  }
+
+  const message = `New trip assigned! ${fcmPickup.address || 'Pickup'} → ${fcmDrop.address || 'Drop'}`;
+
+  const socketPayload: TripAssignedPayload = {
+    type: 'trip_assigned',
+    assignmentId: assignment.id,
+    tripId: assignment.tripId,
+    orderId: assignment.orderId,
+    bookingId: assignment.bookingId,
+    truckRequestId: assignment.truckRequestId,
+    pickup: socketPickup,
+    drop: socketDrop,
+    vehicleNumber: assignment.vehicleNumber,
+    vehicleType: assignment.vehicleType,
+    distanceKm,
+    farePerTruck,
+    customerName,
+    customerPhone: maskedPhone,
+    assignedAt: assignedAtIso,
+    expiresAt: expiresAtIso,
+    serverNowMs,
+    deadlineMs,
+    routePoints,
+    message,
+  };
+
+  const fcmPayloadObj = {
+    type: 'trip_assigned',
+    assignmentId: assignment.id,
+    tripId: assignment.tripId,
+    orderId: assignment.orderId,
+    truckRequestId: assignment.truckRequestId ?? '',
+    pickup: fcmPickup,
+    drop: fcmDrop,
+    vehicleNumber: assignment.vehicleNumber,
+    farePerTruck,
+    distanceKm,
+    customerName,
+    customerPhone: maskedPhone,
+    assignedAt: assignedAtIso,
+    expiresAt: expiresAtIso,
+    serverNowMs,
+    deadlineMs,
+    message,
+  };
+
+  const fcmData: TripAssignedFcmData = {
+    payload: JSON.stringify(fcmPayloadObj),
+    type: 'trip_assigned',
+    assignmentId: assignment.id,
+    tripId: assignment.tripId ?? '',
+    orderId: assignment.orderId ?? '',
+    truckRequestId: assignment.truckRequestId ?? '',
+    pickup: JSON.stringify(fcmPickup),
+    drop: JSON.stringify(fcmDrop),
+    pickupAddress: fcmPickup.address,
+    pickupCity: fcmPickup.city,
+    pickupLat: String(fcmPickup.latitude),
+    pickupLng: String(fcmPickup.longitude),
+    dropAddress: fcmDrop.address,
+    dropCity: fcmDrop.city,
+    dropLat: String(fcmDrop.latitude),
+    dropLng: String(fcmDrop.longitude),
+    vehicleNumber: assignment.vehicleNumber,
+    farePerTruck: String(farePerTruck),
+    distanceKm: String(distanceKm),
+    customerName,
+    customerPhone: maskedPhone,
+    assignedAt: assignedAtIso,
+    expiresAt: expiresAtIso,
+    serverNowMs: String(serverNowMs),
+    deadlineMs: String(deadlineMs),
+    routePoints: JSON.stringify(routePointsForFcm),
+    routePointsTruncated: routePointsTruncated ? 'true' : 'false',
+  };
+
+  return { socketPayload, fcmData };
+}
 
 // =============================================================================
 // TYPES & INTERFACES
@@ -425,8 +661,16 @@ class ConfirmedHoldService {
         // replays via dispatchTripAssignedFanoutFromOutbox (W3-T07). Fast-path
         // success marks the rows 'dispatched' post-commit so the poller stays
         // idle unless a crash occurs. Gated OFF by default for soak-safe rollout.
+        //
+        // Outbox replay safety: /confirm-with-assignments now reads X-Idempotency-Key
+        // (Phase 2 A01-006). Re-driven deliveries cannot double-create ledger rows.
         const fanoutOutboxIds: string[] = [];
-        if (isEnabled(FLAGS.TRIP_ASSIGNED_FANOUT_OUTBOX_ENABLED)) {
+        // P6-T29 (A09-006): Canary partition — deterministic across pods.
+        // SHA-256 fallback (no murmurhash3 dep): hash(transporterId) % 100 < rolloutPercent.
+        const _fanoutRolloutPct = getNumericFlag(NUMERIC_FLAGS.TRIP_ASSIGNED_FANOUT_OUTBOX_ROLLOUT_PCT);
+        const _fanoutHashVal = createHash('sha256').update(updated.transporterId).digest().readUInt32BE(0) % 100;
+        const _fanoutInCanary = _fanoutHashVal < _fanoutRolloutPct;
+        if (isEnabled(FLAGS.TRIP_ASSIGNED_FANOUT_OUTBOX_ENABLED) && _fanoutInCanary) {
           // Fetch parent order's customer/pickup/drop context inside tx so the
           // outbox row carries all fields needed by the dispatcher replay
           // (see order-types.ts TripAssignedFanoutPayload). A tx-scoped fetch
@@ -605,16 +849,14 @@ class ConfirmedHoldService {
           distanceKm: true,
           customerName: true,
           customerPhone: true,
+          // P6-T07 (A03-008): routePoints for trip_assigned driver notification.
+          routePoints: true,
         },
       });
       const pickup = (parentOrder?.pickup as any) || {};
       const drop = (parentOrder?.drop as any) || {};
-      // A13-013: expose both lat/lng and latitude/longitude key shapes to the
-      // socket payload so captain clients keyed on either convention resolve
-      // coordinates without a silent zero-fallback.
-      const socketPickup = { ...pickup, lat: pickup?.latitude ?? pickup?.lat ?? 0, lng: pickup?.longitude ?? pickup?.lng ?? 0 };
-      const socketDrop = { ...drop, lat: drop?.latitude ?? drop?.lat ?? 0, lng: drop?.longitude ?? drop?.lng ?? 0 };
       // A03-003: server-authoritative epoch-ms anchor reused by deadlineMs below.
+      // socketPickup/socketDrop removed — now built inside buildTripAssignedDriverNotification.
       const confirmedHoldDeadlineMs =
         now.getTime() + this.config.driverAcceptTimeoutSeconds * 1000;
       const expiresAtIso = new Date(confirmedHoldDeadlineMs).toISOString();
@@ -659,26 +901,25 @@ class ConfirmedHoldService {
         // P2 F4.1: per-driver try/catch so one failure never aborts the fanout.
         try {
           const farePerTruck = fullData.truckRequest?.pricePerTruck ?? 0;
-          const driverNotification = {
-            type: 'trip_assigned',
-            assignmentId: fullData.id,
-            tripId: fullData.tripId,
-            orderId: fullData.orderId,
-            bookingId: fullData.bookingId,
-            truckRequestId: fullData.truckRequestId,
-            pickup: socketPickup,
-            drop: socketDrop,
-            vehicleNumber: fullData.vehicleNumber,
-            vehicleType: fullData.vehicleType,
-            distanceKm: parentOrder?.distanceKm,
-            farePerTruck,
-            customerName: parentOrder?.customerName || '',
-            customerPhone: maskPhoneForExternal(parentOrder?.customerPhone || ''),
-            assignedAt: now.toISOString(),
-            expiresAt: expiresAtIso,
-            deadlineMs: confirmedHoldDeadlineMs,
-            message: `New trip assigned! ${pickup?.address ?? ''} → ${drop?.address ?? ''}`,
-          };
+          // P6-T08 (A03-008/A03-011): helper builds socket + FCM payloads as a
+          // single unit — routePoints, serverNowMs, deadlineMs always present.
+          // P6-T36: zero-stop orders emit routePoints=[] (handled in helper).
+          // P6-T37: routePoints truncated to 10 pts + flag when JSON > 4 KB.
+          const { socketPayload: driverNotification, fcmData } =
+            buildTripAssignedDriverNotification(
+              parentOrder,
+              farePerTruck,
+              {
+                id: fullData.id,
+                tripId: fullData.tripId,
+                orderId: fullData.orderId,
+                bookingId: fullData.bookingId,
+                truckRequestId: fullData.truckRequestId,
+                vehicleNumber: fullData.vehicleNumber,
+                vehicleType: fullData.vehicleType,
+              },
+              confirmedHoldDeadlineMs,
+            );
 
           // Socket emit
           try {
@@ -700,66 +941,9 @@ class ConfirmedHoldService {
             });
           }
 
-          // FCM enqueue — flatten payload for FCM data constraints (mirrors truck-hold.service.ts:1647-1678)
-          // A05-003: nested pickup/drop + `payload` JSON blob for Captain parser. Legacy
-          // flat keys (pickupLat/pickupLng/pickupAddress/etc.) preserved per master-file
-          // guidance ("latitude ?? lat fallback intact").
-          // A03-005 synergy: farePerTruck sourced from TruckRequest.pricePerTruck (0 fallback)
-          // is already destructured above (`const farePerTruck = fullData.truckRequest?.pricePerTruck ?? 0`).
-          const fcmPickupNested = {
-            address: pickup?.address ?? '',
-            city: pickup?.city ?? '',
-            latitude: pickup?.latitude ?? pickup?.lat ?? 0,
-            longitude: pickup?.longitude ?? pickup?.lng ?? 0,
-          };
-          const fcmDropNested = {
-            address: drop?.address ?? '',
-            city: drop?.city ?? '',
-            latitude: drop?.latitude ?? drop?.lat ?? 0,
-            longitude: drop?.longitude ?? drop?.lng ?? 0,
-          };
-          const fcmPayloadObj = {
-            type: 'trip_assigned',
-            assignmentId: fullData.id,
-            tripId: fullData.tripId,
-            orderId: fullData.orderId,
-            truckRequestId: fullData.truckRequestId ?? '',
-            pickup: fcmPickupNested,
-            drop: fcmDropNested,
-            vehicleNumber: fullData.vehicleNumber ?? '',
-            farePerTruck: Number(farePerTruck ?? 0),
-            distanceKm: Number(parentOrder?.distanceKm ?? 0),
-            customerName: parentOrder?.customerName ?? '',
-            customerPhone: maskPhoneForExternal(parentOrder?.customerPhone || ''),
-            assignedAt: now.toISOString(),
-            expiresAt: expiresAtIso,
-            message: `New trip assigned! ${fcmPickupNested.address || 'Pickup'} → ${fcmDropNested.address || 'Drop'}`,
-          };
-          const fcmData = {
-            payload: JSON.stringify(fcmPayloadObj),
-            type: 'trip_assigned',
-            assignmentId: fullData.id,
-            tripId: fullData.tripId,
-            orderId: fullData.orderId,
-            truckRequestId: fullData.truckRequestId ?? '',
-            pickup: JSON.stringify(fcmPickupNested),
-            drop: JSON.stringify(fcmDropNested),
-            pickupAddress: pickup?.address ?? '',
-            pickupCity: pickup?.city ?? '',
-            pickupLat: String(pickup?.latitude ?? pickup?.lat ?? 0),
-            pickupLng: String(pickup?.longitude ?? pickup?.lng ?? 0),
-            dropAddress: drop?.address ?? '',
-            dropCity: drop?.city ?? '',
-            dropLat: String(drop?.latitude ?? drop?.lat ?? 0),
-            dropLng: String(drop?.longitude ?? drop?.lng ?? 0),
-            vehicleNumber: fullData.vehicleNumber ?? '',
-            farePerTruck: String(fcmPayloadObj.farePerTruck),
-            distanceKm: String(parentOrder?.distanceKm ?? 0),
-            customerName: parentOrder?.customerName ?? '',
-            customerPhone: maskPhoneForExternal(parentOrder?.customerPhone || ''),
-            assignedAt: now.toISOString(),
-            expiresAt: expiresAtIso,
-          };
+          // fcmData is built by buildTripAssignedDriverNotification above —
+          // includes routePoints, serverNowMs, deadlineMs, and all legacy flat
+          // keys (pickupLat/pickupLng/etc.) per A05-003 + A03-003 requirements.
 
           try {
             await queueService.queuePushNotification(fullData.driverId, {

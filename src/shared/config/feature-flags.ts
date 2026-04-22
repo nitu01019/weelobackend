@@ -538,22 +538,28 @@ export const FLAGS = {
     defaultValue: false,
   },
 
-  // --- W3 A03-004 / A13-005: Trip-assigned fan-out outbox ---
-  // When ON, confirmed-hold initialize writes one OrderLifecycleOutbox row per
-  // driver INSIDE the phase-flip transaction so a process crash between tx
-  // commit (line 369) and the post-commit per-driver socket emit + FCM enqueue
-  // loop (~line 472-577) no longer silently drops driver notifications — the
-  // poller replays the fan-out via dispatchTripAssignedFanoutFromOutbox. On
-  // fast-path success, rows are marked 'dispatched' post-commit so the poller
-  // stays idle unless a crash occurs. When OFF: legacy fire-and-forget loop
-  // runs post-commit exactly as before (fallback preserved for soak-safe rollout).
-  // Default OFF — flip ON after the staging soak confirms dispatcher+producer
-  // agreement and the poller's SKIP LOCKED + lockedAt staleness reclaim path
-  // behaves as expected under load.
+  // --- W3 A03-004 / A13-005 / A09-006 (P6-T28+T30): Trip-assigned fan-out outbox ---
+  // When ON (canary partition: hash(transporterId)%100 < FF_TRIP_ASSIGNED_FANOUT_OUTBOX_ROLLOUT_PCT),
+  // confirmed-hold writes one OrderLifecycleOutbox row per driver INSIDE the phase-flip
+  // transaction so crashes between tx commit and the post-commit fanout loop cannot silently
+  // drop driver notifications. Poller replays via dispatchTripAssignedFanoutFromOutbox (W3-T07).
+  // Fast-path success marks rows 'dispatched'; poller stays idle unless crash occurs.
+  //
+  // CANARY ROLLOUT SCHEDULE (flip FF_TRIP_ASSIGNED_FANOUT_OUTBOX_ROLLOUT_PCT, not the bool):
+  //   Stage 1 — 5%:  24h staging soak gate (REQUIRED before any prod flip)
+  //   Stage 2 — 25%: hold 24h, confirm outbox_drain_failures_total/drain_rate < 0.02 for 3 min
+  //   Stage 3 — 100%: full rollout after 72h green soak
+  //
+  // AUTO-REVERT trigger: outbox_drain_failures_total / outbox_drain_rate_per_sec > 0.02 sustained
+  //   for 3 consecutive minutes -> set FF_TRIP_ASSIGNED_FANOUT_OUTBOX_ROLLOUT_PCT=0 + redeploy.
+  //
+  // Observer: P6-09 Rhea  |  Dashboard: weelo-outbox-health
+  // 24h staging soak gate MUST pass before any production flip (A09-002 deferral precedent).
+  // Default OFF (defaultValue: false) — rolloutPercent=0 further gates at hash partition.
   TRIP_ASSIGNED_FANOUT_OUTBOX_ENABLED: {
     env: 'FF_TRIP_ASSIGNED_FANOUT_OUTBOX_ENABLED',
     category: 'release' as const,
-    description: 'Durable-outbox post-commit trip_assigned socket+FCM fanout on confirmed-hold init (A03-004/A13-005)',
+    description: 'Durable-outbox post-commit trip_assigned socket+FCM fanout on confirmed-hold init (A03-004/A13-005/A09-006)',
     defaultValue: false,
   },
 
@@ -659,6 +665,13 @@ export const NUMERIC_FLAGS = {
     env: 'FF_ADAPTIVE_FANOUT_DELAY_MS',
     defaultValue: 0,
     description: 'Delay (ms) between adaptive fanout chunks',
+  },
+  // A09-006 (P6-T29): Canary rollout percentage for TRIP_ASSIGNED_FANOUT_OUTBOX_ENABLED.
+  // 0 = no traffic (default); 5 -> staging soak; 25 -> extended soak; 100 = full rollout.
+  TRIP_ASSIGNED_FANOUT_OUTBOX_ROLLOUT_PCT: {
+    env: 'FF_TRIP_ASSIGNED_FANOUT_OUTBOX_ROLLOUT_PCT',
+    defaultValue: 0,
+    description: 'Canary rollout % for trip-assigned fanout outbox (0=off, 5/25/100 schedule)',
   },
 } as const;
 

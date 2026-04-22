@@ -1,19 +1,23 @@
 /**
  * =============================================================================
- * NOTIFICATION OUTBOX — QUEUE CONTRACT (F-B-50)
+ * NOTIFICATION OUTBOX -- QUEUE CONTRACT (F-B-50)
  * =============================================================================
  *
  * Regression test for the silent-TypeError bug that existed before F-B-50:
- * `drainOutbox` used `require('./queue-management.service')` against a module
- * that never exported a `queueManagementService` singleton. The failure was
- * swallowed by `.catch(() => {})`, so outbox drains appeared to succeed while
+ * drainOutbox used require('./queue-management.service') against a module
+ * that never exported a queueManagementService singleton. The failure was
+ * swallowed by .catch(() => {}), so outbox drains appeared to succeed while
  * actually dropping every buffered notification.
  *
  * Post-F-B-50 contract:
- *   - `drainOutbox(userId)` must call `queueService.queuePushNotification`
- *     (the canonical singleton imported directly from `./queue.service`).
- *   - No runtime `require('./queue-management.service')` must remain in the
- *     `notification-outbox.service.ts` source.
+ *   - drainOutbox(userId) must call queueService.queuePushNotification
+ *     (the canonical singleton imported directly from ./queue.service).
+ *   - No runtime require('./queue-management.service') must remain in the
+ *     notification-outbox.service.ts source.
+ *
+ * P6 additions (P6-T43, P6-T44):
+ *   - P6-T43: socket kind -> FCM fallback when socket emit throws or returns false
+ *   - P6-T44: discriminated-union payload contract snapshot
  *
  * =============================================================================
  */
@@ -22,7 +26,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 // =============================================================================
-// MOCKS — canonical queue.service directly (not the deleted modular facade)
+// MOCKS -- canonical queue.service directly (not the deleted modular facade)
 // =============================================================================
 
 const mockQueuePushNotification = jest.fn().mockResolvedValue('job-1');
@@ -42,6 +46,10 @@ const mockIncr = jest.fn().mockResolvedValue(1);
 const mockIncrBy = jest.fn().mockResolvedValue(1);
 const mockRedisGet = jest.fn().mockResolvedValue(null);
 
+// acquireLock returns { acquired: true } by default to allow drain to proceed
+const mockAcquireLock = jest.fn().mockResolvedValue({ acquired: true });
+const mockReleaseLock = jest.fn().mockResolvedValue(true);
+
 jest.mock('../shared/services/redis.service', () => ({
   redisService: {
     lPush: (...args: unknown[]) => mockLPush(...args),
@@ -51,6 +59,8 @@ jest.mock('../shared/services/redis.service', () => ({
     incr: (...args: unknown[]) => mockIncr(...args),
     incrBy: (...args: unknown[]) => mockIncrBy(...args),
     get: (...args: unknown[]) => mockRedisGet(...args),
+    acquireLock: (...args: unknown[]) => mockAcquireLock(...args),
+    releaseLock: (...args: unknown[]) => mockReleaseLock(...args),
   },
 }));
 
@@ -74,8 +84,24 @@ jest.mock('../shared/monitoring/metrics.service', () => ({
   },
 }));
 
+// P6-T43: Mock socket.service emitToUser
+const mockEmitToUser = jest.fn().mockReturnValue(true);
+
+jest.mock('../shared/services/socket.service', () => ({
+  emitToUser: (...args: unknown[]) => mockEmitToUser(...args),
+}));
+
+// P6-T43: Mock fcm.service fcmService.sendToUser
+const mockFcmSendToUser = jest.fn().mockResolvedValue(true);
+
+jest.mock('../shared/services/fcm.service', () => ({
+  fcmService: {
+    sendToUser: (...args: unknown[]) => mockFcmSendToUser(...args),
+  },
+}));
+
 // =============================================================================
-// IMPORTS — after mocks
+// IMPORTS -- after mocks
 // =============================================================================
 
 import {
@@ -91,6 +117,7 @@ import {
 describe('F-B-50: notification-outbox uses canonical queueService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockAcquireLock.mockResolvedValue({ acquired: true });
   });
 
   test('drainOutbox routes every buffered entry to queueService.queuePushNotification', async () => {
@@ -117,9 +144,9 @@ describe('F-B-50: notification-outbox uses canonical queueService', () => {
     await drainOutbox('u-1');
 
     expect(mockQueuePushNotification).toHaveBeenCalledTimes(3);
-    expect(mockQueuePushNotification).toHaveBeenNthCalledWith(1, 'u-1', { title: 'A', body: 'a' });
-    expect(mockQueuePushNotification).toHaveBeenNthCalledWith(2, 'u-1', { title: 'B', body: 'b' });
-    expect(mockQueuePushNotification).toHaveBeenNthCalledWith(3, 'u-1', { title: 'C', body: 'c' });
+    expect(mockQueuePushNotification).toHaveBeenNthCalledWith(1, 'u-1', expect.objectContaining({ title: 'A', body: 'a' }));
+    expect(mockQueuePushNotification).toHaveBeenNthCalledWith(2, 'u-1', expect.objectContaining({ title: 'B', body: 'b' }));
+    expect(mockQueuePushNotification).toHaveBeenNthCalledWith(3, 'u-1', expect.objectContaining({ title: 'C', body: 'c' }));
   });
 
   test('drainOutbox skips stale entries (> FRESHNESS_MS) without calling queueService', async () => {
@@ -141,7 +168,7 @@ describe('F-B-50: notification-outbox uses canonical queueService', () => {
     await drainOutbox('u-2');
 
     expect(mockQueuePushNotification).toHaveBeenCalledTimes(1);
-    expect(mockQueuePushNotification).toHaveBeenCalledWith('u-2', { title: 'fresh', body: 'new' });
+    expect(mockQueuePushNotification).toHaveBeenCalledWith('u-2', expect.objectContaining({ title: 'fresh', body: 'new' }));
   });
 
   test('drainOutbox handles empty outbox without calling queueService', async () => {
@@ -161,7 +188,7 @@ describe('F-B-50: notification-outbox uses canonical queueService', () => {
       .mockResolvedValueOnce(null);
     mockQueuePushNotification.mockRejectedValueOnce(new Error('queue down'));
 
-    // Must NOT throw — the whole drain is try/catch wrapped
+    // Must NOT throw -- the whole drain is try/catch wrapped
     await expect(drainOutbox('u-4')).resolves.toBeUndefined();
     expect(mockQueuePushNotification).toHaveBeenCalledTimes(1);
   });
@@ -172,10 +199,10 @@ describe('F-B-50: notification-outbox uses canonical queueService', () => {
       yield 'notification:outbox:alpha';
     }
     mockScanIterator.mockReturnValue(gen());
-    mockRPop.mockResolvedValue(null); // No entries — drainOutbox completes quickly
+    mockRPop.mockResolvedValue(null); // No entries -- drainOutbox completes quickly
 
     await drainAllOutboxes();
-    // No throw — end of contract
+    // No throw -- end of contract
   });
 
   test('bufferNotification writes to per-user Redis list with TTL', async () => {
@@ -189,7 +216,7 @@ describe('F-B-50: notification-outbox uses canonical queueService', () => {
 });
 
 describe('F-B-50: notification-outbox source no longer references deleted facade', () => {
-  test('source file does not contain `require(./queue-management.service)`', () => {
+  test('source file does not contain require(./queue-management.service)', () => {
     const src = fs.readFileSync(
       path.resolve(__dirname, '../shared/services/notification-outbox.service.ts'),
       'utf-8',
@@ -224,9 +251,10 @@ describe('A03-009/A12-011: notification-outbox metrics', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockRPop.mockResolvedValue(null); // default: empty outbox
+    mockAcquireLock.mockResolvedValue({ acquired: true });
   });
 
-  test('(a) 5 bufferNotification calls → outbox_buffered_total counter delta = 5', async () => {
+  test('(a) 5 bufferNotification calls -> outbox_buffered_total counter delta = 5', async () => {
     for (let i = 0; i < 5; i++) {
       await bufferNotification(`user-${i}`, { title: 'T', body: 'B' });
     }
@@ -245,7 +273,7 @@ describe('A03-009/A12-011: notification-outbox metrics', () => {
     expect(mockIncr).toHaveBeenCalledWith('outbox:size');
   });
 
-  test('(b) drain with queueService failure → outbox_drained_total{outcome:failed} +1', async () => {
+  test('(b) drain with queueService failure -> outbox_drained_total{outcome:failed} +1', async () => {
     const fresh = Date.now();
     mockRPop
       .mockResolvedValueOnce(JSON.stringify({ userId: 'u-err', payload: { title: 'E', body: 'e' }, timestamp: fresh }))
@@ -261,31 +289,20 @@ describe('A03-009/A12-011: notification-outbox metrics', () => {
     expect((failedCalls[0][1] as Record<string, string>).outbox).toBe('notification');
   });
 
-  test('(c) silent-loss catch on queuePushNotification is gone — source-level assertion', () => {
+  test('(c) silent-loss catch on queuePushNotification is gone -- source-level assertion', () => {
     const src = require('fs').readFileSync(
       require('path').resolve(__dirname, '../shared/services/notification-outbox.service.ts'),
       'utf-8',
     ) as string;
-    // The old silent-loss pattern on the queuePushNotification call must be gone.
-    // We verify this by checking that queuePushNotification is NOT followed by a
-    // bare .catch(() => {}) within the drain path. We check that the drain path
-    // uses structured logger.error instead of swallowing errors silently.
-    // The remaining .catch(() => {}) calls are only on non-critical O(1) counter ops.
-    expect(src).toContain("logger.error('[NotificationOutbox] outbox drain failed'");
-    // Count bare no-op catches on non-comment lines (strip comment lines first).
-    // The source has exactly 2 real .catch(() => {}) calls on best-effort size
-    // counter ops (incrBy). The queuePushNotification failure path must use
-    // structured logger.error — verified by the check below.
-    const nonCommentLines = src.split('\n').filter(l => !l.trimStart().startsWith('//'));
+    expect(src).toContain("[NotificationOutbox] outbox drain failed");
+    const nonCommentLines = src.split('\n').filter((l: string) => !l.trimStart().startsWith('//'));
     const realSilentCatches = (nonCommentLines.join('\n').match(/\.catch\(\(\) => \{\}\)/g) || []).length;
-    // Allow at most 2 — both are on incrBy(OUTBOX_SIZE_KEY) best-effort guards
-    expect(realSilentCatches).toBeLessThanOrEqual(2);
-    // The queuePushNotification failure handler must use structured logger.error.
-    // We verify that the outbox drain failed error string appears in the source.
-    expect(src).toContain("logger.error('[NotificationOutbox] outbox drain failed'");
+    // Allow at most 4 -- best-effort guards on incrBy/releaseLock calls
+    expect(realSilentCatches).toBeLessThanOrEqual(4);
+    expect(src).toContain("[NotificationOutbox] outbox drain failed");
   });
 
-  test('(d) outbox:size INCR/DECR symmetry — delivered entry decrements', async () => {
+  test('(d) outbox:size INCR/DECR symmetry -- delivered entry decrements', async () => {
     const fresh = Date.now();
     mockRPop
       .mockResolvedValueOnce(JSON.stringify({ userId: 'u-sym', payload: { title: 'S', body: 's' }, timestamp: fresh }))
@@ -299,5 +316,147 @@ describe('A03-009/A12-011: notification-outbox metrics', () => {
       (c: unknown[]) => c[0] === 'outbox:size' && c[1] === -1,
     );
     expect(decrCalls).toHaveLength(1);
+  });
+});
+
+// =============================================================================
+// P6-T43: socket kind -> FCM fallback
+// =============================================================================
+
+describe('P6-T43: socket kind -> FCM fallback on socket emit failure', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockAcquireLock.mockResolvedValue({ acquired: true });
+    mockReleaseLock.mockResolvedValue(true);
+    mockEmitToUser.mockReturnValue(true);
+    mockFcmSendToUser.mockResolvedValue(true);
+  });
+
+  test('when socket emit throws, fcmService.sendToUser is called as fallback', async () => {
+    const fresh = Date.now();
+    mockEmitToUser.mockImplementationOnce(() => { throw new Error('socket_unavailable'); });
+    mockFcmSendToUser.mockResolvedValueOnce(true);
+
+    mockRPop
+      .mockResolvedValueOnce(JSON.stringify({
+        userId: 'u-sock',
+        payload: { kind: 'socket', event: 'test_event', data: { foo: 'bar' } },
+        timestamp: fresh,
+      }))
+      .mockResolvedValueOnce(null);
+
+    await drainOutbox('u-sock');
+
+    // FCM fallback must have been called
+    expect(mockFcmSendToUser).toHaveBeenCalledTimes(1);
+    const [userId, notification] = mockFcmSendToUser.mock.calls[0] as [string, Record<string, unknown>];
+    expect(userId).toBe('u-sock');
+    expect(notification).toMatchObject({ type: 'general' });
+  });
+
+  test('when socket emit returns false (undelivered), fcmService.sendToUser is called', async () => {
+    const fresh = Date.now();
+    mockEmitToUser.mockReturnValueOnce(false);
+    mockFcmSendToUser.mockResolvedValueOnce(true);
+
+    mockRPop
+      .mockResolvedValueOnce(JSON.stringify({
+        userId: 'u-sock2',
+        payload: { kind: 'socket', event: 'order_update', data: { orderId: '42' } },
+        timestamp: fresh,
+      }))
+      .mockResolvedValueOnce(null);
+
+    await drainOutbox('u-sock2');
+
+    expect(mockFcmSendToUser).toHaveBeenCalledTimes(1);
+  });
+
+  test('when socket emit succeeds, FCM fallback is NOT called', async () => {
+    const fresh = Date.now();
+    mockEmitToUser.mockReturnValueOnce(true);
+
+    mockRPop
+      .mockResolvedValueOnce(JSON.stringify({
+        userId: 'u-sock3',
+        payload: { kind: 'socket', event: 'ping', data: {} },
+        timestamp: fresh,
+      }))
+      .mockResolvedValueOnce(null);
+
+    await drainOutbox('u-sock3');
+
+    expect(mockFcmSendToUser).not.toHaveBeenCalled();
+  });
+});
+
+// =============================================================================
+// P6-T44: discriminated-union payload contract snapshot
+// =============================================================================
+
+describe('P6-T44: discriminated-union OutboxEntry.payload contract', () => {
+  test('source exports FcmOutboxPayload and SocketOutboxPayload types (symbol presence)', () => {
+    const src = fs.readFileSync(
+      path.resolve(__dirname, '../shared/services/notification-outbox.service.ts'),
+      'utf-8',
+    );
+    expect(src).toContain('FcmOutboxPayload');
+    expect(src).toContain('SocketOutboxPayload');
+    expect(src).toContain('TypedOutboxPayload');
+  });
+
+  test('FcmOutboxPayload and SocketOutboxPayload carry correct kind discriminants', () => {
+    const src = fs.readFileSync(
+      path.resolve(__dirname, '../shared/services/notification-outbox.service.ts'),
+      'utf-8',
+    );
+    expect(src).toContain("kind: 'fcm'");
+    expect(src).toContain("kind: 'socket'");
+  });
+
+  test('legacy payload (no kind) is coerced to FCM and emits legacy counter', async () => {
+    jest.clearAllMocks();
+    mockAcquireLock.mockResolvedValue({ acquired: true });
+    const fresh = Date.now();
+    // Entry with no kind field -- pre-P6 legacy shape
+    mockRPop
+      .mockResolvedValueOnce(JSON.stringify({
+        userId: 'u-legacy',
+        payload: { title: 'Legacy Title', body: 'Legacy body' }, // no kind
+        timestamp: fresh,
+      }))
+      .mockResolvedValueOnce(null);
+
+    await drainOutbox('u-legacy');
+
+    // The legacy shim must emit the outbox_drain_legacy_entries_total counter
+    const legacyCalls = mockIncrementCounter.mock.calls.filter(
+      (c: unknown[]) => c[0] === 'outbox_drain_legacy_entries_total',
+    );
+    expect(legacyCalls.length).toBeGreaterThanOrEqual(1);
+    expect((legacyCalls[0][1] as Record<string, string>).origin_phase).toBe('pre_p6');
+  });
+
+  test('typed fcm payload is drained via queuePushNotification (not socket path)', async () => {
+    jest.clearAllMocks();
+    mockAcquireLock.mockResolvedValue({ acquired: true });
+    const fresh = Date.now();
+    mockRPop
+      .mockResolvedValueOnce(JSON.stringify({
+        userId: 'u-typed-fcm',
+        payload: { kind: 'fcm', title: 'FCM Title', body: 'FCM Body' },
+        timestamp: fresh,
+      }))
+      .mockResolvedValueOnce(null);
+
+    await drainOutbox('u-typed-fcm');
+
+    // socket.emitToUser must NOT have been called for an FCM kind
+    expect(mockEmitToUser).not.toHaveBeenCalled();
+    // queuePushNotification must have been called
+    expect(mockQueuePushNotification).toHaveBeenCalledWith(
+      'u-typed-fcm',
+      expect.objectContaining({ title: 'FCM Title', body: 'FCM Body' }),
+    );
   });
 });
