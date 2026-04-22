@@ -25,6 +25,14 @@ import { logger } from '../../shared/services/logger.service';
 import { redisService } from '../../shared/services/redis.service';
 import { transporterRateLimit } from '../../shared/middleware/transporter-rate-limit.middleware';
 import { prismaClient } from '../../shared/database/prisma.service';
+import { flexHoldCreateSchema, flexHoldExtendSchema } from './truck-hold-lifecycle.routes';
+
+// A01-003 · Idempotency TTLs. SUCCESS must exceed max-hold-window so
+// legitimate late retries (up to FLEX_MAX 130s or CONFIRMED_MAX 180s
+// + network buffer) hit the cache rather than re-executing.
+// Stripe pattern: success TTL >> failure TTL.
+const IDEMPOTENCY_TTL_SUCCESS_SECONDS = 240;
+const IDEMPOTENCY_TTL_FAILURE_SECONDS = 60;
 
 const router = Router();
 
@@ -296,7 +304,7 @@ router.post(
           message: result.message
         };
         if (idempotencyCacheKey) {
-          await redisService.setJSON(idempotencyCacheKey, { status: 200, body: responseBody }, 120)
+          await redisService.setJSON(idempotencyCacheKey, { status: 200, body: responseBody }, IDEMPOTENCY_TTL_SUCCESS_SECONDS)
             .catch(() => {});
         }
         res.json(responseBody);
@@ -311,7 +319,7 @@ router.post(
           }
         };
         if (idempotencyCacheKey) {
-          await redisService.setJSON(idempotencyCacheKey, { status: 400, body: responseBody }, 45)
+          await redisService.setJSON(idempotencyCacheKey, { status: 400, body: responseBody }, IDEMPOTENCY_TTL_FAILURE_SECONDS)
             .catch(() => {});
         }
         res.status(400).json(responseBody);
@@ -467,21 +475,19 @@ router.post(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const transporterId = req.user!.userId;
-      const { orderId, vehicleType, vehicleSubtype, quantity, truckRequestIds } = req.body;
 
-      if (!orderId || !vehicleType || !vehicleSubtype || !quantity || !Array.isArray(truckRequestIds)) {
-        return res.status(400).json({
-          success: false,
-          error: { code: 'VALIDATION_ERROR', message: 'All fields are required' }
-        });
+      const parsed = flexHoldCreateSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ success: false, error: 'VALIDATION_ERROR', issues: parsed.error.issues });
       }
+      const { orderId, vehicleType, vehicleSubtype, quantity, truckRequestIds } = parsed.data;
 
       const result = await flexHoldService.createFlexHold({
         orderId,
         transporterId,
         vehicleType,
         vehicleSubtype,
-        quantity: Number(quantity),
+        quantity,
         truckRequestIds
       });
 
@@ -515,17 +521,14 @@ router.post(
   '/flex-hold/extend',
   authMiddleware,
   roleGuard(['transporter']),
+  transporterRateLimit('flexHoldExtend'),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const transporterId = req.user!.userId;
-      const { holdId, reason, driverId, assignmentId } = req.body;
-
-      if (!holdId) {
-        return res.status(400).json({
-          success: false,
-          error: { code: 'VALIDATION_ERROR', message: 'holdId is required' }
-        });
+      const parsedExtend = flexHoldExtendSchema.safeParse(req.body);
+      if (!parsedExtend.success) {
+        return res.status(400).json({ success: false, error: 'VALIDATION_ERROR', issues: parsedExtend.error.issues });
       }
+      const { holdId, reason, driverId, assignmentId } = parsedExtend.data;
 
       const holdState = await flexHoldService.getFlexHoldState(holdId);
       if (!holdState || holdState.transporterId !== req.user!.userId) {
@@ -619,6 +622,7 @@ router.post(
   '/confirmed-hold/initialize',
   authMiddleware,
   roleGuard(['transporter']),
+  transporterRateLimit('confirmedHoldInit'),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const transporterId = req.user!.userId;
@@ -678,7 +682,7 @@ router.post(
           message: result.message
         };
         if (idempotencyCacheKey) {
-          await redisService.setJSON(idempotencyCacheKey, { status: 200, body: responseBody }, 120)
+          await redisService.setJSON(idempotencyCacheKey, { status: 200, body: responseBody }, IDEMPOTENCY_TTL_SUCCESS_SECONDS)
             .catch(() => {});
         }
         res.json(responseBody);
@@ -688,7 +692,7 @@ router.post(
           error: { code: 'INITIALIZE_FAILED', message: result.message }
         };
         if (idempotencyCacheKey) {
-          await redisService.setJSON(idempotencyCacheKey, { status: 400, body: responseBody }, 45)
+          await redisService.setJSON(idempotencyCacheKey, { status: 400, body: responseBody }, IDEMPOTENCY_TTL_FAILURE_SECONDS)
             .catch(() => {});
         }
         res.status(400).json(responseBody);
