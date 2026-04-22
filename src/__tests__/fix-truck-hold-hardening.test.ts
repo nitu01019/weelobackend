@@ -216,6 +216,8 @@ import { flexHoldService } from '../modules/truck-hold/flex-hold.service';
 import { confirmedHoldService } from '../modules/truck-hold/confirmed-hold.service';
 import { redisService } from '../shared/services/redis.service';
 import { queueService } from '../shared/services/queue.service';
+import type { z } from 'zod';
+import { flexHoldCreateSchema, flexHoldExtendSchema } from '../modules/truck-hold/truck-hold-lifecycle.routes';
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -587,6 +589,65 @@ describe('FIX-39 (#96): Consistent timestamps in confirmed-hold operations', () 
   });
 });
 
+describe('A02-003 + A13-010 (T36): extendFlexHold phase-CAS rejects when phase is CONFIRMED', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockRedisService.acquireLock.mockResolvedValue({ acquired: true });
+    mockRedisService.releaseLock.mockResolvedValue(undefined);
+  });
+
+  test('returns HOLD_EXPIRED when updateMany CAS count=0 because phase advanced to CONFIRMED', async () => {
+    // createdAt=5s ago, flexExpiresAt=5s from now
+    // elapsed=5s, newTotalDuration=min(5+30,130)=35s
+    // newExpiresAt = createdAt+35s = now+30s > currentExpiry(now+5s) => addedSeconds=25 > 0
+    // This ensures the CAS path is reached (not MAX_DURATION_REACHED).
+    const flexHold = buildHoldLedger({
+      phase: 'FLEX',
+      status: 'active',
+      flexExtendedCount: 0,
+      flexExpiresAt: new Date(Date.now() + 5_000),
+      expiresAt: new Date(Date.now() + 5_000),
+      createdAt: new Date(Date.now() - 5_000),
+    });
+
+    // First findUnique call: hold read inside TX (returns FLEX hold)
+    // Second findUnique call: post-CAS diagnostic read (returns CONFIRMED)
+    mockPrisma.truckHoldLedger.findUnique
+      .mockResolvedValueOnce(flexHold)
+      .mockResolvedValueOnce({ phase: 'CONFIRMED', status: 'active' });
+
+    // Order lookup — no broadcast cap
+    mockPrisma.order.findUnique.mockResolvedValue({
+      expiresAt: new Date(Date.now() + 120_000),
+    });
+
+    // CAS count=0: another tx advanced phase to CONFIRMED before this extend
+    mockPrisma.truckHoldLedger.updateMany.mockResolvedValue({ count: 0 });
+
+    const result = await flexHoldService.extendFlexHold({
+      holdId: 'hold-abc-123',
+      reason: 'driver_assigned',
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe('HOLD_EXPIRED');
+
+    // CAS metric incremented with reason=phase_advanced
+    const { metrics: mockMetrics } = jest.requireMock('../shared/monitoring/metrics.service');
+    expect(mockMetrics.incrementCounter).toHaveBeenCalledWith(
+      'flex_hold_extend_cas_rejected_total',
+      { reason: 'phase_advanced' },
+    );
+
+    // updateMany was called with phase+status predicate (CAS attempted)
+    expect(mockPrisma.truckHoldLedger.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ phase: 'FLEX', status: 'active' }),
+      }),
+    );
+  });
+});
+
 describe('FIX-6 edge cases: Ownership check with various hold states', () => {
   beforeEach(() => {
     jest.clearAllMocks();
@@ -626,5 +687,146 @@ describe('FIX-6 edge cases: Ownership check with various hold states', () => {
 
     expect(result.success).toBe(false);
     expect(result.message).toMatch(/Cannot move to CONFIRMED from EXPIRED|expired or been released/);
+  });
+});
+
+// =============================================================================
+// A01-001/A01-002/A01-003 · Phase 1 P1-A + P1-B verifications
+// =============================================================================
+
+/**
+ * P1-T47 — Compile-time parity: the type below will cause tsc --noEmit to fail
+ * if the flexHoldCreateSchema shape no longer contains orderId/vehicleType/quantity.
+ */
+type FlexHoldBody = z.infer<typeof flexHoldCreateSchema>;
+const _typecheck: Pick<FlexHoldBody, 'orderId' | 'vehicleType' | 'quantity'> = null as any;
+void _typecheck;
+
+describe('A01-001 · P1-T47: flexHoldCreateSchema export parity', () => {
+  test('flexHoldCreateSchema is exported from the orphan lifecycle routes file', () => {
+    expect(flexHoldCreateSchema).toBeDefined();
+    expect(typeof flexHoldCreateSchema.safeParse).toBe('function');
+  });
+
+  test('flexHoldCreateSchema validates a well-formed body', () => {
+    const result = flexHoldCreateSchema.safeParse({
+      orderId: 'order-abc',
+      vehicleType: 'truck',
+      vehicleSubtype: '6-wheel',
+      quantity: 2,
+      truckRequestIds: ['tr-1', 'tr-2'],
+    });
+    expect(result.success).toBe(true);
+  });
+
+  test('P1-T40: flexHoldCreateSchema rejects truckRequestIds containing null elements', () => {
+    const result = flexHoldCreateSchema.safeParse({
+      orderId: 'order-abc',
+      vehicleType: 'truck',
+      vehicleSubtype: '6-wheel',
+      quantity: 2,
+      truckRequestIds: [null, null],
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const paths = result.error.issues.map(i => i.path[0]);
+      expect(paths[0]).toBe('truckRequestIds');
+    }
+  });
+});
+
+describe('A01-002 · P1-T41: flexHoldExtendSchema rejects empty body', () => {
+  test('returns invalid when holdId is missing', () => {
+    const result = flexHoldExtendSchema.safeParse({});
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const paths = result.error.issues.map(i => i.path[0]);
+      expect(paths).toContain('holdId');
+    }
+  });
+
+  test('validates a well-formed extend body', () => {
+    const result = flexHoldExtendSchema.safeParse({ holdId: 'hold-123' });
+    expect(result.success).toBe(true);
+  });
+});
+
+describe('A01-001 · P1-T33: IS_ORPHAN_ROUTER export from lifecycle routes', () => {
+  test('IS_ORPHAN_ROUTER is exported and equals true', () => {
+    const mod = require('../modules/truck-hold/truck-hold-lifecycle.routes');
+    expect(mod.IS_ORPHAN_ROUTER).toBe(true);
+  });
+});
+
+describe('A01-001 · P1-T34: _TRUCK_HOLD_LIFECYCLE_IS_ORPHAN re-exported from index', () => {
+  test('index.ts source contains the CI guard re-export', () => {
+    const indexSrc: string = require('fs').readFileSync(
+      require('path').resolve(__dirname, '../modules/truck-hold/index.ts'),
+      'utf-8',
+    );
+    expect(indexSrc).toContain('IS_ORPHAN_ROUTER as _TRUCK_HOLD_LIFECYCLE_IS_ORPHAN');
+    expect(indexSrc).toContain("from './truck-hold-lifecycle.routes'");
+  });
+});
+
+describe('A01-003 · P1-T31: idempotency TTL constants and P1-T30 source verification', () => {
+  const routesSrc: string = require('fs').readFileSync(
+    require('path').resolve(__dirname, '../modules/truck-hold/truck-hold.routes.ts'),
+    'utf-8',
+  );
+
+  test('IDEMPOTENCY_TTL_SUCCESS_SECONDS = 240 is declared', () => {
+    expect(routesSrc).toMatch(/IDEMPOTENCY_TTL_SUCCESS_SECONDS\s*=\s*240/);
+  });
+
+  test('IDEMPOTENCY_TTL_FAILURE_SECONDS = 60 is declared', () => {
+    expect(routesSrc).toMatch(/IDEMPOTENCY_TTL_FAILURE_SECONDS\s*=\s*60/);
+  });
+
+  test('P1-T30: no raw magic literal 120 or 45 in idempotency setJSON calls', () => {
+    const setJsonLines = routesSrc
+      .split('\n')
+      .filter(line => line.includes('setJSON(idempotencyCacheKey'));
+    for (const line of setJsonLines) {
+      expect(line).not.toMatch(/,\s*(120|45)\s*\)/);
+    }
+  });
+
+  test('P1-T31: success idempotency writes use IDEMPOTENCY_TTL_SUCCESS_SECONDS (2 call-sites)', () => {
+    const successCacheLines = routesSrc
+      .split('\n')
+      .filter(line => line.includes('setJSON(idempotencyCacheKey') && line.includes('status: 200'));
+    expect(successCacheLines.length).toBe(2);
+    for (const line of successCacheLines) {
+      expect(line).toContain('IDEMPOTENCY_TTL_SUCCESS_SECONDS');
+    }
+  });
+
+  test('failure idempotency writes use IDEMPOTENCY_TTL_FAILURE_SECONDS (2 call-sites)', () => {
+    const failureCacheLines = routesSrc
+      .split('\n')
+      .filter(line => line.includes('setJSON(idempotencyCacheKey') && line.includes('status: 400'));
+    expect(failureCacheLines.length).toBe(2);
+    for (const line of failureCacheLines) {
+      expect(line).toContain('IDEMPOTENCY_TTL_FAILURE_SECONDS');
+    }
+  });
+
+  test('P1-T05: transporterRateLimit flexHoldExtend is mounted exactly once', () => {
+    const matches = routesSrc.match(/transporterRateLimit\('flexHoldExtend'\)/g) || [];
+    expect(matches.length).toBe(1);
+  });
+
+  test('P1-T06: transporterRateLimit confirmedHoldInit is mounted exactly once', () => {
+    const matches = routesSrc.match(/transporterRateLimit\('confirmedHoldInit'\)/g) || [];
+    expect(matches.length).toBe(1);
+  });
+
+  test('P1-T02: flexHoldCreateSchema.safeParse is used in POST /flex-hold handler', () => {
+    expect(routesSrc).toContain('flexHoldCreateSchema.safeParse');
+  });
+
+  test('P1-T03: flexHoldExtendSchema.safeParse is used in POST /flex-hold/extend handler', () => {
+    expect(routesSrc).toContain('flexHoldExtendSchema.safeParse');
   });
 });

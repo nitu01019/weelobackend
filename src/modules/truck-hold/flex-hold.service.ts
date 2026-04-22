@@ -308,7 +308,7 @@ class FlexHoldService {
         };
       }, {
         isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
-        timeoutMs: 5_000,
+        timeoutMs: 8_000,
         site: 'flex_hold_create',
       });
 
@@ -477,7 +477,10 @@ class FlexHoldService {
     });
 
     const lockKey = REDIS_KEYS.FLEX_HOLD_LOCK(request.holdId);
-    const lock = await redisService.acquireLock(lockKey, 'flex-hold-extension', 10);
+    // 12s = 8s tx + ~2x 1s retry + buffer (A02-003)
+    // Lock covers extend-vs-extend (same holdId serialization); phase-CAS below covers extend-vs-confirm.
+    // TTL floor of 12s ensures the lock outlives the full 8s tx budget plus two full-jitter retry rounds.
+    const lock = await redisService.acquireLock(lockKey, 'flex-hold-extension', 12);
 
     if (!lock.acquired) {
       return {
@@ -488,105 +491,152 @@ class FlexHoldService {
     }
 
     try {
-      // Get current hold state
-      const holdLedger = await prismaClient.truckHoldLedger.findUnique({
-        where: { holdId: request.holdId },
-      });
+      // A02-003 + A13-010: Wrap entire read-check-write inside withDbTimeout so
+      // the DB transaction has a bounded 8s budget and serializes via phase-CAS.
+      // Redis lock (acquired above) covers extend-vs-extend contention.
+      // Phase-CAS updateMany (below) covers extend-vs-confirm TOCTOU.
+      const result = await withDbTimeout(async (tx) => {
+        // Get current hold state inside the transaction
+        const holdLedger = await tx.truckHoldLedger.findUnique({
+          where: { holdId: request.holdId },
+        });
 
-      if (!holdLedger) {
-        return {
-          success: false,
-          message: 'Hold not found',
-          error: 'HOLD_NOT_FOUND',
-        };
-      }
-
-      // Check if in FLEX phase
-      if (holdLedger.phase !== HoldPhase.FLEX) {
-        return {
-          success: false,
-          message: `Hold is in ${holdLedger.phase} phase, cannot extend`,
-          error: 'INVALID_PHASE',
-        };
-      }
-
-      // Check if flex hold has expired
-      if (holdLedger.flexExpiresAt && new Date() > holdLedger.flexExpiresAt) {
-        return {
-          success: false,
-          message: 'Flex hold has expired',
-          error: 'HOLD_EXPIRED',
-        };
-      }
-
-      // Check if max extensions reached
-      const currentExtendedCount = holdLedger.flexExtendedCount || 0;
-      if (currentExtendedCount >= this.config.maxExtensions) {
-        return {
-          success: false,
-          message: 'Maximum extensions reached',
-          error: 'MAX_EXTENSIONS_REACHED',
-        };
-      }
-
-      // Calculate new expiry time
-      const now = new Date();
-      const currentExpiry = holdLedger.flexExpiresAt || holdLedger.expiresAt;
-
-      // Calculate new expiry, ensuring it doesn't exceed max duration
-      const creationTime = holdLedger.createdAt;
-      const elapsedTime = (now.getTime() - creationTime.getTime()) / 1000;
-      const newTotalDuration = Math.min(
-        elapsedTime + this.config.extensionSeconds,
-        this.config.maxDurationSeconds
-      );
-
-      let newExpiresAt = new Date(creationTime.getTime() + newTotalDuration * 1000);
-
-      // AB3: Cap extended hold lifetime to broadcast/order remaining time.
-      const parentOrder = await prismaClient.order.findUnique({
-        where: { id: holdLedger.orderId },
-        select: { expiresAt: true },
-      });
-      if (parentOrder) {
-        const broadcastExpiresAtMs = new Date(parentOrder.expiresAt).getTime();
-        if (newExpiresAt.getTime() > broadcastExpiresAtMs) {
-          newExpiresAt = new Date(broadcastExpiresAtMs);
+        if (!holdLedger) {
+          return { kind: 'error' as const, message: 'Hold not found', error: 'HOLD_NOT_FOUND' };
         }
-      }
-      const addedSeconds = Math.floor(newExpiresAt.getTime() - currentExpiry.getTime()) / 1000;
 
-      // FIX #40: Floor guard — if extension would add 0 seconds (hold already at max), return explicit failure
-      // instead of misleading success with addedSeconds: 0.
-      if (addedSeconds <= 0) {
+        // Check if in FLEX phase
+        if (holdLedger.phase !== HoldPhase.FLEX) {
+          return {
+            kind: 'error' as const,
+            message: `Hold is in ${holdLedger.phase} phase, cannot extend`,
+            error: 'INVALID_PHASE',
+          };
+        }
+
+        // Check if flex hold has expired
+        if (holdLedger.flexExpiresAt && new Date() > holdLedger.flexExpiresAt) {
+          return { kind: 'error' as const, message: 'Flex hold has expired', error: 'HOLD_EXPIRED' };
+        }
+
+        // Check if max extensions reached
+        const currentExtendedCount = holdLedger.flexExtendedCount || 0;
+        if (currentExtendedCount >= this.config.maxExtensions) {
+          return {
+            kind: 'error' as const,
+            message: 'Maximum extensions reached',
+            error: 'MAX_EXTENSIONS_REACHED',
+          };
+        }
+
+        // Calculate new expiry time
+        const now = new Date();
+        const currentExpiry = holdLedger.flexExpiresAt || holdLedger.expiresAt;
+
+        // Calculate new expiry, ensuring it doesn't exceed max duration
+        const creationTime = holdLedger.createdAt;
+        const elapsedTime = (now.getTime() - creationTime.getTime()) / 1000;
+        const newTotalDuration = Math.min(
+          elapsedTime + this.config.extensionSeconds,
+          this.config.maxDurationSeconds,
+        );
+
+        let newExpiresAt = new Date(creationTime.getTime() + newTotalDuration * 1000);
+
+        // AB3: Cap extended hold lifetime to broadcast/order remaining time.
+        const parentOrder = await tx.order.findUnique({
+          where: { id: holdLedger.orderId },
+          select: { expiresAt: true },
+        });
+        if (parentOrder) {
+          const broadcastExpiresAtMs = new Date(parentOrder.expiresAt).getTime();
+          if (newExpiresAt.getTime() > broadcastExpiresAtMs) {
+            newExpiresAt = new Date(broadcastExpiresAtMs);
+          }
+        }
+        const addedSeconds = Math.floor(newExpiresAt.getTime() - currentExpiry.getTime()) / 1000;
+
+        // FIX #40: Floor guard — if extension would add 0 seconds (hold already at max), return explicit failure
+        // instead of misleading success with addedSeconds: 0.
+        if (addedSeconds <= 0) {
+          return {
+            kind: 'error' as const,
+            message: 'Hold is already at maximum duration',
+            error: 'MAX_DURATION_REACHED',
+          };
+        }
+
+        // Calculate total duration for logging
+        const totalDurationSeconds = Math.floor((newExpiresAt.getTime() - creationTime.getTime()) / 1000);
+
+        // A13-010: Phase-CAS — updateMany with phase+status predicate so concurrent
+        // confirm-to-CONFIRMED that advanced the phase causes count=0 here, not
+        // a dirty overwrite. Replaces the former non-atomic update({where:{holdId}}).
+        const cas = await tx.truckHoldLedger.updateMany({
+          where: { holdId: request.holdId, phase: 'FLEX', status: 'active' },
+          data: {
+            flexExpiresAt: newExpiresAt,
+            flexExtendedCount: currentExtendedCount + 1,
+            expiresAt: newExpiresAt,
+            updatedAt: now,
+          },
+        });
+
+        if (cas.count === 0) {
+          // Phase advanced concurrently (confirm arrived) or hold was released/expired.
+          // Determine reason for observability by reading current state (no lock — diagnostic only).
+          const currentState = await tx.truckHoldLedger.findUnique({
+            where: { holdId: request.holdId },
+            select: { phase: true, status: true },
+          });
+          let casReason: string;
+          if (!currentState) {
+            casReason = 'unknown';
+          } else if (currentState.phase !== 'FLEX') {
+            casReason = 'phase_advanced';
+          } else if (currentState.status === 'released') {
+            casReason = 'status_released';
+          } else if (currentState.status === 'expired') {
+            casReason = 'status_expired';
+          } else {
+            casReason = 'unknown';
+          }
+          metrics.incrementCounter('flex_hold_extend_cas_rejected_total', { reason: casReason });
+          throw new Error('HOLD_EXPIRED: phase advanced concurrently');
+        }
+
+        return {
+          kind: 'success' as const,
+          holdLedger,
+          newExpiresAt,
+          addedSeconds,
+          currentExtendedCount,
+          totalDurationSeconds,
+          now,
+        };
+      }, {
+        timeoutMs: 8_000,
+        maxWait: 3_000,
+        site: 'flex_hold_extend',
+      });
+
+      if (result.kind === 'error') {
         return {
           success: false,
-          message: 'Hold is already at maximum duration',
-          error: 'MAX_DURATION_REACHED',
+          message: result.message,
+          error: result.error,
         };
       }
 
-      // Calculate total duration for logging
-      const totalDurationSeconds = Math.floor((newExpiresAt.getTime() - creationTime.getTime()) / 1000);
+      const { holdLedger, newExpiresAt, addedSeconds, currentExtendedCount, totalDurationSeconds, now } = result;
 
-      // Update hold in database
-      const updatedHold = await prismaClient.truckHoldLedger.update({
-        where: { holdId: request.holdId },
-        data: {
-          flexExpiresAt: newExpiresAt,
-          flexExtendedCount: currentExtendedCount + 1,
-          expiresAt: newExpiresAt,
-          updatedAt: now,
-        },
-      });
-
-      // Update Redis cache
+      // Update Redis cache (outside TX — cache, not source of truth)
       await this.cacheFlexHoldState(request.holdId, {
         holdId: request.holdId,
         orderId: holdLedger.orderId,
         transporterId: holdLedger.transporterId,
         phase: HoldPhase.FLEX,
-        baseExpiresAt: creationTime,
+        baseExpiresAt: holdLedger.createdAt,
         currentExpiresAt: newExpiresAt,
         extendedCount: currentExtendedCount + 1,
         canExtend: currentExtendedCount + 1 < this.config.maxExtensions,
@@ -628,6 +678,13 @@ class FlexHoldService {
         message: `Hold extended by ${addedSeconds}s. New expiry: ${newExpiresAt.toISOString()}`,
       };
     } catch (error: any) {
+      if (error?.message?.startsWith('HOLD_EXPIRED')) {
+        return {
+          success: false,
+          message: 'Hold phase advanced concurrently — extend rejected',
+          error: 'HOLD_EXPIRED',
+        };
+      }
       logger.error('[FLEX HOLD] Failed to extend flex hold', {
         error: error.message,
         holdId: request.holdId,
