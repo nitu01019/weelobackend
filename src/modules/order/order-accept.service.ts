@@ -546,17 +546,57 @@ export async function acceptTruckRequest(
   // M-09 FIX: Use queued push notification (consistent with assignment.service.ts pattern)
   // BEFORE: Direct sendPushNotification() — bypasses queue, no retry, no rate limiting.
   // NOW: queuePushNotification() — matches every other FCM call in the codebase.
+  // A05-003: nested pickup/drop + `payload` JSON blob for Captain parser.
+  // A09-001: pre-accept producer site — customerName omitted (DPDP data minimisation).
+  const fcmPickup = {
+    address: orderPickup?.address ?? '',
+    city: orderPickup?.city ?? '',
+    latitude: orderPickup?.latitude ?? 0,
+    longitude: orderPickup?.longitude ?? 0,
+  };
+  const fcmDrop = {
+    address: orderDrop?.address ?? '',
+    city: orderDrop?.city ?? '',
+    latitude: orderDrop?.latitude ?? 0,
+    longitude: orderDrop?.longitude ?? 0,
+  };
+  const fcmExpiresAtIso = new Date(Date.now() + HOLD_CONFIG.driverAcceptTimeoutSeconds * 1000).toISOString();
+  const fcmPayloadObj = {
+    type: 'trip_assigned',
+    assignmentId,
+    tripId,
+    orderId,
+    truckRequestId,
+    pickup: fcmPickup,
+    drop: fcmDrop,
+    vehicleNumber: vehicleNumber || '',
+    farePerTruck: Number(truckRequestPricePerTruck ?? 0),
+    distanceKm: Number(orderDistanceKm ?? 0),
+    customerPhone: orderCustomerPhone,
+    assignedAt: now,
+    expiresAt: fcmExpiresAtIso,
+    message: `New trip assigned! ${fcmPickup.address || 'Pickup'} → ${fcmDrop.address || 'Drop'}`,
+  };
   queueService.queuePushNotification(driverId, {
     title: 'New Trip Assigned!',
     body: `${orderPickup.city || orderPickup.address} → ${orderDrop.city || orderDrop.address}`,
     data: {
+      payload: JSON.stringify(fcmPayloadObj),
       type: 'trip_assigned',
       tripId,
       assignmentId,
       orderId,
+      truckRequestId,
+      pickup: JSON.stringify(fcmPickup),
+      drop: JSON.stringify(fcmDrop),
       driverName: driverName || '',
       vehicleNumber: vehicleNumber || '',
       vehicleType: vehicleType || '',
+      farePerTruck: String(fcmPayloadObj.farePerTruck),
+      distanceKm: String(fcmPayloadObj.distanceKm),
+      customerPhone: fcmPayloadObj.customerPhone,
+      assignedAt: now,
+      expiresAt: fcmExpiresAtIso,
       status: 'trip_assigned'
     }
   }).catch((err: unknown) => {
