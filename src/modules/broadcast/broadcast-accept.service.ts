@@ -17,6 +17,7 @@ import { redisService } from '../../shared/services/redis.service';
 import { prismaClient, withDbTimeout, VehicleStatus } from '../../shared/database/prisma.service';
 import { queueService } from '../../shared/services/queue.service';
 import { HOLD_CONFIG } from '../../core/config/hold-config';
+import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
 import { RADIUS_KEYS } from '../booking/booking.types';
 import { metrics } from '../../shared/monitoring/metrics.service';
 import { assertValidTransition, BOOKING_VALID_TRANSITIONS } from '../../core/state-machines';
@@ -460,12 +461,63 @@ export async function acceptBroadcast(broadcastId: string, params: AcceptBroadca
       // M-03 FIX: Socket.IO emitted once (best-effort, no retry) to avoid duplicate events.
       // Only FCM is retried — push notifications are idempotent by design.
       emitToUser(driverId, SocketEvent.TRIP_ASSIGNED, driverNotification);
+
+      // A05-003: FCM trip_assigned payload — nested pickup/drop + `payload` JSON blob for Captain parser.
+      // A09-001: pre-accept producer site — customerName omitted (DPDP data minimisation).
+      const fcmPickup = {
+        address: pickup.address ?? '',
+        city: pickup.city ?? '',
+        latitude: pickup.latitude ?? pickup.lat ?? 0,
+        longitude: pickup.longitude ?? pickup.lng ?? 0,
+      };
+      const fcmDrop = {
+        address: drop.address ?? '',
+        city: drop.city ?? '',
+        latitude: drop.latitude ?? drop.lat ?? 0,
+        longitude: drop.longitude ?? drop.lng ?? 0,
+      };
+      const fcmPayloadObj = {
+        type: 'trip_assigned',
+        assignmentId: result.assignmentId,
+        tripId: result.tripId,
+        orderId: '',
+        truckRequestId: '',
+        bookingId: broadcastId,
+        pickup: fcmPickup,
+        drop: fcmDrop,
+        vehicleNumber: vehicle?.vehicleNumber || '',
+        farePerTruck: Number(booking?.pricePerTruck ?? 0),
+        distanceKm: Number(booking?.distanceKm ?? 0),
+        customerPhone: maskPhoneForExternal(booking?.customerPhone || ''),
+        assignedAt: now,
+        expiresAt: new Date(Date.now() + HOLD_CONFIG.driverAcceptTimeoutSeconds * 1000).toISOString(),
+        message: `New trip assigned! ${pickup.address || 'Pickup'} → ${drop.address || 'Drop'}`,
+      };
+      const fcmDataBase = {
+        payload: JSON.stringify(fcmPayloadObj),
+        type: 'trip_assigned',
+        tripId: result.tripId,
+        assignmentId: result.assignmentId,
+        bookingId: broadcastId,
+        pickup: JSON.stringify(fcmPickup),
+        drop: JSON.stringify(fcmDrop),
+        vehicleNumber: vehicle?.vehicleNumber || '',
+        vehicleType: vehicle?.vehicleType || '',
+        driverName: driver?.name || '',
+        farePerTruck: String(fcmPayloadObj.farePerTruck),
+        distanceKm: String(fcmPayloadObj.distanceKm),
+        customerPhone: fcmPayloadObj.customerPhone,
+        assignedAt: now,
+        expiresAt: fcmPayloadObj.expiresAt,
+        status: 'trip_assigned',
+      };
+
       try {
         await retryWithBackoff(async () => {
           await sendPushNotification(driverId, {
             title: 'New Trip Assigned!',
             body: `${pickup.city || pickup.address || 'Pickup'} → ${drop.city || drop.address || 'Drop'}`,
-            data: { type: 'trip_assigned', tripId: result.tripId, assignmentId: result.assignmentId, bookingId: broadcastId, driverName: driver?.name || '', vehicleNumber: vehicle?.vehicleNumber || '', vehicleType: vehicle?.vehicleType || '', status: 'trip_assigned' }
+            data: fcmDataBase,
           });
         }, 3, 500);
       } catch (err) {
@@ -480,7 +532,7 @@ export async function acceptBroadcast(broadcastId: string, params: AcceptBroadca
             title: 'New Trip Assigned!',
             body: `${pickup.city || pickup.address || 'Pickup'} → ${drop.city || drop.address || 'Drop'}`,
             priority: 'high', // W0-1: top-level priority drives FCM android.priority; data.priority retained for Android-side client compat.
-            data: { type: 'trip_assigned', priority: 'high', tripId: result.tripId, assignmentId: result.assignmentId, bookingId: broadcastId, driverName: driver?.name || '', vehicleNumber: vehicle?.vehicleNumber || '', vehicleType: vehicle?.vehicleType || '', status: 'trip_assigned' }
+            data: { ...fcmDataBase, priority: 'high' },
           }).catch((err) => { logger.warn('[BroadcastAccept] Driver push notification queue failed', { driverId, assignmentId: result.assignmentId, error: err instanceof Error ? err.message : String(err) }); });
         } catch (_queueErr) {
           // Best effort — timeout handler will surface the assignment to the driver
