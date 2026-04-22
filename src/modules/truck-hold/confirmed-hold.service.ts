@@ -469,9 +469,10 @@ class ConfirmedHoldService {
       // coordinates without a silent zero-fallback.
       const socketPickup = { ...pickup, lat: pickup?.latitude ?? pickup?.lat ?? 0, lng: pickup?.longitude ?? pickup?.lng ?? 0 };
       const socketDrop = { ...drop, lat: drop?.latitude ?? drop?.lat ?? 0, lng: drop?.longitude ?? drop?.lng ?? 0 };
-      const expiresAtIso = new Date(
-        now.getTime() + this.config.driverAcceptTimeoutSeconds * 1000
-      ).toISOString();
+      // A03-003: server-authoritative epoch-ms anchor reused by deadlineMs below.
+      const confirmedHoldDeadlineMs =
+        now.getTime() + this.config.driverAcceptTimeoutSeconds * 1000;
+      const expiresAtIso = new Date(confirmedHoldDeadlineMs).toISOString();
 
       // Schedule driver acceptance timeouts with full data AND
       // fan out per-driver socket emit + FCM enqueue (P2 F4.1).
@@ -518,6 +519,7 @@ class ConfirmedHoldService {
             customerPhone: maskPhoneForExternal(parentOrder?.customerPhone || ''),
             assignedAt: now.toISOString(),
             expiresAt: expiresAtIso,
+            deadlineMs: confirmedHoldDeadlineMs,
             message: `New trip assigned! ${pickup?.address ?? ''} → ${drop?.address ?? ''}`,
           };
 
