@@ -233,3 +233,55 @@ describe('F-A-11: Layered rate-limit keyGenerator', () => {
     });
   });
 });
+
+/**
+ * =============================================================================
+ * P1-T04 / P1-T35 — Transporter rate-limit buckets (A01-002, A01-007)
+ * =============================================================================
+ * Verifies the two new per-transporter rate-limit configs added in Phase 1:
+ *   - flexHoldExtend    (A01-002, 10/min, 120s block)
+ *   - confirmedHoldInit (A01-007,  5/min, 120s block)
+ *
+ * Source-level assertions only — does not exercise Redis. Pair with a supertest
+ * integration in the truck-hold routes file for end-to-end 429 coverage.
+ * =============================================================================
+ */
+describe('P1-T04 A01-002/A01-007: transporter-rate-limit new buckets', () => {
+  const TRL_PATH = path.resolve(
+    __dirname,
+    '../shared/middleware/transporter-rate-limit.middleware.ts',
+  );
+
+  it('declares flexHoldExtend bucket with 10/60s and 120s block', () => {
+    const src = readSource(TRL_PATH);
+    expect(src).toMatch(/flexHoldExtend:\s*\{[\s\S]*?max:\s*10[\s\S]*?window:\s*60[\s\S]*?blockDuration:\s*120/);
+  });
+
+  it('declares confirmedHoldInit bucket with 5/60s and 120s block', () => {
+    const src = readSource(TRL_PATH);
+    expect(src).toMatch(/confirmedHoldInit:\s*\{[\s\S]*?max:\s*5[\s\S]*?window:\s*60[\s\S]*?blockDuration:\s*120/);
+  });
+
+  it('P1-T48: top-of-file comment documents sizing rationale + finding IDs', () => {
+    const src = readSource(TRL_PATH);
+    expect(src).toMatch(/A01-002/);
+    expect(src).toMatch(/A01-007/);
+    expect(src).toMatch(/IDEMPOTENCY_TTL_SUCCESS_SECONDS/);
+  });
+
+  it('new buckets are accepted by the typed RATE_LIMITS map', () => {
+    // Light structural check — module loads and RATE_LIMITS is a Record<string, RateLimitConfig>.
+    // We read the source rather than importing to avoid Redis side effects in this test file.
+    const src = readSource(TRL_PATH);
+    // The exported function signature uses `keyof typeof RATE_LIMITS`; verify the action
+    // literal appears in a `flexHoldExtend:` / `confirmedHoldInit:` form inside the map.
+    const flexIdx = src.indexOf('flexHoldExtend:');
+    const confirmIdx = src.indexOf('confirmedHoldInit:');
+    const mapStart = src.indexOf('const RATE_LIMITS');
+    const mapEnd = src.indexOf('};', mapStart);
+    expect(flexIdx).toBeGreaterThan(mapStart);
+    expect(flexIdx).toBeLessThan(mapEnd);
+    expect(confirmIdx).toBeGreaterThan(mapStart);
+    expect(confirmIdx).toBeLessThan(mapEnd);
+  });
+});

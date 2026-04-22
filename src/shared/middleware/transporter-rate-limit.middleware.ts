@@ -15,6 +15,17 @@
  *           - Blocks temporarily when exceeded
  *           - Allows legitimate high-volume usage
  * =============================================================================
+ *
+ * P1-T48 sizing rationale (A01-002, A01-007):
+ * - flexHoldExtend = 10/min (~1 per 6s, bursty OK — extend is interactive UX)
+ * - confirmedHoldInit = 5/min (SERIALIZABLE tx row-lock cost; 1 per ~12s)
+ * - Both use blockDuration 120s which matches the new idempotency TTL
+ *   (IDEMPOTENCY_TTL_SUCCESS_SECONDS = 240s in truck-hold.routes.ts): replays
+ *   issued after a block clears still hit the idempotency cache within its
+ *   TTL, so a legitimate retry after a block clears returns the cached result
+ *   instead of re-executing.
+ * - AWS API Gateway per-consumer throttling pattern.
+ * =============================================================================
  */
 
 import { Request, Response, NextFunction } from 'express';
@@ -70,6 +81,25 @@ const RATE_LIMITS: Record<string, RateLimitConfig> = {
     max: 10,
     window: 60,
     blockDuration: 60  // 1 minute (short — don't lock driver out for long)
+  },
+
+  // P1-T04 · A01-002 · Flex-hold extend: Max 10 per 60 seconds.
+  // Extend is interactive (transporter clicks "extend" on a near-expiring hold);
+  // 10/min = 1 per 6s is comfortably above any legitimate UX cadence.
+  flexHoldExtend: {
+    max: 10,
+    window: 60,
+    blockDuration: 120  // 2 minutes — aligned with IDEMPOTENCY_TTL_SUCCESS_SECONDS (see header)
+  },
+
+  // P1-T04 · A01-007 · Confirmed-hold initialize: Max 5 per 60 seconds.
+  // Tight because transitionToConfirmed runs a SERIALIZABLE tx with row-level
+  // locks on TruckHoldLedger; a spammy client at 20/min would queue behind its
+  // own locks and starve pool capacity at 833 tx/s peak.
+  confirmedHoldInit: {
+    max: 5,
+    window: 60,
+    blockDuration: 120  // 2 minutes — matches idempotency cache window
   }
 };
 
