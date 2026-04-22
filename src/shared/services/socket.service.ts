@@ -1477,7 +1477,7 @@ function getNextSequenceSync(): number {
   return ++currentSeq;
 }
 
-function withSocketMeta(data: any, seqOverride?: number): any {
+function withSocketMeta(data: any, seqOverride?: number, deadlineMs?: number): any {
   if (!data || typeof data !== 'object' || Array.isArray(data)) {
     return data;
   }
@@ -1485,12 +1485,18 @@ function withSocketMeta(data: any, seqOverride?: number): any {
     Object.prototype.hasOwnProperty.call(data, 'serverTimeMs')) {
     return data;
   }
-  return {
+  const nowMs = Date.now();
+  const base = {
     ...data,
     eventVersion: SOCKET_EVENT_VERSION,
-    serverTimeMs: Date.now(),
+    serverTimeMs: nowMs,
+    serverNowMs: nowMs,
     _seq: typeof seqOverride === 'number' ? seqOverride : getNextSequenceSync()
   };
+  if (typeof deadlineMs === 'number' && Number.isFinite(deadlineMs) && deadlineMs > 0) {
+    return { ...base, deadlineMs };
+  }
+  return base;
 }
 
 // =============================================================================
@@ -1568,7 +1574,7 @@ const DURABLE_EMIT_TTL_SECONDS = 600;
  * @param data Event payload (object)
  * @returns true if emit fired (regardless of whether ZADD succeeded)
  */
-async function durableEmit(userId: string, event: string, data: any): Promise<boolean> {
+async function durableEmit(userId: string, event: string, data: any, deadlineMs?: number): Promise<boolean> {
   if (!io) return false;
   let seq: number | undefined;
   try {
@@ -1594,7 +1600,7 @@ async function durableEmit(userId: string, event: string, data: any): Promise<bo
     seq = undefined;
   }
   try {
-    io.to(`user:${userId}`).emit(event, withSocketMeta(data, seq));
+    io.to(`user:${userId}`).emit(event, withSocketMeta(data, seq, deadlineMs));
   } catch (emitErr: unknown) {
     socketCircuit.reportFailure();
     const msg = emitErr instanceof Error ? emitErr.message : String(emitErr);
