@@ -1398,6 +1398,22 @@ async function setupRedisAdapter(socketServer: Server): Promise<void> {
       redisAdapterLastError = null;
       logger.info(`[Socket] Redis Streams adapter initialized (Instance: ${SERVER_INSTANCE_ID}) [attempt ${attempt}/${MAX_RETRIES}]`);
       logger.info('   Cross-instance WebSocket delivery ENABLED (ElastiCache Serverless compatible)');
+      // A04-003: @socket.io/redis-streams-adapter@0.3.0 uses plain XREAD (not
+      // XREADGROUP) — there is no consumer group and no PEL to reclaim on pod
+      // death. True XAUTOCLAIM reclaim requires a library fork (out of scope);
+      // log + metric so operators can see the gap. Per-user ZSET durable-emit
+      // is the authoritative replay path for lifecycle events.
+      logger.warn(
+        '[Socket] adapter does NOT reclaim cross-instance PEL on pod death — ' +
+          'rely on per-user ZSET durable-emit for lifecycle event replay. ' +
+          'See A04-003 (adapter uses plain XREAD, not XREADGROUP).'
+      );
+      try {
+        const { metrics } = require('../monitoring/metrics.service');
+        metrics.incrementCounter('socket_adapter_no_pel_reclaim_total', {
+          adapter: '@socket.io/redis-streams-adapter',
+        });
+      } catch { /* metrics optional at startup */ }
       return; // Success — exit retry loop
     } catch (error: any) {
       redisAdapterLastError = error?.message || 'unknown';

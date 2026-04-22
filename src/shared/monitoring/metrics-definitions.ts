@@ -420,6 +420,16 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
       'queue_schedule_failed_total',
       'Durable timer schedule failures by timer_type (Redis setTimer rejection; no in-memory fallback)',
     ),
+
+    // A04-003 — observability-only counter on Redis Streams adapter init. The
+    // adapter uses plain XREAD (not XREADGROUP) so there is no consumer-group
+    // PEL to reclaim on pod death. Per-user ZSET durable-emit is the real net.
+    //   Labels: adapter = '@socket.io/redis-streams-adapter'
+    //   Call site: src/shared/services/socket.service.ts (setupRedisAdapter success branch)
+    counter(
+      'socket_adapter_no_pel_reclaim_total',
+      'Redis Streams adapter init events — adapter uses plain XREAD with no consumer-group PEL (no cross-instance reclaim on pod death)',
+    ),
   ];
 
   for (const def of defs) {
