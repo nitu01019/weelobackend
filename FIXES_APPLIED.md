@@ -10,3 +10,4 @@ Format: `| Finding | Task | Commit | Owner | Summary |`
 | A03-003 | W3-T02 | abf34cd8 | clock-anchor-owner | flex-hold emit sites (flex_hold_started:380 + flex_hold_extended:603) pass deadlineMs |
 | A03-003 | W3-T03 | 3d712c59 | clock-anchor-owner | reassign-driver + cascade-dispatch trip_assigned socket emits pass deadlineMs |
 | A03-003 | W3-T04 | 13e1da5c | clock-anchor-owner | confirmed-hold per-driver trip_assigned socket emit passes deadlineMs (pre-computed anchor reused by expiresAtIso) |
+| A03-003 | W3-T05 | f713c2a8 | clock-anchor-owner | FF_SERVER_CLOCK_ANCHOR registered (release, defaultValue:false); withSocketMeta gates serverNowMs+deadlineMs behind flag — flag OFF = pre-A03-003 shape |
