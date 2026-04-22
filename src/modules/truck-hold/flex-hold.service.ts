@@ -377,6 +377,7 @@ class FlexHoldService {
         orderId: request.orderId,
         phase: 'FLEX' as const,
         expiresAt: baseExpiresAt.toISOString(),
+        deadlineMs: baseExpiresAt.getTime(),
         baseDurationSeconds: this.config.baseDurationSeconds,
         canExtend: true,
         maxExtensions: this.config.maxExtensions,
@@ -599,6 +600,7 @@ class FlexHoldService {
         holdId: request.holdId,
         orderId: holdLedger.orderId,
         newExpiresAt: newExpiresAt.toISOString(),
+        deadlineMs: newExpiresAt.getTime(),
         totalRemainingSeconds,                       // PRIMARY: absolute remaining time
         extendedCount: currentExtendedCount + 1,     // Total extensions so far
         addedSeconds,                                // DEPRECATED: delta — use totalRemainingSeconds
