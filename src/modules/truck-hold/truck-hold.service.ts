@@ -1644,28 +1644,62 @@ class TruckHoldService {
       //   3. Per-driver push           — each driver gets their own assignment data
       // queuePushNotification resolves tokens internally (no manual token fetch needed).
       // =====================================================================
+      // A05-003: FCM trip_assigned payload — nested pickup/drop + `payload` JSON blob for Captain parser.
+      // A09-001: pre-accept producer site — customerName omitted (DPDP data minimisation).
       for (const assignment of confirmedAssignments.assignments) {
-        const driverNotificationFcm = {
+        const fcmPickup = {
+          address: order.pickup.address ?? '',
+          city: order.pickup.city ?? '',
+          latitude: order.pickup.latitude ?? order.pickup.lat ?? 0,
+          longitude: order.pickup.longitude ?? order.pickup.lng ?? 0,
+        };
+        const fcmDrop = {
+          address: order.drop.address ?? '',
+          city: order.drop.city ?? '',
+          latitude: order.drop.latitude ?? order.drop.lat ?? 0,
+          longitude: order.drop.longitude ?? order.drop.lng ?? 0,
+        };
+        const expiresAtIso = new Date(Date.now() + DRIVER_TIMEOUT_MS).toISOString();
+        const fcmPayloadObj = {
           type: 'trip_assigned',
           assignmentId: assignment.assignmentId,
           tripId: assignment.tripId,
           orderId: order.id,
           truckRequestId: assignment.truckRequestId,
-          pickupAddress: order.pickup.address,
-          pickupCity: order.pickup.city || '',
-          pickupLat: String(order.pickup.lat ?? order.pickup.latitude ?? 0),
-          pickupLng: String(order.pickup.lng ?? order.pickup.longitude ?? 0),
-          dropAddress: order.drop.address,
-          dropCity: order.drop.city || '',
-          dropLat: String(order.drop.lat ?? order.drop.latitude ?? 0),
-          dropLng: String(order.drop.lng ?? order.drop.longitude ?? 0),
+          pickup: fcmPickup,
+          drop: fcmDrop,
           vehicleNumber: assignment.vehicle.vehicleNumber,
-          fare: String(assignment.farePerTruck ?? 0),
-          distanceKm: String(order.distanceKm ?? 0),
-          customerName: order.customerName || '',
+          farePerTruck: Number(assignment.farePerTruck ?? 0),
+          distanceKm: Number(order.distanceKm ?? 0),
           customerPhone: maskPhoneForExternal(order.customerPhone),
           assignedAt: now,
-          expiresAt: new Date(Date.now() + DRIVER_TIMEOUT_MS).toISOString()
+          expiresAt: expiresAtIso,
+          message: `New trip assigned! ${fcmPickup.address || 'Pickup'} → ${fcmDrop.address || 'Drop'}`,
+        };
+        const driverNotificationFcm = {
+          payload: JSON.stringify(fcmPayloadObj),
+          type: 'trip_assigned',
+          assignmentId: assignment.assignmentId,
+          tripId: assignment.tripId,
+          orderId: order.id,
+          truckRequestId: assignment.truckRequestId ?? '',
+          pickup: JSON.stringify(fcmPickup),
+          drop: JSON.stringify(fcmDrop),
+          pickupAddress: fcmPickup.address,
+          pickupCity: fcmPickup.city,
+          pickupLat: String(fcmPickup.latitude),
+          pickupLng: String(fcmPickup.longitude),
+          dropAddress: fcmDrop.address,
+          dropCity: fcmDrop.city,
+          dropLat: String(fcmDrop.latitude),
+          dropLng: String(fcmDrop.longitude),
+          vehicleNumber: assignment.vehicle.vehicleNumber,
+          farePerTruck: String(fcmPayloadObj.farePerTruck),
+          fare: String(fcmPayloadObj.farePerTruck),
+          distanceKm: String(fcmPayloadObj.distanceKm),
+          customerPhone: fcmPayloadObj.customerPhone,
+          assignedAt: now,
+          expiresAt: expiresAtIso,
         };
 
         queueService.queuePushNotification(assignment.driver.id, {
