@@ -268,6 +268,7 @@ class ConfirmedHoldService {
             orderId: true,
             bookingId: true,
             truckRequestId: true,
+            truckRequest: { select: { pricePerTruck: true } },
           },
         });
         if (assignmentsData.length !== assignmentIds.length) {
@@ -411,6 +412,7 @@ class ConfirmedHoldService {
           orderId: string | null;
           bookingId: string | null;
           truckRequestId: string | null;
+          truckRequest: { pricePerTruck: number } | null;
         }>;
       };
 
@@ -493,6 +495,7 @@ class ConfirmedHoldService {
 
         // P2 F4.1: per-driver try/catch so one failure never aborts the fanout.
         try {
+          const farePerTruck = fullData.truckRequest?.pricePerTruck ?? 0;
           const driverNotification = {
             type: 'trip_assigned',
             assignmentId: fullData.id,
@@ -505,6 +508,7 @@ class ConfirmedHoldService {
             vehicleNumber: fullData.vehicleNumber,
             vehicleType: fullData.vehicleType,
             distanceKm: parentOrder?.distanceKm,
+            farePerTruck,
             customerName: parentOrder?.customerName || '',
             customerPhone: maskPhoneForExternal(parentOrder?.customerPhone || ''),
             assignedAt: now.toISOString(),

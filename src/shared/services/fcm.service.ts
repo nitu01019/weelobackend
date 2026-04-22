@@ -30,6 +30,7 @@ import fs from 'fs';
 import { logger } from './logger.service';
 import { redisService } from './redis.service';
 import { prismaClient } from '../database/prisma.service';
+import { HOLD_CONFIG } from '../../core/config/hold-config';
 
 // Notification types - must match mobile apps
 export const NotificationType = {
@@ -805,7 +806,9 @@ class FCMService {
       assignment_update: 90,
       trip_update: 600,
       driver_assigned: 600,
-      trip_assigned: 600,
+      // A03-001: TTL MUST equal driver-accept window so FCM never lands
+      // after assignment has already auto-declined & reassigned.
+      trip_assigned: HOLD_CONFIG.driverAcceptTimeoutSeconds,
     };
     const ttlSeconds = ttlMap[notification.type] ?? 600;
     const apnsExpiration = Math.floor(Date.now() / 1000) + ttlSeconds;
