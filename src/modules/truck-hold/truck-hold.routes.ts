@@ -632,6 +632,21 @@ router.post(
         });
       }
 
+      // A01-004: per-item validation — Captain previously sent {vehicleId, driverId} (legacy
+      // VehicleDriverAssignment shape); backend service requires {assignmentId, driverId,
+      // truckRequestId}. Reject missing/empty fields with 400 before reaching the service layer.
+      for (let i = 0; i < assignments.length; i++) {
+        const a = assignments[i];
+        if (!a || typeof a.assignmentId !== 'string' || !a.assignmentId ||
+            typeof a.driverId !== 'string' || !a.driverId ||
+            typeof a.truckRequestId !== 'string' || !a.truckRequestId) {
+          return res.status(400).json({
+            success: false,
+            error: { code: 'VALIDATION_ERROR', message: `assignments[${i}] must include non-empty assignmentId, driverId and truckRequestId` },
+          });
+        }
+      }
+
       // F2.7 — X-Idempotency-Key protection against duplicate Phase-2 initialization
       // (network retry, captain double-tap). Mirrors /confirm-with-assignments pattern.
       // Cache lookup runs BEFORE the service-layer transaction so a Redis outage on
