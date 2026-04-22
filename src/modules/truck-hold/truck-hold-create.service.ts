@@ -131,8 +131,8 @@ export async function findActiveLedgerHold(
     where: {
       transporterId,
       orderId,
-      vehicleType: { equals: vehicleType, mode: 'insensitive' },
-      vehicleSubtype: { equals: vehicleSubtype, mode: 'insensitive' },
+      vehicleType,
+      vehicleSubtype,
       status: 'active',
       expiresAt: { gt: now }
     },
