@@ -507,6 +507,34 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
       'fcm_retry_backoff_source_total',
       'FCM retry backoff strategy used per attempt (retry_after_header vs exponential)',
     ),
+
+    // === A03-009 / A12-011: Notification-outbox observability ===
+    // outbox_buffered_total: fires on every Redis LPUSH in bufferNotification.
+    //   Labels: reason = 'adapter_down' | <caller-supplied reason>
+    // outbox_drained_total: fires per entry during drainOutbox drain loop.
+    //   Labels: outcome = 'delivered' | 'stale_skipped' | 'failed'
+    //           outbox  = 'notification'
+    counter(
+      'outbox_buffered_total',
+      'Notifications buffered into the Redis outbox by reason (adapter_down etc) — A03-009',
+    ),
+    counter(
+      'outbox_drained_total',
+      'Outbox drain outcomes by result and outbox name (delivered|stale_skipped|failed) — A03-009',
+    ),
+    // === A04-005 / A04-006 / A12-010+A13-012: dispatch_ack handler observability ===
+    // dispatch_ack_oversized_total: fires when raw payload exceeds 1KB pre-parse DoS guard.
+    //   Call site: src/shared/services/socket.service.ts (dispatch_ack handler P3-E amend)
+    counter(
+      'dispatch_ack_oversized_total',
+      'dispatch_ack payloads rejected before Zod parse because raw length > 1 KB (DoS pre-filter)',
+    ),
+    // dispatch_ack_rate_limited_total: fires when per-socket 10/s rate limit is exceeded.
+    //   Call site: src/shared/services/socket.service.ts (dispatch_ack handler P3-E amend)
+    counter(
+      'dispatch_ack_rate_limited_total',
+      'dispatch_ack events dropped because the per-socket 10/s rate limit was exceeded',
+    ),
   ];
 
   for (const def of defs) {
@@ -546,6 +574,90 @@ export function registerDefaultGauges(gauges: Map<string, GaugeMetric>): void {
     gauge(
       'stream_depth',
       'Socket.IO Redis Streams adapter per-stream depth (F14.5) — labels: stream',
+    ),
+
+    // === A03-009 / A12-011: Notification-outbox size gauge ===
+    // Sampled every 30s via GET outbox:size (O(1) counter key maintained by
+    // bufferNotification INCR / drainOutbox DECR). Avoids SCAN on large sets.
+    gauge(
+      'outbox_size',
+      'Current estimated size of the notification outbox (O(1) Redis counter — sampled every 30s) — A03-009',
+    ),
+    // === A04-006: Socket.IO adapter per-partition stream depth gauges ===
+    // Sampled every 5s via XLEN. One gauge per partition (16 partitions default).
+    // stream naming: socket.io-{i} (matches @socket.io/redis-streams-adapter default streamName)
+    //   Call site: src/shared/services/socket.service.ts (setupRedisAdapter XLEN sweep P3-T19)
+    gauge(
+      'socket_stream_partition_depth_0',
+      'A04-006: Socket.IO Redis Streams adapter stream depth for partition 0 (socket.io-0)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_1',
+      'A04-006: Socket.IO Redis Streams adapter stream depth for partition 1 (socket.io-1)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_2',
+      'A04-006: Socket.IO Redis Streams adapter stream depth for partition 2 (socket.io-2)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_3',
+      'A04-006: Socket.IO Redis Streams adapter stream depth for partition 3 (socket.io-3)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_4',
+      'A04-006: Socket.IO Redis Streams adapter stream depth for partition 4 (socket.io-4)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_5',
+      'A04-006: Socket.IO Redis Streams adapter stream depth for partition 5 (socket.io-5)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_6',
+      'A04-006: Socket.IO Redis Streams adapter stream depth for partition 6 (socket.io-6)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_7',
+      'A04-006: Socket.IO Redis Streams adapter stream depth for partition 7 (socket.io-7)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_8',
+      'A04-006: Socket.IO Redis Streams adapter stream depth for partition 8 (socket.io-8)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_9',
+      'A04-006: Socket.IO Redis Streams adapter stream depth for partition 9 (socket.io-9)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_10',
+      'A04-006: Socket.IO Redis Streams adapter stream depth for partition 10 (socket.io-10)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_11',
+      'A04-006: Socket.IO Redis Streams adapter stream depth for partition 11 (socket.io-11)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_12',
+      'A04-006: Socket.IO Redis Streams adapter stream depth for partition 12 (socket.io-12)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_13',
+      'A04-006: Socket.IO Redis Streams adapter stream depth for partition 13 (socket.io-13)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_14',
+      'A04-006: Socket.IO Redis Streams adapter stream depth for partition 14 (socket.io-14)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_15',
+      'A04-006: Socket.IO Redis Streams adapter stream depth for partition 15 (socket.io-15)',
+    ),
+
+    // === A04-006: Stream partition depth skew ratio gauge ===
+    // Computed as stddev/mean across 16 partitions. > 0.5 indicates hot-shard routing imbalance.
+    //   Call site: src/shared/services/socket.service.ts (setupRedisAdapter XLEN sweep P3-T20)
+    gauge(
+      'socket_stream_partition_depth_skew_ratio',
+      'A04-006: Skew ratio (stddev/mean) of Socket.IO stream partition depths — > 0.5 indicates hot-shard imbalance',
     ),
   ];
 
@@ -593,6 +705,18 @@ export function registerDefaultHistograms(histograms: Map<string, HistogramMetri
       [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30],
     ),
 
+    // A13-011 (P3-T28) — confirmed-hold fanout loop wall-clock duration.
+    // Buckets cover the expected range from a single-driver fanout (< 5ms) up
+    // to a 10-truck fanout under p99 socket + FCM latency (< 2.5s).  Outliers
+    // above 5s signal a stalled await inside the loop that needs investigation.
+    //   Call site: src/modules/truck-hold/confirmed-hold.service.ts
+    //   (after the per-assignment fanout loop, before outbox mark-dispatched)
+    hist(
+      'confirmed_hold_fanout_duration_ms',
+      'Wall-clock duration of the confirmed-hold post-commit per-driver fanout loop in milliseconds',
+      [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000],
+    ),
+
     // === Phase 5 (M-16): FCM send latency ===
     hist(
       'fcm_send_latency_ms',
@@ -616,6 +740,34 @@ export function registerDefaultHistograms(histograms: Map<string, HistogramMetri
       'fcm_boot_dry_run_latency_ms',
       'FCM boot dry-run round-trip latency in milliseconds (credential pipeline validation at startup)',
       [50, 100, 250, 500, 1000, 2500, 5000, 10000],
+    ),
+
+    // === A03-009 / A12-011: Notification-outbox per-entry drain latency ===
+    // Observed per entry in drainOutbox (Date.now() delta around queuePushNotification).
+    //   Labels: outbox = 'notification'
+    hist(
+      'outbox_drain_latency_ms',
+      'Per-entry drain latency in the notification outbox from dequeue to queuePushNotification resolution — A03-009',
+      [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000],
+    ),
+    // === A04-006: Socket.IO adapter XADD latency histogram ===
+    // Observed per XADD call via the InstrumentedRedisClient Proxy wrapper on the adapter client.
+    // Lets SRE see per-stream XADD p50/p99 and correlate with stream depth skew.
+    //   Call site: src/shared/services/socket.service.ts (wrapRedisClientForAdapter P3-T18)
+    hist(
+      'socket_adapter_xadd_ms',
+      'A04-006: Socket.IO Redis Streams adapter XADD latency in milliseconds (per-call, via InstrumentedRedisClient proxy)',
+      [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000],
+    ),
+
+    // === A12-010 / A13-012: dispatch_ack render latency histogram ===
+    // Observed when the ZSET lookup for dispatchedAt succeeds (> 0).
+    // Measures driver overlay render-to-ack latency in ms.
+    //   Call site: src/shared/services/socket.service.ts (dispatch_ack handler P3-T25)
+    hist(
+      'driver_overlay_ack_latency_ms',
+      'A12-010/A13-012: Time from dispatch send (dispatchedAt ZSET) to driver dispatch_ack renderedAt in milliseconds',
+      [50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000],
     ),
   ];
 
