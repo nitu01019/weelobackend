@@ -590,4 +590,92 @@ describe('F-B-26: Durable Emit Contract', () => {
       });
     });
   });
+
+  // ===========================================================================
+  // A09-002 / A12-009 — Phase 2 role-scoped seq counter + writer key schema
+  // ===========================================================================
+  // Phase 2 extends Phase 1 by (a) role-scoping the `socket:seq:{userId}` key
+  // and (b) flipping the replay reader + ACK purger to hit the NEW key. The
+  // replay reader + ACK handler are wired inside the io.on('connection')
+  // callback and exercised via integration tests; here we verify the writer-
+  // side contract (seq key role-scoping) which is the only unit-reachable
+  // surface. Phase-2 reader + cross-role filter assertions are in the
+  // service-level integration suite (see A09-002 rollout plan §7.3.2 W3-T11).
+  //
+  // Ref: master-file §A09-002/§A12-009, plan §7.3.2 W3-T11.
+  // ===========================================================================
+  describe('A09-002 + A12-009 — Phase 2 role-scoped seq counter', () => {
+    beforeEach(() => {
+      mockZSets.clear();
+      mockSeqByKey.clear();
+      mockMultiExecImpl = async (ops) => {
+        const results: any[] = [];
+        for (const op of ops) {
+          if (op.type === 'zAdd') {
+            const [key, score, member] = op.args;
+            const arr = mockZSets.get(key) ?? [];
+            arr.push({ score, member });
+            mockZSets.set(key, arr);
+            results.push(1);
+          } else {
+            results.push(1);
+          }
+        }
+        return results;
+      };
+      socketService.__clearUserRoleCacheForTesting();
+      process.env.FF_DURABLE_EMIT_ENABLED = 'true';
+    });
+
+    afterEach(() => {
+      delete process.env.FF_ROLE_SCOPED_DURABLE_EMIT;
+    });
+
+    it('flag OFF → seq key is legacy `socket:seq:{userId}` (no role suffix)', async () => {
+      process.env.FF_ROLE_SCOPED_DURABLE_EMIT = 'false';
+      const { fakeIo } = makeFakeIo(new Map());
+      socketService.__setIoForTesting(fakeIo, new Map());
+      socketService.__setUserRoleForTesting('u-seq-off', 'transporter');
+
+      socketService.emitToUser('u-seq-off', 'trip_assigned', { id: 't1' });
+      await new Promise((r) => setImmediate(r));
+
+      expect(mockRedisIncr).toHaveBeenCalledWith('socket:seq:u-seq-off');
+      expect(mockRedisIncr).not.toHaveBeenCalledWith('socket:seq:u-seq-off:transporter');
+    });
+
+    it('flag ON → seq key is role-scoped `socket:seq:{userId}:{role}`', async () => {
+      process.env.FF_ROLE_SCOPED_DURABLE_EMIT = 'true';
+      const { fakeIo } = makeFakeIo(new Map());
+      socketService.__setIoForTesting(fakeIo, new Map());
+      socketService.__setUserRoleForTesting('u-seq-on', 'driver');
+
+      socketService.emitToUser('u-seq-on', 'trip_assigned', { id: 't1' });
+      await new Promise((r) => setImmediate(r));
+
+      expect(mockRedisIncr).toHaveBeenCalledWith('socket:seq:u-seq-on:driver');
+      expect(mockRedisIncr).not.toHaveBeenCalledWith('socket:seq:u-seq-on');
+    });
+
+    it('flag ON → each role has an independent seq stream (dual-role safety)', async () => {
+      process.env.FF_ROLE_SCOPED_DURABLE_EMIT = 'true';
+      const { fakeIo } = makeFakeIo(new Map());
+      socketService.__setIoForTesting(fakeIo, new Map());
+
+      // Same userId emits once per role — seqs must be independent per-role.
+      socketService.__setUserRoleForTesting('u-dual', 'transporter');
+      socketService.emitToUser('u-dual', 'trip_assigned', { id: 't1' });
+      await new Promise((r) => setImmediate(r));
+
+      socketService.__setUserRoleForTesting('u-dual', 'driver');
+      socketService.emitToUser('u-dual', 'trip_assigned', { id: 't2' });
+      await new Promise((r) => setImmediate(r));
+
+      // Each per-role key got its own seq=1; they do not collide.
+      expect(mockSeqByKey.get('socket:seq:u-dual:transporter')).toBe(1);
+      expect(mockSeqByKey.get('socket:seq:u-dual:driver')).toBe(1);
+      // Legacy key never touched in Phase 2 mode.
+      expect(mockSeqByKey.has('socket:seq:u-dual')).toBe(false);
+    });
+  });
 });

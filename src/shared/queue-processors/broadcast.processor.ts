@@ -199,34 +199,65 @@ export function registerBroadcastProcessor(
     }
 
     // === PHASE 4: SEQUENCE NUMBERING (flag-gated) ===
+    // A09-002 / A12-009 Phase 2 — transporter broadcast queue is
+    // transporter-room-by-construction; role is fixed at 'transporter'. When
+    // FF_ROLE_SCOPED_DURABLE_EMIT is ON, use atomic MULTI/EXEC dual-write to
+    // both OLD and NEW role-scoped keys for safe rollback.
     let seq: number | undefined;
     if (FF_SEQUENCE_DELIVERY_ENABLED) {
+      const roleScopedEnabled = isEnabled(FLAGS.ROLE_SCOPED_DURABLE_EMIT);
+      const role = 'transporter';
       try {
         // Step 1: increment seq counter (must be sequential -- need value)
-        seq = await redisService.incr(`socket:seq:${transporterId}`);
+        const seqKey = roleScopedEnabled
+          ? `socket:seq:${transporterId}:${role}`
+          : `socket:seq:${transporterId}`;
+        seq = await redisService.incr(seqKey);
         const envelope = JSON.stringify({
-          seq, event, payload: data, createdAt: job.createdAt
+          seq, event, payload: data, role, createdAt: job.createdAt
         });
-        // Step 2: store in unacked set + refresh TTL (parallel -- independent ops)
-        await Promise.all([
-          redisService.zAdd(
-            `socket:unacked:${transporterId}`,
-            seq,
-            envelope
-          ),
-          redisService.expire(
-            `socket:unacked:${transporterId}`,
-            UNACKED_QUEUE_TTL_SECONDS
-          )
-        ]);
+        // Step 2: store in unacked set + refresh TTL
+        const oldKey = `socket:unacked:${transporterId}`;
+        if (roleScopedEnabled) {
+          const newKey = `socket:unacked:${transporterId}:${role}`;
+          await redisService.multi()
+            .zAdd(oldKey, seq, envelope)
+            .expire(oldKey, UNACKED_QUEUE_TTL_SECONDS)
+            .zAdd(newKey, seq, envelope)
+            .expire(newKey, UNACKED_QUEUE_TTL_SECONDS)
+            .exec();
+          try {
+            metrics.incrementCounter('socket_unacked_key_version', { version: 'v1' });
+            metrics.incrementCounter('socket_unacked_key_version', { version: 'v2' });
+          } catch { /* metrics optional */ }
+        } else {
+          await Promise.all([
+            redisService.zAdd(oldKey, seq, envelope),
+            redisService.expire(oldKey, UNACKED_QUEUE_TTL_SECONDS)
+          ]);
+          try {
+            metrics.incrementCounter('socket_unacked_key_version', { version: 'v1' });
+          } catch { /* metrics optional */ }
+        }
         // Attach seq to outgoing payload for client-side dedup
         if (data && typeof data === 'object') {
           data._seq = seq;
         }
       } catch (seqError: unknown) {
-        // Sequence numbering is best-effort -- never block delivery
+        // Sequence numbering is best-effort -- never block delivery.
+        // A09-002 Arch 1B: dual-write abort is surfaced here; emit proceeds
+        // without seq on abort (matches pre-F-B-26 degraded behaviour).
+        const errMessage = seqError instanceof Error ? seqError.message : String(seqError);
+        if (roleScopedEnabled) {
+          try {
+            metrics.incrementCounter('socket_unacked_dual_write_fail_total', { phase: '1' });
+          } catch { /* metrics optional */ }
+          logger.error('durable_emit_dual_write_failed', {
+            userId: transporterId, role: 'transporter', event, errMessage
+          });
+        }
         logger.warn('[Phase4] Sequence numbering failed, delivering without seq', {
-          transporterId, error: seqError instanceof Error ? seqError.message : String(seqError)
+          transporterId, error: errMessage
         });
       }
     }

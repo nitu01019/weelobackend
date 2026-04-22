@@ -1237,21 +1237,47 @@ export function initializeSocket(server: HttpServer): Server {
     // H-9 FIX: Default to ON — opt-out with FF_SEQUENCE_DELIVERY_ENABLED=false
     const FF_SEQ = process.env.FF_SEQUENCE_DELIVERY_ENABLED !== 'false';
     if (FF_SEQ) {
+      // A09-002 / A12-009 Phase 2 — reader flips to NEW role-scoped key when
+      // FF_ROLE_SCOPED_DURABLE_EMIT is ON. Phase-1 dual-write keeps OLD key
+      // populated for rollback. Replay drops envelopes whose `role` tag
+      // mismatches the reconnecting socket's role (belt-and-braces DPDP guard).
+      const roleScopedEnabled = isEnabled(FLAGS.ROLE_SCOPED_DURABLE_EMIT);
+      const socketRole = socket.data.role || resolveUserRole(userId);
+      const unackedKeyForSocket = roleScopedEnabled
+        ? `socket:unacked:${userId}:${socketRole}`
+        : `socket:unacked:${userId}`;
       const lastSeq = Number(socket.handshake.auth?.lastSeq || 0);
       if (lastSeq > 0) {
         (async () => {
           try {
-            const unackedKey = `socket:unacked:${userId}`;
             const messages = await redisService.zRangeByScore(
-              unackedKey,
+              unackedKeyForSocket,
               lastSeq + 1,  // min: messages after lastSeq
               '+inf'        // max: all newer messages
             );
             if (messages.length > 0) {
-              logger.info(`[Phase4] Replaying ${messages.length} unacked messages for ${userId} (lastSeq=${lastSeq})`);
+              logger.info(`[Phase4] Replaying ${messages.length} unacked messages for ${userId} (lastSeq=${lastSeq}, role=${socketRole})`);
               for (const msgStr of messages) {
                 try {
                   const envelope = JSON.parse(msgStr);
+                  // A09-002 / A12-009 Phase 2 — drop cross-role envelopes.
+                  // Any envelope whose `role` tag mismatches the reconnecting
+                  // socket's role is dropped pre-emit (DPDP filter). Counter
+                  // socket_replay_dropped_cross_role_total fires per drop.
+                  if (
+                    roleScopedEnabled &&
+                    envelope.role &&
+                    envelope.role !== socketRole
+                  ) {
+                    try {
+                      const { metrics } = require('../monitoring/metrics.service');
+                      metrics.incrementCounter(
+                        'socket_replay_dropped_cross_role_total',
+                        { role: socketRole }
+                      );
+                    } catch { /* metrics optional */ }
+                    continue;
+                  }
                   socket.emit(envelope.event || 'replay', {
                     ...envelope.payload,
                     _seq: envelope.seq,
@@ -1271,18 +1297,19 @@ export function initializeSocket(server: HttpServer): Server {
         })();
       }
 
-      // ACK handler — client sends { seq: N } after processing message
+      // ACK handler — client sends { seq: N } after processing message.
+      // Phase 2: purge on the NEW role-scoped key when flag ON.
       socket.on(SocketEvent.BROADCAST_ACK, (ackData: { seq?: number }) => {
         const ackSeq = Number(ackData?.seq || 0);
         if (ackSeq <= 0) return;
         // Remove all messages with seq <= ackSeq (cumulative ACK)
         redisService.zRemRangeByScore(
-          `socket:unacked:${userId}`,
+          unackedKeyForSocket,
           0,
           ackSeq
         ).catch((err: any) => {
           logger.warn(`[Phase4] Failed to clear acked messages`, {
-            userId, ackSeq, error: err?.message
+            userId, ackSeq, role: socketRole, error: err?.message
           });
         });
       });
@@ -1641,11 +1668,16 @@ async function durableEmit(userId: string, event: string, data: any, deadlineMs?
   let seq: number | undefined;
   // A09-002 / A12-009 (Arch 1B) — flag-gated Phase-1 atomic dual-write to
   // both OLD (`socket:unacked:{userId}`) and NEW (`socket:unacked:{userId}:{role}`)
-  // ZSET keys. Reader still hits OLD in Phase 1; Phase 2 flips to NEW.
+  // ZSET keys. Phase 2 flips reader to NEW key and role-scopes the seq key
+  // (`socket:seq:{userId}:{role}`) so each role has an independent seq stream;
+  // dual-write preserved for rollback.
   const roleScopedEnabled = isEnabled(FLAGS.ROLE_SCOPED_DURABLE_EMIT);
   const role = roleScopedEnabled ? resolveUserRole(userId) : ROLE_UNKNOWN;
   try {
-    seq = await redisService.incr(`socket:seq:${userId}`);
+    const seqKey = roleScopedEnabled
+      ? `socket:seq:${userId}:${role}`
+      : `socket:seq:${userId}`;
+    seq = await redisService.incr(seqKey);
     const envelope = JSON.stringify({
       seq,
       event,
@@ -1773,7 +1805,10 @@ async function persistRoomEnvelopes(userIds: string[], event: string, data: any)
   await Promise.all(userIds.map(async (uid) => {
     const role = roleScopedEnabled ? resolveUserRole(uid) : ROLE_UNKNOWN;
     try {
-      const seq = await redisService.incr(`socket:seq:${uid}`);
+      const seqKey = roleScopedEnabled
+        ? `socket:seq:${uid}:${role}`
+        : `socket:seq:${uid}`;
+      const seq = await redisService.incr(seqKey);
       const envelope = JSON.stringify({
         seq,
         event,
