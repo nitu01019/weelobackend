@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Weelo Phase 1 — broadcast-baseline alarms.
+# =============================================================================
+# WEELO CLOUDWATCH ALARMS — PHASE 3 BROADCAST RELIABILITY
+# =============================================================================
+#
 # Follows the style of scripts/monitoring/setup-alarms.sh (phase8).
 # Apply BEFORE or AFTER put-dashboard; order independent.
 #
@@ -13,6 +16,39 @@
 # Prereq: the director has created CloudWatch metric-filters for each app counter
 # (or switched the backend to aws-embedded-metrics EMF) — see DASHBOARD-P1.md §"Metric-filter TODOs".
 # Until then these alarms will sit in INSUFFICIENT_DATA, which is the intended safe default.
+#
+# -----------------------------------------------------------------------------
+# ALARM REGISTRY (P3-T41 runbook header)
+# Every alarm created by this script is listed here with metric source + SLO.
+# -----------------------------------------------------------------------------
+#
+#  ALARM NAME                                    METRIC / EXPRESSION                              SLO RATIONALE
+#  ------------------------------------------    -----------------------------------------------  -----------------------------------------------
+#  weelo-p1-socket-adapter-down                  socket_emit_while_adapter_down_total > 0 / 2m    M18: cross-instance emits drop when adapter down
+#  weelo-p1-eta-fallback-spike                   eta_ranking_fallback_total > 5/min / 3m          L3: Google Directions quota/timeout
+#  weelo-p1-fleet-cache-corruption               fleet_cache_corruption_total > 10/hr             L7: JSON.stringify regression
+#  weelo-p1-post-commit-cache-failure-*          post_commit_cache_failure_total > 20/min / 3m    L2: staleness risk after cache write fail
+#  weelo-p1-circuit-breaker-open                 circuit_breaker_state_gauge >= 1 / 5m            F15.3: critical circuit OPEN
+#  weelo-p1-dlq-pushed                           dlq_pushed_total > 0 / 5m                        F7.5: retry exhaustion, jobs on DLQ
+#  weelo-p1-fleetcache-read-error                fleetcache_read_total{result=error} > 300/5m     F3.6: cache corruption / Redis outage
+#  weelo-p1-pool-wait-p99                        pool_wait_seconds p99 > 0.5s / 5m               F14.5: Prisma pool saturation
+#  weelo-p1-fcm-quota-burn                       fcm_quota_consumed_total > 900/s / 5m            F14.5: approaching Firebase 1000/s ceiling
+#
+#  --- P3 SLO / A12-001 + A13-011 alarms (P3-T29 through P3-T40) ---
+#
+#  weelo-p3-hold-request-rate-drop               METRIC_MATH: rate drop > 20% vs 1h ago           P3-T29: booking funnel health
+#  weelo-p3-hold-conversion-low                  METRIC_MATH: confirmed/requested < 0.95 / 5m     P3-T30: hold→confirm conversion SLO
+#  weelo-p3-assignment-emit-fail                 new_assignment_socket_emit_total{result=fail} > 0 / 2m  P3-T31: driver misses assignment
+#  weelo-p3-driver-overlay-fail                  driver_overlay_rendered_total{result=fail} > 0/5m P3-T32: driver overlay not rendering
+#  weelo-p3-fcm-error-rate                       METRIC_MATH: fcm_send_failure_total/fcm_send_success_total+failure > 1% / 5m  P3-T33: FCM delivery health
+#  weelo-p3-socket-reconnect-surge               socket_connect_total > 5000 / 30s               P3-T34: reconnect storm
+#  weelo-p3-fanout-p99                           confirmed_hold_fanout_duration_ms p99 > 600ms / 1m  P3-T35: fanout latency SLO
+#  weelo-p3-outbox-drain-failed                  outbox_drained_total{outcome=failed} > 0 / 5m   P3-T36: outbox failure
+#  weelo-p3-outbox-size-high                     outbox_size > 10000 / 5m                        P3-T37: outbox backlog
+#  weelo-p3-stream-partition-depth-N (×16)       socket_stream_partition_depth_N gauge > 80000 / 30s  P3-T38: per-partition stream depth
+#  weelo-p3-eventloop-lag                        nodejs_eventloop_lag_ms gauge (Maximum) > 50 / 2m   P3-T39: event loop saturation
+#  weelo-p3-socket-xadd-p99                      socket_adapter_xadd_ms p99 > 500ms / 30s        P3-T40: Redis Streams XADD latency
+# -----------------------------------------------------------------------------
 
 set -euo pipefail
 
@@ -260,7 +296,246 @@ put_counter_alarm \
   "${ALARM_SNS_P3_TOPIC_ARN}" \
   "[P3] F14.5 — fcm_quota_consumed_total > 900/s for 5m (threshold=270000 per 5m period). Approaching Firebase 1000/s quota ceiling; throttling imminent."
 
-echo "[T1.7] Phase 1 broadcast-baseline alarms configured in ${AWS_REGION}, namespace=${CW_NAMESPACE}."
+# =============================================================================
+# Phase 3 — SLO / A12-001 + A13-011 alarms (P3-T29 through P3-T40)
+# These cover broadcast reliability, FCM delivery, socket health, and
+# outbox/stream depth. Same INSUFFICIENT_DATA disclaimer applies until the
+# metric-filter / EMF pipeline exports them into the Weelo/Backend namespace.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Helper: metric-math alarm (two metrics, expression-based comparison).
+# CloudWatch requires --metrics JSON for math expressions; we inline it here
+# using a heredoc to avoid temporary files and keep the script portable.
+# ---------------------------------------------------------------------------
+put_metric_math_alarm() {
+  local name="$1"
+  local description="$2"
+  local expression="$3"
+  local threshold="$4"
+  local period="$5"
+  local evaluation_periods="$6"
+  local sns_arn="$7"
+  local metrics_json="$8"
+
+  aws cloudwatch put-metric-alarm \
+    --region "${AWS_REGION}" \
+    --alarm-name "${name}" \
+    --alarm-description "${description}" \
+    --metrics "${metrics_json}" \
+    --comparison-operator GreaterThanThreshold \
+    --threshold "${threshold}" \
+    --evaluation-periods "${evaluation_periods}" \
+    --treat-missing-data notBreaching \
+    --alarm-actions "${sns_arn}"
+}
+
+# -----------------------------------------------------------------------------
+# P3-T29 — hold_request_total rate-drop > 20% over 5 min.
+# Compares current 5m rate to the rate 1h ago. A 20% drop in incoming hold
+# requests is a leading indicator of a booking funnel regression (app crash,
+# bad deploy, or upstream outage).
+# Expression: (m1 - m2) / (m2 + 1) < -0.2  →  expressed as m2 - m1 > 0.2 * m2
+# We invert to use GreaterThanThreshold: (m2 - m1) / (m2 + 1) > 0.2
+# threshold=0.2, evaluation_periods=1 (single 5m datapoint)
+# -----------------------------------------------------------------------------
+HOLD_RATE_DROP_METRICS='[
+  {"Id":"m1","MetricStat":{"Metric":{"Namespace":"'"${CW_NAMESPACE}"'","MetricName":"hold_request_total"},"Period":300,"Stat":"Sum"},"Label":"current_5m","ReturnData":false},
+  {"Id":"m2","MetricStat":{"Metric":{"Namespace":"'"${CW_NAMESPACE}"'","MetricName":"hold_request_total"},"Period":3600,"Stat":"Sum"},"Label":"prev_1h","ReturnData":false},
+  {"Id":"e1","Expression":"(m2/12 - m1) / (m2/12 + 1)","Label":"rate_drop_fraction","ReturnData":true,"Period":300}
+]'
+put_metric_math_alarm \
+  "weelo-p3-hold-request-rate-drop" \
+  "[P3] A12-001/T29 — hold_request_total rate dropped > 20% vs 1h ago (5m window). Booking funnel regression: check app, gateway, or upstream. SLO: < 20% drop." \
+  "(m2/12 - m1) / (m2/12 + 1)" \
+  "0.2" \
+  "300" \
+  "1" \
+  "${ALARM_SNS_P3_TOPIC_ARN}" \
+  "${HOLD_RATE_DROP_METRICS}"
+
+# -----------------------------------------------------------------------------
+# P3-T30 — hold_confirmed_committed_total / hold_request_total < 0.95 / 5min.
+# SLO: 95% of hold requests must proceed to confirmed commit. Drop below this
+# threshold means captains are abandoning holds or the confirm path is broken.
+# Expression: 1 - (m3 / (m4 + 1)) > 0.05  →  threshold = 0.05
+# -----------------------------------------------------------------------------
+HOLD_CONV_METRICS='[
+  {"Id":"m3","MetricStat":{"Metric":{"Namespace":"'"${CW_NAMESPACE}"'","MetricName":"hold_confirmed_committed_total"},"Period":300,"Stat":"Sum"},"Label":"confirmed","ReturnData":false},
+  {"Id":"m4","MetricStat":{"Metric":{"Namespace":"'"${CW_NAMESPACE}"'","MetricName":"hold_request_total"},"Period":300,"Stat":"Sum"},"Label":"requested","ReturnData":false},
+  {"Id":"e2","Expression":"1 - (m3 / (m4 + 1))","Label":"confirm_drop_rate","ReturnData":true,"Period":300}
+]'
+put_metric_math_alarm \
+  "weelo-p3-hold-conversion-low" \
+  "[P3] A12-001/T30 — hold_confirmed_committed/hold_request_total < 0.95 over 5m. SLO breach: captains abandoning holds or confirm path broken. Investigate confirmed-hold.service.ts." \
+  "1 - (m3 / (m4 + 1))" \
+  "0.05" \
+  "300" \
+  "1" \
+  "${ALARM_SNS_P3_TOPIC_ARN}" \
+  "${HOLD_CONV_METRICS}"
+
+# -----------------------------------------------------------------------------
+# P3-T31 — new_assignment_socket_emit_total{result=fail} > 0 / 2min.
+# Any socket emit failure for new assignments means a driver missed the
+# assignment push — results in missed trips and manual dispatch overhead.
+# 2-minute evaluation window (2 × 60s periods) to catch transient failures.
+# -----------------------------------------------------------------------------
+put_counter_alarm \
+  "weelo-p3-assignment-emit-fail" \
+  "new_assignment_socket_emit_total" \
+  "0" \
+  "60" \
+  "2" \
+  "${ALARM_SNS_TOPIC_ARN}" \
+  "[P2] A13-011/T31 — new_assignment_socket_emit_total{result=fail} > 0 sustained 2m. Drivers missing assignment notifications. Investigate socket.service.ts emit path." \
+  "Name=result,Value=fail"
+
+# -----------------------------------------------------------------------------
+# P3-T32 — driver_overlay_rendered_total{result=fail} > 0 / 5min.
+# The driver overlay is the accept/decline screen for new assignments. Any
+# render failure means the driver cannot respond to the assignment (silent loss).
+# -----------------------------------------------------------------------------
+put_counter_alarm \
+  "weelo-p3-driver-overlay-fail" \
+  "driver_overlay_rendered_total" \
+  "0" \
+  "60" \
+  "5" \
+  "${ALARM_SNS_P3_TOPIC_ARN}" \
+  "[P3] A13-011/T32 — driver_overlay_rendered_total{result=fail} > 0 for 5m. Driver UI cannot render assignment overlay; silent loss. Investigate F9.9 render path." \
+  "Name=result,Value=fail"
+
+# -----------------------------------------------------------------------------
+# P3-T33 — FCM delivery error rate > 1% / 5min.
+# Derived from rate(fcm_send_failure_total[5m]) / rate(fcm_send_success+failure[5m]) > 0.01.
+# Firebase errors at >1% indicate token churn, quota exhaustion, or credential issues.
+# -----------------------------------------------------------------------------
+FCM_ERR_RATE_METRICS='[
+  {"Id":"m5","MetricStat":{"Metric":{"Namespace":"'"${CW_NAMESPACE}"'","MetricName":"fcm_send_failure_total"},"Period":300,"Stat":"Sum"},"Label":"fcm_errors","ReturnData":false},
+  {"Id":"m6","MetricStat":{"Metric":{"Namespace":"'"${CW_NAMESPACE}"'","MetricName":"fcm_send_success_total"},"Period":300,"Stat":"Sum"},"Label":"fcm_success","ReturnData":false},
+  {"Id":"e3","Expression":"m5 / (m5 + m6 + 1)","Label":"fcm_error_rate","ReturnData":true,"Period":300}
+]'
+put_metric_math_alarm \
+  "weelo-p3-fcm-error-rate" \
+  "[P3] A13-011/T33 — fcm_delivery_error_rate > 1% over 5m. FCM errors: token churn, quota, or credential issue. Check fcm.service.ts + Firebase console." \
+  "m5 / (m5 + m6 + 1)" \
+  "0.01" \
+  "300" \
+  "1" \
+  "${ALARM_SNS_P3_TOPIC_ARN}" \
+  "${FCM_ERR_RATE_METRICS}"
+
+# -----------------------------------------------------------------------------
+# P3-T34 — socket_reconnect_rate > 5000/s / 30s.
+# rate(socket_connect_total[30s]) > 5000 indicates a reconnect storm (e.g. rolling
+# deploy, Redis adapter restart, or client-side bug causing rapid reconnects).
+# 30s period, 1 evaluation period to catch sudden spikes quickly.
+# threshold=150000 (5000/s × 30s period)
+# -----------------------------------------------------------------------------
+put_counter_alarm \
+  "weelo-p3-socket-reconnect-surge" \
+  "socket_connect_total" \
+  "150000" \
+  "30" \
+  "1" \
+  "${ALARM_SNS_TOPIC_ARN}" \
+  "[P2] A13-011/T34 — socket_connect_total > 5000/s (150000 per 30s). Reconnect storm detected: rolling deploy, Redis adapter restart, or client bug. Check ECS + socket.service.ts."
+
+# -----------------------------------------------------------------------------
+# P3-T35 — confirmed_hold_fanout_duration_ms p99 > 600ms / 1min.
+# The fanout loop after confirmed-hold commit must complete < 600ms p99 so
+# drivers receive assignment notifications before the 45s timer ticks.
+# -----------------------------------------------------------------------------
+put_histogram_p99_alarm \
+  "weelo-p3-fanout-p99" \
+  "confirmed_hold_fanout_duration_ms" \
+  "600" \
+  "60" \
+  "1" \
+  "${ALARM_SNS_TOPIC_ARN}" \
+  "[P2] A13-011/T35 — confirmed_hold_fanout_duration_ms p99 > 600ms over 1m. Fanout latency SLO breach: drivers may not receive notifications before 45s timer. Investigate confirmed-hold.service.ts fanout loop."
+
+# -----------------------------------------------------------------------------
+# P3-T36 — outbox_drained_total{outcome=failed} > 0 / 5min.
+# Any failed outbox drain means a durable notification was not delivered and
+# could not be retried — the driver permanently misses the assignment push.
+# -----------------------------------------------------------------------------
+put_counter_alarm \
+  "weelo-p3-outbox-drain-failed" \
+  "outbox_drained_total" \
+  "0" \
+  "60" \
+  "5" \
+  "${ALARM_SNS_TOPIC_ARN}" \
+  "[P2] A12-001/T36 — outbox_drained_total{outcome=failed} > 0 sustained 5m. Notification outbox drain failures: durable push permanently lost. Inspect outbox consumer + DLQ." \
+  "Name=outcome,Value=failed"
+
+# -----------------------------------------------------------------------------
+# P3-T37 — outbox_size > 10_000.
+# A growing outbox (>10k items) means the poller cannot keep up with production
+# rate. Drivers will experience significant delay in receiving notifications.
+# -----------------------------------------------------------------------------
+put_gauge_max_alarm \
+  "weelo-p3-outbox-size-high" \
+  "outbox_size" \
+  "10000" \
+  "300" \
+  "1" \
+  "${ALARM_SNS_P3_TOPIC_ARN}" \
+  "[P3] A12-001/T37 — outbox_size > 10000. Notification outbox backlog too large; poller cannot keep up. Scale poller or investigate consumer lag."
+
+# -----------------------------------------------------------------------------
+# P3-T38 — socket_stream_partition_depth_N > 80_000 / 30s on ANY partition.
+# Redis Streams adapter uses 16 partitions (0-15). Each partition is tracked as
+# an individual gauge (socket_stream_partition_depth_0 ... _15) sampled via XLEN.
+# A depth > 80k means XREAD consumers are lagging, causing stale broadcast delivery.
+# We create one alarm per gauge metric so CloudWatch can pinpoint the hot shard.
+# -----------------------------------------------------------------------------
+for i in $(seq 0 15); do
+  put_gauge_max_alarm \
+    "weelo-p3-stream-partition-depth-${i}" \
+    "socket_stream_partition_depth_${i}" \
+    "80000" \
+    "30" \
+    "1" \
+    "${ALARM_SNS_TOPIC_ARN}" \
+    "[P2] A12-001/T38 — socket_stream_partition_depth_${i} > 80000 over 30s. Redis Streams adapter consumer lagging on partition ${i}. Check XREAD group lag + pod count."
+done
+
+# -----------------------------------------------------------------------------
+# P3-T39 — nodejs_eventloop_lag_ms > 50ms / 2min.
+# Event loop lag above 50ms causes timer drift, socket timeouts, and delayed
+# promise resolutions — leading indicator of CPU saturation or blocking I/O
+# (e.g. large JSON serialisation, sync crypto, etc.).
+# Metric: nodejs_eventloop_lag_ms gauge (Maximum statistic — catches any pod spikes).
+# -----------------------------------------------------------------------------
+put_gauge_max_alarm \
+  "weelo-p3-eventloop-lag" \
+  "nodejs_eventloop_lag_ms" \
+  "50" \
+  "60" \
+  "2" \
+  "${ALARM_SNS_TOPIC_ARN}" \
+  "[P2] A12-001/T39 — nodejs_eventloop_lag_ms > 50ms (Maximum) over 2m. Node.js event loop saturation: blocking I/O or CPU-bound work. Investigate CPU metrics, GC traces, and sync operations."
+
+# -----------------------------------------------------------------------------
+# P3-T40 — socket_adapter_xadd_ms p99 > 500ms / 30s.
+# The Redis Streams XADD call must complete < 500ms p99 for the socket adapter
+# to deliver broadcasts within the SLO window. Sustained p99 > 500ms indicates
+# Redis memory pressure or network latency to ElastiCache.
+# -----------------------------------------------------------------------------
+put_histogram_p99_alarm \
+  "weelo-p3-socket-xadd-p99" \
+  "socket_adapter_xadd_ms" \
+  "500" \
+  "30" \
+  "1" \
+  "${ALARM_SNS_TOPIC_ARN}" \
+  "[P2] A13-011/T40 — socket_adapter_xadd_ms p99 > 500ms over 30s. Redis Streams XADD latency SLO breach: ElastiCache memory pressure or network latency. Check Redis metrics."
+
+echo "[T1.7+P3] Phase 1 + Phase 3 broadcast alarms configured in ${AWS_REGION}, namespace=${CW_NAMESPACE}."
+echo "[T1.7+P3] Total alarm groups: 9 baseline + 12 P3 SLO + 16 partition-depth = 37 alarms."
 echo "[T1.7] Apply dashboard:"
 echo "       aws cloudwatch put-dashboard \\"
 echo "         --dashboard-name weelo-broadcast-baseline-p1 \\"
