@@ -14,6 +14,7 @@ import { redisService } from '../../shared/services/redis.service';
 import { CreateOrderInput, TruckSelection } from './booking.schema';
 import { transporterOnlineService } from '../../shared/services/transporter-online.service';
 import { ORDER_CONFIG, TIMER_KEYS, GroupedRequests, CreateOrderResult, OrderTimerData } from './legacy-order-types';
+import { maskPhoneForLog } from '../../shared/utils/pii.utils';
 
 // =============================================================================
 // ORDER CREATION
@@ -51,15 +52,14 @@ export async function createOrder(
   // Generate IDs
   const orderId = uuid();
 
-  logger.info(`╔══════════════════════════════════════════════════════════════╗`);
-  logger.info(`║  NEW ORDER REQUEST                                           ║`);
-  logger.info(`╠══════════════════════════════════════════════════════════════╣`);
-  logger.info(`║  Order ID: ${orderId}`);
-  logger.info(`║  Customer: ${customerName} (${customerPhone})`);
-  logger.info(`║  Total Trucks: ${totalTrucks}`);
-  logger.info(`║  Total Amount: ${totalAmount}`);
-  logger.info(`║  Truck Types: ${data.trucks!.map(t => `${t.quantity}x ${t.vehicleType} ${t.vehicleSubtype}`).join(', ')}`);
-  logger.info(`╚══════════════════════════════════════════════════════════════╝`);
+  logger.info('Order request received', {
+    orderId,
+    totalTrucks,
+    totalAmount,
+    customerId,
+    customerNameInitials: customerName?.[0],
+    customerPhoneLast4: maskPhoneForLog(customerPhone)
+  });
 
   // STEP 1: Create parent Order record
   const order = await db.createOrder({
