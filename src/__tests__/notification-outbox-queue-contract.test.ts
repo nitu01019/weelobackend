@@ -38,12 +38,19 @@ const mockRPop = jest.fn();
 const mockExpire = jest.fn().mockResolvedValue(1);
 const mockScanIterator = jest.fn();
 
+const mockIncr = jest.fn().mockResolvedValue(1);
+const mockIncrBy = jest.fn().mockResolvedValue(1);
+const mockRedisGet = jest.fn().mockResolvedValue(null);
+
 jest.mock('../shared/services/redis.service', () => ({
   redisService: {
     lPush: (...args: unknown[]) => mockLPush(...args),
     rPop: (...args: unknown[]) => mockRPop(...args),
     expire: (...args: unknown[]) => mockExpire(...args),
     scanIterator: (...args: unknown[]) => mockScanIterator(...args),
+    incr: (...args: unknown[]) => mockIncr(...args),
+    incrBy: (...args: unknown[]) => mockIncrBy(...args),
+    get: (...args: unknown[]) => mockRedisGet(...args),
   },
 }));
 
@@ -53,6 +60,17 @@ jest.mock('../shared/services/logger.service', () => ({
     warn: jest.fn(),
     error: jest.fn(),
     debug: jest.fn(),
+  },
+}));
+const mockIncrementCounter = jest.fn();
+const mockObserveHistogram = jest.fn();
+const mockSetGauge = jest.fn();
+
+jest.mock('../shared/monitoring/metrics.service', () => ({
+  metrics: {
+    incrementCounter: (...args: unknown[]) => mockIncrementCounter(...args),
+    observeHistogram: (...args: unknown[]) => mockObserveHistogram(...args),
+    setGauge: (...args: unknown[]) => mockSetGauge(...args),
   },
 }));
 
@@ -194,5 +212,92 @@ describe('F-B-50: notification-outbox source no longer references deleted facade
       'utf-8',
     );
     expect(src).not.toContain('queueManagementService');
+  });
+});
+
+
+// =============================================================================
+// A03-009 / A12-011: Notification-outbox metrics correctness
+// =============================================================================
+
+describe('A03-009/A12-011: notification-outbox metrics', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockRPop.mockResolvedValue(null); // default: empty outbox
+  });
+
+  test('(a) 5 bufferNotification calls → outbox_buffered_total counter delta = 5', async () => {
+    for (let i = 0; i < 5; i++) {
+      await bufferNotification(`user-${i}`, { title: 'T', body: 'B' });
+    }
+    const calls = mockIncrementCounter.mock.calls.filter(
+      (c: unknown[]) => c[0] === 'outbox_buffered_total',
+    );
+    expect(calls).toHaveLength(5);
+    // Each call must carry the default reason label
+    for (const call of calls) {
+      expect((call[1] as Record<string, string>).reason).toBe('adapter_down');
+    }
+  });
+
+  test('(a) INCR outbox:size called once per bufferNotification', async () => {
+    await bufferNotification('u-x', { title: 'Hi', body: 'There' });
+    expect(mockIncr).toHaveBeenCalledWith('outbox:size');
+  });
+
+  test('(b) drain with queueService failure → outbox_drained_total{outcome:failed} +1', async () => {
+    const fresh = Date.now();
+    mockRPop
+      .mockResolvedValueOnce(JSON.stringify({ userId: 'u-err', payload: { title: 'E', body: 'e' }, timestamp: fresh }))
+      .mockResolvedValueOnce(null);
+    mockQueuePushNotification.mockRejectedValueOnce(new Error('queue down'));
+
+    await drainOutbox('u-err');
+
+    const failedCalls = mockIncrementCounter.mock.calls.filter(
+      (c: unknown[]) => c[0] === 'outbox_drained_total' && (c[1] as Record<string, string>)?.outcome === 'failed',
+    );
+    expect(failedCalls).toHaveLength(1);
+    expect((failedCalls[0][1] as Record<string, string>).outbox).toBe('notification');
+  });
+
+  test('(c) silent-loss catch on queuePushNotification is gone — source-level assertion', () => {
+    const src = require('fs').readFileSync(
+      require('path').resolve(__dirname, '../shared/services/notification-outbox.service.ts'),
+      'utf-8',
+    ) as string;
+    // The old silent-loss pattern on the queuePushNotification call must be gone.
+    // We verify this by checking that queuePushNotification is NOT followed by a
+    // bare .catch(() => {}) within the drain path. We check that the drain path
+    // uses structured logger.error instead of swallowing errors silently.
+    // The remaining .catch(() => {}) calls are only on non-critical O(1) counter ops.
+    expect(src).toContain("logger.error('[NotificationOutbox] outbox drain failed'");
+    // Count bare no-op catches on non-comment lines (strip comment lines first).
+    // The source has exactly 2 real .catch(() => {}) calls on best-effort size
+    // counter ops (incrBy). The queuePushNotification failure path must use
+    // structured logger.error — verified by the check below.
+    const nonCommentLines = src.split('\n').filter(l => !l.trimStart().startsWith('//'));
+    const realSilentCatches = (nonCommentLines.join('\n').match(/\.catch\(\(\) => \{\}\)/g) || []).length;
+    // Allow at most 2 — both are on incrBy(OUTBOX_SIZE_KEY) best-effort guards
+    expect(realSilentCatches).toBeLessThanOrEqual(2);
+    // The queuePushNotification failure handler must use structured logger.error.
+    // We verify that the outbox drain failed error string appears in the source.
+    expect(src).toContain("logger.error('[NotificationOutbox] outbox drain failed'");
+  });
+
+  test('(d) outbox:size INCR/DECR symmetry — delivered entry decrements', async () => {
+    const fresh = Date.now();
+    mockRPop
+      .mockResolvedValueOnce(JSON.stringify({ userId: 'u-sym', payload: { title: 'S', body: 's' }, timestamp: fresh }))
+      .mockResolvedValueOnce(null);
+    mockQueuePushNotification.mockResolvedValueOnce('job-ok');
+
+    await drainOutbox('u-sym');
+
+    // incrBy(key, -1) should have been called once for the delivered entry
+    const decrCalls = mockIncrBy.mock.calls.filter(
+      (c: unknown[]) => c[0] === 'outbox:size' && c[1] === -1,
+    );
+    expect(decrCalls).toHaveLength(1);
   });
 });

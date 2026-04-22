@@ -174,6 +174,7 @@ export async function processVehicleTransitionOutboxBatch(
         `;
         metrics.incrementCounter('vehicle_transition_outbox_processed_total', {
           result: 'success',
+          outbox: 'vehicle_transition',
         });
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
@@ -187,7 +188,7 @@ export async function processVehicleTransitionOutboxBatch(
         `;
 
         if (isDlq) {
-          metrics.incrementCounter('vehicle_transition_outbox_dlq_total');
+          metrics.incrementCounter('vehicle_transition_outbox_dlq_total', { outbox: 'vehicle_transition' });
           logger.error('[VehicleTransitionOutbox] Row exceeded max attempts — DLQ', {
             id: row.id,
             vehicleId: row.vehicleId.substring(0, 8),
@@ -197,6 +198,7 @@ export async function processVehicleTransitionOutboxBatch(
         } else {
           metrics.incrementCounter('vehicle_transition_outbox_processed_total', {
             result: 'failure',
+            outbox: 'vehicle_transition',
           });
           logger.warn('[VehicleTransitionOutbox] Retry will be attempted next poll', {
             id: row.id,
