@@ -539,12 +539,49 @@ class ConfirmedHoldService {
           }
 
           // FCM enqueue — flatten payload for FCM data constraints (mirrors truck-hold.service.ts:1647-1678)
-          const fcmData = {
+          // A05-003: nested pickup/drop + `payload` JSON blob for Captain parser. Legacy
+          // flat keys (pickupLat/pickupLng/pickupAddress/etc.) preserved per master-file
+          // guidance ("latitude ?? lat fallback intact").
+          // A03-005 synergy: farePerTruck sourced from TruckRequest.pricePerTruck (0 fallback)
+          // is already destructured above (`const farePerTruck = fullData.truckRequest?.pricePerTruck ?? 0`).
+          const fcmPickupNested = {
+            address: pickup?.address ?? '',
+            city: pickup?.city ?? '',
+            latitude: pickup?.latitude ?? pickup?.lat ?? 0,
+            longitude: pickup?.longitude ?? pickup?.lng ?? 0,
+          };
+          const fcmDropNested = {
+            address: drop?.address ?? '',
+            city: drop?.city ?? '',
+            latitude: drop?.latitude ?? drop?.lat ?? 0,
+            longitude: drop?.longitude ?? drop?.lng ?? 0,
+          };
+          const fcmPayloadObj = {
             type: 'trip_assigned',
             assignmentId: fullData.id,
             tripId: fullData.tripId,
             orderId: fullData.orderId,
             truckRequestId: fullData.truckRequestId ?? '',
+            pickup: fcmPickupNested,
+            drop: fcmDropNested,
+            vehicleNumber: fullData.vehicleNumber ?? '',
+            farePerTruck: Number(farePerTruck ?? 0),
+            distanceKm: Number(parentOrder?.distanceKm ?? 0),
+            customerName: parentOrder?.customerName ?? '',
+            customerPhone: maskPhoneForExternal(parentOrder?.customerPhone || ''),
+            assignedAt: now.toISOString(),
+            expiresAt: expiresAtIso,
+            message: `New trip assigned! ${fcmPickupNested.address || 'Pickup'} → ${fcmDropNested.address || 'Drop'}`,
+          };
+          const fcmData = {
+            payload: JSON.stringify(fcmPayloadObj),
+            type: 'trip_assigned',
+            assignmentId: fullData.id,
+            tripId: fullData.tripId,
+            orderId: fullData.orderId,
+            truckRequestId: fullData.truckRequestId ?? '',
+            pickup: JSON.stringify(fcmPickupNested),
+            drop: JSON.stringify(fcmDropNested),
             pickupAddress: pickup?.address ?? '',
             pickupCity: pickup?.city ?? '',
             pickupLat: String(pickup?.latitude ?? pickup?.lat ?? 0),
@@ -554,6 +591,7 @@ class ConfirmedHoldService {
             dropLat: String(drop?.latitude ?? drop?.lat ?? 0),
             dropLng: String(drop?.longitude ?? drop?.lng ?? 0),
             vehicleNumber: fullData.vehicleNumber ?? '',
+            farePerTruck: String(fcmPayloadObj.farePerTruck),
             distanceKm: String(parentOrder?.distanceKm ?? 0),
             customerName: parentOrder?.customerName ?? '',
             customerPhone: maskPhoneForExternal(parentOrder?.customerPhone || ''),
