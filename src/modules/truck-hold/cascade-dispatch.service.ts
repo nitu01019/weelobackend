@@ -401,6 +401,8 @@ class CascadeDispatchService {
         // FCM backup is sent regardless (below), so this just avoids unnecessary Socket emit.
         const isDriverOnline = await isUserConnectedAsync(driver.id).catch(() => false);
         if (isDriverOnline) {
+          // A03-003: anchor deadline on server epoch-ms so Captain offset-corrects the countdown.
+          const cascadeSocketDeadlineMs = Date.now() + HOLD_CONFIG.driverAcceptTimeoutMs;
           await socketService.emitToUser(driver.id, 'trip_assigned', {
             assignmentId,
             tripId,
@@ -410,9 +412,8 @@ class CascadeDispatchService {
             dropAddress: drop?.address || '',
             vehicleNumber,
             status: 'pending',
-            expiresAt: new Date(
-              Date.now() + HOLD_CONFIG.driverAcceptTimeoutMs
-            ).toISOString(),
+            expiresAt: new Date(cascadeSocketDeadlineMs).toISOString(),
+            deadlineMs: cascadeSocketDeadlineMs,
             isCascade: true,
           });
         } else {

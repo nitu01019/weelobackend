@@ -392,12 +392,15 @@ export async function reassignDriver(input: ReassignDriverInput): Promise<Reassi
   }).catch(err => logger.warn('[reassignDriver] FCM to old driver failed', err));
 
   // 8b. Notify NEW driver: new trip assigned (WebSocket + FCM)
+  // A03-003: server-authoritative deadline so Captain countdown is offset-corrected.
+  const reassignSocketDeadlineMs = Date.now() + DRIVER_ACCEPT_TIMEOUT_MS;
   emitToUser(newDriverId, SocketEvent.TRIP_ASSIGNED, {
     assignmentId: newAssignmentId,
     tripId: newTripId,
     bookingId: oldAssignment.bookingId || undefined,
     orderId: oldAssignment.orderId || undefined,
     status: 'pending',
+    deadlineMs: reassignSocketDeadlineMs,
     message: 'New trip assigned to you',
   });
 
