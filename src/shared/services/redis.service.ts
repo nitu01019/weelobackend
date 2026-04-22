@@ -1549,6 +1549,11 @@ class RedisService {
   public isDegraded: boolean = false;
   private reconnectProbeTimer: ReturnType<typeof setInterval> | null = null;
 
+  // P7-T31 / A08b-001 FIX: Boot-time capability flag for HEXPIRE command.
+  // AWS ElastiCache Serverless runs Redis 7.1 (Q2+Q3 2026 decision); HEXPIRE was
+  // added in Redis 7.4.  Probed at startup; falls back to per-entry SET lock key.
+  private hExpireSupported = true;
+
   // M-15 FIX: Environment-aware Redis key prefix.
   // Prevents key collisions when dev/staging/prod share the same Redis instance.
   // Existing keys already have semantic prefixes (geo:, transporter:, {avail:}:),
@@ -1688,6 +1693,25 @@ class RedisService {
     }
 
     this.initialized = true;
+
+    // P7-T31 capability probe: try HEXPIRE via Lua eval on a throwaway key.
+    if (this.useRedis) {
+      try {
+        await this.eval(
+          `return redis.call('HEXPIRE', KEYS[1], 1, 'FIELDS', 1, ARGV[1])`,
+          ['probe:ttl-check'],
+          ['x']
+        );
+        this.hExpireSupported = true;
+        logger.info('[Redis] HEXPIRE capability probe: SUPPORTED (Redis >= 7.4)');
+      } catch (probeErr: unknown) {
+        const probeMsg = probeErr instanceof Error ? probeErr.message : String(probeErr);
+        if (/unknown command|ERR/i.test(probeMsg)) {
+          this.hExpireSupported = false;
+          logger.warn('[Redis] HEXPIRE capability probe: NOT SUPPORTED — using SET fallback (Redis < 7.4)');
+        }
+      }
+    }
   }
 
   /**
@@ -2717,6 +2741,67 @@ class RedisService {
     } catch (e) {
       return { status: 'unhealthy', mode: this.useRedis ? 'redis' : 'memory' };
     }
+  }
+
+  // ===========================================================================
+  // ATOMIC DEQUEUE + PROCESSING HASH TRACKING  (P7-T31 / A08b-001)
+  // ===========================================================================
+
+  /**
+   * Atomically pops a job from `queueKey` and records it in `processingKey`
+   * in a single round-trip (Lua script when HEXPIRE is supported).
+   *
+   * When HEXPIRE is available (Redis >= 7.4): single Lua call — RPOP + HSET +
+   * HEXPIRE so the processing hash field self-expires after 60 s even if the
+   * process crashes without calling hDel.
+   *
+   * When HEXPIRE is unavailable (ElastiCache Serverless on Redis 7.1): falls
+   * back to a separate `SET processing:{jobId} {value} EX 60` lock key plus a
+   * plain HSET so the distributed lock provides TTL-based cleanup and the hash
+   * retains visibility for the crash-recovery path.
+   *
+   * @param queueKey      - Redis LIST key (RPOP source)
+   * @param processingKey - Redis HASH key where in-flight jobs are tracked
+   * @param jobId         - Hash field name (job identifier)
+   * @returns The dequeued serialised job string, or null if the list was empty.
+   */
+  async atomicDequeueAndTrack(
+    queueKey: string,
+    processingKey: string,
+    jobId: string
+  ): Promise<string | null> {
+    if (this.hExpireSupported) {
+      const luaWithHExpire = `
+        local v = redis.call('RPOP', KEYS[1])
+        if v then
+          redis.call('HSET', KEYS[2], ARGV[1], v)
+          redis.call('HEXPIRE', KEYS[2], 60, 'FIELDS', 1, ARGV[1])
+        end
+        return v
+      `;
+      try {
+        const result = await this.eval(luaWithHExpire, [queueKey, processingKey], [jobId]);
+        return typeof result === 'string' ? result : null;
+      } catch (err: unknown) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        if (/unknown command|ERR/i.test(errMsg)) {
+          this.hExpireSupported = false;
+          logger.warn('[Redis] HEXPIRE rejected at runtime — downgrading to SET fallback', { error: errMsg });
+          return this.atomicDequeueAndTrack(queueKey, processingKey, jobId);
+        }
+        throw err;
+      }
+    }
+
+    // Fallback: two-key pattern when HEXPIRE is unavailable.
+    const value = await this.rPop(queueKey);
+    if (value === null) return null;
+    const lockKey = `processing:${jobId}`;
+    await Promise.all([
+      this.client.set(lockKey, value, 60),          // TTL-bearing lock key
+      this.hSet(processingKey, jobId, value),        // visibility hash
+    ]);
+    return value;
   }
 
   // ===========================================================================

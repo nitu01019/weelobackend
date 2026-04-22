@@ -19,6 +19,12 @@ export class RedisService {
   // only calls pg_advisory_unlock for locks this process owns.
   private pgAdvisoryLocks = new Set<string>();
 
+  // P7-T31 / A08b-001 FIX: Boot-time capability flag for HEXPIRE command.
+  // AWS ElastiCache Serverless runs Redis 7.1 (as of Q2+Q3 2026 decision); HEXPIRE
+  // was added in Redis 7.4.  We probe at startup and fall back to a per-entry SET
+  // lock key if the command is unavailable.
+  private hExpireSupported = true;
+
   /**
    * #55 FIX: Safe JSON.stringify that handles circular references.
    * Returns '[Circular]' for back-references instead of throwing.
@@ -129,6 +135,31 @@ export class RedisService {
     }
 
     this.initialized = true;
+
+    // P7-T31 capability probe: try HEXPIRE on a throwaway key.
+    // If the command is unknown (Redis < 7.4) set hExpireSupported = false so
+    // atomicDequeueAndTrack uses the per-entry SET fallback path instead.
+    if (this.useRedis) {
+      try {
+        // HEXPIRE <key> <seconds> FIELDS <count> <field>
+        // We pass a non-existent key — the command itself succeeding means the
+        // server understands the syntax (return value of -2 = key not found, fine).
+        await this.client.eval(
+          `return redis.call('HEXPIRE', KEYS[1], 1, 'FIELDS', 1, ARGV[1])`,
+          ['probe:ttl-check'],
+          ['x']
+        );
+        this.hExpireSupported = true;
+        logger.info('[Redis] HEXPIRE capability probe: SUPPORTED (Redis >= 7.4)');
+      } catch (probeErr: unknown) {
+        const msg = probeErr instanceof Error ? probeErr.message : String(probeErr);
+        if (/unknown command|ERR/i.test(msg)) {
+          this.hExpireSupported = false;
+          logger.warn('[Redis] HEXPIRE capability probe: NOT SUPPORTED — using SET fallback (Redis < 7.4)');
+        }
+        // Any other error (transient) — leave hExpireSupported = true and retry naturally
+      }
+    }
   }
 
   isRedisEnabled(): boolean {
@@ -934,5 +965,72 @@ export class RedisService {
     logger.info('[Redis] Shutting down...');
     this.stopReconnectProbe();
     await this.client.disconnect();
+  }
+
+  // ===========================================================================
+  // ATOMIC DEQUEUE + PROCESSING HASH TRACKING  (P7-T31 / A08b-001)
+  // ===========================================================================
+
+  /**
+   * Atomically pops a job from `queueKey` and records it in `processingKey`
+   * in a single round-trip (Lua script).
+   *
+   * When the Redis server supports HEXPIRE (Redis >= 7.4) a per-field TTL of
+   * 60 s is set on the hash field so stale in-flight markers self-clean even if
+   * the process crashes without calling hDel.
+   *
+   * When HEXPIRE is unavailable (ElastiCache Serverless on Redis 7.1) we fall
+   * back to a separate `SET processing:{jobId} {value} EX 60` lock key plus a
+   * plain HSET so the distributed lock still provides TTL-based cleanup while
+   * the hash is updated for crash-recovery visibility.
+   *
+   * @param queueKey      - Redis LIST key (RPOP source)
+   * @param processingKey - Redis HASH key where in-flight jobs are tracked
+   * @param jobId         - Hash field name (job identifier)
+   * @returns The dequeued serialised job string, or null if the list was empty.
+   */
+  async atomicDequeueAndTrack(
+    queueKey: string,
+    processingKey: string,
+    jobId: string
+  ): Promise<string | null> {
+    if (this.hExpireSupported) {
+      // Single Lua round-trip: RPOP + HSET + HEXPIRE
+      const luaWithHExpire = `
+        local v = redis.call('RPOP', KEYS[1])
+        if v then
+          redis.call('HSET', KEYS[2], ARGV[1], v)
+          redis.call('HEXPIRE', KEYS[2], 60, 'FIELDS', 1, ARGV[1])
+        end
+        return v
+      `;
+      try {
+        const result = await this.client.eval(luaWithHExpire, [queueKey, processingKey], [jobId]);
+        return typeof result === 'string' ? result : null;
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/unknown command|ERR/i.test(msg)) {
+          // Runtime downgrade: the probe succeeded but the command was rejected
+          // (e.g. version mismatch between probe cluster node and data node).
+          this.hExpireSupported = false;
+          logger.warn('[Redis] HEXPIRE rejected at runtime — downgrading to SET fallback', { error: msg });
+          return this.atomicDequeueAndTrack(queueKey, processingKey, jobId);
+        }
+        throw err;
+      }
+    }
+
+    // Fallback: two-key pattern — SET lock key (provides TTL) + HSET for visibility.
+    // RPOP is non-atomic with the HSET pair, but the processing-hash recovery logic
+    // on startup re-enqueues any entry whose lock key has already expired, so the
+    // worst-case duplicated delivery is safe given idempotent job processors.
+    const value = await this.client.rPop(queueKey);
+    if (value === null) return null;
+    const lockKey = `processing:${jobId}`;
+    await Promise.all([
+      this.client.set(lockKey, value, 60),                       // TTL-bearing lock key
+      this.client.hSet(processingKey, jobId, value),             // visibility hash
+    ]);
+    return value;
   }
 }
