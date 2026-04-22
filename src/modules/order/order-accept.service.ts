@@ -528,6 +528,10 @@ export async function acceptTruckRequest(
   }
 
   // ============== NOTIFY DRIVER ==============
+  // A12-008 / A09-001: DPDP Act 2023 S.5(b) — customerName removed from pre-accept
+  // socket trip_assigned payload; customerPhone masked via maskPhoneForExternal
+  // instead of raw value. Customer identity revealed only post-accept via
+  // GET /assignment/{id}/pickup-details.
   const driverNotification = {
     type: 'trip_assigned',
     assignmentId,
@@ -539,8 +543,7 @@ export async function acceptTruckRequest(
     vehicleNumber,
     farePerTruck: truckRequestPricePerTruck,
     distanceKm: orderDistanceKm,
-    customerName: orderCustomerName,
-    customerPhone: orderCustomerPhone,
+    customerPhone: maskPhoneForExternal(orderCustomerPhone || ''),
     assignedAt: now,
     message: `New trip assigned! ${orderPickup.address} → ${orderDrop.address}`
   };
