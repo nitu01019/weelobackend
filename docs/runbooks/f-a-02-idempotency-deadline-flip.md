@@ -312,3 +312,160 @@ If post-flip 400 rate spikes (>1% of `POST /api/v1/orders` returning MISSING_IDE
 | Go/No-go decision | | | | |
 | Flip executed | | | | |
 | T+24h post-flip clean | | | | |
+
+---
+
+## cert-pin rotation
+
+**Owner:** Mobile/Backend SRE
+**Applies to:** Captain app (Android) — `RetrofitClient.kt` + `SocketConnectionManager.kt`
+**Finding:** A15-008 — TLS/Certificate pinning migration
+**Last updated:** 2026-04-23
+
+### Overview
+
+The Captain app uses OkHttp `CertificatePinner` (MASVS-NETWORK-1) to pin the production ALB's
+public-key fingerprint. Pins are injected at build time via `CERT_PIN_PRIMARY` /
+`CERT_PIN_BACKUP` in `local.properties` (local dev) or CI environment variables.
+Placeholder values `AAAA...=` / `BBBB...=` ship in the repo; they are detected at boot
+and rejected in release builds.
+
+---
+
+### 1. CSR → ACM certificate issuance sequence
+
+1. Generate a new private key and CSR on your workstation (or via ACM managed certificate):
+   ```bash
+   openssl req -newkey rsa:2048 -keyout new_server.key -out new_server.csr \
+     -subj "/CN=weelo-alb-380596483.ap-south-1.elb.amazonaws.com"
+   ```
+2. Request certificate in ACM:
+   ```bash
+   aws acm request-certificate \
+     --domain-name weelo-alb-380596483.ap-south-1.elb.amazonaws.com \
+     --validation-method DNS \
+     --region ap-south-1
+   ```
+3. Add the DNS validation CNAME record from ACM to your hosted zone.
+4. Wait for ACM status `ISSUED`.
+5. Attach the ACM certificate ARN to the ALB HTTPS listener (port 443):
+   ```bash
+   aws elbv2 add-listener-certificates \
+     --listener-arn <https-listener-arn> \
+     --certificates CertificateArn=<acm-cert-arn> \
+     --region ap-south-1
+   ```
+
+---
+
+### 2. Computing the SPKI SHA-256 pin
+
+Given the leaf certificate PEM from ACM (or downloaded via `openssl s_client`):
+
+```bash
+# Step 1 — download the current server cert
+openssl s_client -connect weelo-alb-380596483.ap-south-1.elb.amazonaws.com:443 \
+  -servername weelo-alb-380596483.ap-south-1.elb.amazonaws.com \
+  -showcerts 2>/dev/null </dev/null | \
+  openssl x509 -outform PEM > server_leaf.pem
+
+# Step 2 — extract the SPKI and hash it
+openssl x509 -pubkey -in server_leaf.pem -noout \
+  | openssl rsa -pubin -outform DER \
+  | openssl dgst -sha256 -binary \
+  | base64
+```
+
+The output is your `CERT_PIN_PRIMARY` value (e.g. `abc123...xyz=`).
+
+Repeat for the backup/intermediate certificate to get `CERT_PIN_BACKUP`.
+
+---
+
+### 3. Adding the backup pin two weeks before expiry
+
+ACM certificates auto-renew, but SPKI pins are tied to the **key pair**, not the certificate.
+If you rotate the key (new CSR), you get a new SPKI and must update the pin before the old
+certificate expires.
+
+Timeline:
+- **T-14 days:** Compute new SPKI pin. Add it as the *backup* pin in a Captain app release:
+  - Update `CERT_PIN_BACKUP=<new-pin>` in CI env / `local.properties`.
+  - Ship Captain app release to Play Store internal track → production track.
+- **T-0:** Rotate the ALB certificate to use the new key pair.
+- **T+7 days (post-soak):** Update `CERT_PIN_PRIMARY=<new-pin>`, clear `CERT_PIN_BACKUP` (or set to next-next backup).
+- Ship another Captain app release. Monitor for `cert_pin_active_total` log line in CloudWatch.
+
+---
+
+### 4. Rollback via FF_CERT_PINNING_ENABLED killswitch
+
+If pinning causes unexpected SSL errors (e.g., ALB cert rotated unexpectedly):
+
+1. **Immediate (no APK ship needed):** Toggle the remote killswitch via ADB or backend-pushed
+   SharedPrefs update (key `"ff_cert_pinning_enabled"` in SharedPrefs file `"weelo_prefs"`).
+   Setting the value to `false` disables `CertificatePinner` attachment without requiring a
+   new APK:
+   ```bash
+   # Via adb on a debug build:
+   adb shell am broadcast -a com.weelo.logistics.SET_FF \
+     --es key ff_cert_pinning_enabled --ez value false \
+     com.weelo.captain
+   ```
+   (Requires a broadcast receiver wired to the flag — if not yet wired, use Play Store
+   staged rollout to push a hotfix APK with `CERT_PIN_PRIMARY` and `CERT_PIN_BACKUP` updated.)
+
+2. **If the killswitch is not wired:** Ship a hotfix APK with the new pin values in CI env.
+   The existing `ENABLE_CERTIFICATE_PINNING` constant in `Constants.kt` also gates the pinner
+   globally; setting it to `false` (compile-time) disables all pinning for a build.
+
+3. **Post-rollback:** File an incident postmortem and schedule a re-rotation within 7 days.
+
+---
+
+### 5. HSTS staged rollout note
+
+**Handled by backend (P4-D), not by this runbook.** Summary for reference:
+
+- **Phase 1 (staging / canary):** Backend sets `Strict-Transport-Security: max-age=300`
+  (5 minutes) to limit blast radius of misconfiguration.
+- **Phase 2 (after 1-week prod soak with no HTTPS issues):** Raise to
+  `Strict-Transport-Security: max-age=31536000; includeSubDomains`.
+- Do NOT set `preload` until the domain is registered in the HSTS preload list
+  (`https://hstspreload.org`). Premature preload is very hard to undo.
+
+Verify the header is present:
+```bash
+curl -I https://weelo-alb-380596483.ap-south-1.elb.amazonaws.com/api/v1/health \
+  | grep -i strict-transport
+```
+
+---
+
+### 6. Placeholder pin replacement procedure (pre-first-prod-release checklist)
+
+Before the first production release of the Captain app with certificate pinning enabled:
+
+- [ ] ALB HTTPS listener active with ACM certificate (port 443 responding with valid TLS).
+- [ ] `CERT_PIN_PRIMARY` computed via the openssl pipeline in §2 above.
+- [ ] `CERT_PIN_BACKUP` computed from the intermediate CA or pre-generated backup key.
+- [ ] Both values added to CI environment variables AND `local.properties` (gitignored).
+- [ ] `./gradlew :app:assembleRelease` produces APK with non-placeholder pins.
+- [ ] Boot-time `validateCertPinsAtBoot()` in `RetrofitClient.init()` passes (no crash on
+  startup in staging build).
+- [ ] `curl --pinnedpubkey "sha256///<PRIMARY_PIN>"` against the ALB returns 200 OK.
+- [ ] Play Store internal track soak for 48 hours before promoting to production track.
+
+---
+
+### 7. References
+
+- Captain app: `app/src/main/java/com/weelo/logistics/data/remote/RetrofitClient.kt`
+  (`validateCertPinsAtBoot`, `certificatePinner`, `isCertPinningKillswitchActive`)
+- Captain app: `app/src/main/java/com/weelo/logistics/data/remote/socket/SocketConnectionManager.kt`
+  (WSS via `Constants.API.WS_URL`; OkHttpClient injected via `IO.Options.callFactory`)
+- Captain app: `app/src/main/res/xml/network_security_config.xml`
+  (NSC pin-set placeholders; OkHttp CertificatePinner is the enforcement layer)
+- Captain app: `app/build.gradle.kts` (`CERT_PIN_PRIMARY`, `CERT_PIN_BACKUP` buildConfigFields)
+- MASVS-NETWORK-1: https://mas.owasp.org/MASVS/controls/MASVS-NETWORK-1/
+- OkHttp CertificatePinner: https://square.github.io/okhttp/4.x/okhttp/okhttp3/-certificate-pinner/
