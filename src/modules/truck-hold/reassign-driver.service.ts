@@ -30,6 +30,7 @@ import { invalidateVehicleCache } from '../../shared/services/fleet-cache-write.
 // State machine imports available if needed for future transition validation
 // import { ASSIGNMENT_VALID_TRANSITIONS, TERMINAL_ASSIGNMENT_STATUSES } from '../../core/state-machines';
 import { HOLD_CONFIG } from '../../core/config/hold-config';
+import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
 
 // =============================================================================
 // CONSTANTS
@@ -400,19 +401,122 @@ export async function reassignDriver(input: ReassignDriverInput): Promise<Reassi
     message: 'New trip assigned to you',
   });
 
+  // A05-003: FCM trip_assigned payload — nested pickup/drop + `payload` JSON blob for Captain parser.
+  // A09-001: pre-accept producer site — customerName omitted (DPDP data minimisation).
+  // Load pickup/drop/distanceKm/customerPhone/pricePerTruck from booking or order
+  // (whichever is referenced by oldAssignment). Single read; non-fatal if missing.
+  let fcmPickup = { address: '', city: '', latitude: 0, longitude: 0 };
+  let fcmDrop = { address: '', city: '', latitude: 0, longitude: 0 };
+  let fcmDistanceKm = 0;
+  let fcmFarePerTruck = 0;
+  let fcmCustomerPhoneMasked = '';
+  try {
+    if (oldAssignment.orderId) {
+      const order = await prismaClient.order.findUnique({
+        where: { id: oldAssignment.orderId },
+        select: { pickup: true, drop: true, distanceKm: true, customerPhone: true },
+      });
+      if (order) {
+        const pickupRaw = (order.pickup as Record<string, unknown>) || {};
+        const dropRaw = (order.drop as Record<string, unknown>) || {};
+        fcmPickup = {
+          address: (pickupRaw.address as string) ?? '',
+          city: (pickupRaw.city as string) ?? '',
+          latitude: (pickupRaw.latitude as number) ?? (pickupRaw.lat as number) ?? 0,
+          longitude: (pickupRaw.longitude as number) ?? (pickupRaw.lng as number) ?? 0,
+        };
+        fcmDrop = {
+          address: (dropRaw.address as string) ?? '',
+          city: (dropRaw.city as string) ?? '',
+          latitude: (dropRaw.latitude as number) ?? (dropRaw.lat as number) ?? 0,
+          longitude: (dropRaw.longitude as number) ?? (dropRaw.lng as number) ?? 0,
+        };
+        fcmDistanceKm = Number(order.distanceKm ?? 0);
+        fcmCustomerPhoneMasked = maskPhoneForExternal(order.customerPhone || '');
+      }
+      if (oldAssignment.truckRequestId) {
+        const tr = await prismaClient.truckRequest.findUnique({
+          where: { id: oldAssignment.truckRequestId },
+          select: { pricePerTruck: true },
+        });
+        fcmFarePerTruck = Number(tr?.pricePerTruck ?? 0);
+      }
+    } else if (oldAssignment.bookingId) {
+      const booking = await prismaClient.booking.findUnique({
+        where: { id: oldAssignment.bookingId },
+        select: { pickup: true, drop: true, distanceKm: true, customerPhone: true, pricePerTruck: true },
+      });
+      if (booking) {
+        const pickupRaw = (booking.pickup as Record<string, unknown>) || {};
+        const dropRaw = (booking.drop as Record<string, unknown>) || {};
+        fcmPickup = {
+          address: (pickupRaw.address as string) ?? '',
+          city: (pickupRaw.city as string) ?? '',
+          latitude: (pickupRaw.latitude as number) ?? (pickupRaw.lat as number) ?? 0,
+          longitude: (pickupRaw.longitude as number) ?? (pickupRaw.lng as number) ?? 0,
+        };
+        fcmDrop = {
+          address: (dropRaw.address as string) ?? '',
+          city: (dropRaw.city as string) ?? '',
+          latitude: (dropRaw.latitude as number) ?? (dropRaw.lat as number) ?? 0,
+          longitude: (dropRaw.longitude as number) ?? (dropRaw.lng as number) ?? 0,
+        };
+        fcmDistanceKm = Number(booking.distanceKm ?? 0);
+        fcmFarePerTruck = Number(booking.pricePerTruck ?? 0);
+        fcmCustomerPhoneMasked = maskPhoneForExternal(booking.customerPhone || '');
+      }
+    }
+  } catch (loadErr) {
+    logger.warn('[reassignDriver] Failed to load pickup/drop for FCM payload (non-fatal)', {
+      assignmentId: newAssignmentId,
+      error: loadErr instanceof Error ? loadErr.message : String(loadErr),
+    });
+  }
+
+  const reassignAssignedAt = new Date().toISOString();
+  const reassignExpiresAt = new Date(Date.now() + DRIVER_ACCEPT_TIMEOUT_MS).toISOString();
+  const reassignPayloadObj = {
+    type: 'trip_assigned',
+    assignmentId: newAssignmentId,
+    tripId: newTripId,
+    orderId: oldAssignment.orderId || '',
+    truckRequestId: oldAssignment.truckRequestId || '',
+    bookingId: oldAssignment.bookingId || '',
+    pickup: fcmPickup,
+    drop: fcmDrop,
+    vehicleNumber: oldAssignment.vehicleNumber,
+    farePerTruck: fcmFarePerTruck,
+    distanceKm: fcmDistanceKm,
+    customerPhone: fcmCustomerPhoneMasked,
+    assignedAt: reassignAssignedAt,
+    expiresAt: reassignExpiresAt,
+    isReassigned: true,
+    message: `New trip assigned! ${fcmPickup.address || 'Pickup'} → ${fcmDrop.address || 'Drop'}`,
+  };
+
   queueService.queuePushNotification(newDriverId, {
     title: 'New Trip Assigned!',
     body: `Trip for ${oldAssignment.vehicleNumber}. Accept within ${DRIVER_ACCEPT_TIMEOUT_MS / 1000} seconds.`,
     priority: 'high', // W0-1: top-level priority drives FCM android.priority; data.priority retained for Android-side client compat.
     data: {
+      payload: JSON.stringify(reassignPayloadObj),
       type: 'trip_assigned',
       priority: 'high', // Android-side priority via data map per FCM SDK contract
       assignmentId: newAssignmentId,
       tripId: newTripId,
       bookingId: oldAssignment.bookingId || '',
       orderId: oldAssignment.orderId || '',
+      truckRequestId: oldAssignment.truckRequestId || '',
+      pickup: JSON.stringify(fcmPickup),
+      drop: JSON.stringify(fcmDrop),
       vehicleNumber: oldAssignment.vehicleNumber,
       vehicleType: oldAssignment.vehicleType || '',
+      farePerTruck: String(fcmFarePerTruck),
+      distanceKm: String(fcmDistanceKm),
+      customerPhone: fcmCustomerPhoneMasked,
+      assignedAt: reassignAssignedAt,
+      expiresAt: reassignExpiresAt,
+      isReassigned: 'true',
       status: 'trip_assigned',
     },
   }).catch(err => logger.warn('[reassignDriver] FCM to new driver failed', err));
