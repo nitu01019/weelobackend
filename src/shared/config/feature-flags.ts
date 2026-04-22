@@ -531,6 +531,25 @@ export const FLAGS = {
     defaultValue: false,
   },
 
+  // --- W3 A03-004 / A13-005: Trip-assigned fan-out outbox ---
+  // When ON, confirmed-hold initialize writes one OrderLifecycleOutbox row per
+  // driver INSIDE the phase-flip transaction so a process crash between tx
+  // commit (line 369) and the post-commit per-driver socket emit + FCM enqueue
+  // loop (~line 472-577) no longer silently drops driver notifications — the
+  // poller replays the fan-out via dispatchTripAssignedFanoutFromOutbox. On
+  // fast-path success, rows are marked 'dispatched' post-commit so the poller
+  // stays idle unless a crash occurs. When OFF: legacy fire-and-forget loop
+  // runs post-commit exactly as before (fallback preserved for soak-safe rollout).
+  // Default OFF — flip ON after the staging soak confirms dispatcher+producer
+  // agreement and the poller's SKIP LOCKED + lockedAt staleness reclaim path
+  // behaves as expected under load.
+  TRIP_ASSIGNED_FANOUT_OUTBOX_ENABLED: {
+    env: 'FF_TRIP_ASSIGNED_FANOUT_OUTBOX_ENABLED',
+    category: 'release' as const,
+    description: 'Durable-outbox post-commit trip_assigned socket+FCM fanout on confirmed-hold init (A03-004/A13-005)',
+    defaultValue: false,
+  },
+
   // --- F-A-40: Truck-route avoid=highways|tolls legacy gate ---
   // The original code always appended avoid=highways|tolls for truckMode=true.
   // That is INVERTED for Indian trucking: NH/expressways + FASTag tolls are

@@ -366,7 +366,98 @@ class ConfirmedHoldService {
           });
         }
 
-        return { success: true as const, updated, now, confirmedExpiresAt, assignmentsData };
+        // W3 A03-004/A13-005: durable post-commit trip_assigned fan-out via
+        // OrderLifecycleOutbox. When OFF, the legacy fire-and-forget fanout loop
+        // (~line 472-577) runs post-commit unchanged. When ON, one row per driver
+        // is written INSIDE this tx so a process crash between commit and the
+        // fanout loop cannot silently drop driver notifications — the poller
+        // replays via dispatchTripAssignedFanoutFromOutbox (W3-T07). Fast-path
+        // success marks the rows 'dispatched' post-commit so the poller stays
+        // idle unless a crash occurs. Gated OFF by default for soak-safe rollout.
+        const fanoutOutboxIds: string[] = [];
+        if (isEnabled(FLAGS.TRIP_ASSIGNED_FANOUT_OUTBOX_ENABLED)) {
+          // Fetch parent order's customer/pickup/drop context inside tx so the
+          // outbox row carries all fields needed by the dispatcher replay
+          // (see order-types.ts TripAssignedFanoutPayload). A tx-scoped fetch
+          // is required because the post-commit parentOrder read at line ~454
+          // runs AFTER the tx is already released — it cannot inform an
+          // inside-tx write.
+          const fanoutParentOrder = await tx.order.findUnique({
+            where: { id: updated.orderId },
+            select: {
+              id: true,
+              pickup: true,
+              drop: true,
+              distanceKm: true,
+              customerName: true,
+              customerPhone: true,
+            },
+          });
+          const fanoutPickup = (fanoutParentOrder?.pickup as any) || {};
+          const fanoutDrop = (fanoutParentOrder?.drop as any) || {};
+          const fanoutExpiresAtIso = new Date(
+            now.getTime() + this.config.driverAcceptTimeoutSeconds * 1000
+          ).toISOString();
+          const fanoutAssignedAtIso = now.toISOString();
+
+          for (const assignment of assignmentsData) {
+            const assignmentFare = assignment.truckRequest?.pricePerTruck ?? 0;
+            const fanoutPayload = {
+              type: 'trip_assigned_fanout' as const,
+              orderId: assignment.orderId ?? updated.orderId,
+              tripId: assignment.tripId,
+              assignmentId: assignment.id,
+              driverId: assignment.driverId,
+              transporterId: assignment.transporterId,
+              bookingId: assignment.bookingId,
+              truckRequestId: assignment.truckRequestId,
+              pickup: {
+                latitude: Number(fanoutPickup?.latitude ?? fanoutPickup?.lat ?? 0) || 0,
+                longitude: Number(fanoutPickup?.longitude ?? fanoutPickup?.lng ?? 0) || 0,
+                address: typeof fanoutPickup?.address === 'string' ? fanoutPickup.address : '',
+                city: typeof fanoutPickup?.city === 'string' ? fanoutPickup.city : undefined,
+              },
+              drop: {
+                latitude: Number(fanoutDrop?.latitude ?? fanoutDrop?.lat ?? 0) || 0,
+                longitude: Number(fanoutDrop?.longitude ?? fanoutDrop?.lng ?? 0) || 0,
+                address: typeof fanoutDrop?.address === 'string' ? fanoutDrop.address : '',
+                city: typeof fanoutDrop?.city === 'string' ? fanoutDrop.city : undefined,
+              },
+              farePerTruck: Number(assignmentFare ?? 0) || 0,
+              distanceKm: typeof fanoutParentOrder?.distanceKm === 'number' ? fanoutParentOrder.distanceKm : null,
+              vehicleNumber: assignment.vehicleNumber ?? null,
+              vehicleType: assignment.vehicleType ?? null,
+              customerName: fanoutParentOrder?.customerName ?? '',
+              // MASK AT PRODUCER — parser does NOT re-mask. maskPhoneForExternal
+              // is already imported in this file (line 46) and used by the
+              // post-commit fanout loop below (line 519/573/599). Reuse here
+              // so the persisted row is byte-identical to the fast-path emission.
+              customerPhone: maskPhoneForExternal(fanoutParentOrder?.customerPhone || ''),
+              assignedAt: fanoutAssignedAtIso,
+              expiresAt: fanoutExpiresAtIso,
+              message: `New trip assigned! ${fanoutPickup?.address ?? ''} → ${fanoutDrop?.address ?? ''}`,
+              eventId: uuidv4(),
+              eventVersion: 1,
+              serverTimeMs: now.getTime(),
+            };
+            const outboxId = uuidv4();
+            await tx.orderLifecycleOutbox.create({
+              data: {
+                id: outboxId,
+                orderId: assignment.orderId ?? updated.orderId,
+                eventType: 'trip_assigned_fanout',
+                payload: fanoutPayload as unknown as Prisma.InputJsonValue,
+                status: 'pending',
+                attempts: 0,
+                maxAttempts: 10,
+                nextRetryAt: now,
+              },
+            });
+            fanoutOutboxIds.push(outboxId);
+          }
+        }
+
+        return { success: true as const, updated, now, confirmedExpiresAt, assignmentsData, fanoutOutboxIds };
       }, {
         isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
         timeoutMs: 10_000,
@@ -395,7 +486,7 @@ class ConfirmedHoldService {
       // P4 F2.2: assignmentsData now flows out of the same tx that did the ledger
       // flip + truck-request FOR UPDATE, so fanout below always runs against the
       // transporter-scoped view the tx validated (no post-commit re-fetch leak).
-      const { updated, now, confirmedExpiresAt, assignmentsData } = txResult as {
+      const { updated, now, confirmedExpiresAt, assignmentsData, fanoutOutboxIds } = txResult as {
         success: true;
         updated: { orderId: string; transporterId: string; quantity: number };
         now: Date;
@@ -414,6 +505,9 @@ class ConfirmedHoldService {
           truckRequestId: string | null;
           truckRequest: { pricePerTruck: number } | null;
         }>;
+        // W3 A03-004/A13-005: ids of trip_assigned_fanout rows written inside tx
+        // when FLAGS.TRIP_ASSIGNED_FANOUT_OUTBOX_ENABLED is ON. Empty when flag OFF.
+        fanoutOutboxIds: string[];
       };
 
       // Cache state
@@ -627,6 +721,33 @@ class ConfirmedHoldService {
 
       if (missingIds.length > 0) {
         logger.warn('[CONFIRMED HOLD] Some assignments not found', { missingIds });
+      }
+
+      // W3 A03-004/A13-005: fast-path succeeded for all drivers — mark the
+      // trip_assigned_fanout outbox rows as 'dispatched' so the poller stays
+      // idle. On failure here, the rows remain 'pending' and the poller reclaims
+      // after lockedAt staleness (120s), replaying via dispatchTripAssignedFanoutFromOutbox.
+      // The updateMany itself is best-effort — failing to mark-dispatched means
+      // the poller may emit a duplicate socket + FCM, but client-side dedup
+      // (_seq ZSET for socket, collapseKey for FCM) absorbs that.
+      if (fanoutOutboxIds.length > 0) {
+        try {
+          await prismaClient.orderLifecycleOutbox.updateMany({
+            where: { id: { in: fanoutOutboxIds } },
+            data: {
+              status: 'dispatched',
+              processedAt: new Date(),
+              lockedAt: null,
+            },
+          });
+        } catch (markErr: unknown) {
+          const errorMessage = markErr instanceof Error ? markErr.message : String(markErr);
+          logger.warn('[CONFIRMED HOLD] failed to mark trip_assigned_fanout rows dispatched (non-fatal; poller will reclaim)', {
+            holdId,
+            rowCount: fanoutOutboxIds.length,
+            error: errorMessage,
+          });
+        }
       }
 
       logger.info('[CONFIRMED HOLD] Confirmed hold initialized', {
