@@ -42,6 +42,56 @@ const startTime = Date.now();
 // even if Redis isn't connected yet (ECS tasks need time to initialize)
 const STARTUP_GRACE_MS = 15_000;
 
+// =============================================================================
+// A04-006 + A04-004 — /health/ready performance gates (Envoy circuit-breaker)
+//
+// 503 = ALB stops routing NEW connections to this pod immediately.
+// Existing WebSocket sessions continue; Socket.IO drains gracefully once the
+// ALB listener removes the target from its healthy set.  We do NOT call
+// process.exit() here — healthy pods absorb the redirected traffic and this
+// pod recovers on its own once the stall clears.
+//
+// Gate 1 (A04-006): XADD p99 > 500 ms sustained for 30 s
+//   Redis Streams XADD backs every cross-pod socket fanout.  When it stalls
+//   >500 ms at p99 for a full 30 s window the pod is a broadcast black-hole;
+//   the ALB should stop sending new users here.
+//
+// Gate 2 (A04-004): Node.js event-loop p99 > 50 ms sustained for 2 min
+//   A blocked event loop means all I/O (DB, Redis, HTTP) is serialised behind
+//   CPU-heavy work.  At >50 ms p99 the pod degrades all tenants; shedding
+//   keeps other pods healthy while this one recovers (GC, JIT warm-up, etc.).
+// =============================================================================
+
+// --- Ring buffer: 6 slots × 5-second samples = 30-second rolling window ---
+const XADD_RING_SIZE = 6;       // 6 × 5 s = 30 s
+const XADD_SAMPLE_INTERVAL_MS = 5_000;
+const XADD_P99_THRESHOLD_MS = 500;
+
+const EL_RING_SIZE = 24;        // 24 × 5 s = 120 s (2 min)
+const EL_P99_THRESHOLD_MS = 50;
+
+// Circular buffers storing the most-recent p99 sample per slot.
+// null = slot not yet filled.
+const xaddRing: (number | null)[] = new Array(XADD_RING_SIZE).fill(null);
+const elRing: (number | null)[] = new Array(EL_RING_SIZE).fill(null);
+let xaddRingIdx = 0;
+let elRingIdx = 0;
+
+// Sample the metrics every 5 s and advance the ring buffers.
+setInterval(() => {
+  xaddRing[xaddRingIdx] = metrics.getHistogramP99('socket_adapter_xadd_ms');
+  xaddRingIdx = (xaddRingIdx + 1) % XADD_RING_SIZE;
+
+  elRing[elRingIdx] = metrics.getGaugeValue('nodejs_eventloop_lag_ms');
+  elRingIdx = (elRingIdx + 1) % EL_RING_SIZE;
+}, XADD_SAMPLE_INTERVAL_MS).unref(); // .unref() so the timer does not keep the process alive in tests
+
+/** Returns true when every filled slot in the ring exceeds the threshold. */
+function ringAllAbove(ring: (number | null)[], threshold: number): boolean {
+  const filled = ring.filter((v): v is number => v !== null);
+  return filled.length > 0 && filled.every(v => v > threshold);
+}
+
 // Phase 10: Import shutdown flag from server.ts
 // Uses lazy require to avoid circular dependency
 // Handles both variable (boolean) and function (() => boolean) exports
@@ -176,6 +226,28 @@ router.get('/health/ready', async (_req: Request, res: Response) => {
       checks.socketPubSub = adapterStatus.enabled || adapterStatus.mode === 'disabled_by_capability';
     } else {
       checks.socketPubSub = true;
+    }
+
+    // -------------------------------------------------------------------------
+    // A04-006: XADD p99 gate
+    // Kill-switch: HEALTH_READY_XADD_GATE_ENABLED=false disables this gate.
+    // -------------------------------------------------------------------------
+    const xaddGateEnabled = process.env.HEALTH_READY_XADD_GATE_ENABLED !== 'false';
+    if (xaddGateEnabled) {
+      checks.xaddP99 = !ringAllAbove(xaddRing, XADD_P99_THRESHOLD_MS);
+    } else {
+      checks.xaddP99 = true;
+    }
+
+    // -------------------------------------------------------------------------
+    // A04-004: Event-loop p99 gate
+    // Kill-switch: HEALTH_READY_EVENTLOOP_GATE_ENABLED=false disables this gate.
+    // -------------------------------------------------------------------------
+    const elGateEnabled = process.env.HEALTH_READY_EVENTLOOP_GATE_ENABLED !== 'false';
+    if (elGateEnabled) {
+      checks.eventloopP99 = !ringAllAbove(elRing, EL_P99_THRESHOLD_MS);
+    } else {
+      checks.eventloopP99 = true;
     }
 
     // Determine overall status
