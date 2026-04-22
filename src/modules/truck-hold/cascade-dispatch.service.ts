@@ -38,6 +38,9 @@ import { queueService } from '../../shared/services/queue.service';
 import { HOLD_CONFIG } from '../../core/config/hold-config';
 import { getErrorMessage } from '../../shared/utils/error.utils';
 import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
+// P6-T15 (A03-012): import single-source helper directly from confirmed-hold.service
+// (NOT via barrel) — same reasoning as reassign-driver.service.ts (A03-011).
+import { buildTripAssignedDriverNotification } from './confirmed-hold.service';
 
 // =============================================================================
 // CONFIGURATION
@@ -390,122 +393,71 @@ class CascadeDispatchService {
           distanceKm: true,
           customerName: true,
           customerPhone: true,
+          // P6-T07 (A03-008): routePoints for trip_assigned notification.
+          routePoints: true,
         },
       });
 
       if (order) {
-        const pickup = order.pickup as Record<string, unknown>;
-        const drop = order.drop as Record<string, unknown>;
+        // P6-T15 (A03-012): ADR — single-source buildTripAssignedDriverNotification
+        // ensures cascade emit is byte-equal to confirmed-hold + reassign paths.
+        // A03-003: cascadeSocketDeadlineMs anchored on server epoch-ms.
+        const cascadeSocketDeadlineMs = Date.now() + HOLD_CONFIG.driverAcceptTimeoutMs;
 
-        // F-L9 FIX: Check if driver is online before emitting via Socket.
-        // FCM backup is sent regardless (below), so this just avoids unnecessary Socket emit.
+        const truckRequestForHelper = await prismaClient.truckRequest.findUnique({
+          where: { id: truckRequestId },
+          select: { pricePerTruck: true },
+        }).catch(() => null);
+        const farePerTruck = Number(truckRequestForHelper?.pricePerTruck ?? 0);
+
+        const { socketPayload: cascadeSocketPayload, fcmData: cascadeFcmData } =
+          buildTripAssignedDriverNotification(
+            order,
+            farePerTruck,
+            {
+              id: assignmentId,
+              tripId,
+              orderId,
+              bookingId: null,
+              truckRequestId,
+              vehicleNumber,
+              vehicleType,
+            },
+            cascadeSocketDeadlineMs,
+          );
+
+        // F-L9 FIX: Socket only if driver online; FCM always fires below.
         const isDriverOnline = await isUserConnectedAsync(driver.id).catch(() => false);
         if (isDriverOnline) {
-          // A03-003: anchor deadline on server epoch-ms so Captain offset-corrects the countdown.
-          const cascadeSocketDeadlineMs = Date.now() + HOLD_CONFIG.driverAcceptTimeoutMs;
-          await socketService.emitToUser(driver.id, 'trip_assigned', {
-            assignmentId,
-            tripId,
-            orderId,
-            truckRequestId,
-            pickupAddress: pickup?.address || '',
-            dropAddress: drop?.address || '',
-            vehicleNumber,
-            status: 'pending',
-            expiresAt: new Date(cascadeSocketDeadlineMs).toISOString(),
-            deadlineMs: cascadeSocketDeadlineMs,
-            isCascade: true,
-          });
+          await socketService.emitToUser(driver.id, 'trip_assigned', cascadeSocketPayload);
         } else {
           logger.debug('[CascadeDispatch] Skipping Socket emit — driver offline, FCM will deliver', {
             driverId: driver.id,
             assignmentId,
           });
         }
+
+        try {
+          await queueService.queuePushNotification(driver.id, {
+            title: 'New Trip Assigned!',
+            body: `${(order.pickup as any)?.address || 'Pickup'} -> ${(order.drop as any)?.address || 'Drop'}`,
+            data: {
+              ...cascadeFcmData,
+              isCascade: 'true',
+              status: 'pending',
+            },
+          });
+        } catch (fcmErr) {
+          logger.warn('[CascadeDispatch] FCM push failed (non-fatal)', {
+            driverId: driver.id,
+            error: getErrorMessage(fcmErr),
+          });
+        }
       }
     } catch (notifyErr) {
-      logger.warn('[CascadeDispatch] Socket notification failed (non-fatal)', {
+      logger.warn('[CascadeDispatch] Socket/FCM notification failed (non-fatal)', {
         assignmentId,
         error: getErrorMessage(notifyErr),
-      });
-    }
-
-    // FCM push to driver
-    // A05-003: nested pickup/drop + `payload` JSON blob for Captain parser.
-    // A09-001: pre-accept producer site — customerName omitted (DPDP data minimisation).
-    try {
-      const orderForFcm = await prismaClient.order.findUnique({
-        where: { id: orderId },
-        select: {
-          pickup: true,
-          drop: true,
-          distanceKm: true,
-          customerPhone: true,
-        },
-      });
-      const truckRequestForFcm = await prismaClient.truckRequest.findUnique({
-        where: { id: truckRequestId },
-        select: { pricePerTruck: true },
-      });
-      const pickupRaw = (orderForFcm?.pickup as Record<string, unknown>) || {};
-      const dropRaw = (orderForFcm?.drop as Record<string, unknown>) || {};
-      const fcmPickup = {
-        address: (pickupRaw.address as string) ?? '',
-        city: (pickupRaw.city as string) ?? '',
-        latitude: (pickupRaw.latitude as number) ?? (pickupRaw.lat as number) ?? 0,
-        longitude: (pickupRaw.longitude as number) ?? (pickupRaw.lng as number) ?? 0,
-      };
-      const fcmDrop = {
-        address: (dropRaw.address as string) ?? '',
-        city: (dropRaw.city as string) ?? '',
-        latitude: (dropRaw.latitude as number) ?? (dropRaw.lat as number) ?? 0,
-        longitude: (dropRaw.longitude as number) ?? (dropRaw.lng as number) ?? 0,
-      };
-      const assignedAtIso = new Date().toISOString();
-      const expiresAtIso = new Date(Date.now() + HOLD_CONFIG.driverAcceptTimeoutMs).toISOString();
-      const fcmPayloadObj = {
-        type: 'trip_assigned',
-        assignmentId,
-        tripId,
-        orderId,
-        truckRequestId,
-        pickup: fcmPickup,
-        drop: fcmDrop,
-        vehicleNumber,
-        farePerTruck: Number(truckRequestForFcm?.pricePerTruck ?? 0),
-        distanceKm: Number(orderForFcm?.distanceKm ?? 0),
-        customerPhone: maskPhoneForExternal(orderForFcm?.customerPhone || ''),
-        assignedAt: assignedAtIso,
-        expiresAt: expiresAtIso,
-        isCascade: true,
-        message: `New trip assigned! ${fcmPickup.address || 'Pickup'} → ${fcmDrop.address || 'Drop'}`,
-      };
-      await queueService.queuePushNotification(driver.id, {
-        title: 'New Trip Assigned!',
-        body: `${fcmPickup.address || 'Pickup'} -> ${fcmDrop.address || 'Drop'}`,
-        data: {
-          payload: JSON.stringify(fcmPayloadObj),
-          type: 'trip_assigned',
-          assignmentId,
-          tripId,
-          orderId,
-          truckRequestId,
-          pickup: JSON.stringify(fcmPickup),
-          drop: JSON.stringify(fcmDrop),
-          vehicleNumber,
-          farePerTruck: String(fcmPayloadObj.farePerTruck),
-          distanceKm: String(fcmPayloadObj.distanceKm),
-          customerPhone: fcmPayloadObj.customerPhone,
-          assignedAt: assignedAtIso,
-          expiresAt: expiresAtIso,
-          isCascade: 'true',
-          status: 'pending',
-        },
-      });
-    } catch (fcmErr) {
-      logger.warn('[CascadeDispatch] FCM push failed (non-fatal)', {
-        driverId: driver.id,
-        error: getErrorMessage(fcmErr),
       });
     }
 
