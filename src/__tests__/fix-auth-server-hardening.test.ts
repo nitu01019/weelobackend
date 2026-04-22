@@ -372,3 +372,103 @@ describe('A01-005 T43: rate-limiter fires 429 before JSON parser heap (ordering)
     expect(status).toBe(429);
   });
 });
+
+// ---------------------------------------------------------------------------
+// A15-008 P4-T29/T30/T42: HSTS + secure headers smoke tests
+// ---------------------------------------------------------------------------
+
+function startHeaderTestApp(): Promise<{ server: http.Server; port: number }> {
+  return new Promise((resolve, reject) => {
+    const testApp = express();
+
+    // Mirrors the A15-008 middleware block from server.ts
+    testApp.use((_req, res, next) => {
+      res.setHeader('Strict-Transport-Security', 'max-age=300');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('X-Frame-Options', 'DENY');
+      res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+      next();
+    });
+
+    testApp.get('/ping', (_req, res) => res.json({ ok: true }));
+
+    const srv = testApp.listen(0, '127.0.0.1', () => {
+      const addr = srv.address();
+      if (!addr || typeof addr === 'string') return reject(new Error('No address'));
+      resolve({ server: srv, port: (addr as { port: number }).port });
+    });
+    srv.on('error', reject);
+  });
+}
+
+function getHeaders(port: number, path: string): Promise<Record<string, string | string[]>> {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { hostname: '127.0.0.1', port, path, method: 'GET' },
+      (res) => {
+        res.resume();
+        res.on('end', () => resolve(res.headers as Record<string, string | string[]>));
+      }
+    );
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+describe('A15-008 P4-T29/T30/T42: HSTS + OWASP baseline headers', () => {
+  let server: http.Server;
+  let port: number;
+
+  beforeAll(async () => {
+    ({ server, port } = await startHeaderTestApp());
+  });
+
+  afterAll((done) => { server.close(() => done()); });
+
+  it('Strict-Transport-Security header is present with max-age=300', async () => {
+    const headers = await getHeaders(port, '/ping');
+    const hsts = headers['strict-transport-security'] as string;
+    expect(hsts).toBeDefined();
+    expect(hsts).toBe('max-age=300');
+  });
+
+  it('HSTS does not include includeSubDomains (staged rollout — not yet)', async () => {
+    const headers = await getHeaders(port, '/ping');
+    const hsts = (headers['strict-transport-security'] as string) ?? '';
+    expect(hsts).not.toContain('includeSubDomains');
+  });
+
+  it('HSTS does not include preload (staged rollout — not yet)', async () => {
+    const headers = await getHeaders(port, '/ping');
+    const hsts = (headers['strict-transport-security'] as string) ?? '';
+    expect(hsts).not.toContain('preload');
+  });
+
+  it('X-Content-Type-Options is nosniff', async () => {
+    const headers = await getHeaders(port, '/ping');
+    expect(headers['x-content-type-options']).toBe('nosniff');
+  });
+
+  it('X-Frame-Options is DENY', async () => {
+    const headers = await getHeaders(port, '/ping');
+    expect(headers['x-frame-options']).toBe('DENY');
+  });
+
+  it('Referrer-Policy is strict-origin-when-cross-origin', async () => {
+    const headers = await getHeaders(port, '/ping');
+    expect(headers['referrer-policy']).toBe('strict-origin-when-cross-origin');
+  });
+
+  it('server.ts source includes the HSTS middleware block', () => {
+    const fs = require('fs');
+    const path = require('path');
+    const source: string = fs.readFileSync(
+      path.resolve(__dirname, '../server.ts'),
+      'utf-8'
+    );
+    expect(source).toContain("res.setHeader('Strict-Transport-Security', 'max-age=300')");
+    expect(source).toContain("res.setHeader('X-Content-Type-Options', 'nosniff')");
+    expect(source).toContain("res.setHeader('X-Frame-Options', 'DENY')");
+    expect(source).toContain("res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin')");
+  });
+});

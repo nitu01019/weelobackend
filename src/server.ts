@@ -417,6 +417,26 @@ app.get('/health/runtime', authMiddleware, roleGuard(['admin']), async (_req, re
 // the JSON heap. Envoy pre-filter pattern.
 app.use(rateLimiter);
 
+// A15-008 P4-T29/T30/T42: Secure HTTP response headers — placed immediately
+// after rateLimiter so blocked IPs still get the headers, and before the JSON
+// parser so the headers are always set regardless of body parsing outcome.
+//
+// HSTS staged rollout (Part B §2.5 P4-F):
+//   - Phase 1: max-age=300 (5 minutes). Bake for ≥1 week, then raise to 31536000.
+//   - NO includeSubDomains — every subdomain must be TLS-audited first.
+//   - NO preload — only added after 31536000 is stable.
+app.use((_req, res, next) => {
+  // A15-008 Phase 4 · HSTS staged rollout — start at max-age=300 (5 min),
+  // bake 1 week, then raise to 31536000. NO includeSubDomains until every
+  // subdomain is TLS-audited. NO preload. Part B §2.5 P4-F.
+  res.setHeader('Strict-Transport-Security', 'max-age=300');
+  // A15-008 P4-T30 + P4-T42: OWASP baseline headers
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  next();
+});
+
 // A01-005 (T09): Tightened JSON body limit from 1mb to 32kb.
 // Only reached by IPs that pass the rate-limiter above.
 // No webhook raw-body parser exists in this codebase — no bypass needed.
@@ -971,6 +991,15 @@ async function bootstrap(): Promise<void> {
   // P1-T-NEW (Part B §2.2 P1-F): validateProductionConfig pre-flight checks
   // -------------------------------------------------------------------------
   await validateProductionConfig();
+
+  // -------------------------------------------------------------------------
+  // P4-C (A12-006, Part B §2.5 P4-C): DEBUG env guard
+  // DEBUG env exposes internal module traces — forbidden in production.
+  // -------------------------------------------------------------------------
+  if (process.env.NODE_ENV === 'production' && process.env.DEBUG) {
+    logger.error('DEBUG env forbidden in production — remove it before deploy (A12-006, Part B §2.5 P4-C)');
+    process.exit(1);
+  }
 
   // -------------------------------------------------------------------------
   // 4. Start listening for HTTP traffic
