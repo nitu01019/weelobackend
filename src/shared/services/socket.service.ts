@@ -1502,15 +1502,22 @@ function withSocketMeta(data: any, seqOverride?: number, deadlineMs?: number): a
     return data;
   }
   const nowMs = Date.now();
-  const base = {
+  // A03-003: serverNowMs + deadlineMs gated behind FF_SERVER_CLOCK_ANCHOR (default OFF).
+  // When OFF -> pre-A03-003 shape (eventVersion + serverTimeMs + _seq only).
+  // When ON  -> mirror serverNowMs alongside serverTimeMs + optional deadlineMs so
+  // Captain offset-corrects the countdown.
+  const clockAnchorOn = isEnabled(FLAGS.SERVER_CLOCK_ANCHOR);
+  const base: Record<string, any> = {
     ...data,
     eventVersion: SOCKET_EVENT_VERSION,
     serverTimeMs: nowMs,
-    serverNowMs: nowMs,
     _seq: typeof seqOverride === 'number' ? seqOverride : getNextSequenceSync()
   };
-  if (typeof deadlineMs === 'number' && Number.isFinite(deadlineMs) && deadlineMs > 0) {
-    return { ...base, deadlineMs };
+  if (clockAnchorOn) {
+    base.serverNowMs = nowMs;
+    if (typeof deadlineMs === 'number' && Number.isFinite(deadlineMs) && deadlineMs > 0) {
+      base.deadlineMs = deadlineMs;
+    }
   }
   return base;
 }

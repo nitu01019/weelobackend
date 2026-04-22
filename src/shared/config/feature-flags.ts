@@ -314,6 +314,20 @@ export const FLAGS = {
     defaultValue: false,
   },
 
+  // A03-003: Server-authoritative countdown anchors (`serverNowMs` + optional
+  // `deadlineMs`) stamped onto socket payloads by `withSocketMeta`. Captain
+  // computes `offset = serverNowMs - clientNowMsAtReceipt` and anchors
+  // countdowns on offset-corrected `deadlineMs` instead of raw device wall-
+  // clock (Doze wake skew > 10 s observed in ~5% of devices). Default OFF
+  // until Captain build consumes the fields; additive on wire, so older
+  // clients ignore unknown keys.
+  SERVER_CLOCK_ANCHOR: {
+    env: 'FF_SERVER_CLOCK_ANCHOR',
+    category: 'release' as const,
+    description: 'Stamp serverNowMs + optional deadlineMs on socket payloads for offset-corrected client countdowns',
+    defaultValue: false,
+  },
+
   // --- Dual channel delivery (queue.service.ts:81) ---
   // F-B-53: Safe default flipped ON. LaunchDarkly guidance: for a dual-write
   // safety net, over-delivery is safe and under-delivery is not. Explicit
