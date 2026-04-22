@@ -1,0 +1,47 @@
+-- =============================================================================
+-- M-017 — A10-001 Composite index for findActiveLedgerHold hot query (LOW RISK, SCHEMA-ADD)
+-- =============================================================================
+-- FILE ONLY — DO NOT EXECUTE. Run directly via psql when deploying.
+--
+-- Purpose:
+--   Covers the findActiveLedgerHold query at
+--   src/modules/truck-hold/truck-hold-create.service.ts:130 which at >50K
+--   TruckHoldLedger rows degrades from ~50 ms to multi-second because the
+--   existing 4 indexes on TruckHoldLedger (see prisma/schema.prisma:712–749)
+--   do not cover the (transporterId, orderId, phase) access pattern under the
+--   active-hold predicate (status='active' AND phase NOT IN 'EXPIRED','RELEASED').
+--
+-- Why this shape:
+--   1. Leading column transporterId matches the per-transporter hot scan during
+--      broadcast intake (833 holds/s target at 150K rows).
+--   2. Included columns orderId + phase allow index-only scan for the dedup
+--      lookup in holdTrucks() / FF_HOLD_RECONCILE_RECOVERY path.
+--   3. Partial WHERE clause keeps the index narrow — only active, non-terminal
+--      rows are indexed; historical EXPIRED/RELEASED rows are excluded and do
+--      not bloat the btree.
+--
+-- Relation to M-015:
+--   M-015 created UNIQUE (orderId, transporterId) WHERE phase NOT IN
+--   ('EXPIRED','RELEASED') for dedup. M-017 is a separate covering index with
+--   the opposite column order (transporterId-leading) plus phase for scan-time
+--   filtering. Both coexist; neither subsumes the other.
+--
+-- Contract:
+--   - CONCURRENTLY so index creation on a populated table does not block writers.
+--   - IF NOT EXISTS so re-running this file is a no-op.
+--   - Partial predicate mirrors the in-app active-hold predicate.
+--
+-- Apply (run manually; do NOT run inside a BEGIN — CONCURRENTLY forbids it):
+--   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/M-017-truck-hold-ledger-active-find-index.sql
+--
+-- Verify:
+--   psql "$DATABASE_URL" -c "SELECT indexname, indexdef FROM pg_indexes
+--     WHERE tablename='TruckHoldLedger' AND indexname='truck_hold_ledger_active_find_idx';"
+--
+-- Rollback (additive-only change, safe to drop):
+--   DROP INDEX CONCURRENTLY IF EXISTS truck_hold_ledger_active_find_idx;
+-- =============================================================================
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "truck_hold_ledger_active_find_idx"
+  ON "TruckHoldLedger" ("transporterId", "orderId", "phase")
+  WHERE "status" = 'active' AND "phase" NOT IN ('EXPIRED', 'RELEASED');
