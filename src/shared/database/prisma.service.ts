@@ -279,6 +279,7 @@ const DB_POOL_CONFIG = {
   //   Reserve ~7 for RDS internals + admin = 80 available → 50/80 = 62%
   // For scale-up (db.r6g.large): 4 tasks x 25 = 100 of ~1600 = 6% (excellent)
   // Phase 2 F14.1: raised default 20 → 25 for 150K-scale dispatch concurrency.
+  // A10-002: in_flight = λ × W. At 833 tx/s × 0.6 s P99 = 500. 4 pods × 125 = 500 (31% of 1,600 max_connections on r6g.large). Staging keeps 25 to match t4g.micro budget. Production MUST set DB_CONNECTION_LIMIT=125.
   connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT || '25', 10),
   // Phase 10: Reduced from 10s to 5s — fail fast for user-facing APIs
   // 10s wait = user already abandoned. 5s returns meaningful 503 quickly.
