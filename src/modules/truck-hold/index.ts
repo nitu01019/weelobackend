@@ -39,3 +39,8 @@ export type {
   ConfirmedHoldState,
   DriverAcceptResponse,
 } from './confirmed-hold.service';
+
+// A01-001 · CI guard: the lifecycle router is orphan by design; it must
+//   never be mounted. Importing IS_ORPHAN_ROUTER here lets a Jest test
+//   assert that this module does not re-export the lifecycle router.
+export { IS_ORPHAN_ROUTER as _TRUCK_HOLD_LIFECYCLE_IS_ORPHAN } from './truck-hold-lifecycle.routes';

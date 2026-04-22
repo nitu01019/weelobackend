@@ -1,13 +1,11 @@
 /**
- * =============================================================================
- * TRUCK HOLD LIFECYCLE ROUTES - Flex hold, confirmed hold, timeout, progress
- * =============================================================================
- *
- * Extracted from truck-hold.routes.ts (file-split).
- * Contains: flex-hold, confirmed-hold, driver accept/decline,
- *           order-timeout, order-progress, order-assignments.
- * =============================================================================
+ * @deprecated — canonical router is truck-hold.routes.ts; schemas are
+ *   now imported FROM this file (flexHoldCreateSchema, flexHoldExtendSchema).
+ *   DO NOT MOUNT this router via app.use.  (A01-001 · Phase 1 P1-B)
  */
+
+// A01-001 · CI guard: this file is orphan by design — it MUST NOT be mounted.
+export const IS_ORPHAN_ROUTER = true;
 
 import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
@@ -22,7 +20,7 @@ import { transporterRateLimit } from '../../shared/middleware/transporter-rate-l
 // ZOD VALIDATION SCHEMAS
 // =============================================================================
 
-const flexHoldCreateSchema = z.object({
+export const flexHoldCreateSchema = z.object({
   orderId: z.string().min(1, 'orderId is required'),
   vehicleType: z.string().min(1, 'vehicleType is required'),
   vehicleSubtype: z.string().min(1, 'vehicleSubtype is required'),
@@ -30,7 +28,7 @@ const flexHoldCreateSchema = z.object({
   truckRequestIds: z.array(z.string().min(1)).min(1).max(50),
 });
 
-const flexHoldExtendSchema = z.object({
+export const flexHoldExtendSchema = z.object({
   holdId: z.string().min(1, 'holdId is required'),
   reason: z.string().optional(),
   driverId: z.string().optional(),
