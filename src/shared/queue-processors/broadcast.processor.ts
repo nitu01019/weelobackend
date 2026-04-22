@@ -6,6 +6,32 @@
  * - Message TTL enforcement (Phase 4)
  * - Sequence numbering for guaranteed delivery (Phase 4)
  * - Dual-channel delivery: Socket.IO + FCM push (Phase 4)
+ *
+ * =============================================================================
+ * P6-T26 / A13-002: Producer-side ZADD removed — architectural decision record
+ * =============================================================================
+ * Pattern: Kleppmann "Designing Data-Intensive Applications" §11 Outbox —
+ *   the canonical outbox writer is the entity that owns the delivery channel.
+ *   For Socket.IO lifecycle events, that entity is `durableEmit` in
+ *   socket.service.ts, NOT the broadcast queue processor.
+ *
+ * Prior state (pre P6-T21): broadcast.processor wrote ZADD to
+ *   `socket:unacked:{transporterId}` as part of PHASE 4 sequence numbering.
+ *   `durableEmit` ALSO wrote ZADD for every lifecycle emit. This meant each
+ *   broadcast event produced TWO ZADD writes — one from the processor and one
+ *   from the socket service — causing double entries in the replay ZSET (A13-002).
+ *
+ * Fix (P6-T22 → P6-T21 DAG order, Part B §2.7 P6-A):
+ *   1. P6-T22 landed first: durableEmit now pipelines XADD+ZADD atomically
+ *      in a single multi().exec() round-trip. This is the authoritative write.
+ *   2. P6-T21 (this commit): the redundant ZADD block (lines 219-241 in the
+ *      original file) is removed from this processor. durableEmit covers it.
+ *
+ * Shadow counter `broadcast_producer_zadd_removed_total` is emitted on the
+ * code path that would have executed the old ZADD block, for canary observation.
+ *
+ * // DO-NOT-REINTRODUCE-PRODUCER-ZADD-A13-002
+ * =============================================================================
  */
 
 import { logger } from '../services/logger.service';
@@ -19,7 +45,7 @@ const FF_MESSAGE_TTL_ENABLED = isEnabled(FLAGS.MESSAGE_TTL_ENABLED);
 const FF_SEQUENCE_DELIVERY_ENABLED = isEnabled(FLAGS.SEQUENCE_DELIVERY_ENABLED);
 const FF_DUAL_CHANNEL_DELIVERY = isEnabled(FLAGS.DUAL_CHANNEL_DELIVERY);
 
-const UNACKED_QUEUE_TTL_SECONDS = 600;
+// UNACKED_QUEUE_TTL_SECONDS removed: P6-T21 removed producer-side ZADD (A13-002).
 
 const MESSAGE_TTL_MS: Record<string, number> = {
   'new_broadcast': 90_000,
@@ -213,32 +239,18 @@ export function registerBroadcastProcessor(
           ? `socket:seq:${transporterId}:${role}`
           : `socket:seq:${transporterId}`;
         seq = await redisService.incr(seqKey);
-        const envelope = JSON.stringify({
-          seq, event, payload: data, role, createdAt: job.createdAt
-        });
-        // Step 2: store in unacked set + refresh TTL
-        const oldKey = `socket:unacked:${transporterId}`;
-        if (roleScopedEnabled) {
-          const newKey = `socket:unacked:${transporterId}:${role}`;
-          await redisService.multi()
-            .zAdd(oldKey, seq, envelope)
-            .expire(oldKey, UNACKED_QUEUE_TTL_SECONDS)
-            .zAdd(newKey, seq, envelope)
-            .expire(newKey, UNACKED_QUEUE_TTL_SECONDS)
-            .exec();
-          try {
-            metrics.incrementCounter('socket_unacked_key_version', { version: 'v1' });
-            metrics.incrementCounter('socket_unacked_key_version', { version: 'v2' });
-          } catch { /* metrics optional */ }
-        } else {
-          await Promise.all([
-            redisService.zAdd(oldKey, seq, envelope),
-            redisService.expire(oldKey, UNACKED_QUEUE_TTL_SECONDS)
-          ]);
-          try {
-            metrics.incrementCounter('socket_unacked_key_version', { version: 'v1' });
-          } catch { /* metrics optional */ }
-        }
+        // P6-T21 (A13-002): ZADD to socket:unacked:{transporterId} removed.
+        // durableEmit in socket.service.ts now handles the authoritative
+        // ZADD+EXPIRE atomically via multi().exec() (P6-T22). Keeping the
+        // seq INCR above so that the seq value is still stamped onto the
+        // outgoing payload via data._seq (used by client-side dedup + FCM).
+        // Shadow counter for canary: increments where the old ZADD would have run.
+        // DO-NOT-REINTRODUCE-PRODUCER-ZADD-A13-002
+        try {
+          metrics.incrementCounter('broadcast_producer_zadd_removed_total', {
+            event, role
+          });
+        } catch { /* metrics optional */ }
         // Attach seq to outgoing payload for client-side dedup
         if (data && typeof data === 'object') {
           data._seq = seq;
