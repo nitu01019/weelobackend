@@ -450,11 +450,14 @@ export async function acceptBroadcast(broadcastId: string, params: AcceptBroadca
       // =====================================================================
 
       // --- Driver notification (Socket.IO + FCM) with retry ---
+      // A09-001: DPDP Act 2023 S.5(b) — customerName removed from pre-accept socket
+      // trip_assigned payload. Customer identity is revealed only post-accept via
+      // GET /assignment/{id}/pickup-details. Masked phone retained for contact need.
       const driverNotification = {
         type: 'trip_assigned', assignmentId: result.assignmentId, tripId: result.tripId,
         bookingId: broadcastId, pickup, drop, vehicleNumber: vehicle?.vehicleNumber || '',
         farePerTruck: booking.pricePerTruck, distanceKm: booking.distanceKm,
-        customerName: booking.customerName, customerPhone: booking.customerPhone ? 'X'.repeat(Math.max(0, String(booking.customerPhone).length - 4)) + String(booking.customerPhone).slice(-4) : '',
+        customerPhone: maskPhoneForExternal(booking?.customerPhone || ''),
         assignedAt: now, message: `New trip assigned! ${pickup.address || 'Pickup'} → ${drop.address || 'Drop'}`
       };
 
