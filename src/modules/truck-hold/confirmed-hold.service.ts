@@ -662,13 +662,13 @@ class ConfirmedHoldService {
         const nowIso = now.toISOString();
 
         // F-A-75: CAS + driver-row KYC check run in the same TX (FOR UPDATE).
-        const updated = await prismaClient.$transaction(async (tx) => {
+        const updated = await withDbTimeout(async (tx) => {
           await validateActorEligibility(tx, driverId, 'driver_accept');
           return tx.assignment.updateMany({
             where: { id: assignmentId, driverId, status: AssignmentStatus.pending },
             data: { status: AssignmentStatus.driver_accepted, driverAcceptedAt: nowIso },
           });
-        });
+        }, { timeoutMs: 15_000, maxWait: 5_000, site: 'driver_accept_cas' });
 
         if (updated.count === 0) {
           // Assignment was already accepted/declined/cancelled/timed-out
@@ -859,7 +859,7 @@ class ConfirmedHoldService {
         let txOrderId: string | null = null;
 
         try {
-          await prismaClient.$transaction(async (tx) => {
+          await withDbTimeout(async (tx) => {
             // CAS guard: only decline if assignment is still pending
             const updated = await tx.assignment.updateMany({
               where: {
@@ -891,7 +891,7 @@ class ConfirmedHoldService {
                 WHERE "id" = ${txOrderId}
               `;
             }
-          });
+          }, { timeoutMs: 15_000, maxWait: 5_000, site: 'driver_decline_cas' });
         } catch (txErr: any) {
           logger.error('[CONFIRMED HOLD] Atomic decline TX failed', {
             assignmentId, error: txErr?.message,
