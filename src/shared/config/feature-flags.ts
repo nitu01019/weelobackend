@@ -328,6 +328,25 @@ export const FLAGS = {
     defaultValue: false,
   },
 
+  // A09-002 / A12-009 (Arch 1B amendment): 3-phase role-scoped durable-emit
+  // ZSET rollout. Today's `socket:unacked:{userId}` key has no `:role`
+  // component — a dual-role self-driving transporter reconnecting as driver
+  // receives queued transporter-role events (pricing, fleet composition,
+  // competing bids). Latent PII cross-leak at dual-role feature launch.
+  //   Phase 1 (W3-T10): ATOMIC MULTI/EXEC dual-write to OLD and NEW keys;
+  //                     reader still on OLD; envelope carries `role` tag.
+  //   Phase 2 (W3-T11): reader flips to NEW key; dual-write preserved for
+  //                     rollback; replay filters envelope.role ≠ socket.role.
+  //   Phase 3 (W3-T12): OLD-key write removed; flag remains kill-switch.
+  // Default OFF until Perf 4B IOPS pre-flight on staging (dual-write ~2× peak
+  // ZADD+EXPIRE at ~6240 ops/s) is recorded in wave-3-gate.md.
+  ROLE_SCOPED_DURABLE_EMIT: {
+    env: 'FF_ROLE_SCOPED_DURABLE_EMIT',
+    category: 'release' as const,
+    description: 'Role-scoped durable-emit ZSET keys (socket:unacked:{userId}:{role}) — 3-phase rollout, flag-gated dual-write',
+    defaultValue: false,
+  },
+
   // --- Dual channel delivery (queue.service.ts:81) ---
   // F-B-53: Safe default flipped ON. LaunchDarkly guidance: for a dual-write
   // safety net, over-delivery is safe and under-delivery is not. Explicit

@@ -192,6 +192,10 @@ interface IRedisTransaction {
   expire(key: string, ttlSeconds: number): IRedisTransaction;
   sAdd(key: string, ...members: string[]): IRedisTransaction;
   sRem(key: string, ...members: string[]): IRedisTransaction;
+  // A09-002 / A12-009 (Arch 1B) — additive: ZADD + INCR inside MULTI for
+  // atomic role-scoped durable-emit dual-write. Existing callers unaffected.
+  zAdd(key: string, score: number, member: string): IRedisTransaction;
+  incr(key: string): IRedisTransaction;
   exec(): Promise<any[]>;
 }
 
@@ -846,6 +850,16 @@ class InMemoryTransaction implements IRedisTransaction {
     return this;
   }
 
+  zAdd(key: string, score: number, member: string): IRedisTransaction {
+    this.operations.push(() => this.client.zAdd(key, score, member));
+    return this;
+  }
+
+  incr(key: string): IRedisTransaction {
+    this.operations.push(() => this.client.incr(key));
+    return this;
+  }
+
   async exec(): Promise<any[]> {
     const results: any[] = [];
     for (const op of this.operations) {
@@ -1463,10 +1477,33 @@ class RealRedisTransaction implements IRedisTransaction {
     return this;
   }
 
+  zAdd(key: string, score: number, member: string): IRedisTransaction {
+    this.pipeline.zadd(key, score, member);
+    return this;
+  }
+
+  incr(key: string): IRedisTransaction {
+    this.pipeline.incr(key);
+    return this;
+  }
+
   async exec(): Promise<any[]> {
     const results = await this.pipeline.exec();
-    // ioredis returns [[err, result], [err, result], ...]
-    return results.map((r: any) => r[1]);
+    // ioredis returns [[err, result], [err, result], ...] or null on abort.
+    // A09-002 Arch 1B: surface per-op errors so MULTI/EXEC atomic-dual-write
+    // callers can detect partial failure. Throw on null (pipeline aborted —
+    // e.g. connection drop mid-exec) OR on any non-null err in a tuple.
+    // Pre-existing callers (e.g. booking-lifecycle.service.ts) already wrap
+    // exec() in try/catch and do not inspect the return — safe.
+    if (!results) {
+      throw new Error('Redis MULTI/EXEC returned null (pipeline aborted)');
+    }
+    for (const entry of results) {
+      if (Array.isArray(entry) && entry[0]) {
+        throw entry[0] instanceof Error ? entry[0] : new Error(String(entry[0]));
+      }
+    }
+    return results.map((r: any) => Array.isArray(r) ? r[1] : r);
   }
 }
 

@@ -430,6 +430,28 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
       'socket_adapter_no_pel_reclaim_total',
       'Redis Streams adapter init events — adapter uses plain XREAD with no consumer-group PEL (no cross-instance reclaim on pod death)',
     ),
+
+    // A09-002 / A12-009 — role-scoped durable-emit ZSET rollout observability.
+    // Emitted per durableEmit / persistRoomEnvelopes write. Lets SRE watch the
+    // 3-phase rollout ramp (v1 → v2) as FF_ROLE_SCOPED_DURABLE_EMIT flips.
+    //   Labels: version = 'v1' | 'v2'
+    //   Call sites: src/shared/services/socket.service.ts (durableEmit, persistRoomEnvelopes)
+    counter(
+      'socket_unacked_key_version',
+      'Role-scoped durable-emit ZSET writes labelled by key-schema version (v1 = legacy socket:unacked:{userId}, v2 = socket:unacked:{userId}:{role})',
+    ),
+
+    // A09-002 / A12-009 (Arch 1B amendment) — dual-write atomicity failure
+    // observability. Fires when the MULTI/EXEC pipeline around the Phase-1
+    // dual-write rejects. Non-zero indicates partial-failure risk; alert on
+    // any single hit because the abort preserves atomicity but means the
+    // emit did not persist to EITHER key (caller falls back to plain emit).
+    //   Labels: phase = '1' | '2'
+    //   Call sites: src/shared/services/socket.service.ts (durableEmit, persistRoomEnvelopes)
+    counter(
+      'socket_unacked_dual_write_fail_total',
+      'Role-scoped durable-emit dual-write MULTI/EXEC failures by rollout phase (Arch 1B amendment — atomicity abort, neither write visible)',
+    ),
   ];
 
   for (const def of defs) {

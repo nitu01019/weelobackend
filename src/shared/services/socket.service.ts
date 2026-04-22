@@ -39,6 +39,7 @@ import { logger } from './logger.service';
 import { redisService } from './redis.service';
 import { socketCircuit } from './circuit-breaker.service';
 import { isEnabled, FLAGS } from '../config/feature-flags';
+import { AppError } from '../types/error.types';
 import {
   TRANSPORTER_PRESENCE_KEY,
   PRESENCE_TTL_SECONDS as TRANSPORTER_PRESENCE_TTL,
@@ -81,6 +82,35 @@ async function withSocketDbLimit<T>(fn: () => Promise<T>): Promise<T> {
 // Track user connections
 const userSockets = new Map<string, Set<string>>();  // userId -> Set of socketIds
 const socketUsers = new Map<string, string>();        // socketId -> userId
+
+// =============================================================================
+// A09-002 / A12-009 (Arch 1B) — role-scoped durable-emit ZSET key schema
+// =============================================================================
+// `userRoleCache` is populated in the auth middleware (io.use, ~line 263 where
+// `socket.data.role = decoded.role`). `resolveUserRole()` reads the cached
+// role so `durableEmit` / `persistRoomEnvelopes` can compose the role-scoped
+// key (`socket:unacked:{userId}:{role}`) without an extra DB hit per emit.
+//
+// Cache-miss path (rare race: emit fires before the user ever connected on
+// this pod, e.g. cross-instance adapter forward during rolling deploy) falls
+// back to ROLE_UNKNOWN so the new key always has a stable 3-segment shape.
+// The belt-and-braces Phase-2 replay-side filter (envelope.role ≠ socket.role
+// → drop) still guards cross-role leaks; a `ROLE_UNKNOWN` envelope is dropped
+// for any non-unknown reader and redelivered on the next reconnect when the
+// role is known.
+// =============================================================================
+const userRoleCache = new Map<string, string>();     // userId -> role
+const ROLE_UNKNOWN = 'unknown';
+
+function cacheUserRole(userId: string, role: string | undefined): void {
+  if (!userId) return;
+  const normalized = role && role.length > 0 ? role : ROLE_UNKNOWN;
+  userRoleCache.set(userId, normalized);
+}
+
+function resolveUserRole(userId: string): string {
+  return userRoleCache.get(userId) || ROLE_UNKNOWN;
+}
 
 // Per-connection rate limiter (Problem 17 fix)
 const eventCounts = new Map<string, { count: number; resetAt: number }>();
@@ -262,6 +292,10 @@ export function initializeSocket(server: HttpServer): Server {
       socket.data.userId = decoded.userId;
       socket.data.role = decoded.role;
       socket.data.phone = decoded.phone;
+
+      // A09-002 / A12-009 (Arch 1B) — populate role cache for durableEmit
+      // to compose role-scoped ZSET keys without an extra DB lookup per emit.
+      cacheUserRole(decoded.userId, decoded.role);
 
       // Problem 13 fix: Set transporterId for drivers during auth
       if (decoded.role === 'driver') {
@@ -592,6 +626,11 @@ export function initializeSocket(server: HttpServer): Server {
         userSockets.get(userId)?.delete(socket.id);
         if (userSockets.get(userId)?.size === 0) {
           userSockets.delete(userId);
+          // A09-002 / A12-009 (Arch 1B) — last socket for this userId on this
+          // pod has disconnected; drop the role cache so it can be re-seeded
+          // fresh on the next auth. Safe: resolveUserRole() falls back to
+          // ROLE_UNKNOWN if a rare cross-instance emit fires before re-auth.
+          userRoleCache.delete(userId);
         }
 
         // Industry Standard: DoorDash O(1) role counter decrement
@@ -1600,19 +1639,63 @@ const DURABLE_EMIT_TTL_SECONDS = 600;
 async function durableEmit(userId: string, event: string, data: any, deadlineMs?: number): Promise<boolean> {
   if (!io) return false;
   let seq: number | undefined;
+  // A09-002 / A12-009 (Arch 1B) — flag-gated Phase-1 atomic dual-write to
+  // both OLD (`socket:unacked:{userId}`) and NEW (`socket:unacked:{userId}:{role}`)
+  // ZSET keys. Reader still hits OLD in Phase 1; Phase 2 flips to NEW.
+  const roleScopedEnabled = isEnabled(FLAGS.ROLE_SCOPED_DURABLE_EMIT);
+  const role = roleScopedEnabled ? resolveUserRole(userId) : ROLE_UNKNOWN;
   try {
     seq = await redisService.incr(`socket:seq:${userId}`);
     const envelope = JSON.stringify({
       seq,
       event,
       payload: data,
+      role, // carry role tag so Phase-2 replay filter can drop mismatches
       createdAt: Date.now()
     });
-    // ZADD + TTL refresh in parallel (independent ops)
-    await Promise.all([
-      redisService.zAdd(`socket:unacked:${userId}`, seq, envelope),
-      redisService.expire(`socket:unacked:${userId}`, DURABLE_EMIT_TTL_SECONDS)
-    ]);
+    const oldKey = `socket:unacked:${userId}`;
+    if (roleScopedEnabled) {
+      const newKey = `socket:unacked:${userId}:${role}`;
+      // ATOMIC MULTI/EXEC dual-write: both (ZADD + EXPIRE) pairs either
+      // land or both fail. On abort, AppError('DURABLE_EMIT_DUAL_WRITE_FAILED')
+      // is thrown so the outer catch degrades to plain-emit fallback.
+      try {
+        await redisService.multi()
+          .zAdd(oldKey, seq, envelope)
+          .expire(oldKey, DURABLE_EMIT_TTL_SECONDS)
+          .zAdd(newKey, seq, envelope)
+          .expire(newKey, DURABLE_EMIT_TTL_SECONDS)
+          .exec();
+        try {
+          const { metrics } = require('../monitoring/metrics.service');
+          metrics.incrementCounter('socket_unacked_key_version', { version: 'v1' });
+          metrics.incrementCounter('socket_unacked_key_version', { version: 'v2' });
+        } catch { /* metrics optional */ }
+      } catch (multiErr: unknown) {
+        const errMessage = multiErr instanceof Error ? multiErr.message : String(multiErr);
+        logger.error('durable_emit_dual_write_failed', { userId, role, event, errMessage });
+        try {
+          const { metrics } = require('../monitoring/metrics.service');
+          metrics.incrementCounter('socket_unacked_dual_write_fail_total', { phase: '1' });
+        } catch { /* metrics optional */ }
+        throw new AppError(
+          500,
+          'DURABLE_EMIT_DUAL_WRITE_FAILED',
+          'role-scoped dual-write rejected; pipeline aborted, neither key persisted',
+          { userId, event, role }
+        );
+      }
+    } else {
+      // Legacy single-key path (flag OFF) — exact pre-F-B-26 + W3-T10 behaviour.
+      await Promise.all([
+        redisService.zAdd(oldKey, seq, envelope),
+        redisService.expire(oldKey, DURABLE_EMIT_TTL_SECONDS)
+      ]);
+      try {
+        const { metrics } = require('../monitoring/metrics.service');
+        metrics.incrementCounter('socket_unacked_key_version', { version: 'v1' });
+      } catch { /* metrics optional */ }
+    }
   } catch (persistErr: unknown) {
     // ZSET write failed — fall back to non-durable emit. Over-delivery is
     // safe; under-delivery is not. Log and carry on.
@@ -1685,19 +1768,58 @@ function enumerateRoomUserIds(room: string): string[] {
  */
 async function persistRoomEnvelopes(userIds: string[], event: string, data: any): Promise<void> {
   if (userIds.length === 0) return;
+  // A09-002 / A12-009 (Arch 1B) — same flag-gated dual-write as durableEmit.
+  const roleScopedEnabled = isEnabled(FLAGS.ROLE_SCOPED_DURABLE_EMIT);
   await Promise.all(userIds.map(async (uid) => {
+    const role = roleScopedEnabled ? resolveUserRole(uid) : ROLE_UNKNOWN;
     try {
       const seq = await redisService.incr(`socket:seq:${uid}`);
       const envelope = JSON.stringify({
         seq,
         event,
         payload: data,
+        role,
         createdAt: Date.now()
       });
-      await Promise.all([
-        redisService.zAdd(`socket:unacked:${uid}`, seq, envelope),
-        redisService.expire(`socket:unacked:${uid}`, DURABLE_EMIT_TTL_SECONDS)
-      ]);
+      const oldKey = `socket:unacked:${uid}`;
+      if (roleScopedEnabled) {
+        const newKey = `socket:unacked:${uid}:${role}`;
+        try {
+          await redisService.multi()
+            .zAdd(oldKey, seq, envelope)
+            .expire(oldKey, DURABLE_EMIT_TTL_SECONDS)
+            .zAdd(newKey, seq, envelope)
+            .expire(newKey, DURABLE_EMIT_TTL_SECONDS)
+            .exec();
+          try {
+            const { metrics } = require('../monitoring/metrics.service');
+            metrics.incrementCounter('socket_unacked_key_version', { version: 'v1' });
+            metrics.incrementCounter('socket_unacked_key_version', { version: 'v2' });
+          } catch { /* metrics optional */ }
+        } catch (multiErr: unknown) {
+          const errMessage = multiErr instanceof Error ? multiErr.message : String(multiErr);
+          logger.error('durable_emit_dual_write_failed', { userId: uid, role, event, errMessage });
+          try {
+            const { metrics } = require('../monitoring/metrics.service');
+            metrics.incrementCounter('socket_unacked_dual_write_fail_total', { phase: '1' });
+          } catch { /* metrics optional */ }
+          throw new AppError(
+            500,
+            'DURABLE_EMIT_DUAL_WRITE_FAILED',
+            'role-scoped dual-write rejected; pipeline aborted, neither key persisted',
+            { userId: uid, event, role }
+          );
+        }
+      } else {
+        await Promise.all([
+          redisService.zAdd(oldKey, seq, envelope),
+          redisService.expire(oldKey, DURABLE_EMIT_TTL_SECONDS)
+        ]);
+        try {
+          const { metrics } = require('../monitoring/metrics.service');
+          metrics.incrementCounter('socket_unacked_key_version', { version: 'v1' });
+        } catch { /* metrics optional */ }
+      }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       logger.warn('[persistRoomEnvelopes] ZSET write failed for user', { userId: uid, event, error: msg });
@@ -2219,4 +2341,20 @@ export function __setIoForTesting(fakeIo: unknown, localUsers?: Map<string, stri
       socketUsers.set(socketId, userId);
     }
   }
+}
+
+/**
+ * A09-002 / A12-009 (Arch 1B) — test-only hook. Lets atomicity unit tests
+ * seed the userRoleCache so durableEmit can resolve a role without going
+ * through the full auth middleware. Production code must NEVER call this.
+ */
+export function __setUserRoleForTesting(userId: string, role: string): void {
+  if (process.env.NODE_ENV !== 'test') return;
+  cacheUserRole(userId, role);
+}
+
+/** Test-only: clear the userRoleCache between cases. */
+export function __clearUserRoleCacheForTesting(): void {
+  if (process.env.NODE_ENV !== 'test') return;
+  userRoleCache.clear();
 }
