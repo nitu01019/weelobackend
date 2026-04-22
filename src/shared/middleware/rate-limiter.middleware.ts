@@ -2,25 +2,25 @@
  * =============================================================================
  * RATE LIMITER MIDDLEWARE
  * =============================================================================
- * 
+ *
  * Prevents abuse by limiting request rates.
- * 
+ *
  * SCALABILITY (Production-ready for millions of users):
  * - Redis-backed store for distributed rate limiting across ECS instances
  * - Falls back to in-memory store if Redis is unavailable (graceful degradation)
  * - Different limits for different endpoint types
  * - Atomic Redis INCR + EXPIRE ensures accurate counting under high concurrency
- * 
+ *
  * SECURITY:
  * - Protects against brute force attacks
  * - Prevents API abuse
  * - Per-phone rate limiting for OTP (not per-IP)
- * 
+ *
  * MODULARITY:
  * - RedisRateLimitStore is a reusable class implementing express-rate-limit's Store
  * - Uses existing redisService singleton (no new Redis connections)
  * - Can be swapped for any other store without changing limiter configs
- * 
+ *
  * EASY UNDERSTANDING:
  * - Each limiter clearly documents its purpose, window, and max
  * - Redis store is transparent — same behavior as in-memory, just distributed
@@ -30,12 +30,131 @@
 
 import rateLimit from 'express-rate-limit';
 import { Request, Response } from 'express';
+import { IncomingMessage } from 'http';
+import { createHash } from 'crypto';
 import { config } from '../../config/environment';
 import { redisService } from '../services/redis.service';
 import { logger } from '../services/logger.service';
 import { FLAGS, isEnabled } from '../config/feature-flags';
 import { isInCidrList } from '../utils/net.utils';
 import { metrics } from '../monitoring/metrics.service';
+
+// =============================================================================
+// A04-001 / P5-T09 + P5-T10: IN-PROC TOKEN BUCKET for HTTP upgrade rate limiting
+// =============================================================================
+//
+// `rate-limiter-flexible` is NOT in package.json, so this hand-rolled token
+// bucket is used instead (~25 lines). Uses a lazy-refill pattern:
+//   - Map<key, { tokens: number; lastRefill: number }>
+//   - consume(key, n) refills lazily at TOKENS_PER_SEC before consuming.
+//   - Returns true if the request is allowed, false if rate-limited.
+//
+// P5-A AMENDMENT: This is the FAST PATH — in-proc only, NOT Redis. A 75K/s
+// reboot storm would consume 75% of Redis 100K/s ceiling, starving auth +
+// adapter + outbox. In-proc is the correct first line of defense.
+//
+// Tuning: 30 tokens per 3s window = 10 tokens/sec per fingerprint bucket.
+// =============================================================================
+
+interface TokenBucketEntry {
+  tokens: number;
+  lastRefill: number;
+}
+
+const BUCKET_CAPACITY = 30;       // max burst
+const TOKENS_PER_SEC = 10;        // refill rate
+const BUCKET_CLEANUP_INTERVAL_MS = 60_000;
+const BUCKET_ENTRY_TTL_MS = 120_000; // prune entries idle > 2 min
+
+const _tokenBuckets = new Map<string, TokenBucketEntry>();
+
+// Lazy periodic cleanup — entries older than TTL are pruned to prevent unbounded growth.
+const _cleanupInterval = setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of _tokenBuckets) {
+    const idleMs = now - entry.lastRefill;
+    if (idleMs > BUCKET_ENTRY_TTL_MS) {
+      _tokenBuckets.delete(key);
+    }
+  }
+}, BUCKET_CLEANUP_INTERVAL_MS);
+if (_cleanupInterval.unref) _cleanupInterval.unref();
+
+export const ipUpgradeTokenBucket = {
+  /**
+   * Consume n tokens from the bucket for `key`.
+   * Refills lazily before consuming.
+   * Returns a Promise<void> that resolves if allowed, rejects if rate-limited.
+   * (Mirrors the RateLimiterMemory.consume() contract so server.ts can use
+   * .then(() => true).catch(() => false) idiom.)
+   */
+  consume(key: string, _n: number = 1): Promise<void> {
+    const now = Date.now();
+    let entry = _tokenBuckets.get(key);
+    if (!entry) {
+      entry = { tokens: BUCKET_CAPACITY, lastRefill: now };
+      _tokenBuckets.set(key, entry);
+    }
+    // Lazy refill
+    const elapsedSec = (now - entry.lastRefill) / 1000;
+    const refilled = Math.min(BUCKET_CAPACITY, entry.tokens + elapsedSec * TOKENS_PER_SEC);
+    entry.tokens = refilled;
+    entry.lastRefill = now;
+
+    if (entry.tokens >= 1) {
+      entry.tokens -= 1;
+      return Promise.resolve();
+    }
+    return Promise.reject(new Error('rate_limited'));
+  },
+};
+
+// =============================================================================
+// A04-001 / P5-B: BUCKET KEY NORMALIZER
+// key = sha256(ipSubnet + userAgent + acceptLanguage).slice(0,16)
+// IPv4 → /24 subnet  (Indian CGNAT has 10K+ subscribers per /24)
+// IPv6 → /64 subnet
+// =============================================================================
+
+/**
+ * Extract the /24 (IPv4) or /64 (IPv6) subnet string from an IP.
+ * Falls back to the original IP on parse failure.
+ */
+function normalizeSubnet(rawIp: string): string {
+  // Strip IPv4-mapped prefix
+  const ip = rawIp.startsWith('::ffff:') ? rawIp.slice(7) : rawIp;
+
+  if (!ip.includes(':')) {
+    // IPv4: mask to /24
+    const parts = ip.split('.');
+    if (parts.length === 4) {
+      return `${parts[0]}.${parts[1]}.${parts[2]}.0/24`;
+    }
+    return ip;
+  }
+  // IPv6: mask to /64 (first 4 groups)
+  const groups = ip.split(':');
+  // Expand :: if present — just use first 4 groups with zero-fill
+  const first4 = groups.slice(0, 4).map(g => g || '0');
+  while (first4.length < 4) first4.push('0');
+  return `${first4.join(':')}::/64`;
+}
+
+/**
+ * Compute a 16-char fingerprint key for the HTTP upgrade token bucket.
+ * Key = sha256(ipSubnet + '|' + userAgent + '|' + acceptLanguage).slice(0,16)
+ * Per P5-B amendment.
+ */
+export function normalizeBucketKey(req: IncomingMessage): string {
+  const rawIp =
+    (req.headers['x-forwarded-for'] as string | undefined)?.split(',')[0]?.trim() ||
+    (req.socket?.remoteAddress ?? 'unknown');
+  const subnet = normalizeSubnet(rawIp);
+  const ua = (req.headers['user-agent'] ?? '').slice(0, 128);
+  const lang = (req.headers['accept-language'] ?? '').slice(0, 64);
+  const payload = `${subnet}|${ua}|${lang}`;
+  return createHash('sha256').update(payload).digest('hex').slice(0, 16);
+}
 
 // =============================================================================
 // REDIS RATE LIMIT STORE (Distributed across all ECS instances)

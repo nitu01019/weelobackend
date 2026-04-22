@@ -236,6 +236,166 @@ describe('F-A-11: Layered rate-limit keyGenerator', () => {
 
 /**
  * =============================================================================
+ * A04-001 / P5-T09+P5-T10+P5-T41: HTTP Upgrade in-proc token bucket
+ * =============================================================================
+ *
+ * Tests for `ipUpgradeTokenBucket` (hand-rolled in-proc token bucket) and
+ * `normalizeBucketKey` (P5-B fingerprint: sha256(ipSubnet+UA+lang).slice(0,16)).
+ *
+ * P5-A: In-proc only — never Redis. No mocking required.
+ *
+ * Covered:
+ *   - IPv4 /24 subnet collapse: two IPs in same /24 share the same bucket key.
+ *   - IPv6 /64 subnet collapse: two IPs in same /64 share the same bucket key.
+ *   - Health-probe bypass: x-internal-health header skips token bucket (source-level).
+ *   - Open-fail (P5-T41): limiter error must NOT destroy the socket (source-level).
+ *   - Token bucket consume: resolves when tokens available, rejects when exhausted.
+ * =============================================================================
+ */
+describe('A04-001 / P5-T09+P5-T10: normalizeBucketKey — IPv4 /24 subnet collapse', () => {
+  let normalizeBucketKey: (req: any) => string;
+
+  beforeAll(() => {
+    jest.resetModules();
+    normalizeBucketKey = require('../shared/middleware/rate-limiter.middleware').normalizeBucketKey;
+  });
+
+  it('two IPs in the same /24 share the same bucket key (different last octet)', () => {
+    const reqA = { headers: { 'x-forwarded-for': '203.0.113.10', 'user-agent': 'WeeloCaptain/1', 'accept-language': 'en-IN' }, socket: { remoteAddress: '203.0.113.10' } };
+    const reqB = { headers: { 'x-forwarded-for': '203.0.113.99', 'user-agent': 'WeeloCaptain/1', 'accept-language': 'en-IN' }, socket: { remoteAddress: '203.0.113.99' } };
+    expect(normalizeBucketKey(reqA)).toBe(normalizeBucketKey(reqB));
+  });
+
+  it('two IPs in DIFFERENT /24 subnets produce different bucket keys', () => {
+    const reqA = { headers: { 'x-forwarded-for': '203.0.113.10', 'user-agent': 'WeeloCaptain/1', 'accept-language': 'en-IN' }, socket: { remoteAddress: '203.0.113.10' } };
+    const reqC = { headers: { 'x-forwarded-for': '203.0.114.10', 'user-agent': 'WeeloCaptain/1', 'accept-language': 'en-IN' }, socket: { remoteAddress: '203.0.114.10' } };
+    expect(normalizeBucketKey(reqA)).not.toBe(normalizeBucketKey(reqC));
+  });
+
+  it('key is exactly 16 hex characters', () => {
+    const req = { headers: { 'x-forwarded-for': '10.0.0.5', 'user-agent': 'test', 'accept-language': 'hi' }, socket: { remoteAddress: '10.0.0.5' } };
+    const key = normalizeBucketKey(req);
+    expect(key).toMatch(/^[0-9a-f]{16}$/);
+  });
+
+  it('falls back to socket.remoteAddress when x-forwarded-for is absent', () => {
+    const req = { headers: { 'user-agent': 'WeeloCaptain/1', 'accept-language': 'en-IN' }, socket: { remoteAddress: '10.0.5.7' } };
+    const key = normalizeBucketKey(req);
+    expect(key).toMatch(/^[0-9a-f]{16}$/);
+  });
+});
+
+describe('A04-001 / P5-T10: normalizeBucketKey — IPv6 /64 subnet collapse', () => {
+  let normalizeBucketKey: (req: any) => string;
+
+  beforeAll(() => {
+    jest.resetModules();
+    normalizeBucketKey = require('../shared/middleware/rate-limiter.middleware').normalizeBucketKey;
+  });
+
+  it('two IPs in same /64 (differ only in last 64 bits) share the same bucket key', () => {
+    const reqA = { headers: { 'x-forwarded-for': '2001:db8:1234:5678::1', 'user-agent': 'ua', 'accept-language': 'en' }, socket: { remoteAddress: '2001:db8:1234:5678::1' } };
+    const reqB = { headers: { 'x-forwarded-for': '2001:db8:1234:5678::9999', 'user-agent': 'ua', 'accept-language': 'en' }, socket: { remoteAddress: '2001:db8:1234:5678::9999' } };
+    expect(normalizeBucketKey(reqA)).toBe(normalizeBucketKey(reqB));
+  });
+
+  it('two IPs in DIFFERENT /64 subnets produce different bucket keys', () => {
+    const reqA = { headers: { 'x-forwarded-for': '2001:db8:1234:5678::1', 'user-agent': 'ua', 'accept-language': 'en' }, socket: { remoteAddress: '2001:db8:1234:5678::1' } };
+    const reqC = { headers: { 'x-forwarded-for': '2001:db8:1234:5679::1', 'user-agent': 'ua', 'accept-language': 'en' }, socket: { remoteAddress: '2001:db8:1234:5679::1' } };
+    expect(normalizeBucketKey(reqA)).not.toBe(normalizeBucketKey(reqC));
+  });
+
+  it('IPv4-mapped IPv6 ::ffff:203.0.113.10 collapses to same /24 bucket as plain 203.0.113.10', () => {
+    const reqA = { headers: { 'x-forwarded-for': '::ffff:203.0.113.10', 'user-agent': 'ua', 'accept-language': 'en' }, socket: { remoteAddress: '::ffff:203.0.113.10' } };
+    const reqB = { headers: { 'x-forwarded-for': '203.0.113.50', 'user-agent': 'ua', 'accept-language': 'en' }, socket: { remoteAddress: '203.0.113.50' } };
+    expect(normalizeBucketKey(reqA)).toBe(normalizeBucketKey(reqB));
+  });
+});
+
+describe('A04-001 / P5-T41: bypass + open-fail (source-level assertions)', () => {
+  it('server.ts upgrade handler references HEALTH_SECRET bypass', () => {
+    const fs = require('fs');
+    const path = require('path');
+    const src: string = fs.readFileSync(
+      path.resolve(__dirname, '../server.ts'),
+      'utf-8'
+    );
+    expect(src).toContain('x-internal-health');
+    expect(src).toContain('HEALTH_SECRET');
+  });
+
+  it('server.ts upgrade handler does NOT destroy socket on error (open-fail P5-T41)', () => {
+    const fs = require('fs');
+    const path = require('path');
+    const src: string = fs.readFileSync(
+      path.resolve(__dirname, '../server.ts'),
+      'utf-8'
+    );
+    // Locate the upgrade handler body between its opening and the next
+    // initializeSocket call — that is the precise region that must be open-fail.
+    const upgradeHandlerStart = src.indexOf('server.on(\'upgrade\'');
+    const upgradeHandlerEnd = src.indexOf('initializeSocket(server)', upgradeHandlerStart);
+    expect(upgradeHandlerStart).toBeGreaterThan(-1);
+    expect(upgradeHandlerEnd).toBeGreaterThan(upgradeHandlerStart);
+    const upgradeBlock = src.substring(upgradeHandlerStart, upgradeHandlerEnd);
+
+    // Must contain the open-fail counter inside the upgrade handler block
+    expect(upgradeBlock).toContain('rate_limiter_open_fail_total');
+    // The only socket.destroy() calls in the upgrade block must be inside
+    // the "allowed" rejection paths (token_bucket, max_global_connections),
+    // and NONE must appear in the catch branch.
+    // Locate the catch block inside the upgrade handler
+    const catchIdx = upgradeBlock.lastIndexOf('} catch (err) {');
+    expect(catchIdx).toBeGreaterThan(-1);
+    const catchBlock = upgradeBlock.substring(catchIdx, catchIdx + 500);
+    // Open-fail: catch must NOT destroy the socket
+    expect(catchBlock).not.toContain('socket.destroy()');
+  });
+
+  it('server.ts upgrade handler is gated on SOCKET_UPGRADE_LIMITER_ENABLED !== "false"', () => {
+    const fs = require('fs');
+    const path = require('path');
+    const src: string = fs.readFileSync(
+      path.resolve(__dirname, '../server.ts'),
+      'utf-8'
+    );
+    expect(src).toContain('SOCKET_UPGRADE_LIMITER_ENABLED');
+  });
+});
+
+describe('A04-001 / P5-T09: ipUpgradeTokenBucket consume behavior', () => {
+  let ipUpgradeTokenBucket: { consume: (key: string, n?: number) => Promise<void> };
+
+  beforeEach(() => {
+    jest.resetModules();
+    ipUpgradeTokenBucket = require('../shared/middleware/rate-limiter.middleware').ipUpgradeTokenBucket;
+  });
+
+  it('resolves for a fresh bucket key (tokens available)', async () => {
+    const key = `test-fresh-${Date.now()}-${Math.random()}`;
+    await expect(ipUpgradeTokenBucket.consume(key, 1)).resolves.toBeUndefined();
+  });
+
+  it('rejects after the bucket capacity is exhausted', async () => {
+    const key = `test-exhaust-${Date.now()}-${Math.random()}`;
+    // Drain the 30-token capacity
+    const drainPs = Array.from({ length: 30 }, () => ipUpgradeTokenBucket.consume(key, 1));
+    await Promise.all(drainPs);
+    // Next consume must reject
+    await expect(ipUpgradeTokenBucket.consume(key, 1)).rejects.toThrow('rate_limited');
+  });
+
+  it('two keys in the same /24 produce the same normalizeBucketKey and share a bucket', () => {
+    const normalizeBucketKey = require('../shared/middleware/rate-limiter.middleware').normalizeBucketKey;
+    const reqA = { headers: { 'x-forwarded-for': '10.0.0.1', 'user-agent': 'WeeloCaptain/1', 'accept-language': 'en' }, socket: { remoteAddress: '10.0.0.1' } };
+    const reqB = { headers: { 'x-forwarded-for': '10.0.0.200', 'user-agent': 'WeeloCaptain/1', 'accept-language': 'en' }, socket: { remoteAddress: '10.0.0.200' } };
+    // Both should produce the same fingerprint (they're in the same /24)
+    expect(normalizeBucketKey(reqA)).toBe(normalizeBucketKey(reqB));
+  });
+});
+
+/**
+ * =============================================================================
  * P1-T04 / P1-T35 — Transporter rate-limit buckets (A01-002, A01-007)
  * =============================================================================
  * Verifies the two new per-transporter rate-limit configs added in Phase 1:

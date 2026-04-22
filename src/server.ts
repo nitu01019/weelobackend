@@ -56,7 +56,7 @@ import { initializeSocket, getConnectedUserCount, getConnectionStats, getRedisAd
 // Middleware
 import { errorHandler } from './shared/middleware/error.middleware';
 import { requestLogger } from './shared/middleware/request-logger.middleware';
-import { rateLimiter } from './shared/middleware/rate-limiter.middleware';
+import { rateLimiter, ipUpgradeTokenBucket, normalizeBucketKey } from './shared/middleware/rate-limiter.middleware';
 import {
   requestIdMiddleware,
   securityHeaders,
@@ -762,6 +762,99 @@ async function bootstrap(): Promise<void> {
     }
   } else {
     logger.info('[Redis] Eviction policy check skipped — using in-memory fallback');
+  }
+
+  // -------------------------------------------------------------------------
+  // 1b-PRE. A04-001 / P5-T09 + P5-T11 + P5-T41: HTTP Upgrade Rate Limiter
+  // -------------------------------------------------------------------------
+  // Registered BEFORE initializeSocket() so this pre-filter runs first on the
+  // 'upgrade' event. Socket.IO registers its own 'upgrade' listener inside
+  // initializeSocket(); both listeners receive the event independently.
+  // When this handler calls socket.destroy(), the TCP socket is gone before
+  // Socket.IO's handler fires — Socket.IO never sees the request.
+  //
+  // P5-A: Uses in-proc RateLimiterMemory (hand-rolled ipUpgradeTokenBucket)
+  // as FAST PATH to avoid consuming Redis 100K/s ceiling during reboot storms.
+  //
+  // P5-I: Entire body wrapped in try/catch — uncaught promise rejections in
+  // httpServer.on('upgrade') have no error-emit path and would crash the worker.
+  //
+  // Gate: SOCKET_UPGRADE_LIMITER_ENABLED !== 'false' (default ON).
+  // Bypass: x-internal-health === HEALTH_SECRET  OR  source IP in ALB_CIDR_ALLOW.
+  // -------------------------------------------------------------------------
+  if (process.env.SOCKET_UPGRADE_LIMITER_ENABLED !== 'false') {
+    const albCidrAllow: string[] = (process.env.ALB_CIDR_ALLOW ?? '')
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean);
+
+    // Module-level handshake counter for P5-T21 backpressure cap
+    let handshakesInProgress = 0;
+    const MAX_GLOBAL_CONNECTIONS = parseInt(
+      process.env.SOCKET_MAX_GLOBAL_CONNECTIONS || '10000',
+      10
+    );
+
+    server.on('upgrade', (req, socket) => {
+      (async () => {
+        try {
+          // --- Bypass: health probe header ---
+          const healthSecret = process.env.HEALTH_SECRET;
+          if (healthSecret && req.headers['x-internal-health'] === healthSecret) {
+            return; // allow through to Socket.IO's own handler
+          }
+
+          // --- Bypass: ALB CIDR allowlist ---
+          if (albCidrAllow.length > 0) {
+            const rawIp =
+              (req.headers['x-forwarded-for'] as string | undefined)?.split(',')[0]?.trim() ||
+              req.socket?.remoteAddress ||
+              '';
+            const { isInCidrList: cidrCheck } = await import('./shared/utils/net.utils');
+            if (cidrCheck(rawIp, albCidrAllow)) {
+              return; // trusted ALB source — skip rate limit
+            }
+          }
+
+          // --- P5-T21: Global handshake cap ---
+          if (handshakesInProgress >= MAX_GLOBAL_CONNECTIONS) {
+            metrics.incrementCounter('socket_upgrade_rate_limited_total', { reason: 'max_global_connections' });
+            socket.destroy();
+            return;
+          }
+
+          // --- Token bucket: fingerprint key per P5-B ---
+          const key = normalizeBucketKey(req);
+          const allowed = await ipUpgradeTokenBucket.consume(key, 1).then(() => true).catch(() => false);
+          if (!allowed) {
+            metrics.incrementCounter('socket_upgrade_rate_limited_total', { reason: 'token_bucket' });
+            socket.destroy();
+            return;
+          }
+
+          // --- Accepted: track in-flight handshake ---
+          handshakesInProgress++;
+          metrics.incrementGauge('handshakes_in_progress', 1);
+
+          // Decrement when the socket ends (connect or error)
+          socket.once('close', () => {
+            handshakesInProgress--;
+            metrics.incrementGauge('handshakes_in_progress', -1);
+          });
+        } catch (err) {
+          // P5-I: Open-fail (P5-T41): never close-fail on unexpected errors
+          logger.error('[UpgradeRL] upgrade rate-limit handler error — failing open', {
+            err: err instanceof Error ? err.message : String(err),
+          });
+          metrics.incrementCounter('rate_limiter_open_fail_total');
+          // Allow traffic through — do NOT destroy the socket
+        }
+      })();
+    });
+
+    logger.info('[A04-001] HTTP upgrade rate-limit handler registered (in-proc token bucket, /24+UA+lang fingerprint)');
+  } else {
+    logger.info('[A04-001] HTTP upgrade rate-limit handler DISABLED (SOCKET_UPGRADE_LIMITER_ENABLED=false)');
   }
 
   // -------------------------------------------------------------------------

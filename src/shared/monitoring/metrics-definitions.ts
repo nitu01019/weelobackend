@@ -546,6 +546,47 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
       'dispatch_ack_rate_limited_total',
       'dispatch_ack events dropped because the per-socket 10/s rate limit was exceeded',
     ),
+
+    // === A04-002 / A15-010 (P5-08): Two-tier JWT cache observability ===
+    // jwt_cache_hits_total{tier}: tracks L1 hit, L2 hit, and full-verify paths.
+    //   Labels: tier = 'l1' | 'l2' | 'full'
+    //   L1 hit = served from in-process LRU; L2 hit = served from Redis;
+    //   full = jwt.verify ran + cache populated.
+    //   Dashboard: L1/(L1+L2+full) ratio shows cache effectiveness.
+    //   Call site: src/modules/auth/auth.service.ts (verifyAccessTokenCached)
+    counter(
+      'jwt_cache_hits_total',
+      'JWT verification cache outcomes by tier (l1=in-process LRU | l2=Redis | full=jwt.verify ran) — A04-002',
+    ),
+
+    // jwt_cache_miss_total: fires when neither L1 nor L2 has the entry.
+    //   (Currently recorded implicitly via tier=full; this counter is reserved
+    //    for a future path where miss vs full-verify are distinguished.)
+    //   Call site: reserved for src/modules/auth/auth.service.ts
+    counter(
+      'jwt_cache_miss_total',
+      'JWT verification cache misses (neither L1 nor L2 had a valid entry) — A04-002',
+    ),
+
+    // jwt_invalidate_publish_failed_total: fires when redisService.publish('jwt_invalidate', ...)
+    // throws inside the logout flow. Non-zero rate means logout is not propagating to
+    // other ECS tasks; their L1/L2 caches will serve revoked tokens until TTL expires.
+    //   Alert: any hit in 5m window → page oncall (token revocation gap)
+    //   Call site: src/modules/auth/auth.service.ts (logout)
+    counter(
+      'jwt_invalidate_publish_failed_total',
+      'Failures publishing jwt_invalidate Pub/Sub message on logout — non-zero means cross-task cache invalidation is broken — A04-002',
+    ),
+
+    // auth_blacklist_bypass_detected_total: auto-revert signal for P5-C.
+    // Fires when a token is served from cache and the blacklist lookup is
+    // skipped (FF_JWT_CACHE_SKIP_BLACKLIST=ON). Any non-zero rate in production
+    // without a Bloom filter backend is a security incident.
+    //   Call site: reserved for future Bloom-filter path in auth.service.ts
+    counter(
+      'auth_blacklist_bypass_detected_total',
+      'Cache-served JWT requests where blacklist check was skipped (FF_JWT_CACHE_SKIP_BLACKLIST) — used by P5-C auto-revert — A04-002',
+    ),
   ];
 
   for (const def of defs) {
@@ -669,6 +710,33 @@ export function registerDefaultGauges(gauges: Map<string, GaugeMetric>): void {
     gauge(
       'socket_stream_partition_depth_skew_ratio',
       'A04-006: Skew ratio (stddev/mean) of Socket.IO stream partition depths — > 0.5 indicates hot-shard imbalance',
+    ),
+
+    // === A04-001 / P5-T38+T39: HTTP upgrade rate-limit gauges ===
+    // (counters are auto-registered by incrementCounter; gauge must be pre-registered)
+    // See also: counter defs for socket_upgrade_rate_limited_total, rate_limiter_open_fail_total
+    //   registered below in registerDefaultCounters.
+
+    // === A04-001 / P5-T21: HTTP upgrade handshakes in progress ===
+    // Incremented when the upgrade handler accepts a request (after token-bucket
+    // allow); decremented on socket 'connect' or error. Lets ops observe the
+    // in-flight WS handshake count independently of fully-connected sockets.
+    // Alert: sustained > SOCKET_MAX_GLOBAL_CONNECTIONS (default 10 000).
+    //   Call site: src/server.ts (httpServer.on('upgrade') handler)
+    gauge(
+      'handshakes_in_progress',
+      'A04-001: HTTP WebSocket upgrade handshakes in-flight (post token-bucket, pre socket.io connect/error)',
+    ),
+
+    // === A04-002 / A15-010 (P5-08/P5-09): Socket auth latency p99 gauge ===
+    // Updated every 30s by a sampler in auth.middleware.ts (future) OR by ops
+    // tooling that aggregates the http_request_duration_ms histogram filtered to
+    // auth paths. Value = p99 milliseconds for socket upgrade auth verification.
+    //   Alert: > 15ms for 2 consecutive minutes → auto-revert FF_JWT_CACHE_ENABLED
+    //   Call site: reserved for auth latency sampling (P5-09 phase)
+    gauge(
+      'socket_auth_latency_p99_ms',
+      'P99 socket authentication latency in ms — alert threshold 15ms triggers JWT cache auto-revert (A04-002 canary gate)',
     ),
   ];
 
