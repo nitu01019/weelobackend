@@ -132,11 +132,49 @@ export interface AssignmentCacheRefreshPayload {
   serverTimeMs: number;
 }
 
+// W3 A03-004 / A13-005: durable post-commit trip_assigned fan-out via outbox.
+// Replaces the fire-and-forget socket emit + FCM enqueue loop at
+// confirmed-hold.service.ts:472-577 so a process crash between DB tx commit
+// and the per-driver loop no longer silently drops driver notifications.
+// One row per driver is written INSIDE the confirmed-hold tx; the outbox
+// poller replays emitToUser + queuePushNotification on crash-recovery.
+// customerPhone stores the ALREADY-MASKED value (producer calls
+// maskPhoneForExternal before persisting; parser does NOT re-mask so the
+// replayed payload is byte-identical to the fast-path emission).
+// pickup/drop use canonical { latitude, longitude, ... }; socket lat/lng
+// aliasing (A13-013) is applied at dispatcher-replay time, keeping the row
+// producer-shape-agnostic.
+export interface TripAssignedFanoutPayload {
+  type: 'trip_assigned_fanout';
+  orderId: string;
+  tripId: string | null;
+  assignmentId: string;
+  driverId: string;
+  transporterId: string;
+  bookingId: string | null;
+  truckRequestId: string | null;
+  pickup: { latitude: number; longitude: number; address: string; city?: string };
+  drop: { latitude: number; longitude: number; address: string; city?: string };
+  farePerTruck: number;
+  distanceKm: number | null;
+  vehicleNumber: string | null;
+  vehicleType: string | null;
+  customerName: string;
+  customerPhone: string;
+  assignedAt: string;
+  expiresAt: string;
+  message: string;
+  eventId: string;
+  eventVersion: number;
+  serverTimeMs: number;
+}
+
 export type OrderLifecycleOutboxPayload =
   | OrderCancelledOutboxPayload
   | TripCompletedOutboxPayload
   | AssignmentTimerSchedulePayload
-  | AssignmentCacheRefreshPayload;
+  | AssignmentCacheRefreshPayload
+  | TripAssignedFanoutPayload;
 
 export interface LifecycleOutboxRow {
   id: string;
