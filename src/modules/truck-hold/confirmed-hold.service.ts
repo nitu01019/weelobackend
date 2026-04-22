@@ -571,6 +571,16 @@ class ConfirmedHoldService {
       // Schedule driver acceptance timeouts with full data AND
       // fan out per-driver socket emit + FCM enqueue (P2 F4.1).
       const missingIds: string[] = [];
+      // W3 A13-005: confirmed-hold fanout observability (agent-13-scale-model.md F-05).
+      // `expected` = intended per-driver notifications for this hold. `socket_ok`
+      // and `fcm_ok` increment per successful channel delivery inside the loop.
+      // Sustained socket_ok/expected < 0.99 or fcm_ok/expected < 0.99 signals
+      // fast-path degradation; the A03-004 outbox covers durable replay when it
+      // happens, but the counter is the alertable SLO signal.
+      const expectedFanouts = assignments.length;
+      let fanoutSocketSuccess = 0;
+      let fanoutFcmSuccess = 0;
+      metrics.incrementCounter('confirmed_hold_fanout_total', { outcome: 'expected' }, expectedFanouts);
       for (const assignment of assignments) {
         const fullData = assignmentMap.get(assignment.assignmentId);
 
@@ -625,6 +635,9 @@ class ConfirmedHoldService {
               driverNotification
             );
             metrics.incrementCounter('new_assignment_socket_emit_total', { result: 'success' });
+            // W3 A13-005: channel-granular fanout success counter.
+            metrics.incrementCounter('confirmed_hold_fanout_total', { outcome: 'socket_ok' });
+            fanoutSocketSuccess += 1;
           } catch (sockErr) {
             metrics.incrementCounter('new_assignment_socket_emit_total', { result: 'fail' });
             logger.warn('[CONFIRMED HOLD] socket emit trip_assigned failed', {
@@ -702,6 +715,9 @@ class ConfirmedHoldService {
               data: fcmData,
             });
             metrics.incrementCounter('new_assignment_fcm_enqueue_total', { result: 'success' });
+            // W3 A13-005: channel-granular fanout success counter.
+            metrics.incrementCounter('confirmed_hold_fanout_total', { outcome: 'fcm_ok' });
+            fanoutFcmSuccess += 1;
           } catch (fcmErr) {
             metrics.incrementCounter('new_assignment_fcm_enqueue_total', { result: 'fail' });
             logger.warn('[CONFIRMED HOLD] FCM enqueue trip_assigned failed', {
@@ -753,6 +769,12 @@ class ConfirmedHoldService {
       logger.info('[CONFIRMED HOLD] Confirmed hold initialized', {
         holdId,
         confirmedExpiresAt,
+        // W3 A13-005: fanout observability fields — makes SLO tracking possible
+        // from a single log scan before the counter ratios are aggregated upstream.
+        expectedFanouts,
+        fanoutSocketSuccess,
+        fanoutFcmSuccess,
+        fanoutOutboxRows: fanoutOutboxIds.length,
       });
 
       // P2 F2.6: counter for confirmed-hold post-commit commits.

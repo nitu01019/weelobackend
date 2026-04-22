@@ -452,6 +452,33 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
       'socket_unacked_dual_write_fail_total',
       'Role-scoped durable-emit dual-write MULTI/EXEC failures by rollout phase (Arch 1B amendment — atomicity abort, neither write visible)',
     ),
+
+    // A09-002 / A12-009 Phase 2 — cross-role replay drop observability.
+    // Fires when the reconnect-time replay filter drops an envelope whose
+    // `role` tag mismatches the reconnecting socket's role. Belt-and-braces
+    // DPDP guard; non-zero indicates dual-role users reconnecting into a
+    // different role with queued events from a prior role session.
+    //   Labels: role = <socket.data.role>
+    //   Call site: src/shared/services/socket.service.ts (Phase 2 replay reader)
+    counter(
+      'socket_replay_dropped_cross_role_total',
+      'Durable-emit replay envelopes dropped due to role mismatch (envelope.role != socket.role) — Phase 2 DPDP filter',
+    ),
+
+    // A13-005 — confirmed-hold post-commit fanout observability. Emitted once
+    // per outcome per confirmed-hold initialize: one 'expected' bump per driver
+    // assignment (how many notifications the fast path intended to send), one
+    // 'socket_ok' bump per successful socket emit, one 'fcm_ok' bump per FCM
+    // enqueue. The ratio socket_ok/expected + fcm_ok/expected is the SLO signal
+    // for fast-path health; sustained divergence signals poller catch-up (and
+    // potential driver-notification loss pre-A03-004 outbox flip, or poller
+    // replay latency post-flip).
+    //   Labels: outcome = 'expected' | 'socket_ok' | 'fcm_ok'
+    //   Call site: src/modules/truck-hold/confirmed-hold.service.ts (fanout loop post-commit)
+    counter(
+      'confirmed_hold_fanout_total',
+      'Confirmed-hold post-commit fan-out outcomes by type (expected = intended notifications; socket_ok / fcm_ok = successful channel delivery)',
+    ),
   ];
 
   for (const def of defs) {
