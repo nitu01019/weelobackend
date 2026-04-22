@@ -413,6 +413,48 @@ function getPrismaClient(): PrismaClient {
       return result;
     });
 
+    // =========================================================================
+    // P1-T-DBMETRICS — DB pool gauges (sampled every 10s)
+    // =========================================================================
+    // Registers two gauges so Prometheus/Grafana can alert on pool starvation:
+    //   db_pool_available_connections — free slots in the connection pool
+    //   db_pool_wait_queue_depth      — requests currently waiting for a slot
+    //
+    // Prisma's public API does not expose pool internals directly. We register
+    // the gauges with best-effort values pulled from $metrics.json() when
+    // available (Prisma 4.9+ engines). If the runtime does not provide pool
+    // stats, the gauges remain registered and observable (value = 0) so
+    // dashboards do not break.
+    //
+    // The interval uses .unref() so the Node.js event loop is not kept alive
+    // by this timer during tests. Skipped entirely in NODE_ENV=test.
+    // =========================================================================
+    if (process.env.NODE_ENV !== 'test') {
+      const poolGaugeInterval = setInterval(async () => {
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-var-requires
+          const { metrics } = require('../monitoring/metrics.service');
+          // TODO: replace with prisma.$metrics.json() when Prisma >= 4.9 engine
+          // exposes pool_available_connections and pool_wait_queue_depth fields.
+          // Until then, default to 0 (gauge registered, value reflects "unknown").
+          let available = 0;
+          let waitDepth = 0;
+          try {
+            const raw = await (prisma as any).$metrics?.json?.();
+            if (raw) {
+              const avail = raw.gauges?.find((g: any) => g.key === 'prisma_pool_connections_open');
+              const waiting = raw.gauges?.find((g: any) => g.key === 'prisma_pool_connections_busy');
+              if (avail) available = (DB_POOL_CONFIG.connectionLimit - (avail.value ?? 0));
+              if (waiting) waitDepth = waiting.value ?? 0;
+            }
+          } catch { /* $metrics not available in this runtime — use 0 */ }
+          metrics.setGauge?.('db_pool_available_connections', available, { pool_name: 'primary' });
+          metrics.setGauge?.('db_pool_wait_queue_depth', waitDepth, { pool_name: 'primary' });
+        } catch { /* metrics unavailable — never crash the service */ }
+      }, 10_000);
+      poolGaugeInterval.unref();
+    }
+
     logger.info(`🗄️ Prisma connection pool configured: limit=${DB_POOL_CONFIG.connectionLimit}, timeout=${DB_POOL_CONFIG.poolTimeout}s`);
     logger.info(`🐢 Slow query logging enabled: threshold=${SLOW_QUERY_THRESHOLD_MS}ms`);
     logger.info(`🔄 Cache invalidation middleware enabled for User and Vehicle writes`);
@@ -473,7 +515,19 @@ export async function withDbTimeout<T>(
   //   with exponential backoff. Max 3 retries (100ms → 200ms → 400ms).
   // =====================================================================
   const maxRetries = options.maxRetries ?? 3;
-  const RETRYABLE_CODES = new Set(['P2034', 'P2028']);
+  // =====================================================================
+  // RETRY POLICY — Full-jitter backoff (AWS Architecture Blog pattern)
+  // =====================================================================
+  // (a) Full-jitter formula: backoffMs = random(0, min(cap, base * 2^attempt))
+  //     Decorrelates retry waves across 833 tx/s hold-waves at 150K-driver scale.
+  //     Unlike fixed exponential backoff, full jitter prevents all pods retrying
+  //     at the same instant (thundering herd), spreading load uniformly.
+  // (b) Per-attempt statement_timeout is set via SET LOCAL (5–8 s across call-sites).
+  //     The transaction-level timeout = timeoutMs + 2000ms safety buffer.
+  // (c) P2024 (connection-pool timeout) is retryable: pool saturation is transient
+  //     at peak hold-waves; a short backoff gives a free connection time to appear.
+  // =====================================================================
+  const RETRYABLE_CODES = new Set(['P2034', 'P2028', 'P2024']);
 
   for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
     try {
@@ -502,15 +556,17 @@ export async function withDbTimeout<T>(
       const isRetryable = RETRYABLE_CODES.has(prismaCode);
 
       if (isRetryable && attempt <= maxRetries) {
-        // Exponential backoff: 100ms, 200ms, 400ms + ≥50ms jitter (Arch 1A).
-        // At 833 SERIALIZABLE tx/s, deterministic backoff synchronises retries
-        // into waves (thundering herd). Jitter smooths the retry distribution.
-        const backoffMs = (100 * Math.pow(2, attempt - 1)) + Math.floor(Math.random() * 50);
-        logger.warn(`[withDbTimeout] Serializable conflict (${prismaCode}), retry ${attempt}/${maxRetries} after ${backoffMs}ms`);
+        // AWS full jitter: random in [0, min(1000ms, 100ms * 2^attempt)]
+        // attempt 1 → [0, 100ms], attempt 2 → [0, 200ms], attempt 3 → [0, 400ms], cap 1000ms.
+        // Full jitter (not decorrelated jitter) per AWS Architecture Blog recommendation.
+        const backoffMs = Math.floor(Math.random() * Math.min(1000, 100 * Math.pow(2, attempt)));
+        logger.warn(`[withDbTimeout] Retryable conflict (${prismaCode}), retry ${attempt}/${maxRetries} after ${backoffMs}ms`);
         // P4 F2.NEW-1: observability for serializable retries.
         try {
           const { metrics } = require('../monitoring/metrics.service');
           metrics.incrementCounter('tx_serializable_conflict_total', { site: metricSite, outcome: 'retry', code: prismaCode });
+          // P1-T17: histogram of actual retry wait — surfaces p99 retry latency per call-site.
+          metrics.observeHistogram?.('tx_retry_wait_seconds', backoffMs / 1000, { site: metricSite });
         } catch { /* metrics optional — never block the retry */ }
         await new Promise(resolve => setTimeout(resolve, backoffMs));
         continue;

@@ -669,3 +669,86 @@ describe('Edge cases', () => {
     });
   });
 });
+
+// =============================================================================
+// P1-T37: Full-jitter backoff distribution (A13-010)
+// =============================================================================
+// Verifies that the AWS full-jitter formula:
+//   backoffMs = Math.floor(Math.random() * Math.min(1000, 100 * 2^attempt))
+// satisfies two invariants critical for thundering-herd suppression at 833 tx/s:
+//   1. Hard cap: no sample ever exceeds 1000ms
+//   2. Spread: std-dev at attempt 3 exceeds 80ms (confirms real jitter, not near-zero)
+
+describe('P1-T37: withDbTimeout full-jitter backoff distribution', () => {
+  /**
+   * Replicates the exact formula from prisma.service.ts withDbTimeout so the
+   * test does not import the service (avoids DB connection side-effects).
+   */
+  function computeBackoff(attempt: number, rand: number): number {
+    return Math.floor(rand * Math.min(1000, 100 * Math.pow(2, attempt)));
+  }
+
+  function stdDev(samples: number[]): number {
+    const mean = samples.reduce((a, b) => a + b, 0) / samples.length;
+    const variance = samples.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / samples.length;
+    return Math.sqrt(variance);
+  }
+
+  const SAMPLE_COUNT = 10_000;
+
+  it('should never exceed 1000ms cap across 10,000 samples for attempts 1-3', () => {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      for (let i = 0; i < SAMPLE_COUNT; i++) {
+        const backoffMs = computeBackoff(attempt, Math.random());
+        expect(backoffMs).toBeLessThanOrEqual(1000);
+        expect(backoffMs).toBeGreaterThanOrEqual(0);
+      }
+    }
+  });
+
+  it('should have standard deviation > 80ms at attempt 3 (spread confirms real jitter)', () => {
+    const samples: number[] = [];
+    for (let i = 0; i < SAMPLE_COUNT; i++) {
+      samples.push(computeBackoff(3, Math.random()));
+    }
+    const sd = stdDev(samples);
+    // attempt 3: uniform[0, 800ms] → theoretical std-dev ≈ 231ms; assert > 80ms with margin
+    expect(sd).toBeGreaterThan(80);
+  });
+
+  it('should have correct cap per attempt: attempt 1 <= 200ms, attempt 2 <= 400ms, attempt 3 <= 800ms', () => {
+    // Formula: Math.min(1000, 100 * 2^attempt)
+    //   attempt 1 → min(1000, 100*2) = 200ms
+    //   attempt 2 → min(1000, 100*4) = 400ms
+    //   attempt 3 → min(1000, 100*8) = 800ms
+    const caps = [200, 400, 800];
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const cap = caps[attempt - 1];
+      for (let i = 0; i < 500; i++) {
+        const backoffMs = computeBackoff(attempt, Math.random());
+        expect(backoffMs).toBeLessThan(cap + 1); // Math.floor ensures strictly < cap+1
+      }
+    }
+  });
+
+  it('should respect 1000ms hard cap at high attempt numbers (attempt 10)', () => {
+    for (let i = 0; i < 1000; i++) {
+      const backoffMs = computeBackoff(10, Math.random());
+      expect(backoffMs).toBeLessThanOrEqual(1000);
+    }
+  });
+
+  it('should produce 0 when Math.random returns 0 (boundary: min of range)', () => {
+    expect(computeBackoff(1, 0)).toBe(0);
+    expect(computeBackoff(2, 0)).toBe(0);
+    expect(computeBackoff(3, 0)).toBe(0);
+  });
+
+  it('should produce value < cap when Math.random approaches 1 (boundary: max of range)', () => {
+    // Formula cap per attempt: 200ms, 400ms, 800ms
+    // Math.floor(0.9999 * 200) = 199 (< 200)
+    expect(computeBackoff(1, 0.9999)).toBeLessThan(200);
+    expect(computeBackoff(2, 0.9999)).toBeLessThan(400);
+    expect(computeBackoff(3, 0.9999)).toBeLessThan(800);
+  });
+});

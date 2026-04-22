@@ -19,7 +19,7 @@
     "contracts:verify": "node packages/contracts/verify.mjs",
     "db:migrate:dev": "prisma migrate dev",
     "db:generate": "prisma generate",
-    "db:push:prod": "prisma migrate deploy",
+    "db:push:prod:DANGER_DO_NOT_USE": "prisma migrate deploy",
     "db:push:prod:deploy": "prisma migrate deploy",
     "docker:build": "docker build -t weelo-backend:latest .",
     "docker:dev": "docker-compose up -d",
