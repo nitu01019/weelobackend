@@ -38,6 +38,9 @@ const logFormat = winston.format.combine(
 );
 
 // Sensitive fields to never log
+// A12-002 / A12-007: DPDP Act 2023 S.5(b) data minimisation — phone, name, customerName,
+// driverName, customerPhone, driverPhone, otp, token added so substring-match sanitizer
+// auto-redacts any meta key containing these tokens (e.g. `driverPhone`, `customer.name`).
 const SENSITIVE_FIELDS = [
   'password',
   'token',
@@ -47,7 +50,13 @@ const SENSITIVE_FIELDS = [
   'apiKey',
   'authorization',
   'otp',
-  'pin'
+  'pin',
+  'phone',
+  'name',
+  'customerName',
+  'driverName',
+  'customerPhone',
+  'driverPhone'
 ];
 
 /**

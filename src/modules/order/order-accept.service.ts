@@ -473,7 +473,12 @@ export async function acceptTruckRequest(
   metrics.incrementCounter('assignment_success_total');
   logger.info(`Truck request ${truckRequestId} accepted`);
   logger.info(`   Vehicle: ${vehicleNumber} (${vehicleType})`);
-  logger.info(`   Driver: ${driverName} (${driverPhone})`);
+  // A12-002: DPDP Act 2023 S.5(b) — drop driverName, mask phone. See SENSITIVE_FIELDS in logger.service.ts.
+  logger.info('Driver notified', {
+    driverId,
+    assignmentId,
+    driverPhoneLast4: maskPhoneForExternal(driverPhone || ''),
+  });
   logger.info(`   Order progress: ${newTrucksFilled}/${orderTotalTrucks}`);
 
   // F-H6 FIX: Schedule 45s assignment timeout immediately after creation
