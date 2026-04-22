@@ -179,6 +179,20 @@ export async function processVehicleTransitionOutboxBatch(
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
         const isDlq = nextAttempts >= VEHICLE_TRANSITION_OUTBOX_MAX_ATTEMPTS;
+        // A11-001 P6-T19/P6-T20: vehicle_cache_sync_failures_total with source label.
+        // 'fleet' when error message matches fleet/invalidate pattern; 'availability' otherwise.
+        const cacheSource: string =
+          /fleet|invalidate/i.test(message) ? 'fleet' : 'availability';
+        metrics.incrementCounter('vehicle_cache_sync_failures_total', {
+          source: cacheSource,
+        });
+        logger.warn('[VehicleTransitionOutbox] Cache sync failure (diagnostic)', {
+          id: row.id,
+          vehicleId: row.vehicleId.substring(0, 8),
+          source: cacheSource,
+          error: message,
+        });
+
 
         await tx.$executeRaw`
           UPDATE "VehicleTransitionOutbox"

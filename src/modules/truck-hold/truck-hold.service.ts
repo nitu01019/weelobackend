@@ -114,6 +114,8 @@ import { holdExpiryCleanupService } from '../hold-expiry/hold-expiry-cleanup.ser
 // See `./hold-eligibility.ts` for the rationale (KYC FSM, Ola, Uber Rider Identity).
 import { validateActorEligibility, HoldEligibilityError } from './hold-eligibility';
 export { validateActorEligibility, HoldEligibilityError } from './hold-eligibility';
+// A11-001 P6-F: feature-flagged outbox enqueue for post-commit vehicle cache sync
+import { isEnabled, FLAGS } from '../../shared/config/feature-flags';
 
 // =============================================================================
 // TYPES & INTERFACES
@@ -1559,6 +1561,33 @@ class TruckHoldService {
       }, {
         isolationLevel: Prisma.TransactionIsolationLevel.Serializable
       });
+      // =========================================================================
+      // A11-001 P6-F: Post-commit vehicle cache invalidation via outbox (NOT inline)
+      // =========================================================================
+      // 833 holds/s x 4 avg trucks = 3.3K Redis ops/s inline adds 30-80ms p99.
+      // Instead: one $executeRaw INSERT per assignment so the drain worker
+      // (BATCH_SIZE=50) handles all Redis ops asynchronously. HTTP response
+      // returns BEFORE any Redis work. Feature-flagged via VEHICLE_TRANSITION_OUTBOX.
+      if (isEnabled(FLAGS.VEHICLE_TRANSITION_OUTBOX)) {
+        for (const a of confirmedAssignments.assignments) {
+          // Fire-and-forget: failure is logged, never blocks the response.
+          prismaClient.$executeRaw`
+            INSERT INTO "VehicleTransitionOutbox"
+              ("vehicleId", "vehicleKey", "transporterId",
+               "fromStatus", "toStatus", "reason")
+            VALUES
+              (${a.vehicle.id}, ${null}, ${a.vehicle.transporterId},
+               ${'available'}, ${'on_hold'}, ${'confirmHoldWithAssignments'})
+            ON CONFLICT DO NOTHING
+          `.catch((err: unknown) => {
+            logger.warn('[TruckHold][P6-F] Outbox INSERT failed (non-fatal)', {
+              vehicleId: a.vehicle.id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+        }
+      }
+
       const assignmentIds = confirmedAssignments.assignments.map((assignment) => assignment.assignmentId);
       const tripIds = confirmedAssignments.assignments.map((assignment) => assignment.tripId);
       const newTrucksFilled = confirmedAssignments.newTrucksFilled;

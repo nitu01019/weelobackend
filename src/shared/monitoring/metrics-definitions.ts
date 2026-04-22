@@ -587,6 +587,15 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
       'auth_blacklist_bypass_detected_total',
       'Cache-served JWT requests where blacklist check was skipped (FF_JWT_CACHE_SKIP_BLACKLIST) — used by P5-C auto-revert — A04-002',
     ),
+    // === A11-001 P6-T19: Vehicle cache sync failure observability ===
+    // Fires from the VehicleTransitionOutbox drain worker when onVehicleTransition
+    // throws for a specific cache sink.
+    //   Labels: source = 'availability' | 'fleet'
+    //   Call site: src/shared/services/vehicle-transition-outbox.service.ts
+    counter(
+      'vehicle_cache_sync_failures_total',
+      'Vehicle cache sync failures by source (availability | fleet) — A11-001 P6-T19',
+    ),
   ];
 
   for (const def of defs) {

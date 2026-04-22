@@ -34,6 +34,8 @@ import { invalidateVehicleCache } from '../../shared/services/fleet-cache-write.
 import { enqueueCompletionLifecycleOutbox } from '../order/order-lifecycle-outbox.service';
 import type { TripCompletedOutboxPayload } from '../order/order-types';
 import { trackingService } from '../tracking/tracking.service';
+// A11-001 P6-G: feature-flagged outbox enqueue for symmetric in_transit->available hook
+import { isEnabled, FLAGS } from '../../shared/config/feature-flags';
 
 // =============================================================================
 // TYPES
@@ -158,25 +160,44 @@ export async function completeTrip(
       }
     });
 
-    // Post-transaction: Redis vehicle availability sync (non-fatal)
+    // Post-transaction: Redis vehicle availability sync — A11-001 P6-G outbox path (non-fatal).
+    // When flag ON: enqueue VehicleTransitionOutbox row (drain worker handles Redis async).
+    // When flag OFF: legacy try/await inline path for soak-safe rollout.
     if (assignment.vehicleId) {
-      try {
-        const vehicle = await prismaClient.vehicle.findUnique({
-          where: { id: assignment.vehicleId },
-          select: { vehicleKey: true, transporterId: true }
+      if (isEnabled(FLAGS.VEHICLE_TRANSITION_OUTBOX)) {
+        // Enqueue in_transit (or actualVehicleStatus) -> available via outbox.
+        prismaClient.$executeRaw`
+          INSERT INTO "VehicleTransitionOutbox"
+            ("vehicleId", "vehicleKey", "transporterId",
+             "fromStatus", "toStatus", "reason")
+          VALUES
+            (${assignment.vehicleId}, ${null}, ${assignment.transporterId},
+             ${actualVehicleStatus}, ${'available'}, ${'tripCompletion'})
+          ON CONFLICT DO NOTHING
+        `.catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          logger.warn('[COMPLETION][P6-G] Outbox INSERT failed (non-fatal)', { ...logCtx, error: msg });
         });
-        if (vehicle?.vehicleKey && assignment.transporterId) {
-          await liveAvailabilityService.onVehicleStatusChange(
-            assignment.transporterId, vehicle.vehicleKey, actualVehicleStatus, 'available'
-          );
+      } else {
+        // Legacy: inline Redis sync (kept for soak-safe rollout)
+        try {
+          const vehicle = await prismaClient.vehicle.findUnique({
+            where: { id: assignment.vehicleId },
+            select: { vehicleKey: true, transporterId: true }
+          });
+          if (vehicle?.vehicleKey && assignment.transporterId) {
+            await liveAvailabilityService.onVehicleStatusChange(
+              assignment.transporterId, vehicle.vehicleKey, actualVehicleStatus, 'available'
+            );
+          }
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          logger.warn('[COMPLETION] Redis vehicle sync failed (non-fatal)', { ...logCtx, error: msg });
         }
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        logger.warn('[COMPLETION] Redis vehicle sync failed (non-fatal)', { ...logCtx, error: msg });
       }
     }
 
-    logger.info('[COMPLETION] Atomic TX committed', { ...logCtx, vehicleId: assignment.vehicleId });
+        logger.info('[COMPLETION] Atomic TX committed', { ...logCtx, vehicleId: assignment.vehicleId });
 
     // =========================================================================
     // (c) Redis tracking cleanup — completeTracking keys

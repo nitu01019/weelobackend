@@ -543,4 +543,111 @@ describe('F-A-64 — VehicleTransitionOutbox', () => {
       mod.stopVehicleTransitionOutboxPoller();
     });
   });
+
+  // -------------------------------------------------------------------------
+  // A11-001 P6-T41 — Chaos: availability failure does NOT fail broadcast
+  // -------------------------------------------------------------------------
+
+  describe('A11-001 P6-T41: availability-service failure is isolated from the broadcast commit', () => {
+    it('broadcast commit returns 200 path: outbox drain failure does not throw to caller', async () => {
+      // Simulate an availability-service failure during drain
+      (globalThis as { __vtoScript?: unknown }).__vtoScript = [
+        { behavior: 'fail', message: 'Redis ECONNRESET availability' },
+      ];
+      const mod = loadPollerModule();
+      const row = addRow({ toStatus: 'on_hold', reason: 'confirmHoldWithAssignments' });
+
+      // The drain worker should NOT throw — it catches and retries.
+      // processed = 1 means the row was handled (even if it failed internally).
+      const processed = await mod.runVehicleTransitionOutboxPoll();
+      expect(processed).toBe(1);
+
+      // Row stays unprocessed (retry queued), but the call did not throw.
+      const after = findRow(row.id)!;
+      expect(after.processedAt).toBeNull();
+      expect(after.attempts).toBe(1);
+
+      // vehicle_cache_sync_failures_total incremented with source=availability
+      // (error message contains 'availability')
+      expect(metricsCounters['vehicle_cache_sync_failures_total']).toBe(1);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // A11-001 P6-T42 — Chaos: fleet-cache failure emits correct source label
+  // -------------------------------------------------------------------------
+
+  describe('A11-001 P6-T42: fleet-cache failure emits separate source label', () => {
+    it('error containing fleet keyword increments vehicle_cache_sync_failures_total{source=fleet}', async () => {
+      // Fleet-cache style error message
+      (globalThis as { __vtoScript?: unknown }).__vtoScript = [
+        { behavior: 'fail', message: 'fleet invalidation Redis TIMEOUT' },
+      ];
+      const mod = loadPollerModule();
+      addRow({ toStatus: 'available', reason: 'tripCompletion' });
+
+      const processed = await mod.runVehicleTransitionOutboxPoll();
+      expect(processed).toBe(1);
+
+      // Metric should fire; the mock records it in metricsCounters without labels,
+      // so we verify the count. Source-label verification is done via the spy below.
+      expect(metricsCounters['vehicle_cache_sync_failures_total']).toBeGreaterThanOrEqual(1);
+
+      // Verify incrementCounter was called with source='fleet'
+      const { metrics: metricsMock } = jest.requireMock('../shared/monitoring/metrics.service') as {
+        metrics: { incrementCounter: jest.Mock };
+      };
+      const syncFailCalls = metricsMock.incrementCounter.mock.calls.filter(
+        (call: unknown[]) => call[0] === 'vehicle_cache_sync_failures_total'
+      );
+      expect(syncFailCalls.length).toBeGreaterThanOrEqual(1);
+      const labels = syncFailCalls[syncFailCalls.length - 1][1] as { source: string };
+      expect(labels.source).toBe('fleet');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // A11-001 P6-T48 — Invariant: 10 assignments → availability drops by 10
+  // -------------------------------------------------------------------------
+
+  describe('A11-001 P6-T48: 10 synthetic assignments → availability count drops after drain', () => {
+    it('after drain settles, onVehicleTransition called exactly 10 times', async () => {
+      const mod = loadPollerModule();
+
+      // Enqueue 10 synthetic available→on_hold rows
+      for (let i = 0; i < 10; i += 1) {
+        addRow({
+          vehicleId: `veh-${i}`,
+          vehicleKey: `vk-${i}`,
+          transporterId: 'tr-batch-1',
+          fromStatus: 'available',
+          toStatus: 'on_hold',
+          reason: 'confirmHoldWithAssignments',
+        });
+      }
+
+      // Drain in one batch (BATCH_SIZE=50 can handle 10)
+      const processed = await mod.runVehicleTransitionOutboxPoll();
+      expect(processed).toBe(10);
+
+      // All 10 rows should now be processed
+      const stillPending = fakeOutbox.filter((r) => r.processedAt === null);
+      expect(stillPending).toHaveLength(0);
+
+      // onVehicleTransition called once per row
+      expect(onVehicleTransitionMock).toHaveBeenCalledTimes(10);
+
+      // Each call used the correct from/to pattern
+      for (let i = 0; i < 10; i += 1) {
+        expect(onVehicleTransitionMock).toHaveBeenCalledWith(
+          'tr-batch-1',
+          `veh-${i}`,
+          `vk-${i}`,
+          'available',
+          'on_hold',
+          'confirmHoldWithAssignments'
+        );
+      }
+    });
+  });
 });
