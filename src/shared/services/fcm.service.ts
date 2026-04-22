@@ -27,6 +27,7 @@
  */
 
 import fs from 'fs';
+import { createHash } from 'crypto';
 import { logger } from './logger.service';
 import { redisService } from './redis.service';
 import { prismaClient } from '../database/prisma.service';
@@ -960,13 +961,21 @@ class FCMService {
     const ttlSeconds = ttlMap[notification.type] ?? 600;
     const apnsExpiration = Math.floor(Date.now() / 1000) + ttlSeconds;
 
-    // P2 F6.3: Collapse retries/duplicates with the same business key into a
+    // P2 F6.3 / A03-010: Collapse retries/duplicates with the same business key into a
     // single visible notification (one buzz per booking, not N).
-    const collapseKey =
+    // Namespaced by event type so trip_assigned and order_cancelled with the same
+    // bookingId do NOT collapse to the same tray slot.
+    const collapseKeyRaw = `${notification.type}:${
       (notification.data?.bookingId as string | undefined) ??
       (notification.data?.orderId as string | undefined) ??
       (notification.data?.assignmentId as string | undefined) ??
-      undefined;
+      'unkeyed'
+    }`;
+    // P6-T38: FCM collapseKey length bound — 128 chars is well within the 1 KB
+    // FCM maximum and safe across all Android / APNs versions.
+    const collapseKey = collapseKeyRaw.length <= 128
+      ? collapseKeyRaw
+      : `${collapseKeyRaw.slice(0, 100)}.${createHash('sha256').update(collapseKeyRaw).digest('hex').slice(0, 8)}`;
 
     // A03-002 / A05-001 / A13-004: When FF_FCM_DATA_ONLY_FULLSCREEN is ON AND the
     // notification type is in FULLSCREEN_TYPES, omit the top-level `notification:`

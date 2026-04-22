@@ -587,9 +587,10 @@ describe('FCM Service Hardening', () => {
   });
 
   // =========================================================================
-  // P2 F6.3: buildMessage sets collapseKey on android + apns-collapse-id
+  // P2 F6.3 / P6-T10 / P6-T38 / P6-T11 / P6-T47:
+  //   collapseKey namespaced by event type + length bound (A03-010)
   // =========================================================================
-  describe('P2 F6.3: collapseKey on android + apns', () => {
+  describe('P2 F6.3 / A03-010: namespaced collapseKey on android + apns', () => {
     beforeEach(async () => {
       process.env.FIREBASE_SERVICE_ACCOUNT_PATH = '/tmp/test-sa.json';
       await fcmService.initialize();
@@ -599,8 +600,51 @@ describe('FCM Service Hardening', () => {
       delete process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
     });
 
-    test('bookingId in data sets android.collapseKey AND apns-collapse-id', async () => {
+    // P6-T11: same type + same bookingId → identical collapseKey
+    test('same type + same bookingId produces identical collapseKey on both sends', async () => {
       const notification = makeNotification({
+        type: 'trip_assigned',
+        data: { bookingId: 'b-999', foo: 'bar' },
+      });
+
+      mockSend.mockResolvedValue('msg-id');
+      await fcmService.sendToTokens(['tok-col-a'], notification, 'u-col-a');
+      await fcmService.sendToTokens(['tok-col-b'], notification, 'u-col-b');
+
+      const key1 = mockSend.mock.calls[0][0].android.collapseKey;
+      const key2 = mockSend.mock.calls[1][0].android.collapseKey;
+      expect(key1).toBe('trip_assigned:b-999');
+      expect(key2).toBe('trip_assigned:b-999');
+      expect(key1).toBe(key2);
+    });
+
+    // P6-T11: different types + same bookingId → DIFFERENT collapseKeys
+    test('different event types with the same bookingId produce DIFFERENT collapseKeys', async () => {
+      const n1 = makeNotification({ type: 'trip_assigned',    data: { bookingId: 'b-999' } });
+      const n2 = makeNotification({ type: 'order_cancelled',  data: { bookingId: 'b-999' } });
+
+      mockSend.mockResolvedValue('msg-id');
+      await fcmService.sendToTokens(['tok-col-c'], n1, 'u-col-c');
+
+      mockSend.mockClear();
+      await fcmService.sendToTokens(['tok-col-d'], n2, 'u-col-d');
+
+      const key1 = mockSend.mock.calls[0][0].android.collapseKey;
+
+      // reset and send n1 again to compare
+      mockSend.mockClear();
+      await fcmService.sendToTokens(['tok-col-e'], n1, 'u-col-e');
+      const key1Again = mockSend.mock.calls[0][0].android.collapseKey;
+
+      expect(key1).toBe('order_cancelled:b-999');
+      expect(key1Again).toBe('trip_assigned:b-999');
+      expect(key1).not.toBe(key1Again);
+    });
+
+    // P6-T11: bookingId in data sets android.collapseKey AND apns-collapse-id (namespaced)
+    test('bookingId in data sets android.collapseKey AND apns-collapse-id with type prefix', async () => {
+      const notification = makeNotification({
+        type: NotificationType.GENERAL,
         data: { bookingId: 'b-999', foo: 'bar' },
       });
 
@@ -608,38 +652,87 @@ describe('FCM Service Hardening', () => {
       await fcmService.sendToTokens(['tok-collapse-1'], notification, 'u-col-1');
 
       const sent = mockSend.mock.calls[0][0];
-      expect(sent.android.collapseKey).toBe('b-999');
-      expect(sent.apns.headers['apns-collapse-id']).toBe('b-999');
+      expect(sent.android.collapseKey).toBe(`${NotificationType.GENERAL}:b-999`);
+      expect(sent.apns.headers['apns-collapse-id']).toBe(`${NotificationType.GENERAL}:b-999`);
     });
 
-    test('falls back to orderId, then assignmentId when bookingId is absent', async () => {
-      const orderOnly = makeNotification({ data: { orderId: 'o-123' } });
+    // P6-T11: falls back to orderId then assignmentId (namespaced)
+    test('falls back to orderId, then assignmentId when bookingId is absent (namespaced)', async () => {
+      const orderOnly = makeNotification({ type: NotificationType.GENERAL, data: { orderId: 'o-123' } });
       mockSend.mockResolvedValueOnce('msg-id');
       await fcmService.sendToTokens(['tok-collapse-2'], orderOnly, 'u-col-2');
 
       const sentOrder = mockSend.mock.calls[0][0];
-      expect(sentOrder.android.collapseKey).toBe('o-123');
-      expect(sentOrder.apns.headers['apns-collapse-id']).toBe('o-123');
+      expect(sentOrder.android.collapseKey).toBe(`${NotificationType.GENERAL}:o-123`);
+      expect(sentOrder.apns.headers['apns-collapse-id']).toBe(`${NotificationType.GENERAL}:o-123`);
 
       mockSend.mockClear();
-      const assignmentOnly = makeNotification({ data: { assignmentId: 'a-456' } });
+      const assignmentOnly = makeNotification({ type: NotificationType.GENERAL, data: { assignmentId: 'a-456' } });
       mockSend.mockResolvedValueOnce('msg-id');
       await fcmService.sendToTokens(['tok-collapse-3'], assignmentOnly, 'u-col-3');
 
       const sentAssignment = mockSend.mock.calls[0][0];
-      expect(sentAssignment.android.collapseKey).toBe('a-456');
-      expect(sentAssignment.apns.headers['apns-collapse-id']).toBe('a-456');
+      expect(sentAssignment.android.collapseKey).toBe(`${NotificationType.GENERAL}:a-456`);
+      expect(sentAssignment.apns.headers['apns-collapse-id']).toBe(`${NotificationType.GENERAL}:a-456`);
     });
 
-    test('omits collapseKey entirely when no business ID is present', async () => {
-      const notification = makeNotification({ data: { foo: 'bar' } });
+    // P6-T11: missing IDs → 'unkeyed' suffix
+    test('collapseKey uses type:unkeyed when no business ID is present', async () => {
+      const notification = makeNotification({ type: NotificationType.GENERAL, data: { foo: 'bar' } });
 
       mockSend.mockResolvedValueOnce('msg-id');
       await fcmService.sendToTokens(['tok-collapse-4'], notification, 'u-col-4');
 
       const sent = mockSend.mock.calls[0][0];
-      expect(sent.android).not.toHaveProperty('collapseKey');
-      expect(sent.apns.headers).not.toHaveProperty('apns-collapse-id');
+      expect(sent.android.collapseKey).toBe(`${NotificationType.GENERAL}:unkeyed`);
+      expect(sent.apns.headers['apns-collapse-id']).toBe(`${NotificationType.GENERAL}:unkeyed`);
+    });
+
+    // P6-T38: >128 char result → truncated with hash suffix
+    test('collapseKey longer than 128 chars is truncated to 100 chars + 8-char sha256 suffix', async () => {
+      // Craft a type string that will exceed 128 chars in total:
+      // "very_long_type_name_here:" (25) + 104-char bookingId = 129 chars total → triggers truncation
+      const longType = 'very_long_event_type_name_'; // 26 chars
+      const longId   = 'x'.repeat(103);              // 103 chars → total = 26 + 1 + 103 = 130 chars
+      const notification = makeNotification({
+        type: longType,
+        data: { bookingId: longId },
+      });
+
+      mockSend.mockResolvedValueOnce('msg-id');
+      await fcmService.sendToTokens(['tok-collapse-5'], notification, 'u-col-5');
+
+      const sent = mockSend.mock.calls[0][0];
+      const key: string = sent.android.collapseKey;
+
+      // Must be exactly 109 chars: 100 + '.' + 8-char hex hash
+      expect(key.length).toBe(109);
+      // Last 9 chars are '.' + 8 hex chars
+      expect(key).toMatch(/\.[0-9a-f]{8}$/);
+      // First 100 chars are the raw key sliced
+      const raw = `${longType}:${longId}`;
+      expect(key.startsWith(raw.slice(0, 100))).toBe(true);
+
+      // Same on APNs
+      expect(sent.apns.headers['apns-collapse-id']).toBe(key);
+    });
+
+    // P6-T47: integration — 2 sends in sequence with same bookingId different types → different keys
+    test('integration: two sequential sends same bookingId, different types → different collapseKeys', async () => {
+      mockSend.mockResolvedValue('msg-id');
+
+      const send1 = makeNotification({ type: 'new_broadcast',   data: { bookingId: 'bk-777' } });
+      const send2 = makeNotification({ type: 'assignment_update', data: { bookingId: 'bk-777' } });
+
+      await fcmService.sendToTokens(['tok-int-1'], send1, 'u-int-1');
+      await fcmService.sendToTokens(['tok-int-2'], send2, 'u-int-2');
+
+      const key1 = mockSend.mock.calls[0][0].android.collapseKey;
+      const key2 = mockSend.mock.calls[1][0].android.collapseKey;
+
+      expect(key1).toBe('new_broadcast:bk-777');
+      expect(key2).toBe('assignment_update:bk-777');
+      expect(key1).not.toBe(key2);
     });
   });
 
