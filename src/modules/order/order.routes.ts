@@ -32,7 +32,7 @@ import { prismaClient } from '../../shared/database/prisma.service';
 import { createOrderSchema } from '../booking/booking.schema';
 // FIX F-1-4: Use shared utils instead of inline duplicates
 import { normalizeOrderLifecycleState, normalizeOrderStatus } from '../../shared/utils/order-lifecycle.utils';
-import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
+import { maskPhoneForExternal, maskPhoneForLog } from '../../shared/utils/pii.utils';
 
 const router = Router();
 
@@ -274,7 +274,7 @@ router.post(
         // Create order and broadcast
         const result = await orderService.createOrder(orderRequest);
 
-        logger.info(`Order created by ${user.phone}: ${result.orderId}`);
+        logger.info('Order created', { orderId: result.orderId, userId: user.userId, phoneLast4: maskPhoneForLog(user.phone) });
 
         const responseData = buildCreateOrderResponseData(
           result,
@@ -303,7 +303,7 @@ router.post(
         // MODULARITY: Lock is scoped to this request only
         // =================================================================
         await redisService.releaseLock(lockKey, user.userId);
-        logger.debug(`🔓 Lock released for customer ${user.phone}`);
+        logger.debug('Lock released for customer', { userId: user.userId, phoneLast4: maskPhoneForLog(user.phone) });
       }
     } catch (error: any) {
       logger.error(`Order creation error: ${error.message}`);
@@ -576,7 +576,7 @@ router.post(
       const reason = typeof req.body.reason === 'string' ? req.body.reason.substring(0, 500) : '';
       const idempotencyKey = req.header('X-Idempotency-Key') || req.header('x-idempotency-key') || undefined;
 
-      logger.info(`📛 Order cancellation requested: ${orderId} by ${user.phone}`);
+      logger.info('Order cancellation requested', { orderId, userId: user.userId, phoneLast4: maskPhoneForLog(user.phone) });
 
       // Cancel the order and broadcast to transporters
       const result = await orderService.cancelOrder(orderId, user.userId, reason, idempotencyKey);
@@ -1001,7 +1001,7 @@ router.delete(
       const user = req.user;
       const idempotencyKey = req.header('X-Idempotency-Key') || req.header('x-idempotency-key') || undefined;
 
-      logger.info(`📛 Cancel request: Order ${orderId} by customer ${user.phone}`);
+      logger.info('Cancel request', { orderId, userId: user.userId, phoneLast4: maskPhoneForLog(user.phone) });
 
       // SCALABILITY: Use existing cancelOrder service
       const result = await orderService.cancelOrder(orderId, user.userId, 'Customer cancelled from app', idempotencyKey);

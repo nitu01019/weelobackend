@@ -962,3 +962,119 @@ describe('GROUP 4: PII masking inventory -- all files with customerPhone in noti
     expect(maskedCount).toBeGreaterThanOrEqual(17);
   });
 });
+
+// =========================================================================
+// GROUP 5: A12-003/A12-004/A12-005 — DPDP Act 2023 §5(b) logger PII audit
+// =========================================================================
+
+describe('GROUP 5: A12-003/A12-004/A12-005 — no raw phone in logger template literals', () => {
+  /**
+   * Returns true when a logger call line contains a raw phone template
+   * expression that is NOT wrapped in maskPhoneForLog / maskPhoneForExternal.
+   */
+  function hasRawPhoneInLoggerLine(line: string): boolean {
+    const trimmed = line.trim();
+    // Must be a logger call
+    if (!/logger\.(info|warn|error|debug|verbose)/.test(trimmed)) return false;
+    // Skip comment lines
+    if (trimmed.startsWith('//') || trimmed.startsWith('*')) return false;
+    // Skip if already uses masking helper
+    if (trimmed.includes('maskPhoneForLog') || trimmed.includes('maskPhoneForExternal')) return false;
+    // Detect raw phone template interpolations
+    const rawPhonePatterns = [
+      /\$\{[^}]*\.phone[^}]*\}/,           // ${user.phone}, ${driver.phone}, etc.
+      /\$\{customerPhone\}/,               // ${customerPhone}
+      /\$\{[^}]*customerPhone[^}]*\}/,     // ${order.customerPhone}, etc.
+      /\$\{data\.phone\}/,                 // ${data.phone}
+      /\$\{data\.name\}/,                  // ${data.name} (PII name in log)
+      /\$\{customer(Name|Phone)\}/,        // ${customerName}, ${customerPhone}
+    ];
+    return rawPhonePatterns.some(re => re.test(trimmed));
+  }
+
+  // -----------------------------------------------------------------------
+  // 5.1 — order.routes.ts (A12-003)
+  // -----------------------------------------------------------------------
+  describe('A12-003: order.routes.ts', () => {
+    const source = readSource('modules/order/order.routes.ts');
+    const lines = source.split('\n');
+
+    it('imports maskPhoneForLog from pii.utils', () => {
+      expect(source).toContain('maskPhoneForLog');
+    });
+
+    it('no raw ${...phone...} inside logger.* calls', () => {
+      const violations = lines
+        .map((line, idx) => ({ line, lineNo: idx + 1 }))
+        .filter(({ line }) => hasRawPhoneInLoggerLine(line));
+      expect(violations).toHaveLength(0);
+    });
+
+    it('no raw ${user.phone} string interpolation in any logger call', () => {
+      const loggerPhoneHits = lines.filter(
+        l => /logger\.(info|warn|error|debug)/.test(l) && /\$\{user\.phone\}/.test(l)
+      );
+      expect(loggerPhoneHits).toHaveLength(0);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // 5.2 — legacy-order-create.service.ts (A12-004)
+  // -----------------------------------------------------------------------
+  describe('A12-004: legacy-order-create.service.ts', () => {
+    const source = readSource('modules/booking/legacy-order-create.service.ts');
+    const lines = source.split('\n');
+
+    it('imports maskPhoneForLog from pii.utils', () => {
+      expect(source).toContain('maskPhoneForLog');
+    });
+
+    it('no ASCII banner (║) lines in logger calls', () => {
+      const bannerLoggerLines = lines.filter(
+        l => /logger\.(info|warn|error|debug)/.test(l) && l.includes('║')
+      );
+      expect(bannerLoggerLines).toHaveLength(0);
+    });
+
+    it('no raw ${customerPhone} or ${customerName} inside logger.* calls', () => {
+      const violations = lines
+        .map((line, idx) => ({ line, lineNo: idx + 1 }))
+        .filter(({ line }) => hasRawPhoneInLoggerLine(line));
+      expect(violations).toHaveLength(0);
+    });
+
+    it('structured log uses customerPhoneLast4 key (not raw customerPhone)', () => {
+      expect(source).toContain('customerPhoneLast4: maskPhoneForLog(customerPhone)');
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // 5.3 — driver.service.ts (A12-005)
+  // -----------------------------------------------------------------------
+  describe('A12-005: driver.service.ts', () => {
+    const source = readSource('modules/driver/driver.service.ts');
+    const lines = source.split('\n');
+
+    it('imports maskPhoneForLog from pii.utils', () => {
+      expect(source).toContain('maskPhoneForLog');
+    });
+
+    it('no raw ${data.phone} inside logger.* calls', () => {
+      const violations = lines.filter(
+        l => /logger\.(info|warn|error|debug)/.test(l) && /\$\{data\.phone\}/.test(l)
+      );
+      expect(violations).toHaveLength(0);
+    });
+
+    it('no raw ${data.name} inside logger.* calls', () => {
+      const violations = lines.filter(
+        l => /logger\.(info|warn|error|debug)/.test(l) && /\$\{data\.name\}/.test(l)
+      );
+      expect(violations).toHaveLength(0);
+    });
+
+    it('driver creation log uses structured phoneLast4 meta', () => {
+      expect(source).toContain('phoneLast4: maskPhoneForLog(data.phone)');
+    });
+  });
+});
