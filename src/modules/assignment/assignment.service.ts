@@ -29,7 +29,7 @@ import { TERMINAL_ASSIGNMENT_STATUSES, ASSIGNMENT_VALID_TRANSITIONS } from '../.
 import { enqueueCompletionLifecycleOutbox } from '../order/order-lifecycle-outbox.service';
 import type { TripCompletedOutboxPayload } from '../order/order-types';
 import { tryAutoRedispatch } from './auto-redispatch.service';
-import { completeTrip } from './completion-orchestrator';
+import { completeTrip, scheduleRatingPrompt } from './completion-orchestrator';
 // P4 F12.7: lazy require for acquireAcceptLock/releaseAcceptLock to avoid eager
 // load of hold-state-machine via assignment-response.service.ts at module init,
 // which breaks tests that mock prisma client without a HoldPhase enum.
@@ -1361,15 +1361,17 @@ class AssignmentService {
           ? (await prismaClient.order.findUnique({ where: { id: assignment.orderId }, select: { customerId: true } }).catch(() => null))?.customerId
           : undefined);
       if (ratingCustomerId) {
-        setTimeout(async () => {
-          try {
-            await queueService.queuePushNotification(ratingCustomerId, {
-              title: 'How was your delivery?',
-              body: `Rate your experience with ${assignment.driverName || 'your driver'}`,
-              data: { type: 'rating_prompt', assignmentId, tripId: assignment.tripId, screen: 'RATING' }
-            });
-          } catch (err) { logger.warn('Rating prompt FCM failed', { assignmentId }); }
-        }, 3 * 60 * 1000);
+        // P7-T28 / A08a-001 FIX: persist via OrderLifecycleOutbox instead of setTimeout
+        // so the rating prompt survives an ECS restart.
+        scheduleRatingPrompt(
+          ratingCustomerId,
+          assignmentId,
+          assignment.tripId,
+          assignment.driverName || 'your driver',
+          180_000
+        ).catch((err) => {
+          logger.warn('[ASSIGNMENT] Rating prompt scheduling failed (non-fatal)', { assignmentId, error: err instanceof Error ? err.message : String(err) });
+        });
         try {
           const reminderData = JSON.stringify({ customerId: ratingCustomerId, assignmentId, driverName: assignment.driverName || 'your driver' });
           redisService.set(`rating:remind:24h:${assignmentId}`, reminderData, 24 * 3600).catch(() => {});

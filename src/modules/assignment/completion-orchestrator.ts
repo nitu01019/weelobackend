@@ -65,6 +65,56 @@ const RATING_REMINDER_24H_TTL = 24 * 3600;
 const RATING_REMINDER_72H_TTL = 72 * 3600;
 
 // =============================================================================
+// DURABLE RATING-PROMPT SCHEDULER
+// =============================================================================
+
+/**
+ * Schedules a rating prompt FCM notification via OrderLifecycleOutbox so that
+ * the scheduled row persists across an ECS restart.
+ *
+ * P7-T27 / A08a-002 FIX: Replaces setTimeout-based scheduling which is lost on
+ * process crash/restart. The outbox poller fires the FCM after nextRetryAt
+ * (= now + delayMs) via the rating_prompt_schedule handler.
+ *
+ * @param customerId   - Recipient of the rating prompt
+ * @param assignmentId - Associated assignment (for payload / dedup)
+ * @param tripId       - Associated trip
+ * @param driverName   - Driver name for notification body
+ * @param delayMs      - Milliseconds to delay before sending
+ */
+export async function scheduleRatingPrompt(
+  customerId: string,
+  assignmentId: string,
+  tripId: string,
+  driverName: string,
+  delayMs: number
+): Promise<void> {
+  const outboxId = uuid();
+  await prismaClient.orderLifecycleOutbox.create({
+    data: {
+      id: outboxId,
+      orderId: assignmentId,
+      eventType: 'rating_prompt_schedule',
+      payload: {
+        type: 'rating_prompt_schedule',
+        customerId,
+        assignmentId,
+        tripId,
+        driverName,
+        scheduleAt: new Date(Date.now() + delayMs).toISOString(),
+        eventId: outboxId,
+        eventVersion: 1,
+        serverTimeMs: Date.now(),
+      } as unknown as import('@prisma/client').Prisma.InputJsonValue,
+      status: 'pending',
+      attempts: 0,
+      maxAttempts: 5,
+      nextRetryAt: new Date(Date.now() + delayMs),
+    },
+  });
+}
+
+// =============================================================================
 // MAIN ENTRY POINT
 // =============================================================================
 
@@ -242,17 +292,15 @@ export async function completeTrip(
     const ratingCustomerId = await resolveCustomerId(assignment.bookingId, assignment.orderId);
     if (ratingCustomerId) {
       try {
-        setTimeout(async () => {
-          try {
-            await queueService.queuePushNotification(ratingCustomerId, {
-              title: 'How was your delivery?',
-              body: `Rate your experience with ${assignment.driverName || 'your driver'}`,
-              data: { type: 'rating_prompt', assignmentId, tripId: assignment.tripId, screen: 'RATING' }
-            });
-          } catch (err) {
-            logger.warn('[COMPLETION] Rating prompt FCM failed', { assignmentId });
-          }
-        }, RATING_PROMPT_DELAY_MS);
+        // P7-T29 / A08a-002 FIX: persist via OrderLifecycleOutbox instead of setTimeout
+        // so the rating prompt survives an ECS restart.
+        await scheduleRatingPrompt(
+          ratingCustomerId,
+          assignmentId,
+          assignment.tripId,
+          assignment.driverName || 'your driver',
+          RATING_PROMPT_DELAY_MS
+        );
       } catch (err: unknown) {
         logger.warn('[COMPLETION] Rating prompt scheduling failed (non-fatal)', { assignmentId });
       }

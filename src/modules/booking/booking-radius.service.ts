@@ -13,6 +13,7 @@
 
 import { db, BookingRecord } from '../../shared/database/db';
 import { prismaClient } from '../../shared/database/prisma.service';
+import { v4 as uuidv4 } from 'uuid';
 import { logger } from '../../shared/services/logger.service';
 import { emitToUser, SocketEvent } from '../../shared/services/socket.service';
 import { fcmService } from '../../shared/services/fcm.service';
@@ -87,28 +88,31 @@ export class BookingRadiusService {
     try {
       await redisService.setTimer(TIMER_KEYS.RADIUS_STEP(bookingId), timerData, expiresAt);
     } catch (redisErr: unknown) {
-      logger.warn('[RADIUS] Redis failed for radius scheduling, using in-memory fallback', {
+      logger.warn('[RADIUS] Redis failed for radius scheduling, using durable outbox fallback', {
         bookingId, error: (redisErr as Error)?.message
       });
-      // H-13 FIX: Acquire distributed lock inside setTimeout callback to prevent
-      // duplicate execution when multiple instances have the same in-memory fallback.
-      // DR-23 FIX: Store timer handle for cancellation; DR-24 FIX: unique lockId
-      const fallbackTimer = setTimeout(async () => {
-        this.fallbackTimers.delete(bookingId);
-        const lockId = `fallback-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
-        const lock = await redisService.acquireLock(`radius:${bookingId}`, lockId, 30).catch(() => ({ acquired: false }));
-        if (!lock.acquired) return; // another instance handling it
-        try {
-          await this.advanceRadiusStep(timerData);
-        } catch (err: unknown) {
-          logger.error('[RADIUS] In-memory fallback radius step failed', {
-            bookingId, error: (err as Error)?.message
-          });
-        } finally {
-          await redisService.releaseLock(`radius:${bookingId}`, lockId).catch(() => {});
-        }
-      }, step1.timeoutMs);
-      this.fallbackTimers.set(bookingId, fallbackTimer);
+      // P7-T30 / A08a-003 FIX: Replace in-memory setTimeout fallback with OrderLifecycleOutbox
+      // row so the radius expansion step survives an ECS restart.
+      // The outbox poller picks up the row after step1.timeoutMs and calls advanceRadiusStep
+      // via the radius_expansion_step handler. The booking-status guard inside advanceRadiusStep
+      // ensures cancelled/expired bookings are silently skipped.
+      const fallbackOutboxId = uuidv4();
+      prismaClient.orderLifecycleOutbox.create({
+        data: {
+          id: fallbackOutboxId,
+          orderId: bookingId,
+          eventType: 'radius_expansion_step',
+          payload: { ...timerData } as unknown as import('@prisma/client').Prisma.InputJsonValue,
+          status: 'pending',
+          attempts: 0,
+          maxAttempts: 3,
+          nextRetryAt: new Date(Date.now() + step1.timeoutMs),
+        },
+      }).catch((dbErr: unknown) => {
+        logger.error('[RADIUS] Durable outbox fallback INSERT failed — step may be lost', {
+          bookingId, error: dbErr instanceof Error ? dbErr.message : String(dbErr)
+        });
+      });
     }
 
     logger.info(`[RADIUS] Progressive expansion scheduled for booking ${bookingId} (step 2 in ${step1.timeoutMs / 1000}s)`);
@@ -326,27 +330,27 @@ export class BookingRadiusService {
       try {
         await redisService.setTimer(TIMER_KEYS.RADIUS_STEP(data.bookingId), nextTimerData, nextExpiresAt);
       } catch (redisErr: unknown) {
-        logger.warn('[RADIUS] Redis failed for next step scheduling, using in-memory fallback', {
+        logger.warn('[RADIUS] Redis failed for next step scheduling, using durable outbox fallback', {
           bookingId: data.bookingId, step: nextStepIndex + 1, error: (redisErr as Error)?.message
         });
-        // H-13 FIX: Acquire distributed lock inside setTimeout callback
-        // DR-23 FIX: Store timer handle for cancellation; DR-24 FIX: unique lockId
-        const nextFallbackTimer = setTimeout(async () => {
-          this.fallbackTimers.delete(data.bookingId);
-          const lockId = `fallback-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
-          const lock = await redisService.acquireLock(`radius:${data.bookingId}`, lockId, 30).catch(() => ({ acquired: false }));
-          if (!lock.acquired) return;
-          try {
-            await this.advanceRadiusStep(nextTimerData);
-          } catch (err: unknown) {
-            logger.error('[RADIUS] In-memory fallback next step failed', {
-              bookingId: data.bookingId, error: (err as Error)?.message
-            });
-          } finally {
-            await redisService.releaseLock(`radius:${data.bookingId}`, lockId).catch(() => {});
-          }
-        }, step.timeoutMs);
-        this.fallbackTimers.set(data.bookingId, nextFallbackTimer);
+        // P7-T30 / A08a-003 FIX: Replace in-memory setTimeout fallback with OrderLifecycleOutbox row.
+        const nextFallbackOutboxId = uuidv4();
+        prismaClient.orderLifecycleOutbox.create({
+          data: {
+            id: nextFallbackOutboxId,
+            orderId: data.bookingId,
+            eventType: 'radius_expansion_step',
+            payload: { ...nextTimerData } as unknown as import('@prisma/client').Prisma.InputJsonValue,
+            status: 'pending',
+            attempts: 0,
+            maxAttempts: 3,
+            nextRetryAt: new Date(Date.now() + step.timeoutMs),
+          },
+        }).catch((dbErr: unknown) => {
+          logger.error('[RADIUS] Durable outbox fallback INSERT failed — next step may be lost', {
+            bookingId: data.bookingId, error: dbErr instanceof Error ? dbErr.message : String(dbErr)
+          });
+        });
       }
       await redisService.set(RADIUS_KEYS.CURRENT_STEP(data.bookingId), nextStepIndex.toString(),
         Math.ceil(BOOKING_CONFIG.TIMEOUT_MS / 1000) + 120).catch(() => { });
@@ -362,27 +366,27 @@ export class BookingRadiusService {
       try {
         await redisService.setTimer(TIMER_KEYS.RADIUS_STEP(data.bookingId), finalTimerData, finalExpiresAt);
       } catch (redisErr: unknown) {
-        logger.warn('[RADIUS] Redis failed for final step scheduling, using in-memory fallback', {
+        logger.warn('[RADIUS] Redis failed for final step scheduling, using durable outbox fallback', {
           bookingId: data.bookingId, error: (redisErr as Error)?.message
         });
-        // H-13 FIX: Acquire distributed lock inside setTimeout callback
-        // DR-23 FIX: Store timer handle for cancellation; DR-24 FIX: unique lockId
-        const finalFallbackTimer = setTimeout(async () => {
-          this.fallbackTimers.delete(data.bookingId);
-          const lockId = `fallback-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
-          const lock = await redisService.acquireLock(`radius:${data.bookingId}`, lockId, 30).catch(() => ({ acquired: false }));
-          if (!lock.acquired) return;
-          try {
-            await this.advanceRadiusStep(finalTimerData);
-          } catch (err: unknown) {
-            logger.error('[RADIUS] In-memory fallback final step failed', {
-              bookingId: data.bookingId, error: (err as Error)?.message
-            });
-          } finally {
-            await redisService.releaseLock(`radius:${data.bookingId}`, lockId).catch(() => {});
-          }
-        }, step.timeoutMs);
-        this.fallbackTimers.set(data.bookingId, finalFallbackTimer);
+        // P7-T30 / A08a-003 FIX: Replace in-memory setTimeout fallback with OrderLifecycleOutbox row.
+        const finalFallbackOutboxId = uuidv4();
+        prismaClient.orderLifecycleOutbox.create({
+          data: {
+            id: finalFallbackOutboxId,
+            orderId: data.bookingId,
+            eventType: 'radius_expansion_step',
+            payload: { ...finalTimerData } as unknown as import('@prisma/client').Prisma.InputJsonValue,
+            status: 'pending',
+            attempts: 0,
+            maxAttempts: 3,
+            nextRetryAt: new Date(Date.now() + step.timeoutMs),
+          },
+        }).catch((dbErr: unknown) => {
+          logger.error('[RADIUS] Durable outbox fallback INSERT failed — final step may be lost', {
+            bookingId: data.bookingId, error: dbErr instanceof Error ? dbErr.message : String(dbErr)
+          });
+        });
       }
     }
   }
