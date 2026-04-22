@@ -596,6 +596,19 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
       'vehicle_cache_sync_failures_total',
       'Vehicle cache sync failures by source (availability | fleet) — A11-001 P6-T19',
     ),
+
+    // === P7-T09 (A05-007 / Part B P7-F): FCM egress rate-limit counter ===
+    // Fires from fcmService._consumeEgressTokens() when a sendToUsersMulticast
+    // batch is rejected by the in-process 8K/s token bucket.
+    // Sustained non-zero rate means multi-broadcast concurrency needs to be reduced
+    // or the token-bucket ceiling raised (after confirming Google quota was raised).
+    //   Labels: batch_size = '>500' | '<count>'
+    //   Call site: src/shared/services/fcm.service.ts (_consumeEgressTokens)
+    //   Alert: any non-zero rate in production → investigate burst pattern
+    counter(
+      'fcm_egress_rate_limited_total',
+      'FCM sends rejected by the 8K/s in-process egress token bucket (P7-T01/A05-002)',
+    ),
   ];
 
   for (const def of defs) {
@@ -626,6 +639,29 @@ export function registerDefaultGauges(gauges: Map<string, GaugeMetric>): void {
     // whose `dispatchState='dispatching'` hasn't advanced past a threshold age.
     // Non-zero and growing = the outbox poller is lagging, worth paging oncall.
     gauge('order_stale_dispatching_state', 'Orders stuck in dispatchState=dispatching past the stale threshold (F-A-70)'),
+
+    // === P7-T09 (A13-003 / A05-007): FCM connection-reuse ratio gauge ===
+    // Sampled every 60s from FCM HTTP Agent. Tracks keepAlive reuse effectiveness.
+    // fcm_send_connection_reuse_ratio = (successSends - newConnections) / successSends.
+    // At maxSockets:400, steady-state should be >0.95 during peak broadcast windows.
+    //   Call site: fcm.service.ts health check (future observability export)
+    //   Alert: < 0.8 sustained 5 min → HTTP keep-alive not working as expected
+    gauge(
+      'fcm_send_connection_reuse_ratio',
+      'Estimated HTTP connection reuse ratio for FCM sends (P7-T09 / A13-003)',
+    ),
+
+    // === P7-T09 (A05-007): FCM multicast failure ratio gauge ===
+    // Derived metric: fcm_send_failure_total{error_code=multicast_chunk} /
+    //   (fcm_send_success_total{tokens_bucket=multicast} + fcm_send_failure_total)
+    // Observability-only — computed and SET by a 60s cron in the FCM service
+    // (future work). When > 0.02 sustained 3 min → auto-revert
+    //   FF_FCM_MULTICAST_ENABLED=false per Part B P7-F playbook.
+    //   Dashboard: weelo-fcm-multicast-health
+    gauge(
+      'fcm_multicast_failure_ratio',
+      'Fraction of FCM multicast sends that failed per 60s window (P7-T09 / A05-007) — auto-revert gate',
+    ),
 
     // === Phase 1 (F-series) — observability baseline ===
     gauge(
@@ -711,6 +747,208 @@ export function registerDefaultGauges(gauges: Map<string, GaugeMetric>): void {
     gauge(
       'socket_stream_partition_depth_15',
       'A04-006: Socket.IO Redis Streams adapter stream depth for partition 15 (socket.io-15)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_16',
+      'A13-007: Socket.IO Redis Streams adapter stream depth for partition 16 (socket.io-16)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_17',
+      'A13-007: Socket.IO Redis Streams adapter stream depth for partition 17 (socket.io-17)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_18',
+      'A13-007: Socket.IO Redis Streams adapter stream depth for partition 18 (socket.io-18)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_19',
+      'A13-007: Socket.IO Redis Streams adapter stream depth for partition 19 (socket.io-19)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_20',
+      'A13-007: Socket.IO Redis Streams adapter stream depth for partition 20 (socket.io-20)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_21',
+      'A13-007: Socket.IO Redis Streams adapter stream depth for partition 21 (socket.io-21)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_22',
+      'A13-007: Socket.IO Redis Streams adapter stream depth for partition 22 (socket.io-22)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_23',
+      'A13-007: Socket.IO Redis Streams adapter stream depth for partition 23 (socket.io-23)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_24',
+      'A13-007: Socket.IO Redis Streams adapter stream depth for partition 24 (socket.io-24)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_25',
+      'A13-007: Socket.IO Redis Streams adapter stream depth for partition 25 (socket.io-25)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_26',
+      'A13-007: Socket.IO Redis Streams adapter stream depth for partition 26 (socket.io-26)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_27',
+      'A13-007: Socket.IO Redis Streams adapter stream depth for partition 27 (socket.io-27)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_28',
+      'A13-007: Socket.IO Redis Streams adapter stream depth for partition 28 (socket.io-28)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_29',
+      'A13-007: Socket.IO Redis Streams adapter stream depth for partition 29 (socket.io-29)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_30',
+      'A13-007: Socket.IO Redis Streams adapter stream depth for partition 30 (socket.io-30)',
+    ),
+    gauge(
+      'socket_stream_partition_depth_31',
+      'A13-007: Socket.IO Redis Streams adapter stream depth for partition 31 (socket.io-31)',
+    ),
+
+    // === A13-007: Per-partition stream oldest-entry age gauges (Stage-1: 32 partitions) ===
+    // Sampled by the XLEN sweep (or a future XINFO STREAM call) every 5s.
+    // Value = age in seconds of the oldest entry still in the stream (XINFO first-entry
+    // delivery-time compared to now). Lets SRE detect retention lag independently of
+    // stream depth — a deep stream with a young oldest-entry is healthy; a shallow
+    // stream with an old oldest-entry may indicate a stalled consumer.
+    //   stream naming: socket.io-{i} (matches @socket.io/redis-streams-adapter default)
+    //   Alert threshold: > 300s (5 min) indicates consumer is not keeping up.
+    //   Call site: src/shared/services/socket.service.ts (setupRedisAdapter XLEN sweep)
+    gauge(
+      'stream_oldest_entry_age_seconds_0',
+      'A13-007: Age in seconds of oldest entry in socket.io-0 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_1',
+      'A13-007: Age in seconds of oldest entry in socket.io-1 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_2',
+      'A13-007: Age in seconds of oldest entry in socket.io-2 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_3',
+      'A13-007: Age in seconds of oldest entry in socket.io-3 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_4',
+      'A13-007: Age in seconds of oldest entry in socket.io-4 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_5',
+      'A13-007: Age in seconds of oldest entry in socket.io-5 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_6',
+      'A13-007: Age in seconds of oldest entry in socket.io-6 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_7',
+      'A13-007: Age in seconds of oldest entry in socket.io-7 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_8',
+      'A13-007: Age in seconds of oldest entry in socket.io-8 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_9',
+      'A13-007: Age in seconds of oldest entry in socket.io-9 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_10',
+      'A13-007: Age in seconds of oldest entry in socket.io-10 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_11',
+      'A13-007: Age in seconds of oldest entry in socket.io-11 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_12',
+      'A13-007: Age in seconds of oldest entry in socket.io-12 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_13',
+      'A13-007: Age in seconds of oldest entry in socket.io-13 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_14',
+      'A13-007: Age in seconds of oldest entry in socket.io-14 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_15',
+      'A13-007: Age in seconds of oldest entry in socket.io-15 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_16',
+      'A13-007: Age in seconds of oldest entry in socket.io-16 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_17',
+      'A13-007: Age in seconds of oldest entry in socket.io-17 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_18',
+      'A13-007: Age in seconds of oldest entry in socket.io-18 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_19',
+      'A13-007: Age in seconds of oldest entry in socket.io-19 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_20',
+      'A13-007: Age in seconds of oldest entry in socket.io-20 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_21',
+      'A13-007: Age in seconds of oldest entry in socket.io-21 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_22',
+      'A13-007: Age in seconds of oldest entry in socket.io-22 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_23',
+      'A13-007: Age in seconds of oldest entry in socket.io-23 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_24',
+      'A13-007: Age in seconds of oldest entry in socket.io-24 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_25',
+      'A13-007: Age in seconds of oldest entry in socket.io-25 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_26',
+      'A13-007: Age in seconds of oldest entry in socket.io-26 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_27',
+      'A13-007: Age in seconds of oldest entry in socket.io-27 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_28',
+      'A13-007: Age in seconds of oldest entry in socket.io-28 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_29',
+      'A13-007: Age in seconds of oldest entry in socket.io-29 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_30',
+      'A13-007: Age in seconds of oldest entry in socket.io-30 Redis stream (retention lag indicator)',
+    ),
+    gauge(
+      'stream_oldest_entry_age_seconds_31',
+      'A13-007: Age in seconds of oldest entry in socket.io-31 Redis stream (retention lag indicator)',
     ),
 
     // === A04-006: Stream partition depth skew ratio gauge ===

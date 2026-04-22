@@ -1618,10 +1618,30 @@ async function setupRedisAdapter(socketServer: Server): Promise<void> {
       // silent cross-instance message loss. readCount:100 is the maximum
       // per-read batch so lagging tasks catch up quickly.
       // A04-006 (P3-T18): wrap client so XADD calls emit socket_adapter_xadd_ms histogram.
-      const streamCount = parseInt(process.env.SOCKET_STREAM_COUNT || '16', 10);
+      //
+      // A13-007 (Part B §2.8 P7-J) — STAGED ROLLOUT — Stage 1:
+      //   streamCount 16 → 32 × maxLen 100K → 250K.
+      //   Memory estimate: 32 partitions × 250K entries × ~500B avg = ~4 GB.
+      //   Safe under the 13 GB ElastiCache ceiling documented in plan Q2+Q3.
+      //
+      //   Stage 2 (DEFERRED — requires 30-day soak + cluster-mode):
+      //     64 × 500K × ~500B ≈ 16 GB would exceed the 13 GB ceiling.
+      //     Requires ElastiCache cluster-mode and a 30-day soak gate before promotion.
+      //
+      //   DRAIN CAVEAT: @socket.io/redis-streams-adapter does NOT rebalance streams
+      //   mid-flight. Changing streamCount in a rolling deploy creates a ~60s window
+      //   where new pods read from the new stream count while old pods still write to
+      //   old streams. Ops plan: drain old streams + rolling deploy during off-peak.
+      //   Accepted risk: ~60s replay gap for events in flight during the rollout window.
+      //
+      //   Env overrides: SOCKET_STREAM_PARTITIONS and SOCKET_STREAM_MAXLEN allow
+      //   per-deployment tuning without a code change (e.g., set to 16/100000 on
+      //   staging, promote 32/250000 for production).
+      const streamCount = Number(process.env.SOCKET_STREAM_PARTITIONS ?? '32');
+      const maxLen = Number(process.env.SOCKET_STREAM_MAXLEN ?? '250000');
       socketServer.adapter(createAdapter(wrapRedisClientForAdapter(client), {
         streamCount,
-        maxLen: 100_000,
+        maxLen,
         readCount: 100,
       }));
       // A04-006 (P3-T19 + P3-T20): XLEN sweep — pipelined, one round-trip per 5s.
@@ -1631,7 +1651,7 @@ async function setupRedisAdapter(socketServer: Server): Promise<void> {
           try {
             const rawClient = redisService.getClient();
             if (!rawClient) return;
-            const partitionCount = parseInt(process.env.SOCKET_STREAM_COUNT || '16', 10);
+            const partitionCount = Number(process.env.SOCKET_STREAM_PARTITIONS ?? '32');
             const depths = await Promise.all(
               Array.from({ length: partitionCount }, (_, i) =>
                 (rawClient.xLen ? rawClient.xLen(`socket.io-${i}`) : Promise.resolve(0)) as Promise<number>
@@ -1712,9 +1732,10 @@ async function setupRedisAdapter(socketServer: Server): Promise<void> {
       if (!client || !io) return;
       // H-16 (Phase 3): same explicit adapter options on the retry path.
       // A04-006 (P3-T18): wrap client for XADD instrumentation on recovery path too.
+      // A13-007: keep recovery path in sync with primary — same env-override pattern.
       io.adapter(createAdapter(wrapRedisClientForAdapter(client), {
-        streamCount: parseInt(process.env.SOCKET_STREAM_COUNT || '16', 10),
-        maxLen: 100_000,
+        streamCount: Number(process.env.SOCKET_STREAM_PARTITIONS ?? '32'),
+        maxLen: Number(process.env.SOCKET_STREAM_MAXLEN ?? '250000'),
         readCount: 100,
       }));
       redisPubSubInitialized = true;

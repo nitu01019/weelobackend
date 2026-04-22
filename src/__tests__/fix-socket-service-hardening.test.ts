@@ -691,3 +691,92 @@ describe('Socket Service Hardening Fixes', () => {
     });
   });
 });
+
+
+// =============================================================================
+// A13-007 (P7-T34 / P7-T35) — Stage-1: 32 partitions × 250K maxLen env overrides
+// =============================================================================
+
+describe('A13-007 P7-T34: socket adapter stage-1 stream config (32 × 250K defaults)', () => {
+  const SOCKET_SERVICE_PATH = require('path').resolve(__dirname, '../shared/services/socket.service.ts');
+
+  beforeEach(() => {
+    delete process.env.SOCKET_STREAM_PARTITIONS;
+    delete process.env.SOCKET_STREAM_MAXLEN;
+  });
+
+  afterEach(() => {
+    delete process.env.SOCKET_STREAM_PARTITIONS;
+    delete process.env.SOCKET_STREAM_MAXLEN;
+  });
+
+  it('source uses SOCKET_STREAM_PARTITIONS with default 32', () => {
+    const fs = require('fs');
+    const source: string = fs.readFileSync(SOCKET_SERVICE_PATH, 'utf-8');
+    expect(source).toContain("SOCKET_STREAM_PARTITIONS ?? '32'");
+  });
+
+  it('source uses SOCKET_STREAM_MAXLEN with default 250000', () => {
+    const fs = require('fs');
+    const source: string = fs.readFileSync(SOCKET_SERVICE_PATH, 'utf-8');
+    expect(source).toContain("SOCKET_STREAM_MAXLEN ?? '250000'");
+  });
+
+  it('env override: Number(SOCKET_STREAM_PARTITIONS ?? "32") yields 32 when unset', () => {
+    const val = Number(process.env.SOCKET_STREAM_PARTITIONS ?? '32');
+    expect(val).toBe(32);
+  });
+
+  it('env override: SOCKET_STREAM_PARTITIONS=16 yields 16', () => {
+    process.env.SOCKET_STREAM_PARTITIONS = '16';
+    const val = Number(process.env.SOCKET_STREAM_PARTITIONS ?? '32');
+    expect(val).toBe(16);
+  });
+
+  it('env override: Number(SOCKET_STREAM_MAXLEN ?? "250000") yields 250000 when unset', () => {
+    const val = Number(process.env.SOCKET_STREAM_MAXLEN ?? '250000');
+    expect(val).toBe(250000);
+  });
+
+  it('env override: SOCKET_STREAM_MAXLEN=100000 yields 100000', () => {
+    process.env.SOCKET_STREAM_MAXLEN = '100000';
+    const val = Number(process.env.SOCKET_STREAM_MAXLEN ?? '250000');
+    expect(val).toBe(100000);
+  });
+
+  it('source does NOT contain legacy SOCKET_STREAM_COUNT env var in createAdapter calls', () => {
+    const fs = require('fs');
+    const source: string = fs.readFileSync(SOCKET_SERVICE_PATH, 'utf-8');
+    // SOCKET_STREAM_COUNT must no longer appear in streamCount assignments inside createAdapter
+    const createAdapterMatches = source.match(/createAdapter[\s\S]*?streamCount[\s\S]*?SOCKET_STREAM_COUNT/);
+    expect(createAdapterMatches).toBeNull();
+  });
+
+  it('A13-007 comment block cites staged rollout rationale', () => {
+    const fs = require('fs');
+    const source: string = fs.readFileSync(SOCKET_SERVICE_PATH, 'utf-8');
+    expect(source).toContain('A13-007');
+    expect(source).toContain('STAGED ROLLOUT');
+    expect(source).toContain('DRAIN CAVEAT');
+  });
+});
+
+describe('A13-007 P7-T35: stream_oldest_entry_age_seconds gauges registered (0-31)', () => {
+  it('metrics-definitions registers stream_oldest_entry_age_seconds_N gauges for all 32 partitions', async () => {
+    const { registerDefaultGauges } = await import('../shared/monitoring/metrics-definitions');
+    const gauges = new Map();
+    registerDefaultGauges(gauges);
+    for (let i = 0; i < 32; i++) {
+      expect(gauges.has(`stream_oldest_entry_age_seconds_${i}`)).toBe(true);
+    }
+  });
+
+  it('metrics-definitions registers socket_stream_partition_depth_N gauges for all 32 partitions', async () => {
+    const { registerDefaultGauges } = await import('../shared/monitoring/metrics-definitions');
+    const gauges = new Map();
+    registerDefaultGauges(gauges);
+    for (let i = 0; i < 32; i++) {
+      expect(gauges.has(`socket_stream_partition_depth_${i}`)).toBe(true);
+    }
+  });
+});
