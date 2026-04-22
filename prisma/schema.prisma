@@ -746,7 +746,41 @@ model TruckHoldLedger {
   @@index([transporterId, status, expiresAt])
   @@index([phase, flexExpiresAt])
   @@index([phase, confirmedExpiresAt])
+  // A10-003 · See partial-predicate note above TruckHoldIdempotency model.
+  // Prisma cannot express `WHERE status='active' AND phase NOT IN ('EXPIRED','RELEASED')`,
+  // so the psql CREATE INDEX CONCURRENTLY statement adds the partial clause manually.
+  @@index([transporterId, orderId, phase], map: "truck_hold_ledger_active_find_idx")
 }
+
+// -----------------------------------------------------------------------------
+// A10-003 · Partial composite index for active-hold dedup lookups (Phase 1 P1-H).
+// This Prisma declaration reserves the index NAME and column ORDER, but Prisma
+// has NO syntax for partial-predicate indexes (Part B §2.2 P1-D). The partial
+// WHERE clause MUST be applied via direct psql — NEVER via `prisma migrate deploy`
+// or `prisma db pull` (db pull will silently rewrite this as a full index).
+//
+// Operator step (one-time, staging then prod, per CLAUDE.md DB rules):
+//   CREATE INDEX CONCURRENTLY IF NOT EXISTS truck_hold_ledger_active_find_idx
+//     ON "TruckHoldLedger" ("transporterId", "orderId", "phase")
+//     WHERE status = 'active' AND phase NOT IN ('EXPIRED','RELEASED');
+//
+// Verification (Part B §2.2 P1-E — relaxed gate):
+//   EXPLAIN ANALYZE SELECT * FROM "TruckHoldLedger"
+//     WHERE "transporterId"=$1 AND "orderId"=$2
+//       AND "phase"='FLEX' AND "status"='active';
+//   Expected plan line: "Index Only Scan using truck_hold_ledger_active_find_idx"
+//     OR "Index Scan using truck_hold_ledger_active_find_idx"
+//   (Index Only Scan requires fresh visibility map; at 833 writes/s the VM lags
+//    several seconds — Index Scan is also acceptable.)
+//
+// P1-T45 additive-index rationale: this index is ADDITIVE to existing
+//   @@index([orderId, status, expiresAt]) and @@index([transporterId, status, expiresAt])
+//   because this one supports the (transporterId, orderId, phase) predicate
+//   used by active-hold dedup lookups; neither existing index covers that key.
+// CI guard: a pg_indexes.indexdef scan on the dedup-query staging DB must return
+//   a row whose indexdef contains "WHERE" for indexname='truck_hold_ledger_active_find_idx'
+//   (Part B §2.2 P1-D). Fail the build if not.
+// -----------------------------------------------------------------------------
 
 // =============================================================================
 // TRUCK HOLD IDEMPOTENCY (duplicate-safe hold/release retries)
