@@ -37,6 +37,7 @@ import { socketService, isUserConnectedAsync } from '../../shared/services/socke
 import { queueService } from '../../shared/services/queue.service';
 import { HOLD_CONFIG } from '../../core/config/hold-config';
 import { getErrorMessage } from '../../shared/utils/error.utils';
+import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
 
 // =============================================================================
 // CONFIGURATION
@@ -429,24 +430,74 @@ class CascadeDispatchService {
     }
 
     // FCM push to driver
+    // A05-003: nested pickup/drop + `payload` JSON blob for Captain parser.
+    // A09-001: pre-accept producer site — customerName omitted (DPDP data minimisation).
     try {
-      const order = await prismaClient.order.findUnique({
+      const orderForFcm = await prismaClient.order.findUnique({
         where: { id: orderId },
-        select: { pickup: true, drop: true },
+        select: {
+          pickup: true,
+          drop: true,
+          distanceKm: true,
+          customerPhone: true,
+        },
       });
-      const pickup = (order?.pickup as Record<string, unknown>) || {};
-      const drop = (order?.drop as Record<string, unknown>) || {};
-
+      const truckRequestForFcm = await prismaClient.truckRequest.findUnique({
+        where: { id: truckRequestId },
+        select: { pricePerTruck: true },
+      });
+      const pickupRaw = (orderForFcm?.pickup as Record<string, unknown>) || {};
+      const dropRaw = (orderForFcm?.drop as Record<string, unknown>) || {};
+      const fcmPickup = {
+        address: (pickupRaw.address as string) ?? '',
+        city: (pickupRaw.city as string) ?? '',
+        latitude: (pickupRaw.latitude as number) ?? (pickupRaw.lat as number) ?? 0,
+        longitude: (pickupRaw.longitude as number) ?? (pickupRaw.lng as number) ?? 0,
+      };
+      const fcmDrop = {
+        address: (dropRaw.address as string) ?? '',
+        city: (dropRaw.city as string) ?? '',
+        latitude: (dropRaw.latitude as number) ?? (dropRaw.lat as number) ?? 0,
+        longitude: (dropRaw.longitude as number) ?? (dropRaw.lng as number) ?? 0,
+      };
+      const assignedAtIso = new Date().toISOString();
+      const expiresAtIso = new Date(Date.now() + HOLD_CONFIG.driverAcceptTimeoutMs).toISOString();
+      const fcmPayloadObj = {
+        type: 'trip_assigned',
+        assignmentId,
+        tripId,
+        orderId,
+        truckRequestId,
+        pickup: fcmPickup,
+        drop: fcmDrop,
+        vehicleNumber,
+        farePerTruck: Number(truckRequestForFcm?.pricePerTruck ?? 0),
+        distanceKm: Number(orderForFcm?.distanceKm ?? 0),
+        customerPhone: maskPhoneForExternal(orderForFcm?.customerPhone || ''),
+        assignedAt: assignedAtIso,
+        expiresAt: expiresAtIso,
+        isCascade: true,
+        message: `New trip assigned! ${fcmPickup.address || 'Pickup'} → ${fcmDrop.address || 'Drop'}`,
+      };
       await queueService.queuePushNotification(driver.id, {
         title: 'New Trip Assigned!',
-        body: `${pickup?.address || 'Pickup'} -> ${drop?.address || 'Drop'}`,
+        body: `${fcmPickup.address || 'Pickup'} -> ${fcmDrop.address || 'Drop'}`,
         data: {
+          payload: JSON.stringify(fcmPayloadObj),
           type: 'trip_assigned',
           assignmentId,
           tripId,
           orderId,
           truckRequestId,
+          pickup: JSON.stringify(fcmPickup),
+          drop: JSON.stringify(fcmDrop),
           vehicleNumber,
+          farePerTruck: String(fcmPayloadObj.farePerTruck),
+          distanceKm: String(fcmPayloadObj.distanceKm),
+          customerPhone: fcmPayloadObj.customerPhone,
+          assignedAt: assignedAtIso,
+          expiresAt: expiresAtIso,
+          isCascade: 'true',
           status: 'pending',
         },
       });
