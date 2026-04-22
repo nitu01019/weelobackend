@@ -453,6 +453,10 @@ export async function withDbTimeout<T>(
     maxRetries?: number;
     /** P4 F2.NEW-1: metric label so dashboards can localize retry hot spots. */
     site?: string;
+    /** A10-004: max time (ms) to wait for a free connection before $transaction
+     *  starts. Forwarded to Prisma $transaction. Default 5000ms — lifts Prisma's
+     *  library default of 2000ms to accommodate A10-002 pool sizing at 833 tx/s. */
+    maxWait?: number;
   } = {}
 ): Promise<T> {
   const timeoutMs = options.timeoutMs ?? DB_STATEMENT_TIMEOUT_MS;
@@ -486,7 +490,10 @@ export async function withDbTimeout<T>(
         {
           isolationLevel: options.isolationLevel,
           // Prisma-level timeout is 2s above statement_timeout as safety buffer
-          timeout: timeoutMs + 2000
+          timeout: timeoutMs + 2000,
+          // A10-004: explicit maxWait (default 5000ms) overrides Prisma's 2000ms
+          // library default — must exceed pool_timeout (A10-002) under saturation.
+          maxWait: options.maxWait ?? 5000,
         }
       );
     } catch (error: unknown) {
@@ -494,8 +501,10 @@ export async function withDbTimeout<T>(
       const isRetryable = RETRYABLE_CODES.has(prismaCode);
 
       if (isRetryable && attempt <= maxRetries) {
-        // Exponential backoff: 100ms, 200ms, 400ms
-        const backoffMs = 100 * Math.pow(2, attempt - 1);
+        // Exponential backoff: 100ms, 200ms, 400ms + ≥50ms jitter (Arch 1A).
+        // At 833 SERIALIZABLE tx/s, deterministic backoff synchronises retries
+        // into waves (thundering herd). Jitter smooths the retry distribution.
+        const backoffMs = (100 * Math.pow(2, attempt - 1)) + Math.floor(Math.random() * 50);
         logger.warn(`[withDbTimeout] Serializable conflict (${prismaCode}), retry ${attempt}/${maxRetries} after ${backoffMs}ms`);
         // P4 F2.NEW-1: observability for serializable retries.
         try {
