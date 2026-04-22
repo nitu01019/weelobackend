@@ -26,9 +26,21 @@
  * =============================================================================
  */
 
+import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { Request, Response, NextFunction } from 'express';
 import { logger } from '../services/logger.service';
 import { registerDefaultCounters, registerDefaultGauges, registerDefaultHistograms } from './metrics-definitions';
+
+// =============================================================================
+// EVENT LOOP DELAY HISTOGRAM (P3-T01)
+// Uses Node.js built-in monitorEventLoopDelay with 20ms resolution (prod).
+// Enabled at module load; guarded so it does not run during Jest test runs.
+// =============================================================================
+const eventLoopDelayHistogram = monitorEventLoopDelay({ resolution: 20 });
+if (process.env.NODE_ENV !== 'test') {
+  eventLoopDelayHistogram.enable();
+  logger.info('eventloop_delay_histogram_enabled=true');
+}
 
 // =============================================================================
 // METRIC TYPES
@@ -389,10 +401,27 @@ class MetricsService {
       value: 0
     });
 
-    // Event loop lag
+    // Event loop lag (legacy — kept for dashboard compatibility; updated from histogram mean)
     this.gauges.set('nodejs_eventloop_lag_ms', {
       name: 'nodejs_eventloop_lag_ms',
-      help: 'Node.js event loop lag in milliseconds',
+      help: 'Node.js event loop lag in milliseconds (mean; use p50/p99/p999 for percentile-accurate data)',
+      value: 0
+    });
+
+    // P3-T02: Percentile gauges from monitorEventLoopDelay histogram
+    this.gauges.set('nodejs_eventloop_lag_p50_ms', {
+      name: 'nodejs_eventloop_lag_p50_ms',
+      help: 'Node.js event loop lag p50 in milliseconds (10s window)',
+      value: 0
+    });
+    this.gauges.set('nodejs_eventloop_lag_p99_ms', {
+      name: 'nodejs_eventloop_lag_p99_ms',
+      help: 'Node.js event loop lag p99 in milliseconds (10s window)',
+      value: 0
+    });
+    this.gauges.set('nodejs_eventloop_lag_p999_ms', {
+      name: 'nodejs_eventloop_lag_p999_ms',
+      help: 'Node.js event loop lag p999 in milliseconds (10s window)',
       value: 0
     });
 
@@ -435,21 +464,43 @@ class MetricsService {
    * Start collecting system metrics periodically
    */
   private startSystemMetricsCollection(): void {
-    // Collect every 15 seconds
-    const timer = setInterval(() => {
+    // Memory: sample every 15 seconds.
+    const memTimer = setInterval(() => {
       const memUsage = process.memoryUsage();
       this.setGauge('nodejs_memory_heap_used_bytes', memUsage.heapUsed);
       this.setGauge('nodejs_memory_heap_total_bytes', memUsage.heapTotal);
-
-      // Measure event loop lag
-      const start = process.hrtime.bigint();
-      setImmediate(() => {
-        const lag = Number(process.hrtime.bigint() - start) / 1e6; // Convert to ms
-        this.setGauge('nodejs_eventloop_lag_ms', lag);
-      });
     }, 15000);
-    // Prevent this timer from blocking Jest process exit.
-    timer.unref();
+    memTimer.unref();
+
+    // ---------------------------------------------------------------------------
+    // P3-T02 — Event loop delay via monitorEventLoopDelay histogram (Node built-in)
+    //
+    // Percentile math:
+    //   • .percentile(N) returns nanoseconds since the V8 tick resolution is 1ns.
+    //   • Divide by 1e6 to convert to milliseconds for Prometheus/Grafana.
+    //   • p50 = median lag seen over the last interval (baseline health).
+    //   • p99 = tail latency — spikes here correlate with user-visible slowdowns.
+    //   • p999 = worst-case lag — critical alerts fire on this value.
+    //   • .reset() clears the histogram after each sample window so the next
+    //     interval reflects only new observations (non-cumulative reporting).
+    // ---------------------------------------------------------------------------
+    if (process.env.NODE_ENV !== 'test') {
+      const lagTimer = setInterval(() => {
+        const p50 = eventLoopDelayHistogram.percentile(50) / 1e6;
+        const p99 = eventLoopDelayHistogram.percentile(99) / 1e6;
+        const p999 = eventLoopDelayHistogram.percentile(99.9) / 1e6;
+        const mean = eventLoopDelayHistogram.mean / 1e6;
+
+        this.setGauge('nodejs_eventloop_lag_p50_ms', p50);
+        this.setGauge('nodejs_eventloop_lag_p99_ms', p99);
+        this.setGauge('nodejs_eventloop_lag_p999_ms', p999);
+        // P3-T03: legacy gauge preserved for existing dashboards
+        this.setGauge('nodejs_eventloop_lag_ms', mean);
+
+        eventLoopDelayHistogram.reset();
+      }, 10000);
+      lagTimer.unref();
+    }
   }
 
   // ===========================================================================
@@ -460,10 +511,11 @@ class MetricsService {
    * Increment a counter
    */
   incrementCounter(name: string, labels: Record<string, string> = {}, value: number = 1): void {
-    const counter = this.counters.get(name);
+    let counter = this.counters.get(name);
     if (!counter) {
-      logger.warn(`Counter ${name} not found`);
-      return;
+      // Auto-register: create a minimal counter definition on first use.
+      counter = { name, help: `Auto: ${name}`, labels: {} };
+      this.counters.set(name, counter);
     }
 
     const labelKey = this.labelsToKey(labels);
@@ -512,10 +564,19 @@ class MetricsService {
    * Observe a value in a histogram
    */
   observeHistogram(name: string, value: number, labels: Record<string, string> = {}): void {
-    const histogram = this.histograms.get(name);
+    let histogram = this.histograms.get(name);
     if (!histogram) {
-      logger.warn(`Histogram ${name} not found`);
-      return;
+      // Auto-register: create a histogram with default latency buckets on first use.
+      histogram = {
+        name,
+        help: `Auto: ${name}`,
+        buckets: this.latencyBuckets,
+        values: new Map(),
+        bucketCounts: new Map(),
+        sum: new Map(),
+        count: new Map(),
+      };
+      this.histograms.set(name, histogram);
     }
 
     const labelKey = this.labelsToKey(labels);
@@ -532,7 +593,7 @@ class MetricsService {
     const values = histogram.values.get(labelKey)!;
     values.push(value);
     if (values.length > 1000) {
-      values.shift();
+      values.splice(0, 1);
     }
 
     const cumulativeBuckets = histogram.bucketCounts.get(labelKey)!;
@@ -625,6 +686,49 @@ class MetricsService {
   }
 
   /**
+   * Read a gauge's current value.
+   * Returns 0 if the gauge is not registered.
+   */
+  getGaugeValue(name: string): number {
+    return this.gauges.get(name)?.value ?? 0;
+  }
+
+  /**
+   * Compute a percentile (0..1) over the raw histogram values for the
+   * given metric and label set.  Returns 0 when no data has been recorded.
+   * Used by /health/ready performance gates.
+   */
+  getHistogramP99(name: string, labels: Record<string, string> = {}): number {
+    const histogram = this.histograms.get(name);
+    if (!histogram) return 0;
+    const labelKey = this.labelsToKey(labels);
+    const values = histogram.values.get(labelKey);
+    if (!values || values.length === 0) return 0;
+    const sorted = [...values].sort((a, b) => a - b);
+    return this.percentile(sorted, 0.99);
+  }
+
+  /**
+   * Push one observation into a histogram, auto-registering it on first use.
+   * Used by the health-gate ring-buffer and by test code that needs to
+   * synthesise XADD latency samples without importing the full adapter.
+   */
+  recordHistogramSample(name: string, value: number, labels: Record<string, string> = {}): void {
+    if (!this.histograms.has(name)) {
+      this.histograms.set(name, {
+        name,
+        help: `Auto-registered histogram: ${name}`,
+        buckets: this.latencyBuckets,
+        values: new Map(),
+        bucketCounts: new Map(),
+        sum: new Map(),
+        count: new Map()
+      });
+    }
+    this.observeHistogram(name, value, labels);
+  }
+
+  /**
    * Get metrics as JSON (for health endpoint)
    */
   getMetricsJSON(): Record<string, unknown> {
@@ -710,8 +814,11 @@ class MetricsService {
 
   private pruneHttpRequestSamples(nowMs: number): void {
     const minTimestamp = nowMs - this.maxHttpSampleWindowMs;
-    while (this.httpRequestSamples.length > 0 && this.httpRequestSamples[0].timestampMs < minTimestamp) {
-      this.httpRequestSamples.shift();
+    const firstValid = this.httpRequestSamples.findIndex((s) => s.timestampMs >= minTimestamp);
+    if (firstValid === -1) {
+      this.httpRequestSamples.length = 0;
+    } else if (firstValid > 0) {
+      this.httpRequestSamples.splice(0, firstValid);
     }
   }
 
