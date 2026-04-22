@@ -665,4 +665,68 @@ describe('FCM Service Hardening', () => {
       expect(typeof fcmService.notifyPayment).toBe('function');
     });
   });
+
+  // =========================================================================
+  // P1-T38 (A05-019): Base64 FCM private-key round-trip
+  // =========================================================================
+  describe('P1-T38: Base64 FCM private-key round-trip', () => {
+    // Access the firebase-admin mock for assertions
+    const firebaseAdminMock = require('firebase-admin');
+
+    afterEach(() => {
+      delete process.env.FIREBASE_PRIVATE_KEY_B64;
+      delete process.env.FIREBASE_PRIVATE_KEY;
+      delete process.env.FIREBASE_PROJECT_ID;
+      delete process.env.FIREBASE_CLIENT_EMAIL;
+      delete process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
+    });
+
+    test('FIREBASE_PRIVATE_KEY_B64 is base64-decoded and passed to credential.cert', async () => {
+      // Arrange: create a realistic PEM-like key and base64-encode it
+      const fakePem = '-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEArandomfakekey\n-----END RSA PRIVATE KEY-----\n';
+      const b64Key = Buffer.from(fakePem, 'utf8').toString('base64');
+
+      process.env.FIREBASE_PRIVATE_KEY_B64 = b64Key;
+      process.env.FIREBASE_PROJECT_ID = 'test-project-b64';
+      process.env.FIREBASE_CLIENT_EMAIL = 'test@test.iam.gserviceaccount.com';
+
+      jest.clearAllMocks();
+
+      await fcmService.initialize();
+
+      // credential.cert should have been called with the decoded PEM (not the base64 string)
+      expect(firebaseAdminMock.credential.cert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          projectId: 'test-project-b64',
+          privateKey: fakePem,
+          clientEmail: 'test@test.iam.gserviceaccount.com',
+        })
+      );
+    });
+
+    test('FIREBASE_PRIVATE_KEY_B64 decoded key equals the original PEM string', () => {
+      // Pure round-trip: encode then decode must be lossless
+      const originalPem = '-----BEGIN RSA PRIVATE KEY-----\nSOMEKEYDATA==\n-----END RSA PRIVATE KEY-----\n';
+      const encoded = Buffer.from(originalPem, 'utf8').toString('base64');
+      const decoded = Buffer.from(encoded, 'base64').toString('utf8');
+      expect(decoded).toBe(originalPem);
+    });
+
+    test('falls back to FIREBASE_PRIVATE_KEY with \\n replacement when FIREBASE_PRIVATE_KEY_B64 is absent', async () => {
+      process.env.FIREBASE_PROJECT_ID = 'test-project-fallback';
+      process.env.FIREBASE_PRIVATE_KEY = 'fake-key-with\\nnewlines';
+      process.env.FIREBASE_CLIENT_EMAIL = 'fallback@test.iam.gserviceaccount.com';
+
+      jest.clearAllMocks();
+
+      await fcmService.initialize();
+
+      expect(firebaseAdminMock.credential.cert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          // \\n in env var should be converted to real \n
+          privateKey: 'fake-key-with\nnewlines',
+        })
+      );
+    });
+  });
 });

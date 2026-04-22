@@ -479,6 +479,34 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
       'confirmed_hold_fanout_total',
       'Confirmed-hold post-commit fan-out outcomes by type (expected = intended notifications; socket_ok / fcm_ok = successful channel delivery)',
     ),
+
+    // === A05-019 (P1-T23): FCM boot credential failure counter ===
+    // Fires on any FCM init or dry-run failure. The `reason` label is a closed
+    // enum: base64_decode_failed | pem_parse_failed | dry_run_failed | env_missing.
+    // NEVER use raw error messages as label values (high cardinality + PII leak).
+    //   Call site: src/shared/services/fcm.service.ts (_emitInitFailureMetric)
+    //   Alarm: any non-zero rate in production → page oncall (credential mis-config)
+    counter(
+      'fcm_init_missing_config',
+      'FCM credential init or boot dry-run failures — reason label is a closed enum (base64_decode_failed|pem_parse_failed|dry_run_failed|env_missing)',
+    ),
+
+    // === A05-019 (P1-T??): FCM mock-mode drop counter ===
+    // Already referenced by fcm.service.ts; registered here so incrementCounter
+    // does not silently warn on boot.
+    counter(
+      'fcm_mock_mode_drop_total',
+      'FCM notifications dropped because the service is in mock mode (no credentials configured)',
+    ),
+
+    // === A05-019: FCM retry backoff source counter ===
+    // Already referenced by fcm.service.ts (executeWithRetry). Registered here
+    // so the warn-and-return branch in incrementCounter is never triggered.
+    //   Labels: source = 'retry_after_header' | 'exponential'
+    counter(
+      'fcm_retry_backoff_source_total',
+      'FCM retry backoff strategy used per attempt (retry_after_header vs exponential)',
+    ),
   ];
 
   for (const def of defs) {
@@ -577,6 +605,17 @@ export function registerDefaultHistograms(histograms: Map<string, HistogramMetri
       'pool_wait_seconds',
       'Prisma connection pool wait time in seconds (F14.5) — labels: pool_name',
       [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+    ),
+
+    // === A05-019 (P1-T46): FCM boot dry-run latency ===
+    // Observed after the boot dry-run send completes (success or expected
+    // invalid-token response). Measures how long Firebase OAuth minting +
+    // network round-trip takes at process start. Useful for boot-time SLO.
+    //   Call site: src/shared/services/fcm.service.ts (_observeDryRunLatency)
+    hist(
+      'fcm_boot_dry_run_latency_ms',
+      'FCM boot dry-run round-trip latency in milliseconds (credential pipeline validation at startup)',
+      [50, 100, 250, 500, 1000, 2500, 5000, 10000],
     ),
   ];
 

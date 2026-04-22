@@ -65,23 +65,46 @@ const FCM_TOKEN_KEY = (userId: string) => `fcm:tokens:${userId}`;
 // FCM tokens expire after ~60 days, we set 90-day TTL for safety
 const FCM_TOKEN_TTL_SECONDS = 90 * 24 * 60 * 60; // 90 days
 
+// =============================================================================
+// INIT-PATH LOG REDACTOR
+// Removes PEM blocks and long base64 runs from strings before logging.
+// Prevents private-key material from appearing in structured log payloads
+// (CloudWatch, Datadog, etc.) which could be scraped by observability tools.
+// =============================================================================
+
+/**
+ * Redact PEM blocks and long base64 sequences from a string or Error.
+ * Used exclusively on FCM init/catch/dry-run log paths.
+ *
+ * @param input - raw error message or arbitrary string
+ * @returns sanitised string safe to pass to logger
+ */
+function redactInitLog(input: unknown): string {
+  const raw = input instanceof Error ? input.message : String(input ?? '');
+  return raw
+    // Remove PEM-formatted key blocks (-----BEGIN ... -----END ...-----)
+    .replace(/-----BEGIN [^\n]+-----[\s\S]*?-----END [^\n]+-----/g, '[PEM_REDACTED]')
+    // Remove runs of 40+ base64 characters (private key fragments, tokens)
+    .replace(/[A-Za-z0-9+/=]{40,}/g, '[B64_REDACTED]');
+}
+
 /**
  * FCM Service class
- * 
+ *
  * SCALABILITY:
  * - FCM tokens stored in Redis (shared across ECS instances)
  * - Falls back to in-memory Map if Redis is unavailable
  * - Firebase Admin SDK handles millions of messages automatically
- * 
+ *
  * EASY UNDERSTANDING:
  * - Firebase Admin SDK integration is optional
  * - Works without it by logging notifications (useful for development)
  * - Token storage is transparent — Redis or in-memory, same API
- * 
+ *
  * MODULARITY:
  * - Token storage is decoupled from notification sending
  * - Can switch storage backend without changing notification logic
- * 
+ *
  * To enable real push notifications:
  * 1. npm install firebase-admin
  * 2. Set FIREBASE_SERVICE_ACCOUNT_PATH in .env
@@ -107,18 +130,55 @@ class FCMService {
    *
    * Credential resolution order:
    * 1. File-based: FIREBASE_SERVICE_ACCOUNT_PATH (local dev, existing behavior)
-   * 2. Inline env vars: FIREBASE_PROJECT_ID + FIREBASE_PRIVATE_KEY + FIREBASE_CLIENT_EMAIL (production ECS)
+   * 2. Inline env vars: FIREBASE_PROJECT_ID + FIREBASE_PRIVATE_KEY (or FIREBASE_PRIVATE_KEY_B64) + FIREBASE_CLIENT_EMAIL (production ECS)
    * 3. Mock mode: no credentials — notifications logged to console only
+   *
+   * P1-T20: If FIREBASE_PRIVATE_KEY_B64 is set and non-empty, it takes precedence
+   *         over FIREBASE_PRIVATE_KEY (base64-decoded, Prime Video re:Invent pattern).
+   * P1-T21: In production, credential init failure triggers process.exit(1) unless
+   *         FCM_FAIL_FAST_IN_PROD=false (rollback gate).
+   * P1-T22: After successful init in production, a dry-run send validates the
+   *         credential pipeline end-to-end.
+   * P1-T23: Every failure path emits fcm_init_missing_config with an enum reason label.
+   * P1-T46: Dry-run send latency is observed as fcm_boot_dry_run_latency_ms histogram.
    */
   async initialize(): Promise<void> {
     const serviceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
     const projectId = process.env.FIREBASE_PROJECT_ID;
-    const privateKey = process.env.FIREBASE_PRIVATE_KEY;
     const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
     const isProduction = process.env.NODE_ENV === 'production';
+    const failFastEnabled = process.env.FCM_FAIL_FAST_IN_PROD !== 'false';
+
+    // P1-T20: Prefer base64-encoded private key (FIREBASE_PRIVATE_KEY_B64) over
+    // the literal-\n variant (FIREBASE_PRIVATE_KEY). Resolves ECS secret injection
+    // environments where newlines get double-escaped.
+    let resolvedPrivateKey: string | undefined;
+    const privateKeyB64 = process.env.FIREBASE_PRIVATE_KEY_B64;
+    if (privateKeyB64 && privateKeyB64.trim().length > 0) {
+      try {
+        resolvedPrivateKey = Buffer.from(privateKeyB64, 'base64').toString('utf8');
+      } catch (b64Err) {
+        // Decoding failed — fall through to FIREBASE_PRIVATE_KEY fallback
+        logger.warn('[FCM] FIREBASE_PRIVATE_KEY_B64 decode failed, falling back to FIREBASE_PRIVATE_KEY', {
+          error: redactInitLog(b64Err),
+        });
+        this._emitInitFailureMetric('base64_decode_failed');
+        if (isProduction && failFastEnabled) {
+          logger.error('[FCM] CRITICAL: base64 key decode failed in production — exiting');
+          process.exit(1);
+        }
+      }
+    }
+    // Fallback: literal \n → real newlines (existing behaviour)
+    if (!resolvedPrivateKey) {
+      const rawKey = process.env.FIREBASE_PRIVATE_KEY;
+      if (rawKey) {
+        resolvedPrivateKey = rawKey.replace(/\\n/g, '\n');
+      }
+    }
 
     const hasFileCreds = !!serviceAccountPath;
-    const hasInlineCreds = !!(projectId && privateKey && clientEmail);
+    const hasInlineCreds = !!(projectId && resolvedPrivateKey && clientEmail);
 
     // --- Strategy 1: File-based credentials ---
     if (hasFileCreds) {
@@ -131,9 +191,13 @@ class FCMService {
         this.admin = firebaseAdmin;
         this.isInitialized = true;
         logger.info('[FCM] Firebase: file credentials — SDK initialized');
+        // P1-T22: boot dry-run (production only)
+        await this._bootDryRun(isProduction, failFastEnabled);
         return;
       } catch (error) {
-        logger.warn('[FCM] File-based init failed, trying inline credentials...', error);
+        logger.warn('[FCM] File-based init failed, trying inline credentials...', {
+          error: redactInitLog(error),
+        });
         // Fall through to inline
       }
     }
@@ -145,32 +209,114 @@ class FCMService {
         firebaseAdmin.initializeApp({
           credential: firebaseAdmin.credential.cert({
             projectId: projectId!,
-            // FIREBASE_PRIVATE_KEY arrives with literal \n — convert to real newlines
-            privateKey: privateKey!.replace(/\\n/g, '\n'),
+            privateKey: resolvedPrivateKey!,
             clientEmail: clientEmail!,
           } as any)
         });
         this.admin = firebaseAdmin;
         this.isInitialized = true;
         logger.info('[FCM] Firebase: inline credentials — SDK initialized');
+        // P1-T22: boot dry-run (production only)
+        await this._bootDryRun(isProduction, failFastEnabled);
         return;
       } catch (error) {
-        logger.warn('[FCM] Inline credential init failed. Falling back to mock mode.', error);
+        this._emitInitFailureMetric('pem_parse_failed');
+        logger.warn('[FCM] Inline credential init failed. Falling back to mock mode.', {
+          error: redactInitLog(error),
+        });
+        // P1-T21: fail-fast in production
+        if (isProduction && failFastEnabled) {
+          logger.error('[FCM] CRITICAL: inline credential init failed in production — exiting');
+          process.exit(1);
+        }
       }
     }
 
     // --- Strategy 3: Mock mode ---
     if (isProduction) {
       this.mockModeReason = 'No Firebase credentials found in production environment';
+      this._emitInitFailureMetric('env_missing');
       logger.error('[FCM] Firebase: MOCK MODE — no credentials found in production. Push notifications DISABLED.');
-      try {
-        const { metrics } = require('../monitoring/metrics.service');
-        metrics.incrementCounter('fcm_init_missing_config');
-      } catch { /* metrics not available */ }
+      // P1-T21: fail-fast in production on missing credentials
+      if (failFastEnabled) {
+        logger.error('[FCM] CRITICAL: no FCM credentials in production — exiting');
+        process.exit(1);
+      }
     } else {
       this.mockModeReason = 'Development mode — no Firebase credentials configured';
       logger.warn('[FCM] Firebase: MOCK MODE (console only). Set FIREBASE_SERVICE_ACCOUNT_PATH or FIREBASE_PROJECT_ID+FIREBASE_PRIVATE_KEY+FIREBASE_CLIENT_EMAIL to enable.');
     }
+  }
+
+  /**
+   * P1-T23: Emit fcm_init_missing_config counter with an enum reason label.
+   * Reason values are a closed enum — never pass raw error messages (high-cardinality/PII).
+   */
+  private _emitInitFailureMetric(
+    reason: 'base64_decode_failed' | 'pem_parse_failed' | 'dry_run_failed' | 'env_missing'
+  ): void {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { metrics } = require('../monitoring/metrics.service');
+      metrics.incrementCounter('fcm_init_missing_config', { reason });
+    } catch { /* metrics not available during early boot */ }
+  }
+
+  /**
+   * P1-T22 / P1-T46: Boot dry-run to validate credential pipeline end-to-end.
+   * Only runs in production. Sends a dry-run message to a known-invalid token —
+   * Firebase validates the credential and OAuth minting path without delivering.
+   *
+   * On Firebase auth / OAuth error in production → process.exit(1).
+   * On token-not-found (expected) → success, credential is valid.
+   * Non-production: skipped entirely (no-op).
+   */
+  private async _bootDryRun(isProduction: boolean, failFastEnabled: boolean): Promise<void> {
+    // P1-T22: dry-run is production-only
+    if (!isProduction || !this.admin) return;
+    const dryRunStart = Date.now();
+    try {
+      await this.admin.messaging().send(
+        { token: 'invalid-dry-run-token', dryRun: true },
+      );
+      // Unexpected success (shouldn't happen with invalid token), treat as OK
+      const elapsedMs = Date.now() - dryRunStart;
+      this._observeDryRunLatency(elapsedMs);
+    } catch (dryRunErr: any) {
+      const elapsedMs = Date.now() - dryRunStart;
+      const code: string = dryRunErr?.errorInfo?.code || dryRunErr?.code || '';
+      // messaging/registration-token-not-registered = expected with invalid token
+      // This means the credential pipeline works correctly.
+      if (
+        code === 'messaging/registration-token-not-registered' ||
+        code === 'messaging/invalid-registration-token'
+      ) {
+        this._observeDryRunLatency(elapsedMs);
+        logger.info('[FCM] Boot dry-run: credential pipeline OK (invalid-token response as expected)');
+        return;
+      }
+      // Any other error = auth/OAuth failure — credentials did not pass Firebase validation
+      this._emitInitFailureMetric('dry_run_failed');
+      logger.error('[FCM] Boot dry-run failed — credential pipeline error', {
+        code,
+        error: redactInitLog(dryRunErr),
+      });
+      if (isProduction && failFastEnabled) {
+        logger.error('[FCM] CRITICAL: boot dry-run failed in production — exiting');
+        process.exit(1);
+      }
+    }
+  }
+
+  /**
+   * P1-T46: Emit boot dry-run latency histogram.
+   */
+  private _observeDryRunLatency(elapsedMs: number): void {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { metrics } = require('../monitoring/metrics.service');
+      metrics.observeHistogram('fcm_boot_dry_run_latency_ms', elapsedMs);
+    } catch { /* metrics not available during early boot */ }
   }
 
   // ===========================================================================
