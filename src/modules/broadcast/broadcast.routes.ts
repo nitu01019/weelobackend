@@ -23,6 +23,37 @@ import { logger } from '../../shared/services/logger.service';
 import { redisService } from '../../shared/services/redis.service';
 import { AppError } from '../../shared/types/error.types';
 import { buildAcceptResponse } from '../../shared/api-response.builder';
+import { createHmac, randomBytes } from 'crypto';
+
+// =============================================================================
+// A09-007: Idempotency key helpers (local — truck-hold.routes.ts does not export these)
+// =============================================================================
+
+// 240s TTL aligned with IDEMPOTENCY_TTL_SUCCESS_SECONDS in truck-hold.routes.ts
+const BROADCAST_IDEMPOTENCY_TTL_SUCCESS_SECONDS = 240;
+// Server-generated keys use 30s TTL (short-lived; client-supplied keys keep full 240s)
+const BROADCAST_SERVER_KEY_TTL_SECONDS = 30;
+// HMAC secret for server-generated key signing — ensures the key was issued by this server
+const HMAC_SECRET = process.env.IDEMPOTENCY_HMAC_SECRET || 'weelo-idem-fallback-secret';
+
+/**
+ * Read client-supplied X-Idempotency-Key header, or generate a server-issued key
+ * with a `req-` prefix if none is present.
+ * Server-generated keys are HMAC-signed so they can be validated on replay.
+ */
+function readOrGenerateIdempotencyKey(req: Request): { key: string; serverGenerated: boolean } {
+  const headerVal = req.header('X-Idempotency-Key');
+  if (headerVal && headerVal.trim().length >= 8) {
+    return { key: headerVal.trim(), serverGenerated: false };
+  }
+  // Generate: req-<timestamp>-<8-byte random hex>-<hmac(8)>
+  const ts = Date.now().toString(36);
+  const rand = randomBytes(8).toString('hex');
+  const raw = `req-${ts}-${rand}`;
+  const sig = createHmac('sha256', HMAC_SECRET).update(raw).digest('hex').slice(0, 8);
+  const key = `${raw}-${sig}`;
+  return { key, serverGenerated: true };
+}
 
 const router = Router();
 
@@ -185,10 +216,12 @@ router.post(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const body = validateSchema(acceptBroadcastBodySchema, req.body);
-      const idempotencyKeyHeader = req.header('X-Idempotency-Key');
-      const idempotencyKey = idempotencyKeyHeader
-        ? validateSchema(idempotencyKeyHeaderSchema, idempotencyKeyHeader)
-        : undefined;
+      // A09-007 (T11): Generate server key if client did not supply X-Idempotency-Key
+      const { key: idempotencyKey, serverGenerated } = readOrGenerateIdempotencyKey(req);
+      // Validate client-supplied keys against the schema; server-generated keys are already valid
+      if (!serverGenerated) {
+        validateSchema(idempotencyKeyHeaderSchema, idempotencyKey);
+      }
       const actorUserId = req.user!.userId;
       const actorRole = req.user!.role;
       const effectiveDriverId = actorRole === 'driver'
@@ -209,6 +242,9 @@ router.post(
         }
       );
 
+      // A09-007 (T39): Always echo the idempotency key in the response header
+      res.setHeader('X-Idempotency-Key', idempotencyKey);
+
       // F-M7: Use unified response builder (keeps backward-compatible top-level fields)
       const structured = buildAcceptResponse({
         assignmentId: result.assignmentId,
@@ -225,6 +261,8 @@ router.post(
         status: 'ASSIGNED',
         resultCode: result.resultCode || 'ASSIGNED',
         replayed: result.replayed === true,
+        // A09-007 (T39): Include idempotencyKey in response envelope
+        idempotencyKey,
       });
     } catch (error) {
       next(error);

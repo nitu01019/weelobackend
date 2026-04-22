@@ -102,6 +102,10 @@ async function retryWithBackoff<T>(
 }
 
 export async function acceptBroadcast(broadcastId: string, params: AcceptBroadcastParams): Promise<AcceptBroadcastResult> {
+  // A09-007: idempotencyKey is required — routes layer must generate or read from header
+  if (!params.idempotencyKey) {
+    throw new Error('idempotencyKey required per A09-007 contract — routes layer must generate or read from header');
+  }
   const { driverId, vehicleId, idempotencyKey, actorUserId, actorRole, metadata } = params;
   // C-04 FIX: Use same lock key pattern as cancelBooking (`booking:${bookingId}`)
   // so accept and cancel serialize against each other. broadcastId === bookingId.
@@ -160,7 +164,7 @@ export async function acceptBroadcast(broadcastId: string, params: AcceptBroadca
   }
 
   try {
-    const lock = await redisService.acquireLock(lockKey, lockHolder, 20);
+    const lock = await redisService.acquireLock(lockKey, lockHolder, 240); // A09-007: raised from 20s → 240s (aligned with IDEMPOTENCY_TTL_SUCCESS_SECONDS)
     lockAcquired = lock.acquired;
     if (!lockAcquired) {
       incrementAcceptMetric('lockContention');
@@ -176,7 +180,7 @@ export async function acceptBroadcast(broadcastId: string, params: AcceptBroadca
     // primary lock mechanism throws (e.g., transient Redis error on first attempt).
     try {
       const secondaryLockKey = `broadcast-accept-fallback:${broadcastId}`;
-      const secondaryLock = await redisService.acquireLock(secondaryLockKey, lockHolder, 20);
+      const secondaryLock = await redisService.acquireLock(secondaryLockKey, lockHolder, 240); // A09-007: raised from 20s → 240s
       if (secondaryLock.acquired) {
         secondaryLockAcquired = true;
         logger.info('[BroadcastAccept] Secondary Redis lock acquired', { broadcastId, vehicleId, driverId });
