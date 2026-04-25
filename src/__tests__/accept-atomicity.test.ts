@@ -85,10 +85,13 @@ const mockTruckHoldLedgerFindFirst = jest.fn();
 const mockExecuteRaw = jest.fn();
 const mockTransaction = jest.fn();
 
-// Build a transaction-scoped proxy with mocks that track calls inside tx
+// Build a transaction-scoped proxy with mocks that track calls inside tx.
+// F-A-75: validateActorEligibility runs SELECT ... FOR UPDATE on the User row
+// inside the tx. Default to an active+verified driver so the eligibility gate
+// passes; tests that want eligibility denial override $queryRaw locally.
 function buildTxProxy() {
   return {
-    $queryRaw: jest.fn().mockResolvedValue([]),
+    $queryRaw: jest.fn().mockResolvedValue([{ isActive: true, kycStatus: 'VERIFIED' }]),
     $executeRaw: jest.fn().mockResolvedValue(0),
     $executeRawUnsafe: jest.fn().mockResolvedValue(0),
     assignment: {
@@ -101,6 +104,14 @@ function buildTxProxy() {
     },
   };
 }
+
+// A10-005: handleDriverAcceptance now wraps the CAS update in withDbTimeout
+// instead of a bare $transaction. Default impl runs the callback against a
+// fresh tx proxy each call, so existing per-test mockReturnValueOnce setups
+// on mockAssignmentUpdateMany / mockAssignmentFindUnique still apply.
+const mockWithDbTimeout = jest.fn().mockImplementation(
+  async (fn: (tx: any) => Promise<any>, _opts?: any) => fn(buildTxProxy())
+);
 
 jest.mock('../shared/database/prisma.service', () => ({
   prismaClient: {
@@ -120,7 +131,9 @@ jest.mock('../shared/database/prisma.service', () => ({
     },
     $executeRaw: (...args: any[]) => mockExecuteRaw(...args),
     $transaction: (...args: any[]) => mockTransaction(...args),
+    $queryRaw: jest.fn().mockResolvedValue([{ isActive: true, kycStatus: 'VERIFIED' }]),
   },
+  withDbTimeout: (...args: any[]) => mockWithDbTimeout(...args),
   HoldPhase: {
     FLEX: 'FLEX',
     CONFIRMED: 'CONFIRMED',
