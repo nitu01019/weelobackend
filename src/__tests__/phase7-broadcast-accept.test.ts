@@ -129,6 +129,20 @@ jest.mock('../shared/services/queue.service', () => ({
 }));
 
 // ---------------------------------------------------------------------------
+// Vehicle lifecycle mock
+// A11-003: production routes cache invalidation through onVehicleTransition()
+// when FF_BROADCAST_ACCEPT_VEHICLE_HOOK is ON (default true). The hook funnels
+// the available -> on_hold transition through the canonical lifecycle helper
+// (Redis availability counters + fleet-cache invalidation), replacing the
+// legacy direct redis.del() call. The flag stays ON in production per
+// "Features Ship ON, Not OFF" — tests assert the hook is invoked.
+// ---------------------------------------------------------------------------
+const mockOnVehicleTransition = jest.fn();
+jest.mock('../shared/services/vehicle-lifecycle.service', () => ({
+  onVehicleTransition: (...args: any[]) => mockOnVehicleTransition(...args),
+}));
+
+// ---------------------------------------------------------------------------
 // Prisma mock
 // ---------------------------------------------------------------------------
 const mockTxExecuteRaw = jest.fn();
@@ -197,11 +211,16 @@ const TRANSPORTER_ID = '44444444-4444-4444-4444-444444444444';
 const CUSTOMER_ID = '55555555-5555-5555-5555-555555555555';
 const ACTOR_USER_ID = TRANSPORTER_ID;
 
+// A09-007 contract (commit 6860705b): acceptBroadcast requires an idempotencyKey —
+// the routes layer must generate one or read from the HTTP header. Supplying one here
+// satisfies the new precondition for all happy-path tests; per-test cases that need to
+// probe the "no key" branch (now the A09-007 throw) override via { ...baseParams, idempotencyKey: undefined }.
 const baseParams = {
   driverId: DRIVER_ID,
   vehicleId: VEHICLE_ID,
   actorUserId: ACTOR_USER_ID,
   actorRole: 'transporter' as const,
+  idempotencyKey: 'test-idem-default',
 };
 
 function makeBooking(overrides: Record<string, unknown> = {}) {
@@ -677,14 +696,22 @@ describe('Phase 7: Broadcast Accept Pipeline', () => {
     });
 
     test('skips idempotency cache when no idempotencyKey provided', async () => {
+      // A09-007 contract (commit 6860705b): acceptBroadcast now REQUIRES idempotencyKey
+      // and the service throws before reaching any idempotency lookup. This preserves
+      // the test's original intent (no-key → no idem cache touch) by asserting the
+      // stronger new invariant — the request never even proceeds to the cache read.
       setupSuccessfulAcceptMocks();
-      await acceptBroadcast(BROADCAST_ID, baseParams);
+      await expect(
+        acceptBroadcast(BROADCAST_ID, { ...baseParams, idempotencyKey: undefined })
+      ).rejects.toThrow(
+        /idempotencyKey required per A09-007 contract/
+      );
 
-      // getJSON should not be called for idempotency (but may be called for other purposes)
+      // Because the service throws at the precondition, the idempotency cache is
+      // never consulted — confirming the "skips idempotency cache" guarantee.
       const idemCalls = mockRedisGetJSON.mock.calls.filter(
         (c: any[]) => typeof c[0] === 'string' && c[0].includes('idem:')
       );
-      // When no key provided, no idempotency lookup
       expect(idemCalls.length).toBe(0);
     });
   });
@@ -1230,10 +1257,14 @@ describe('Phase 7: Broadcast Accept Pipeline', () => {
       setupSuccessfulAcceptMocks();
       await acceptBroadcast(BROADCAST_ID, baseParams);
 
-      const vehicleCacheDel = mockRedisDel.mock.calls.find(
-        (c: any[]) => typeof c[0] === 'string' && c[0].includes(`cache:vehicles:transporter:${TRANSPORTER_ID}`)
+      // FF_BROADCAST_ACCEPT_VEHICLE_HOOK is ON by default (W-0 C / A11-003).
+      // Production funnels the available -> on_hold cache sync through
+      // onVehicleTransition() instead of a direct redis.del. Asserting on the
+      // hook keeps the test honest while keeping the feature flag ON.
+      const transition = mockOnVehicleTransition.mock.calls.find(
+        (c: any[]) => c[0] === TRANSPORTER_ID && c[3] === 'available' && c[4] === 'on_hold'
       );
-      expect(vehicleCacheDel).toBeDefined();
+      expect(transition).toBeDefined();
     });
 
     test('invalidates broadcast list cache on success', async () => {
