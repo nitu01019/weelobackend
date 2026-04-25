@@ -157,11 +157,17 @@ jest.mock('../shared/database/prisma.service', () => ({
 
 // ---------------------------------------------------------------------------
 // Socket service mock
+// D1-4 / FF_CUSTOMER_PROGRESS_MIRROR (default ON) replaced the legacy
+// transporter emitToUser('driver_accepted', ...) with emitToRoom on
+// 'order:{orderId}'. Both are mocked so tests can target whichever channel
+// production currently uses.
 // ---------------------------------------------------------------------------
 const mockEmitToUser = jest.fn();
+const mockEmitToRoom = jest.fn();
 jest.mock('../shared/services/socket.service', () => ({
   socketService: {
     emitToUser: (...args: any[]) => mockEmitToUser(...args),
+    emitToRoom: (...args: any[]) => mockEmitToRoom(...args),
   },
 }));
 
@@ -241,6 +247,8 @@ function resetAllMocks(): void {
     return fn(tx);
   });
   mockEmitToUser.mockReset();
+  mockEmitToRoom.mockReset();
+  mockEmitToRoom.mockResolvedValue(undefined);
   mockReleaseVehicle.mockReset();
   mockApplyPostAcceptSideEffects.mockReset();
   mockApplyPostAcceptSideEffects.mockResolvedValue(undefined);
@@ -893,12 +901,18 @@ describe('C. Side Effects (Post-Commit)', () => {
 
     await confirmedHoldService.handleDriverAcceptance('assign-001', 'driver-001');
 
-    expect(mockEmitToUser).toHaveBeenCalledWith(
-      'transporter-001',
+    // D1-4: emit goes to the 'order:{orderId}' room via emitToRoom (mirror path),
+    // not to the transporter via emitToUser. The mirror payload is
+    // intentionally narrow — it carries orderId + driverId for correlation
+    // and the count fields for progress UI. holdId/assignmentId are NOT in
+    // the mirror payload by design (they'd leak transporter-internal state
+    // to the customer feed); customers correlate by orderId, transporters
+    // by the dashboard side that subscribes to the same room.
+    expect(mockEmitToRoom).toHaveBeenCalledWith(
+      'order:order-001',
       'driver_accepted',
       expect.objectContaining({
-        holdId: 'hold-001',
-        assignmentId: 'assign-001',
+        orderId: 'order-001',
         driverId: 'driver-001',
       })
     );
@@ -942,19 +956,19 @@ describe('C. Side Effects (Post-Commit)', () => {
     expect(result.accepted).toBe(true);
   });
 
-  it('C6: if Socket emit fails after CAS commit, outer catch returns failure but CAS already happened', async () => {
+  it('C6: if Socket emit fails after CAS commit, accept still succeeds (D1-4 mirror swallows)', async () => {
     setupAcceptanceHappyPath();
-    mockEmitToUser.mockRejectedValue(new Error('Socket disconnected'));
+    mockEmitToRoom.mockRejectedValue(new Error('Socket disconnected'));
 
     const result = await confirmedHoldService.handleDriverAcceptance('assign-001', 'driver-001');
 
-    // Socket emit failure propagates to outer catch (emitToUser is awaited without its own try/catch).
-    // The CAS update already committed, so the assignment state is correct in the database.
-    // The function returns a generic failure, but the important thing is the CAS commit is durable.
-    expect(result.success).toBe(false);
-    expect(result.message).toBe('Failed to handle driver acceptance');
-
-    // CAS update DID execute and commit before the socket error
+    // D1-4 wraps the customer-mirror emit in its own try/catch (logger.warn on
+    // failure) so the post-CAS socket fault no longer propagates to the outer
+    // catch. The CAS commit is the source of truth for accept; mirror is
+    // best-effort. Test purpose preserved: CAS ran exactly once and accept
+    // is reported successful even when the mirror channel is degraded.
+    expect(result.success).toBe(true);
+    expect(result.accepted).toBe(true);
     expect(mockAssignmentUpdateMany).toHaveBeenCalledTimes(1);
   });
 
@@ -985,7 +999,8 @@ describe('C. Side Effects (Post-Commit)', () => {
 
     await confirmedHoldService.handleDriverAcceptance('assign-001', 'driver-001');
 
-    const socketCall = mockEmitToUser.mock.calls.find(
+    // D1-4: counts are forwarded into the customer-mirror payload.
+    const socketCall = mockEmitToRoom.mock.calls.find(
       (call: any[]) => call[1] === 'driver_accepted'
     );
     expect(socketCall).toBeDefined();
@@ -997,7 +1012,7 @@ describe('C. Side Effects (Post-Commit)', () => {
 
     await confirmedHoldService.handleDriverAcceptance('assign-001', 'driver-001');
 
-    const socketCall = mockEmitToUser.mock.calls.find(
+    const socketCall = mockEmitToRoom.mock.calls.find(
       (call: any[]) => call[1] === 'driver_accepted'
     );
     expect(socketCall).toBeDefined();
@@ -1009,9 +1024,11 @@ describe('C. Side Effects (Post-Commit)', () => {
 
     await confirmedHoldService.handleDriverAcceptance('assign-001', 'driver-001');
 
-    const socketCall = mockEmitToUser.mock.calls.find(
+    // D1-4: message string is forwarded verbatim into the mirror payload.
+    const socketCall = mockEmitToRoom.mock.calls.find(
       (call: any[]) => call[1] === 'driver_accepted'
     );
+    expect(socketCall).toBeDefined();
     expect(socketCall![2].message).toContain('1/');
     expect(socketCall![2].message).toContain('confirmed');
   });
@@ -1426,17 +1443,18 @@ describe('E. What-If Scenarios', () => {
     expect(result.accepted).toBe(true);
   });
 
-  it('E15: Socket.IO is disconnected — CAS already committed, error caught at outer level', async () => {
+  it('E15: Socket.IO is disconnected — CAS already committed, mirror failure swallowed (D1-4)', async () => {
     setupAcceptanceHappyPath();
-    mockEmitToUser.mockRejectedValue(new Error('Socket disconnected'));
+    mockEmitToRoom.mockRejectedValue(new Error('Socket disconnected'));
 
     const result = await confirmedHoldService.handleDriverAcceptance('assign-001', 'driver-001');
 
-    // Socket emit failure propagates to outer catch since emitToUser is awaited without local try/catch.
-    // CAS update already committed successfully before the socket error.
-    expect(result.success).toBe(false);
-    expect(result.message).toBe('Failed to handle driver acceptance');
-    // Verify CAS update DID run
+    // D1-4 wraps the customer-mirror emit in try/catch so a degraded socket
+    // pipe does not roll back accept. CAS commit is durable; mirror is
+    // best-effort. Test purpose preserved: CAS ran exactly once and accept
+    // is reported successful.
+    expect(result.success).toBe(true);
+    expect(result.accepted).toBe(true);
     expect(mockAssignmentUpdateMany).toHaveBeenCalledTimes(1);
   });
 
@@ -1522,10 +1540,12 @@ describe('E. What-If Scenarios', () => {
     mockRedisHMSet.mockResolvedValue(undefined);
     mockRedisExpire.mockResolvedValue(true);
     mockEmitToUser.mockResolvedValue(undefined);
+    mockEmitToRoom.mockResolvedValue(undefined);
 
     await confirmedHoldService.handleDriverAcceptance('assign-001', 'driver-001');
 
-    const socketCall = mockEmitToUser.mock.calls.find(
+    // D1-4: mirror payload carries the clamped trucksPending.
+    const socketCall = mockEmitToRoom.mock.calls.find(
       (call: any[]) => call[1] === 'driver_accepted'
     );
     expect(socketCall).toBeDefined();
@@ -1662,15 +1682,20 @@ describe('F. Data Integrity', () => {
     );
   });
 
-  it('F10: socket event targets the correct transporter (holdLedger.transporterId)', async () => {
+  it('F10: socket event targets the correct order room (D1-4 customer mirror)', async () => {
     setupAcceptanceHappyPath();
 
     await confirmedHoldService.handleDriverAcceptance('assign-001', 'driver-001');
 
-    const socketCall = mockEmitToUser.mock.calls.find(
+    // D1-4 retargeted the emit channel from the transporter user-room to the
+    // 'order:{orderId}' room so customers + transporter can subscribe to the
+    // same progress feed. Test purpose preserved: emit goes to the correct
+    // entity for this flow.
+    const socketCall = mockEmitToRoom.mock.calls.find(
       (call: any[]) => call[1] === 'driver_accepted'
     );
-    expect(socketCall![0]).toBe('transporter-001');
+    expect(socketCall).toBeDefined();
+    expect(socketCall![0]).toBe('order:order-001');
   });
 
   it('F11: return value includes correct assignmentId', async () => {
