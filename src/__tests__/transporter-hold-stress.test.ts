@@ -767,6 +767,10 @@ describe('B. Hold confirmation saga (confirmHoldWithAssignments)', () => {
     mockVehicleUpdateMany.mockResolvedValue({ count: 1 });
     mockOrderUpdate.mockResolvedValue({ trucksFilled: 2, totalTrucks: 5 });
     mockTruckHoldLedgerUpdate.mockResolvedValue({});
+    // A02-006 Stage 2: when FF_HOLD_FINALIZE_CAS + FF_HOLD_FINALIZE_IN_ASSIGNMENT_TX
+    // are both ON (defaults true), finalize runs as a CAS updateMany inside the
+    // assignment tx. count>=1 == row updated; count===0 throws HOLD_FINALIZE_CAS_MISS.
+    mockTruckHoldLedgerUpdateMany.mockResolvedValue({ count: 1 });
   }
 
   it('B01: full saga happy path — all steps succeed', async () => {
@@ -1111,9 +1115,16 @@ describe('B. Hold confirmation saga (confirmHoldWithAssignments)', () => {
       HOLD_ID, T1, assignments, releaseHoldFn, broadcastFn
     );
 
-    expect(mockTruckHoldLedgerUpdate).toHaveBeenCalledWith(
+    // A02-006 Stage 2 (FF_HOLD_FINALIZE_CAS + FF_HOLD_FINALIZE_IN_ASSIGNMENT_TX,
+    // both default-ON): finalize is a CAS updateMany inside the assignment tx
+    // with the phase-not-terminal predicate. Replaces the legacy bare update().
+    expect(mockTruckHoldLedgerUpdateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { holdId: HOLD_ID },
+        where: expect.objectContaining({
+          holdId: HOLD_ID,
+          status: 'active',
+          phase: { notIn: ['EXPIRED', 'RELEASED'] },
+        }),
         data: expect.objectContaining({ status: 'confirmed' }),
       })
     );
