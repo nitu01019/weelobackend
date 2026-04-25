@@ -54,6 +54,43 @@ export const getEarningsQuerySchema = z.object({
 // Removed: updateTripStatusSchema — moved to tracking module (tracking.schema.ts)
 
 /**
+ * W-5 E4-1b / B2 fix — Zod schema for POST /api/v1/transporter/heartbeat.
+ *
+ * The Captain app (Android) `NetworkClassifier.kt` emits Android-API telephony
+ * labels: WIFI / NR / LTE / HSPA / EDGE / CELL / NONE / UNKNOWN. iOS / future
+ * Captain builds are expected to emit canonical labels:
+ * WIFI / 5G / 4G / 3G / 2G / UNKNOWN. The Zod enum below is the SUPERSET so
+ * neither shape produces a 400; server-side `normalizeNetworkClass()` in
+ * presence.config.ts collapses both forms to the canonical wire enum before
+ * persistence and before any downstream consumer reads it.
+ *
+ * The field is `.nullable().optional()` so older app builds — which omit the
+ * field entirely or send null — pass validation unchanged.
+ *
+ * The schema validates the wire shape only; coordinate range / vehicle
+ * resolution / availability sync remain in the route handler so the existing
+ * 503 / 400 contracts are preserved.
+ *
+ * NOTE: This widens, not narrows. No Captain build that was passing today can
+ * fail tomorrow. The cellular cohort that 100%-rejected before this change
+ * starts passing on deploy.
+ */
+export const heartbeatRequestSchema = z.object({
+  latitude: z.number().min(-90).max(90),
+  longitude: z.number().min(-180).max(180),
+  vehicleId: z.string().optional(),
+  isOnTrip: z.boolean().optional(),
+  networkClass: z.enum([
+    // canonical wire form (iOS / future Captain / SSOT)
+    'WIFI', '4G', '5G', '3G', '2G', 'UNKNOWN',
+    // Captain Android telephony aliases (server normalises post-parse)
+    'NR', 'LTE', 'HSPA', 'EDGE', 'CELL', 'NONE',
+  ]).nullable().optional(),
+}).passthrough();
+
+export type HeartbeatRequestInput = z.infer<typeof heartbeatRequestSchema>;
+
+/**
  * Schema for transporter creating a driver
  */
 export const createDriverSchema = z.object({
