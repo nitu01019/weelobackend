@@ -609,6 +609,93 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
       'fcm_egress_rate_limited_total',
       'FCM sends rejected by the 8K/s in-process egress token bucket (P7-T01/A05-002)',
     ),
+
+    // === W-2a B-6 (OAD-5 / V5 contract audit): Hold finalize CAS-miss + flex revoke observability ===
+    // hold_finalize_cas_miss_total: fires when the confirmed-hold finalize CAS detects
+    // the ledger row advanced to a terminal state (expired/released/confirmed) between
+    // TX start and finalize. Routed through the route layer as a 404 + HOLD_NOT_FOUND
+    // envelope (see truck-hold.routes.ts:876 + events.asyncapi.yaml HoldNotFound).
+    //   Labels: reason = 'expired' | 'released' | 'confirmed' | 'unknown'
+    //   Call site: src/modules/truck-hold/confirmed-hold.service.ts (CAS-miss branch)
+    counter(
+      'hold_finalize_cas_miss_total',
+      'Confirmed-hold finalize CAS-miss outcomes (ledger row advanced terminal between TX start and finalize) — labels: reason',
+    ),
+    // flex_revoke_sent_total: fires per flex_hold_superseded fan-out emission to the
+    // losing drivers (winner is excluded — see B-7 winner-exclusion test).
+    //   Labels: outcome = 'success' | 'fail' | 'adapter_down'
+    //   Call site: flex-hold revoke fan-out path
+    counter(
+      'flex_revoke_sent_total',
+      'Flex-hold supersede revoke fan-out emissions to losing drivers — labels: outcome',
+    ),
+
+    // === W-3 D1-6 (D-01): Customer progress mirror emit observability ===
+    // Pre-registered so the customerProgressMirror helper's incrementCounter
+    // call doesn't trip the warn-and-return branch. Fires once per mirror
+    // emission of driver_accepted / driver_declined / trucks_remaining_update
+    // events relayed from the transporter pipeline to the customer room.
+    //   Labels: event = 'driver_accepted' | 'driver_declined' | 'trucks_remaining_update'
+    counter(
+      'customer_progress_mirror_emit_total',
+      'Customer progress mirror events emitted by helper (D-01 / W-3 D1-6) — labels: event',
+    ),
+
+    // === W-4 E2-2: Replica lag fallback observability ===
+    // Fires when a read-from-replica path falls back to the primary because
+    // replica lag exceeded the safety threshold (or the replica probe failed).
+    //   Labels: caller = <call-site identifier>
+    //   Pair with replica_lag_seconds gauge for full picture.
+    counter(
+      'replica_lag_fallback_total',
+      'Replica reads that fell back to the primary due to lag/probe failure (W-4 E2-2) — labels: caller',
+    ),
+
+    // === W-5 D3-3: FCM upgrade campaign observability ===
+    // fcm_upgrade_required_skip_total: fires when an upgrade-required notify is
+    // skipped before send (e.g., user already on min build, throttled, opted-out).
+    //   Labels: reason = <closed enum, e.g. below_min_version|throttled|opt_out|missing_token>
+    counter(
+      'fcm_upgrade_required_skip_total',
+      'FCM upgrade-required notifications skipped before send (W-5 D3-3) — labels: reason=below_min_version|throttled|opt_out|missing_token'
+    ),
+    // fcm_upgrade_notified_total: fires per upgrade notify outcome.
+    //   Labels: result = success|failed
+    counter(
+      'fcm_upgrade_notified_total',
+      'FCM upgrade-required notifications dispatched (W-5 D3-3) — labels: result=success|failed'
+    ),
+    // fcm_upgrade_notify_failure_total: fires on upgrade notify failure with a
+    // closed-enum failure category for dashboard breakdown (sourced from
+    // normalizeFirebaseErrorCode — see W-5 D3.T3).
+    //   Labels: category = <closed enum, e.g. token_invalid|quota|network|unknown>
+    counter(
+      'fcm_upgrade_notify_failure_total',
+      'FCM upgrade-required notify failures by category (W-5 D3-3) — labels: category=token_invalid|quota|network|unknown'
+    ),
+
+    // === W-5 E3-6: Audit retention observability ===
+    // audit_retention_pruned_total: cumulative count of audit rows pruned by
+    // the retention sweep (no labels — single counter).
+    counter(
+      'audit_retention_pruned_total',
+      'Audit log rows pruned by the retention sweep (W-5 E3-6)'
+    ),
+    // audit_retention_failed_total: fires when the retention sweep itself
+    // throws or otherwise fails to complete a cycle.
+    counter(
+      'audit_retention_failed_total',
+      'Audit retention sweep failures (W-5 E3-6)'
+    ),
+
+    // === A01-009: Tiered rate limiting ===
+    // rate_limit_denied_total: fires when a user request is denied by the
+    // per-tier rate limiter (basic/pro/enterprise). Gated by FF_RATE_LIMIT_TIERED.
+    //   Call site: rate-limit middleware deny path (A01-009)
+    counter(
+      'rate_limit_denied_total',
+      'Requests denied by tiered rate limiter, by user tier (A01-009)'
+    ),
   ];
 
   for (const def of defs) {
@@ -985,6 +1072,17 @@ export function registerDefaultGauges(gauges: Map<string, GaugeMetric>): void {
       'socket_auth_latency_p99_ms',
       'P99 socket authentication latency in ms — alert threshold 15ms triggers JWT cache auto-revert (A04-002 canary gate)',
     ),
+
+    // === W-4 E2-2: Replica lag observability ===
+    // Sampled by the replica-lag probe (pg_stat_replication / SELECT
+    // EXTRACT(EPOCH FROM now()-pg_last_xact_replay_timestamp())). Read paths
+    // gate on this gauge before serving from the replica; sustained > threshold
+    // triggers replica_lag_fallback_total bumps and primary-read fallback.
+    //   Alert: > 5s sustained 1m → investigate replica health
+    gauge(
+      'replica_lag_seconds',
+      'Current PostgreSQL replica lag in seconds (W-4 E2-2) — read-path fallback gate',
+    ),
   ];
 
   for (const def of defs) {
@@ -1094,6 +1192,16 @@ export function registerDefaultHistograms(histograms: Map<string, HistogramMetri
       'driver_overlay_ack_latency_ms',
       'A12-010/A13-012: Time from dispatch send (dispatchedAt ZSET) to driver dispatch_ack renderedAt in milliseconds',
       [50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000],
+    ),
+
+    // === W-2a B-6 (OAD-5 / V5 contract audit): Flex revoke fan-out latency ===
+    // Observed per flex_hold_superseded emission. Buckets in seconds because the
+    // tail of this loop (network adapter retries) can stretch to several seconds.
+    //   Call site: flex-hold revoke fan-out path (paired with flex_revoke_sent_total)
+    hist(
+      'flex_revoke_latency_seconds',
+      'W-2a B-6: Per-emission latency of the flex_hold_superseded revoke fan-out in seconds',
+      [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
     ),
   ];
 

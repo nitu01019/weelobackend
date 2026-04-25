@@ -784,6 +784,27 @@ export const FLAGS = {
     description: 'Network-class heartbeat ingestion for adaptive delivery decisions (Wave-0 E)',
     defaultValue: true,
   },
+
+  // --- Phase 5 R4: server_time_sync emit (A15-006) ---
+  SERVER_TIME_SYNC_EMIT: {
+    env: 'FF_SERVER_TIME_SYNC_EMIT',
+    category: 'release' as const,
+    description: 'Periodic server_time_sync emission to clients for clock-skew correction (A15-006)',
+  },
+
+  // --- Phase 1: per-sequence ack semantics ---
+  PER_SEQ_ACK: {
+    env: 'FF_PER_SEQ_ACK',
+    category: 'release' as const,
+    description: 'Per-sequence ack: only the acked seq is removed from the durable buffer (default OFF; cumulative ack remains until enabled)',
+  },
+
+  // --- Phase 4: tiered rate limiting (A01-009) ---
+  RATE_LIMIT_TIERED: {
+    env: 'FF_RATE_LIMIT_TIERED',
+    category: 'release' as const,
+    description: 'Tiered (basic/pro/enterprise) per-user rate limits keyed by User.tier (A01-009)',
+  },
 } as const;
 
 // ---------------------------------------------------------------------------
