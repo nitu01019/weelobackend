@@ -50,7 +50,7 @@ import { validateAndLogEnvironment } from './core/config/env.validation';
 // Config & Services
 import { config } from './config/environment';
 import { logger } from './shared/services/logger.service';
-import { logFlagStates, validateFeatureFlags, flagHealthRouter, isEnabled, FLAGS } from './shared/config/feature-flags';
+import { validateFeatureFlags, flagHealthRouter, isEnabled, FLAGS } from './shared/config/feature-flags';
 import { initializeSocket, getConnectedUserCount, getConnectionStats, getRedisAdapterStatus } from './shared/services/socket.service';
 
 // Middleware
@@ -1196,12 +1196,11 @@ async function bootstrap(): Promise<void> {
 
   logger.info(`Server started on port ${PORT}`);
 
-  // M-8 FIX: Validate all feature flags at startup (fail-fast on invalid values in production)
+  // M-8 FIX: Validate all feature flags at startup (fail-fast on invalid values in production).
+  // verify_1_flags.md L-3 dedupe: validateFeatureFlags() internally delegates to
+  // logFlagStates() (feature-flags.ts:966), so a single call covers both the
+  // M-8 fail-fast check and the M-3 deploy-time flag dump.
   validateFeatureFlags();
-
-  // M-3 FIX: Dump all feature flag states once at startup for deploy-time verification.
-  // Called after app.listen so logger is fully initialized.
-  logFlagStates();
 }
 
 bootstrap().catch((err) => {
