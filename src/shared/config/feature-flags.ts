@@ -321,6 +321,20 @@ export const FLAGS = {
     defaultValue: false,
   },
 
+  // H3 / A05-017: flip the `effectivePriority` default from 'normal' to 'high'
+  // so that time-critical customer-direction FCMs (driver_accepted,
+  // assignment_update, driver_approaching, order_completed, order_cancelled,
+  // booking_cancelled, booking_status_changed) wake devices out of Doze by
+  // default. Explicit producers still override. Default=true per H3 council
+  // verdict so customer notifications reach Android devices reliably; can be
+  // flipped OFF via env during a Firebase-billing / OEM-wake-quota investigation.
+  FCM_PRIORITY_HIGH_DEFAULT: {
+    env: 'FF_FCM_PRIORITY_HIGH_DEFAULT',
+    category: 'release' as const,
+    description: 'A05-017 — high priority default (behaviour: Firebase billing + OEM wake-quota). H3 default=true so time-critical customer FCMs wake devices out of Doze.',
+    defaultValue: true,
+  },
+
   // A03-003: Server-authoritative countdown anchors (`serverNowMs` + optional
   // `deadlineMs`) stamped onto socket payloads by `withSocketMeta`. Captain
   // computes `offset = serverNowMs - clientNowMsAtReceipt` and anchors
@@ -643,6 +657,132 @@ export const FLAGS = {
     category: 'release' as const,
     description: 'Socket.IO upgrade rate limiter (P5-01/P5-04 sibling agent)',
     defaultValue: false,
+  },
+
+  // ==========================================================================
+  // W-0 HARDENING FLAGS (Wave 0 — 2026-04-25)
+  // 17 flags registered by W-0 T-3; 16 default ON, 1 default OFF (AUDIT_METADATA_STRICT
+  // per OAD-2 — flipped ON in W-5 after 24h warn-only bake). Explicit defaultValue
+  // on each entry overrides the category implicit default so behaviour is deterministic
+  // regardless of whether the env var is set.
+  // ==========================================================================
+
+  // === CATEGORY A: queue hardening ===
+  QUEUE_BLMOVE_DEQUEUE: {
+    env: 'FF_QUEUE_BLMOVE_DEQUEUE',
+    category: 'ops' as const,
+    description: 'BLMOVE atomic dequeue with phantom-job reaper (Wave-0 A)',
+    defaultValue: true,
+  },
+  QUEUE_BACKLOG_CAPS: {
+    env: 'FF_QUEUE_BACKLOG_CAPS',
+    category: 'ops' as const,
+    description: 'Per-queue backlog caps with shed-oldest eviction (Wave-0 A)',
+    defaultValue: true,
+  },
+  DELAY_POLLER_LEADER_LOCK: {
+    env: 'FF_DELAY_POLLER_LEADER_LOCK',
+    category: 'ops' as const,
+    description: 'Leader-election lock around delayed-job poller sweep (Wave-0 A)',
+    defaultValue: true,
+  },
+
+  // === CATEGORY B: hold / flex revoke consistency ===
+  HOLD_FINALIZE_CAS: {
+    env: 'FF_HOLD_FINALIZE_CAS',
+    category: 'ops' as const,
+    description: 'CAS guard on hold finalize transition to prevent lost updates (Wave-0 B)',
+    defaultValue: true,
+  },
+  HOLD_FINALIZE_IN_ASSIGNMENT_TX: {
+    env: 'FF_HOLD_FINALIZE_IN_ASSIGNMENT_TX',
+    category: 'ops' as const,
+    description: 'Finalize hold inside assignment transaction for atomic commit (Wave-0 B)',
+    defaultValue: true,
+  },
+  HOLD_404_403_COLLAPSE: {
+    env: 'FF_HOLD_404_403_COLLAPSE',
+    category: 'ops' as const,
+    description: 'Collapse hold 404/403 responses to prevent hold-state enumeration (Wave-0 B)',
+    defaultValue: true,
+  },
+  FLEX_REVOKE_FAN_OUT: {
+    env: 'FF_FLEX_REVOKE_FAN_OUT',
+    category: 'ops' as const,
+    description: 'Fan-out flex revoke to all losing holders on confirmed-hold promotion (Wave-0 B)',
+    defaultValue: true,
+  },
+
+  // === CATEGORY C: broadcast accept + cascade dispatch ===
+  BROADCAST_ACCEPT_VEHICLE_HOOK: {
+    env: 'FF_BROADCAST_ACCEPT_VEHICLE_HOOK',
+    category: 'ops' as const,
+    description: 'onVehicleTransition hook on broadcast accept path for cache sync (Wave-0 C)',
+    defaultValue: true,
+  },
+  CASCADE_DISPATCH_VEHICLE_HOOK: {
+    env: 'FF_CASCADE_DISPATCH_VEHICLE_HOOK',
+    category: 'ops' as const,
+    description: 'onVehicleTransition hook on cascade dispatch for cache sync (Wave-0 C)',
+    defaultValue: true,
+  },
+  CASCADE_DB_TIMEOUT_STRICT: {
+    env: 'FF_CASCADE_DB_TIMEOUT_STRICT',
+    category: 'ops' as const,
+    description: 'Strict DB timeout on cascade dispatch queries to bound tail latency (Wave-0 C)',
+    defaultValue: true,
+  },
+
+  // === CATEGORY D: customer progress + FCM delivery ===
+  CUSTOMER_PROGRESS_MIRROR: {
+    env: 'FF_CUSTOMER_PROGRESS_MIRROR',
+    category: 'ops' as const,
+    description: 'Mirror customer progress events via durable outbox for at-least-once delivery (Wave-0 D)',
+    defaultValue: true,
+  },
+  FCM_TOPIC_SUBSCRIPTIONS_ENABLED: {
+    env: 'FF_FCM_TOPIC_SUBSCRIPTIONS_ENABLED',
+    category: 'ops' as const,
+    description: 'FCM topic subscriptions for fan-out notifications (Wave-0 D)',
+    defaultValue: true,
+  },
+  FCM_REGISTRATION_ENABLED: {
+    env: 'FF_FCM_REGISTRATION_ENABLED',
+    category: 'ops' as const,
+    description: 'Kill-switch on POST /notifications/register-token — flip OFF to immediately reject new device-token registrations without redeploy. Existing DeviceToken rows + push delivery remain active. Returns 503 with code FCM_REGISTRATION_DISABLED when off (B1).',
+    defaultValue: true,
+  },
+  FCM_UPGRADE_CAMPAIGN: {
+    env: 'FF_FCM_UPGRADE_CAMPAIGN',
+    category: 'ops' as const,
+    description: 'FCM upgrade-campaign pathway for stale-client remediation (Wave-0 D)',
+    defaultValue: true,
+  },
+
+  // === CATEGORY E: audit + replica lag + network class ===
+  AUDIT_METADATA_STRICT: {
+    env: 'FF_AUDIT_METADATA_STRICT',
+    category: 'release' as const,
+    description: 'Strict audit metadata schema enforcement (OAD-2 commit #2 flipped ON 2026-04-25 — pre-prod direct flip per user direction; production rollout should still observe audit_metadata_pii_stripped_total counter for 24h before raising)',
+    defaultValue: true,
+  },
+  REPLICA_LAG_GUARD: {
+    env: 'FF_REPLICA_LAG_GUARD',
+    category: 'ops' as const,
+    description: 'Replica-lag guard to reroute reads when standby falls behind threshold (Wave-0 E)',
+    defaultValue: true,
+  },
+  AUDIT_RETENTION_PRUNE: {
+    env: 'FF_AUDIT_RETENTION_PRUNE',
+    category: 'ops' as const,
+    description: 'Scheduled audit-log retention pruning to enforce storage caps (Wave-0 E)',
+    defaultValue: true,
+  },
+  NETWORK_CLASS_HEARTBEAT: {
+    env: 'FF_NETWORK_CLASS_HEARTBEAT',
+    category: 'ops' as const,
+    description: 'Network-class heartbeat ingestion for adaptive delivery decisions (Wave-0 E)',
+    defaultValue: true,
   },
 } as const;
 
