@@ -78,13 +78,42 @@ let xaddRingIdx = 0;
 let elRingIdx = 0;
 
 // Sample the metrics every 5 s and advance the ring buffers.
-setInterval(() => {
-  xaddRing[xaddRingIdx] = metrics.getHistogramP99('socket_adapter_xadd_ms');
+// Skipped under NODE_ENV=test: the interval fires across test files where the
+// metrics service is mocked without getHistogramP99/getGaugeValue, throwing
+// async errors that pollute unrelated tests (verify_8 H2). Tests covering
+// the gates set NODE_ENV != 'test' or call startHealthSampler() explicitly.
+let _healthSampler: NodeJS.Timeout | undefined;
+
+function sampleHealthMetrics(): void {
+  const xaddP99 = typeof metrics.getHistogramP99 === 'function'
+    ? metrics.getHistogramP99('socket_adapter_xadd_ms')
+    : null;
+  xaddRing[xaddRingIdx] = xaddP99;
   xaddRingIdx = (xaddRingIdx + 1) % XADD_RING_SIZE;
 
-  elRing[elRingIdx] = metrics.getGaugeValue('nodejs_eventloop_lag_ms');
+  const elGauge = typeof metrics.getGaugeValue === 'function'
+    ? metrics.getGaugeValue('nodejs_eventloop_lag_ms')
+    : null;
+  elRing[elRingIdx] = elGauge;
   elRingIdx = (elRingIdx + 1) % EL_RING_SIZE;
-}, XADD_SAMPLE_INTERVAL_MS).unref(); // .unref() so the timer does not keep the process alive in tests
+}
+
+export function startHealthSampler(): void {
+  if (_healthSampler) return;
+  _healthSampler = setInterval(sampleHealthMetrics, XADD_SAMPLE_INTERVAL_MS);
+  _healthSampler.unref(); // do not keep process alive
+}
+
+export function stopHealthSampler(): void {
+  if (_healthSampler) {
+    clearInterval(_healthSampler);
+    _healthSampler = undefined;
+  }
+}
+
+if (process.env.NODE_ENV !== 'test') {
+  startHealthSampler();
+}
 
 /** Returns true when every filled slot in the ring exceeds the threshold. */
 function ringAllAbove(ring: (number | null)[], threshold: number): boolean {
