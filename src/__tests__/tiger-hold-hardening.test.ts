@@ -254,16 +254,21 @@ describe('Flex Hold Extension (Fix #18, #19)', () => {
       orderId: 'order-1',
       transporterId: 'transporter-1',
       phase: 'FLEX',
+      status: 'active',
       flexExpiresAt: currentExpiry,
       expiresAt: currentExpiry,
       flexExtendedCount: 0,
       createdAt,
     });
 
-    mockPrismaClient.truckHoldLedger.update.mockResolvedValue({
-      holdId: 'hold-1',
-      flexExpiresAt: new Date(createdAt.getTime() + 40000),
+    // AB3 cap: parent order lookup. Use far-future expiresAt so the cap is a no-op.
+    mockPrismaClient.order.findUnique.mockResolvedValue({
+      expiresAt: new Date(now.getTime() + 600_000),
     });
+
+    // A13-010 phase-CAS: extendFlexHold now uses updateMany (not update) so the
+    // phase+status predicate can reject concurrent confirms. count=1 == success.
+    mockPrismaClient.truckHoldLedger.updateMany.mockResolvedValue({ count: 1 });
 
     const result = await flexHoldService.extendFlexHold({
       holdId: 'hold-1',
