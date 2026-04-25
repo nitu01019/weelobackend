@@ -82,6 +82,7 @@ const mockAssignmentCreate = jest.fn();
 const mockAssignmentFindFirst = jest.fn();
 const mockTruckRequestFindFirst = jest.fn();
 const mockTruckRequestUpdate = jest.fn();
+const mockTruckRequestFindUnique = jest.fn();
 const mockVehicleFindFirst = jest.fn();
 const mockVehicleUpdateMany = jest.fn();
 const mockOrderUpdate = jest.fn();
@@ -100,6 +101,7 @@ jest.mock('../shared/database/prisma.service', () => ({
     },
     truckRequest: {
       findFirst: (...args: unknown[]) => mockTruckRequestFindFirst(...args),
+      findUnique: (...args: unknown[]) => mockTruckRequestFindUnique(...args),
       update: (...args: unknown[]) => mockTruckRequestUpdate(...args),
     },
     vehicle: {
@@ -112,6 +114,13 @@ jest.mock('../shared/database/prisma.service', () => ({
     },
     $transaction: (...args: unknown[]) => mockTransaction(...args),
   },
+  // A02-007: cascade-dispatch now wraps its Serializable tx in withDbTimeout.
+  // Forward the callback to the same mockTransaction pipeline so the existing
+  // expectations on mockTransaction/tx-proxy assertions below keep working.
+  withDbTimeout: (
+    fn: (tx: unknown) => Promise<unknown>,
+    _opts?: unknown,
+  ) => mockTransaction(fn, _opts),
 }));
 
 // Prisma enums
@@ -240,6 +249,7 @@ function resetAllMocks(): void {
   mockAssignmentCreate.mockReset();
   mockAssignmentFindFirst.mockReset();
   mockTruckRequestFindFirst.mockReset();
+  mockTruckRequestFindUnique.mockReset();
   mockTruckRequestUpdate.mockReset();
   mockVehicleFindFirst.mockReset();
   mockVehicleUpdateMany.mockReset();
@@ -344,7 +354,13 @@ function setupRetryHappyPath(opts: {
     distanceKm: 1400,
     customerName: 'Test Customer',
     customerPhone: '9999999999',
+    routePoints: [],
   });
+
+  // A03-012: cascade-dispatch fetches truckRequest.findUnique outside the tx for
+  // pricePerTruck — needed by buildTripAssignedDriverNotification. The .catch is
+  // only safe if findUnique returns a real Promise.
+  mockTruckRequestFindUnique.mockResolvedValue({ pricePerTruck: 1000 });
 
   // Post-transaction: socket + FCM
   mockEmitToUser.mockResolvedValue(undefined);
@@ -566,7 +582,15 @@ describe('A. Retry Same Driver on Decline', () => {
     );
     expect(tripCall).toBeDefined();
     expect(tripCall![0]).toBe(sameDriver.id);
-    expect(tripCall![2].isCascade).toBe(true);
+    // A03-012 (single-source buildTripAssignedDriverNotification): isCascade is
+    // now carried by FCM data only (cascadeFcmData.isCascade='true') so the
+    // confirmed-hold and cascade socket payloads are byte-equal. Assert the
+    // marker on the FCM channel where it actually lives.
+    const fcmCall = mockQueuePushNotification.mock.calls.find(
+      (call: unknown[]) => call[0] === sameDriver.id
+    );
+    expect(fcmCall).toBeDefined();
+    expect((fcmCall![1] as { data: { isCascade: string } }).data.isCascade).toBe('true');
   });
 
   test('A16: FCM push sent to same driver', async () => {
@@ -749,8 +773,14 @@ describe('B. Retry Same Driver on Timeout', () => {
 
     await cascadeDispatchService.retrySameDriver(buildCascadeCtx());
 
+    // A02-007: cascade-dispatch now routes the tx through withDbTimeout, which
+    // passes the 8000ms budget via `timeoutMs` (the wrapper forwards it to
+    // Prisma as `timeout: timeoutMs + 2000` internally). The withDbTimeout mock
+    // in this suite forwards (fn, opts) to mockTransaction so the assertion
+    // targets the opts bag on the same call.
     const transactionOpts = mockTransaction.mock.calls[0][1];
-    expect(transactionOpts.timeout).toBe(8000);
+    expect(transactionOpts.timeoutMs).toBe(8000);
+    expect(transactionOpts.site).toBe('cascade_assign');
   });
 
   test('B14: New assignment gets unique UUID for assignmentId', async () => {
