@@ -187,7 +187,7 @@ export interface AssignmentRecord {
   driverName: string;
   driverPhone: string;
   tripId: string;
-  status: 'pending' | 'driver_accepted' | 'driver_declined' | 'en_route_pickup' | 'at_pickup' | 'in_transit' | 'arrived_at_drop' | 'completed' | 'partial_delivery' | 'cancelled' | 'superseded';
+  status: 'pending' | 'driver_accepted' | 'driver_declined' | 'en_route_pickup' | 'at_pickup' | 'in_transit' | 'arrived_at_drop' | 'completed' | 'partial_delivery' | 'cancelled' | 'superseded' | 'cancelled_by_driver';
   assignedAt: string;
   driverAcceptedAt?: string | null;
   startedAt?: string | null;
