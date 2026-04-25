@@ -50,7 +50,7 @@ import { validateAndLogEnvironment } from './core/config/env.validation';
 // Config & Services
 import { config } from './config/environment';
 import { logger } from './shared/services/logger.service';
-import { logFlagStates, validateFeatureFlags, flagHealthRouter } from './shared/config/feature-flags';
+import { logFlagStates, validateFeatureFlags, flagHealthRouter, isEnabled, FLAGS } from './shared/config/feature-flags';
 import { initializeSocket, getConnectedUserCount, getConnectionStats, getRedisAdapterStatus } from './shared/services/socket.service';
 
 // Middleware
@@ -584,6 +584,28 @@ app.use(errorHandler);
   }
 }
 
+// W-0 T-3 / Plan D D3.T6 — fail-fast boot assertion; see function below.
+class BootAssertionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'BootAssertionError';
+  }
+}
+
+async function assertFcmUpgradeCampaignReadiness(): Promise<void> {
+  // W-0 SSOT collapse (verify_1_flags.md M-1): the FF_FCM_UPGRADE_CAMPAIGN
+  // gate now routes through isEnabled(FLAGS.X) so the registry is the single
+  // source of truth. The dynamic prisma import below remains deferred to
+  // avoid pulling Prisma into the boot graph before server.listen.
+  if (!isEnabled(FLAGS.FCM_UPGRADE_CAMPAIGN)) return;
+  const m = parseInt(process.env.MIN_SUPPORTED_APP_VERSION ?? '0', 10);
+  if (!(m > 0)) return;
+  const { prismaClient: pc } = await import('./shared/database/prisma.service');
+  const r: unknown[] = await pc.$queryRaw`SELECT 1 FROM information_schema.columns WHERE table_name='DeviceToken' AND column_name='appVersionCode'`;
+  if (r.length === 0) throw new BootAssertionError('FF_FCM_UPGRADE_CAMPAIGN requires DeviceToken.appVersionCode column. Run W-3/W-5 SQL migration before flipping this flag with MIN_SUPPORTED_APP_VERSION > 0.');
+  logger.info('[BootAssert] FF_FCM_UPGRADE_CAMPAIGN readiness check passed');
+}
+
 // =============================================================================
 // A01-005 (P1-T-NEW / Part B §2.2 P1-F): validateProductionConfig
 // Pre-flight validation gate — called inside bootstrap() BEFORE server.listen.
@@ -1034,6 +1056,21 @@ async function bootstrap(): Promise<void> {
     logger.warn(`[Startup] Idempotency cleanup job failed to start (non-fatal): ${msg}`);
   }
 
+  // E3-5 (hardening_E §2.3): Audit-retention scheduler.
+  // Leader-locked prune of StatusEvent rows older than retention window
+  // (default 90d, DPDP Act 2023 §5(b) / GDPR Art 5(1)(e)). Skips registration
+  // if FF_AUDIT_RETENTION_PRUNE=false at boot OR StatusEvent table missing
+  // (E-01 preflight — SQL `docs/ops/sql/E3-statusevent-create-table.sql`
+  // applied separately per CLAUDE.md no-prisma-migrate rule). Runtime tick
+  // gate re-reads the flag every fire so kill-switch is redeploy-free.
+  try {
+    const { registerAuditRetentionSchedule } = await import('./shared/queue-processors/audit-retention');
+    await registerAuditRetentionSchedule();
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn(`[Startup] Audit-retention scheduler failed to register (non-fatal): ${msg}`);
+  }
+
   // -------------------------------------------------------------------------
   // BEGIN prefix-overlap assertion (F-B-03)
   // Fail-fast at boot if two Redis namespace owners share an overlapping prefix.
@@ -1093,6 +1130,13 @@ async function bootstrap(): Promise<void> {
     logger.error('DEBUG env forbidden in production — remove it before deploy (A12-006, Part B §2.5 P4-C)');
     process.exit(1);
   }
+
+  // -------------------------------------------------------------------------
+  // W-0 T-3 / Plan D D3.T6: FF_FCM_UPGRADE_CAMPAIGN readiness assertion.
+  // Must run AFTER prisma is usable but BEFORE server.listen so a
+  // misconfigured deploy refuses traffic (fail-fast).
+  // -------------------------------------------------------------------------
+  await assertFcmUpgradeCampaignReadiness();
 
   // -------------------------------------------------------------------------
   // 4. Start listening for HTTP traffic
