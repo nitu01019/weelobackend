@@ -1,679 +1,889 @@
 # Codebase Concerns
 
-**Analysis Date:** 2026-02-19
-
-## Tech Debt
-
-### Stub Implementations (Customer Module)
-
-**Issue:** Multiple customer-facing features return placeholder data instead of real implementations.
-
-**Files:**
-- `src/modules/customer/customer.service.ts` (lines 51, 110, 139)
-
-**Impact:**
-- Wallet balance always returns 0 with `_stub: true` flag
-- Customer settings are not persisted to database
-- updateSettings() logs warning but does not save changes
-- Clients marked with `_stub: true` may not display properly or cause confusion
-
-**Fix approach:**
-1. Design wallet schema in Prisma (balance, currency, transactions)
-2. Implement CustomerSettings model with proper persistence
-3. Update getWallet(), getSettings(), updateSettings() to use database
-4. Remove `_stub` flags once real implementation is in place
-5. Add wallet transaction logging for audit trail
-
-**Priority:** Medium - affects customer functionality but not core booking flow
+**Analysis Date:** 2026-05-04
+**Branch:** `fix/critical-broadcast-reliability-2026-04-21`
+**Scope:** Technical debt, dead code, fragility, persistence risks, security, performance, tests, duplicate implementations
 
 ---
 
-### Fire-and-Forget Socket Emissions
+## 1. Dead / Stale Directories (USER'S TOP PRIORITY)
 
-**Issue:** Socket.io `emit()` calls are not awaited but failures are silently ignored.
+This section answers the explicit question: "where is the rusty stuff, empty folders, unused things?"
 
-**Files:**
-- `src/modules/broadcast/broadcast.service.ts` (lines 667, 707-708, 983-984, 1022-1023, 1046)
-- `src/shared/services/socket.service.ts` (multiple emit calls throughout)
+### 1.1 `dist/` — committed build artifacts with space-numbered duplicate trees (98 MB, 7,692 files)
 
-**Pattern:**
-```typescript
-// Line 667-668 in broadcast.service.ts
-emitToUser(driverId, 'trip_assigned', driverNotification);
-sendPushNotification(driverId, {...}).catch(err => {...});  // Only FCM has catch
+The compiled output dir is correctly listed in `.gitignore` (`dist/` line 28) and is **not tracked in git** (`git ls-files dist | wc -l = 0`). However, it is present on disk and contains *clear evidence of macOS Finder duplication accidents* — the classic "file 2.ext", "file 3.ext", "folder 2/" pattern that happens when zip files get extracted multiple times or files get drag-copied into the same folder.
+
+**The smoking gun — five EMPTY space-numbered duplicate directories at the top of `dist/`:**
+- `dist/__tests__ 2/` — 0 files (alongside real `dist/__tests__/` with 770 files)
+- `dist/config 2/` — 0 files
+- `dist/core 2/` — 0 files
+- `dist/modules 3/` — 0 files (note the "3", not "2" — implies even more rounds of accidental duplication)
+- `dist/shared 2/` — 0 files
+
+**3,045 duplicate files** exist inside `dist/` matching pattern `* 2.*`, `* 3.*`, or `* 4.*`. Examples:
+
+```
+dist/src/core/state-machines 2.d.ts
+dist/src/core/state-machines 3.d.ts
+dist/src/config/secrets 2.js
+dist/src/config/secrets 3.js
+dist/src/config/secrets 4.js
+dist/src/shared/middleware/backward-compat.middleware 2.js
 ```
 
-**Impact:**
-- Socket emissions that fail are never logged or retried
-- Real-time updates may not reach clients if socket is disconnected
-- No visibility into delivery failures
-- Customers may not see truck confirmations, drivers may not see trip assignments
+**Reproducible commands:**
+```bash
+# Confirm dist is gitignored and not tracked
+grep "^dist/" .gitignore                  # → "dist/"
+git ls-files dist | wc -l                 # → 0
 
-**Fix approach:**
-1. Make emitToUser/emitToRoom return Promises
-2. Wrap socket emissions in try-catch with logging
-3. Implement retry logic with exponential backoff for critical emissions
-4. Add metrics tracking for failed emissions
-5. For non-critical events, implement fire-and-forget pattern explicitly
+# See total dist size + duplicate count
+du -sh dist                               # → 98M
+find dist -name "* 2*" -o -name "* 3*" -o -name "* 4*" | wc -l  # → 3045
 
-**Priority:** High - affects real-time notification reliability
-
----
-
-### Missing Error Handling on Database Operations
-
-**Issue:** Many database operations in broadcast and order modules use generic Error throws instead of typed AppError.
-
-**Files:**
-- `src/modules/order/order.service.ts` (line 571)
-- `src/modules/broadcast/broadcast.service.ts` (line 574+)
-
-**Example:**
-```typescript
-// Line 571 in order.service.ts
-throw new Error('Either routePoints OR both pickup and drop must be provided');
-// TODO: Replace with ValidationError when imported
+# Confirm space-numbered dirs are empty
+find dist -type d \( -name "* 2" -o -name "* 3" \) -empty       # → 5 dirs
 ```
 
-**Impact:**
-- Inconsistent error responses to API clients
-- No error codes for monitoring/alerting
-- Clients cannot distinguish between validation errors, server errors, and resource not found
-- Generic Error objects don't include proper HTTP status codes
+**Recommendation: P0 — DELETE the entire `dist/` directory.**
 
-**Fix approach:**
-1. Import and use AppError from `src/shared/types/error.types`
-2. Replace all generic Error throws with AppError variants
-3. Add proper error codes (VALIDATION_ERROR, NOT_FOUND, etc.)
-4. Include context in error messages for debugging
+```bash
+rm -rf dist/                              # Reclaim 98 MB, remove 3,045 stale duplicate files
+npm run build                             # Regenerate cleanly when needed
+```
 
-**Priority:** Medium - affects error reporting and client error handling
+This is a build output, not source. Nothing in the repo imports from `dist/`. It is regenerated by `npm run build` (`tsc`). The duplicate trees are not just clutter — they are an active risk because if a future engineer runs `npm start` (which executes `node dist/server.js` per `package.json:main`), there is a small chance the wrong stale-duplicate file gets loaded.
+
+### 1.2 `package-lock 2.json` — duplicate at repo root (142 KB)
+
+```bash
+ls -lh "package-lock 2.json"              # → 142 KB, last modified 30 Apr 07:16
+git ls-files "package-lock 2.json"        # → not tracked
+```
+
+Recommendation: **P0 — delete.** It's a stale Finder copy of the actual `package-lock.json`. Same accident pattern as in `dist/`.
+
+```bash
+rm "package-lock 2.json"
+```
+
+### 1.3 `.planning/` graveyards — old multi-agent council/review outputs
+
+The `.planning/` tree is a compost heap of multi-agent planning experiments. **31 files are tracked in git** (`git ls-files .planning | wc -l = 31`). Many are deleted in the working tree but still tracked (D-status; see §2 below). On disk:
+
+| Subdirectory | Files on disk | Size | Status | Recommendation |
+|---|---:|---:|---|---|
+| `.planning/arch-rewrite-2026-05-03/` | 30 | 804K | **ACTIVE** (today's date is 2026-05-04, yesterday's work) | KEEP — referenced by `docs/ARCHITECTURE-2026-05-03.md` |
+| `.planning/runbooks/` | 3 | 24K | **ACTIVE** TLS / refresh-token / cascade runbooks | KEEP — operational |
+| `.planning/verification/` | 4 | 56K | **ACTIVE** dashboards/handoffs (P1) | KEEP — operational |
+| `.planning/codebase/` | 0 | 0B | This directory (where this file is being written) | KEEP |
+| `.planning/phase1-rps-validation-2026-04-27/` | 3 | 16K | Phase-1 validation, 1 week old | ARCHIVE or delete |
+| `.planning/codex-customer-flow-review/` | 1 | 4K | One-off Codex review | DELETE |
+| `.planning/review-2026-04-21/` | 31 | 36K | 35 `*.done` markers + 7 dirs (most empty) | DELETE — execution receipts only |
+| `.planning/claude-team-final-index/` | 0 | 0B | EMPTY — 2 empty subdirs | DELETE |
+| `.planning/claude-revalidation-customer-flow/` | 0 | 0B | EMPTY (1 empty subdir) | DELETE |
+| `.planning/codebase/` (this file's home) | 0 | 0B | Writing into this now | KEEP |
+| `.planning/final-verification/` | 0 | 0B | EMPTY | DELETE |
+| `.planning/master-execution-plan/` | 0 | 0B | EMPTY | DELETE |
+| `.planning/phases/` | 0 | 0B | 3 empty phase subdirs (executed phases) | DELETE |
+| `.planning/plan-reviews-2026-04-23/` | 0 | 0B | EMPTY | DELETE |
+| `.planning/re-review-2026-04-23/` | 0 | 0B | 2 empty subdirs | DELETE |
+| `.planning/research/` | 0 | 0B | EMPTY (referenced but already deleted) | DELETE |
+| `.planning/reviews/` | 0 | 0B | EMPTY | DELETE |
+| `.planning/transporter_to_driver_fix_plan/` | 0 | 0B | EMPTY | DELETE |
+| `.planning/config.json` | 1 | 4K | YOLO config | KEEP |
+
+**Reproducible commands:**
+```bash
+ls -la .planning/
+du -sh .planning/*
+find .planning -type d -empty
+git ls-files .planning  # → 31 files still tracked despite being deleted on disk
+```
+
+**Recommendation P1:**
+1. Commit the `.planning/*.md` deletions (they are deliberate — see §2).
+2. Delete all empty subdirectories listed above.
+3. Keep only `arch-rewrite-2026-05-03/`, `runbooks/`, `verification/`, `codebase/`, `config.json`.
+
+```bash
+# Delete all empty .planning subtrees
+find .planning -type d -empty -delete
+
+# Then commit the staged deletions visible in git status
+git add -u .planning/
+```
+
+### 1.4 `.council-2026-04-24/` — old AI session logs (1.4 MB, 38 files)
+
+Build/test/lint output captures from a council review session 10 days ago. Largest file is `raw_lint.log` at 1.27 MB.
+
+```bash
+du -sh .council-2026-04-24                # → 1.4M
+ls .council-2026-04-24 | head             # raw_*.log, test_*.log, PSQL_COMMANDS_TO_RUN.sh
+git ls-files .council-2026-04-24 | wc -l  # → 1 (only MANUAL_STEPS_TO_RUN.md, which is deleted)
+```
+
+**Recommendation P1: DELETE entire directory.** The only file ever tracked (`MANUAL_STEPS_TO_RUN.md`) is already in deletion-staged state. Logs are diagnostic-only; never go on master.
+
+### 1.5 `.council-2026-04-26/` — empty council directory
+
+```bash
+ls .council-2026-04-26                    # → empty
+du -sh .council-2026-04-26                # → 0B
+git ls-files .council-2026-04-26          # → only the deleted SQL_RUN_OPERATOR_GUIDE.md
+```
+
+**Recommendation P0: DELETE.** Already empty on disk — just commit the deletion of the one tracked file.
+
+### 1.6 Other tooling outputs (not gitignored, not tracked, large on disk)
+
+| Path | Size | Tracked? | In .gitignore? | Recommendation |
+|---|---:|---|---|---|
+| `.code-review-graph/` | 218 MB | No | No | **P0** — add to `.gitignore`, delete from disk |
+| `graphify-out/` | 20 MB | No | No | **P0** — add to `.gitignore`, delete from disk |
+| `coverage/` | 26 MB | No | Yes (`coverage/`) | OK — gitignored, can delete to reclaim |
+| `logs/` | 24 MB | No | Yes (`logs/`) | OK — gitignored. Optionally delete to reclaim |
+
+```bash
+du -sh .code-review-graph graphify-out coverage logs
+git check-ignore -v .code-review-graph graphify-out  # → not ignored
+```
+
+**Action:**
+```bash
+# Add to .gitignore (currently missing)
+echo -e "\n# Tooling outputs\n.code-review-graph/\ngraphify-out/" >> .gitignore
+rm -rf .code-review-graph graphify-out
+```
+
+### 1.7 Empty directories across the repo
+
+`find . -type d -empty -not -path './node_modules*' -not -path './.git*'` returns **27 empty directories**, including:
+
+```
+./docs/superpowers/specs                           # specs dir empty (plans dir has files)
+./.code-review-graph/wiki
+./.council-2026-04-26
+./.council-2026-04-24/understanding
+./.planning/research                               # already deleted on disk
+./.planning/codebase                               # this file is being written here
+./.planning/claude-team-final-index/expansion
+./.planning/claude-team-final-index/validation
+./.planning/review-2026-04-21/INVESTIGATION
+./.planning/review-2026-04-21/VERIFICATION
+./.planning/re-review-2026-04-23/CONTEXT
+./.planning/re-review-2026-04-23/VERIFICATION
+./.planning/claude-revalidation-customer-flow/deep-validation
+./.planning/plan-reviews-2026-04-23
+./.planning/master-execution-plan
+./.planning/phases/01-broadcast-lifecycle-correctness   # already deleted on disk
+./.planning/phases/04-surge-h3-rollout
+./.planning/phases/04-captain-phase2-migration
+./.planning/transporter_to_driver_fix_plan
+./.planning/final-verification
+./.planning/reviews
+./dist/__tests__ 2                                 # see §1.1
+./dist/modules 3
+./dist/config 2
+./dist/shared 2
+./dist/core 2
+```
+
+Reproducible:
+```bash
+find . -type d -empty -not -path './node_modules*' -not -path './.git*'
+```
+
+### 1.8 `.DS_Store` files committed to repo
+
+3 `.DS_Store` files are tracked in git despite `.gitignore` containing `.DS_Store`:
+
+```bash
+git ls-files | grep "DS_Store"
+# .DS_Store
+# src/.DS_Store
+# src/modules/.DS_Store
+```
+
+These were committed before `.gitignore` was set up, and `git rm --cached` was never run.
+
+**Recommendation P1:**
+```bash
+git rm --cached .DS_Store src/.DS_Store src/modules/.DS_Store
+git commit -m "chore: untrack .DS_Store files"
+```
 
 ---
 
-## Known Bugs
+## 2. Stale planning docs (D-status in git)
 
-### Unchecked Optional Properties in Socket Handler
+Per `git status --short`, **36 files are deleted in the working tree but still tracked in git** (`git status --short | grep "^ D" | wc -l = 36`). All are inside `.planning/`, `.council-*/`, or `docs/superpowers/`. Examples:
 
-**Issue:** Socket event handlers access optional properties without null checks.
+```
+ D .council-2026-04-24/MANUAL_STEPS_TO_RUN.md
+ D .council-2026-04-26/SQL_RUN_OPERATOR_GUIDE.md
+ D .planning/PROJECT.md
+ D .planning/REQUIREMENTS.md
+ D .planning/ROADMAP.md
+ D .planning/STATE.md
+ D .planning/codebase/ARCHITECTURE.md
+ D .planning/codebase/CONCERNS.md          ← this file is being recreated now
+ D .planning/codebase/CONVENTIONS.md
+ D .planning/codebase/INTEGRATIONS.md
+ D .planning/codebase/STACK.md
+ D .planning/codebase/STRUCTURE.md
+ D .planning/codebase/TESTING.md
+ D .planning/phase3-wave2-f-a-76-enumeration.md
+ D .planning/phases/01-broadcast-lifecycle-correctness/01-01-PLAN.md
+ ... (28 more)
+ D docs/superpowers/plans/2026-03-18-production-fixes-plan.md
+ D docs/superpowers/plans/2026-03-24-critical-issues-fix.md
+ D docs/superpowers/specs/2026-03-18-production-fixes-design.md
+```
 
-**Files:**
-- `src/shared/services/socket.service.ts` (line 545)
+**Analysis:** These look like leftover planning docs from already-executed phases. The mapper (this very tool) is currently recreating the `.planning/codebase/*.md` set, so those 7 will be re-added. The remaining 29 are genuinely stale.
 
-**Code:**
+**Recommendation P1: COMMIT THE DELETIONS.**
+
+```bash
+git add -u .planning/ .council-2026-04-24/ .council-2026-04-26/ docs/superpowers/
+git commit -m "chore: remove executed planning docs and stale council session logs"
+```
+
+Do NOT restore them. They are execution receipts of completed work; the architectural source of truth is now `docs/ARCHITECTURE-2026-05-03.md` (per `.planning/arch-rewrite-2026-05-03/00-RECON/INVENTORY.md`).
+
+---
+
+## 3. Known issues from CLAUDE.md (current status)
+
+The project's own `CLAUDE.md` (lines 530–600) flags the following. Verified status as of 2026-05-04:
+
+### 3.1 ✅ RESOLVED (mis-flagged as open) — `/api/v1/transporter/dispatch/replay` 404
+
+**CLAUDE.md says:** "Captain app calls this endpoint but returns 404… HIGH PRIORITY."
+
+**Actual state:** The route IS implemented and mounted.
+- Defined: `src/modules/transporter/transporter.routes.ts:1023` (full implementation with cursor/limit pagination, Redis-backed 3s rate limit, returns `broadcast_created` events)
+- Mounted: `src/server.ts:520` — `app.use('${API_PREFIX}/transporter', transporterRouter)` (where `API_PREFIX = '/api/v1'`)
+- Tests cover it: `src/__tests__/routes-split.test.ts:1456,1463,1471,1493,1575` and `src/__tests__/transporter-availability-stress.test.ts:647,1053,1054`
+- Stub also exists at `src/modules/transporter/transporter-dispatch.routes.ts:22` returning 501 (not mounted, harmless)
+
+**Recommendation P2:** Update CLAUDE.md to mark this as resolved.
+
+### 3.2 ✅ RESOLVED (mis-flagged as open) — FleetCache JSON corruption
+
+**CLAUDE.md says:** "Cache read error: SyntaxError: Unexpected token 'o', '[object Obj'… `JSON.stringify()` missing somewhere in `fleet-cache.service.ts`."
+
+**Actual state:** All fleet-cache writes go through `cacheService` which wraps `JSON.stringify`/`JSON.parse` correctly with graceful fallback:
+- `src/shared/services/cache.service.ts:240–246` — JSON.parse failure logs warning and returns null (treats as cache miss)
+- `src/shared/services/cache.service.ts:255–256` — JSON.stringify happens automatically on `set()` if value is not a string
+- `src/shared/services/fleet-cache-write.service.ts` uses `cacheService.set(cacheKey, vehicle, …)` with object — never bypasses the wrapper
+- No direct `redisService.set('fleet…', objectInstead-of-string)` patterns found
+
+**Recommendation P2:** Update CLAUDE.md to mark this as resolved. The graceful fallback at `cache.service.ts:240` already prevents prod crashes if a corrupt key were to exist.
+
+### 3.3 🔴 OPEN — No `_prisma_migrations` table
+
+**CLAUDE.md says:** "DB was set up with `prisma db push` not `prisma migrate deploy`. Future schema changes must be done via direct SQL."
+
+**Actual state — this remains true and is now a *much* worse problem than before:**
+
+- `prisma/schema.prisma` is a **0-byte file** (`ls -la prisma/schema.prisma → 0 bytes`).
+- Yet `package.json` has scripts: `"db:migrate:dev": "prisma migrate dev"`, `"db:generate": "prisma generate"`, `"db:push:prod:DANGER_DO_NOT_USE": "prisma migrate deploy"`, and `"db:push:prod:deploy": "prisma migrate deploy"`.
+- The empty schema means `npm run db:generate` will fail or produce an empty client. Anyone running `npm run db:migrate:dev` on a fresh checkout will get nothing.
+- Migrations exist in TWO directories: `prisma/migrations/` (7 timestamped + 2 ad-hoc) and `migrations/` (16 manual `M-*.sql` files plus 2 phase3 SQL files). 26 SQL files total.
+- `prisma/manual-migrations/phase-p1-sc1-sc2-indexes.sql` exists as a third migration channel.
+
+```bash
+ls -la prisma/schema.prisma                # → 0 bytes
+ls prisma/migrations/                      # 7 dated + 2 ad-hoc
+ls migrations/                             # 16 M-* files
+ls prisma/manual-migrations/               # 1 file
+```
+
+**Risk:** Anyone running `prisma db push` or `prisma migrate deploy` against staging or prod will catastrophically wipe / corrupt the schema because:
+1. The schema.prisma is empty, so prisma sees a "blank" target state.
+2. There is no `_prisma_migrations` table to track what's already applied.
+3. Applied schema state lives only in production Postgres.
+
+**Recommendation P0 (CRITICAL):**
+1. **Restore `prisma/schema.prisma`** from a known-good prior commit. From `git status` the file is `M` (modified), so:
+   ```bash
+   git log --oneline prisma/schema.prisma | head -5
+   git show <last-good-sha>:prisma/schema.prisma > prisma/schema.prisma
+   ```
+2. **Block dangerous npm scripts.** Rename `db:push:prod:deploy` → `db:push:prod:DANGER_DO_NOT_USE_2`. Currently both names exist for the same destructive command.
+3. **Document the SQL-only workflow** more prominently than buried in CLAUDE.md.
+4. **Plan migration tracking restoration** — initialize `_prisma_migrations` table from the M-001…M-017 history in `migrations/`.
+
+### 3.4 ✅ RESOLVED — Metrics counters not registered
+
+CLAUDE.md (line 591) already marks this as resolved 2026-04-11. No action.
+
+### 3.5 ⚠️ OPEN (frontend-only) — Captain App `HOLD_DURATION_SECONDS = 15`
+
+CLAUDE.md flags `HOLD_DURATION_SECONDS = 15` in `TruckHoldConfirmScreen.kt` should be 90. This is in the Android Captain app, not in this repo. **Cannot verify or fix from this codebase.**
+
+**Recommendation P1:** Hand off to Captain app team. Backend (`FLEX_HOLD_DURATION_SECONDS=90` in env) is correct.
+
+---
+
+## 4. Persistence & Reliability Risks
+
+### 4.1 Timer/setTimeout/setInterval sprawl — 109 in-process timers
+
+```bash
+grep -rEn "setTimeout\(|setInterval\(" src/ --include="*.ts" | grep -v "__tests__\|\.test\." | wc -l
+# → 109
+```
+
+Of these, ~60 are in production services (not jobs/poller scaffolding). Top hotspots:
+
+| File | Timers | Risk |
+|---|---:|---|
+| `src/shared/services/redis.service.ts` | 7 | reconnect probes, blocking pop polling, ttl loops |
+| `src/shared/services/socket.service.ts` | 8 | adapter reconnect, presence sweeps, FCM retries |
+| `src/shared/services/queue.service.ts` | 6 | tick interval, delay poller, processing reaper, durable timer schedule |
+| `src/modules/booking/booking.service.ts:152` | 1 | expiry checker — module-level `setInterval`, restarts lost on pod recycle |
+| `src/modules/booking/order.service.ts:117` | 1 | order expiry — same pattern, *parallel duplicate* of `booking.service` |
+| `src/modules/booking/legacy-order-expiry.service.ts:40` | 1 | legacy code path still running an interval |
+| `src/modules/order/order-timer.service.ts:188` | 1 | module-level `orderTimerCheckerInterval` |
+| `src/modules/order-timeout/smart-timeout.service.ts:772` | 1 | module-level cleanup interval |
+| `src/modules/truck-hold/truck-hold.service.ts:2396` | 1 | cleanup interval inside class |
+| `src/modules/truck-hold/truck-hold-cleanup.service.ts:70` | 1 | dedicated cleanup |
+| `src/modules/hold-expiry/hold-reconciliation.service.ts:49` | 1 | reconciliation interval |
+| `src/modules/tracking/tracking-fleet.service.ts:110` | 1 | offline checker |
+| `src/shared/services/transporter-online.service.ts:437` | 1 | stale cleanup |
+| `src/shared/services/notification-outbox.service.ts:430,529` | 2 | size + sweep timers |
+| `src/shared/services/vehicle-transition-outbox.service.ts:319` | 1 | poll timer |
+| `src/shared/services/leader-election.service.ts:154` | 1 | leader heartbeat |
+| `src/shared/services/google-maps.service.ts:67` | 1 | metrics interval |
+| `src/shared/services/cache.service.ts:59` | 1 | InMemory cleanup (correctly `.unref()`) |
+| `src/shared/jobs/cleanup-expired-orders.job.ts` | 2 | OK — guarded by feature flag |
+| `src/shared/jobs/cleanup-status-events.job.ts:123` | 1 | OK — but file has `// @ts-nocheck` |
+| `src/shared/jobs/cleanup-order-idempotency.job.ts:168` | 1 | OK |
+| `src/shared/jobs/trip-sla-monitor.job.ts:241` | 1 | OK |
+
+Reproducible:
+```bash
+grep -rEn "setTimeout\(|setInterval\(" src/ --include="*.ts" \
+  | grep -v "__tests__\|\.test\." \
+  | grep -E "(service|job)\.ts"
+```
+
+**Risk pattern:** Many of these are bare `setInterval` without `.unref()`, meaning graceful shutdown can hang. The custom ESLint rule `eslint-rules/no-setinterval-without-unref.js` catches this — verify it is enabled in `.eslintrc.json`.
+
+**Risk pattern 2:** Many are *cluster-wide work that runs on every ECS task*. Three tasks × `setInterval(cleanup, 30s)` = 3× the load, racing for the same DB rows. Hold-reconciliation correctly uses `leader-election.service.ts`, but several others do not.
+
+**Recommendation P1:**
+1. Audit every service-level `setInterval` for: (a) `.unref()` to allow shutdown, (b) leader-election guard so it only runs on one task.
+2. Migrate `legacy-order-expiry.service.ts` interval to BullMQ/SQS (see §4.3).
+3. Add `cleanup-status-events.job.ts:1 @ts-nocheck` to a backlog.
+
+### 4.2 Background promises — orphan `.catch` patterns
+
+464 places fire-and-forget Promises with `.catch`:
+
+```bash
+grep -rEn "\.catch\(" src/ --include="*.ts" | grep -v "__tests__\|\.test\." | wc -l
+```
+
+Highest concentration in `src/shared/database/repositories/vehicle.repository.ts` (8 in 270 lines) and `src/shared/database/prisma.service.ts` (~12). Pattern looks like:
+
 ```typescript
-io.sockets.sockets.forEach((socket: any) => {
-  // socket might not have expected properties
+redisService.del(vehiclesCacheKey(vehicle.transporterId)).catch(err => {
+  // logs, but vehicle write has already returned success
 });
 ```
 
-**Problem:**
-- Typing as `any` bypasses null checks
-- forEach on socket collection could fail if socket is undefined
-- No validation that socket has expected properties
+This is the documented pattern from CLAUDE.md §3 ("Status Updates Must Be Idempotent and Transactionally Safe"). **The risk is well-known and partially mitigated** by the Redis-Postgres outbox pattern (`vehicle-transition-outbox.service.ts`).
 
-**Impact:** Potential crashes when iterating socket connections
+**Recommendation P2:** Audit each fire-and-forget against the outbox to ensure cache-update failure cannot leave persistent drift.
 
-**Fix approach:**
-1. Remove `any` type, use proper Socket type
-2. Add null/undefined checks before accessing socket properties
-3. Add try-catch around the forEach loop
+### 4.3 In-memory queues lose state on pod restart
+
+CLAUDE.md §5 explicitly warns about this. Current state:
+
+- `queue.service.ts` is an in-process Redis-backed worker pool — **NOT BullMQ**. It does ship to Redis, but workers exist only in-process. Reaper at line 1259 catches orphaned jobs.
+- Many call sites fire-and-forget into `queueService.queuePushNotification…` — 21 call sites identified across `order/`, `booking/`, `custom-booking/`, `rating/`, etc.
+- No BullMQ. No SQS adapter for non-tracking queues (Kinesis is used only for tracking telemetry per `.env.example` line 60).
+- `legacy-order-timeout.service.ts:119` still uses queueService — legacy path lives on.
+
+**Recommendation P1:** Adopt BullMQ for all timer/queue work that survives restarts. Define migration path from `queue.service.ts` (the bespoke implementation in `src/shared/services/`) to a battle-tested library.
+
+### 4.4 Vehicle status vs assignment status race
+
+CLAUDE.md §4 ("Vehicle Status ≠ Assignment Status — CRITICAL Separation") flags this as an *industry pattern* concern. Current code has the right CAS guards in `truck-hold-confirm.service.ts` (lines 807–824 retry loop with `FINALIZE_RETRY_DELAYS_MS`), but the ESLint rule `eslint-rules/cas-vehicle-update-must-check-count.js` exists specifically to prevent regression. Verify that rule is enabled in CI and `.eslintrc.json`.
 
 ---
 
-### Race Condition in Order Expiry
+## 5. Database Concerns
 
-**Issue:** Order expiry check doesn't atomically mark as expired before checking.
+### 5.1 🔴 `prisma/schema.prisma` is empty (0 bytes)
 
-**Files:**
-- `src/modules/broadcast/broadcast.service.ts` (lines 891-910)
+See §3.3. **Highest single risk in the repo.** Anyone running `npm run db:generate` or `npm run db:migrate:dev` will fail or destroy the model. Restore from git history immediately.
 
-**Pattern:**
+```bash
+git log --oneline -- prisma/schema.prisma | head
+git diff HEAD~5 -- prisma/schema.prisma
+```
+
+### 5.2 Three parallel migration channels
+
+| Channel | Path | File count | Use |
+|---|---|---:|---|
+| Prisma timestamped | `prisma/migrations/2026*` | 7 | Originally intended Prisma source-of-truth |
+| Prisma ad-hoc SQL | `prisma/migrations/{add_indexes,phase6-indexes}.sql` | 2 | Bypassing migration runner |
+| Manual SQL hotfixes | `migrations/M-001…M-017*.sql` | 16 | Direct psql per CLAUDE.md "DB rules" |
+| Manual SQL Phase 3 | `migrations/phase3-*.sql` | 2 | Phase 3 indexes |
+| Manual indexes | `prisma/manual-migrations/phase-p1-sc1-sc2-indexes.sql` | 1 | P1 indexes |
+
+That's 28 SQL files across 4 directories. With NO `_prisma_migrations` tracking table on production, no engineer can answer "what is actually applied to prod?" without psql access.
+
+**Recommendation P0:** Pick ONE canonical channel. Document execution order. Initialize `_prisma_migrations` (even if back-dated) so tooling works again.
+
+### 5.3 N+1 query risk hotspots
+
+Sample of `for (…) { await prisma… }` patterns in service code:
+
+```
+src/modules/order-timeout/smart-timeout.service.ts:669       loop over expiredOrders → progressEvent.findFirst per order
+src/modules/order-timeout/progress.service.ts:386            loop over views → transporterBroadcastView.update per view
+src/modules/booking/booking.service.ts:872                   loop over cappedTransporters → booking.findUnique per transporter
+src/modules/booking/booking-broadcast.service.ts:198         loop over eligibleTransporters → booking.findUnique per transporter
+src/modules/order/order-cancel.service.ts                    loop over activeHolds → tx.truckRequest.updateMany per hold
+```
+
+These are not always N+1 (some use `findUnique` on indexed columns and the loop bound is small), but they are candidates for batched or `IN`-clause queries. Cross-reference against `prisma/schema.prisma` (currently empty — see §5.1) to identify missing composite indexes.
+
+**Recommendation P2:** Profile production logs for slow queries originating from these loops.
+
+### 5.4 Schema drift risk
+
+Per CLAUDE.md "SESSION 2026-03-22", the `HoldPhase` ENUM and `confirmedAtLegacy` column were applied via direct psql, not migration. `migrations/M-014-truckholdledger-confirmed-at-legacy.sql` documents the column post-hoc with `ADD COLUMN IF NOT EXISTS`. Any future engineer trying to reverse-engineer the schema by reading `prisma/schema.prisma` (which is empty!) will be misled.
+
+---
+
+## 6. Security & Secret Hygiene
+
+### 6.1 🔴 Hardcoded fallback secret in production code
+
 ```typescript
-// Lines 898-907
-for (const booking of allBookings) {
-  if (booking.status === 'active') {
-    const expiresAt = new Date(booking.expiresAt);
-    if (expiresAt < now) {
-      await db.updateBooking(booking.id, { status: 'expired' });  // Non-atomic
-    }
-  }
+// src/modules/pricing/pricing.service.ts:78
+function getQuoteHmacKey(): string {
+  return process.env.JWT_SECRET || 'weelo-dev-pricing-hmac-key';
 }
 ```
 
-**Problem:**
-- Between reading expiry time and updating status, concurrent requests could process same booking
-- Multiple workers/instances could try to expire same booking simultaneously
-- No distributed lock to prevent concurrent expiry
+The fallback string `weelo-dev-pricing-hmac-key` will sign quote tokens if `JWT_SECRET` is undefined at runtime. The comment claims "production env validator enforces a non-empty JWT_SECRET" — verify this in `src/core/config/env.validation.ts`. If validation is skipped in any code path (e.g., `--skipEnvValidation`, dry-run scripts, or NODE_ENV=test → production deploy), quote tokens become forgeable.
 
-**Impact:**
-- Duplicate notifications sent to customers/drivers
-- Inconsistent state if one expiry succeeds and another fails
-- Resource waste on duplicate processing
+**Recommendation P0:** Replace with a hard error:
 
-**Fix approach:**
-1. Use distributed lock via Redis (redisService.acquireLock)
-2. Implement atomic check-and-update pattern
-3. Add idempotency key to prevent duplicate processing
-4. Use database transaction with SELECT FOR UPDATE
-
-**Priority:** High - affects booking lifecycle consistency at scale
-
----
-
-### Missing Await on Database Calls (Historical)
-
-**Issue:** Previous version had missing `await` keywords on async DB calls. While likely fixed, needs verification.
-
-**Files:**
-- `src/shared/database/prisma.service.ts` (auto-expiry logic)
-
-**Pattern from ORDER_LIFECYCLE_FIX_COMPLETE.md:**
 ```typescript
-// BEFORE (BROKEN):
-const order = db.getOrderById(orderId);  // Missing await!
-```
-
-**Status:** Supposedly fixed but should verify all auto-expiry code paths have proper await.
-
-**Fix approach:**
-1. Grep for `db\.\w+\(` without `await`
-2. Lint rule to catch missing awaits on async functions
-3. Add TypeScript strict mode to catch Promise types not being awaited
-
-**Priority:** Critical if unfixed - causes database inconsistency
-
----
-
-## Security Considerations
-
-### Debug Logging in Driver Auth
-
-**Issue:** Debug log at line 160-161 logs phone numbers to identify issues.
-
-**Files:**
-- `src/modules/driver-auth/driver-auth.service.ts` (lines 160-161)
-
-**Code:**
-```typescript
-// DEBUG: Log actual phone numbers to identify the issue
-logger.info('[DRIVER AUTH DEBUG] Phone numbers check', {
-  driverPhone: driverPhone,
-  transporterPhone: transporterPhone
-});
-```
-
-**Risk:** Phone numbers are personally identifiable information (PII). If logs are stored without encryption or access control, this could expose customer contact data.
-
-**Current Mitigation:** Logger service has masking, but explicit phone logging overrides it.
-
-**Recommendations:**
-1. Remove debug logging of raw phone numbers
-2. Use maskForLogging() utility already available in crypto.utils.ts
-3. Log only last 2 digits: `+91XXXXXXXX${phone.slice(-2)}`
-4. Add review of all PII logging in request/response handlers
-
----
-
-### Sensitive Parameter Masking
-
-**Issue:** Request logger masks sensitive params but coverage may be incomplete.
-
-**Files:**
-- `src/shared/middleware/request-logger.middleware.ts` (lines with SENSITIVE_PARAMS)
-
-**Current Coverage:**
-```typescript
-const SENSITIVE_PARAMS = ['token', 'key', 'secret', 'password', 'otp'];
-```
-
-**Gaps:**
-- Phone numbers not masked (high PII value)
-- Email addresses not masked
-- Financial data (prices, wallet balance) not masked
-- Custom header tokens may not be caught
-
-**Recommendations:**
-1. Expand SENSITIVE_PARAMS to include: phone, email, aadhar, license, pan
-2. Review all auth headers (JWT tokens in Authorization header)
-3. Test masking with actual request payloads from captain app
-4. Consider per-field masking depth (first X chars vs last X chars)
-
----
-
-### Missing Input Validation on Socket Events
-
-**Issue:** Socket event handlers don't validate incoming data before processing.
-
-**Files:**
-- `src/shared/services/socket.service.ts` (throughout)
-
-**Risk:**
-- Malformed location data could corrupt tracking records
-- Oversized payloads could cause memory issues
-- Invalid role/userId could grant unauthorized access
-
-**Recommendations:**
-1. Add Zod schema validation for all socket event payloads
-2. Sanitize coordinate values (lat/lng ranges: ±90, ±180)
-3. Add maximum payload size limits
-4. Validate userId matches authenticated token
-
----
-
-## Performance Bottlenecks
-
-### O(n) Broadcast Expiry Scan
-
-**Issue:** Checking all bookings for expiry every 5 seconds is O(n) complexity.
-
-**Files:**
-- `src/modules/broadcast/broadcast.service.ts` (lines 891-910)
-
-**Current Approach:**
-```typescript
-const allBookings = await db.getAllBookings();
-for (const booking of allBookings) {  // Loops through ALL bookings
-  if (expiresAt < now) {
-    // expire it
-  }
+function getQuoteHmacKey(): string {
+  const key = process.env.JWT_SECRET;
+  if (!key) throw new Error('JWT_SECRET is required to sign quote tokens');
+  return key;
 }
 ```
 
-**Problem:**
-- With 1M active bookings, this does 1M comparisons every 5 seconds
-- Full table scans are expensive even with indexes
-- No pagination or cursor support
-
-**Current Capacity:** Works fine for <100k concurrent bookings. Degrades at scale.
-
-**Improvement Path:**
-1. Use Redis sorted set with expiry times as scores
-2. Use ZRANGEBYSCORE to get only expired items in O(log n)
-3. Implement pagination in DB query: WHERE expiresAt < now LIMIT 1000
-4. Use database index on expiresAt column (already should exist)
-5. Consider partition/sharding by date (today's bookings in separate key)
-
-**Priority:** Medium - acceptable now, critical at 10x scale
-
----
-
-### Socket.io Memory Leak Risk
-
-**Issue:** userSockets Map and socketUsers Map grow without bounds if clients don't disconnect cleanly.
-
-**Files:**
-- `src/shared/services/socket.service.ts` (lines 49-50)
-
-**Current Safeguard:** MAX_CONNECTIONS_PER_USER = 5 prevents single user from consuming unlimited sockets.
-
-**Gap:** If socket 'disconnect' event is missed (network failure, proxy timeout), entries remain in Map.
-
-**Impact:**
-- Memory usage grows with stale socket references
-- Eventually could cause out-of-memory crashes
-- Affects broadcast to non-existent sockets
-
-**Fix Approach:**
-1. Add periodic cleanup job (every 5 min) to remove stale entries
-2. Compare userSockets keys against actual connected socketIds
-3. Add Max length guard: if (userSockets.size > MAX_USERS_EXPECTED) clear oldest entries
-4. Log stale socket removal for debugging
-
-**Priority:** Medium - becomes critical at 100k+ concurrent connections
-
----
-
-## Fragile Areas
-
-### Broadcast Service (High Complexity)
-
-**Files:** `src/modules/broadcast/broadcast.service.ts` (1,139 lines)
-
-**Why Fragile:**
-- 1,139 lines in single file - hard to reason about
-- Multiple state transitions (searching → held → assigned → accepted → in_progress → completed)
-- Complex lock management with Redis acquireLock/releaseLock
-- Distributed idempotency via Redis cache
-- Multiple notification paths (socket, FCM, SMS)
-- Transactional updates across multiple tables (broadcasts, assignments, vehicles)
-
-**Safe Modification:**
-1. Add comprehensive logging at each state transition
-2. Always write unit tests before modifying transaction logic
-3. Test both happy path and error cases (Redis down, DB transaction fails, etc.)
-4. Use distributed tracing to follow request through state machine
-5. Review lock timeouts - 8 seconds may be too long for high-volume scenarios
-
-**Test Coverage:** Only 2 test files total in repo. Broadcast has no specific test file.
-
----
-
-### Order Service (Complex Multi-Type System)
-
-**Files:** `src/modules/order/order.service.ts` (1,558 lines)
-
-**Why Fragile:**
-- Handles multi-vehicle type orders (tipper + container + open)
-- Creates separate TruckRequest for each vehicle type
-- Broadcast filtering depends on exact vehicle type matching
-- Price calculation for multiple types
-- Cache invalidation across multiple keys
-
-**Safe Modification:**
-1. Test with all 3 vehicle types, multiple quantities
-2. Verify cache invalidation: TRANSPORTERS_BY_VEHICLE, ORDER, ACTIVE_REQUESTS
-3. Check broadcast filtering still matches correct transporters
-4. Add integration test for complete order lifecycle
-
-**Test Coverage:** None. High risk for regressions.
-
----
-
-### Redis Service (Large Surface Area)
-
-**Files:** `src/shared/services/redis.service.ts` (1,801 lines)
-
-**Why Fragile:**
-- Handles geospatial queries, sets, hashes, pub/sub, distributed locks
-- Fallback to in-memory storage when Redis unavailable (masks failures)
-- Connection pooling with reconnection logic
-- Pipeline operations with rollback
-- Complex type conversions
-
-**Safe Modification:**
-1. Test with actual Redis connection failures
-2. Verify in-memory fallback still works correctly
-3. Check pool size doesn't exceed configured max
-4. Test geospatial commands with edge cases (0,0 coordinates, null results)
-
-**Test Coverage:** None. Critical service has no tests.
-
----
-
-## Scaling Limits
-
-### Redis Connection Pool
-
-**Current:** Max 50 connections (line 59 of redis.service.ts)
-
-**Capacity:** Suitable for ~100k concurrent users with connection pooling
-
-**Limit:** At 500k+ concurrent users, 50 connections becomes bottleneck
-
-**Scaling Path:**
-1. Increase pool size to 100-200 for medium scaling
-2. Implement connection sharding: separate Redis instances for different key patterns
-3. Use Redis Cluster for horizontal scaling
-4. Monitor connection utilization with metrics
-
----
-
-### Database Concurrency
-
-**Current:** Prisma default connection pool (typically 10 connections)
-
-**Capacity:** ~100 concurrent queries
-
-**Limit:** High-traffic endpoints may queue requests
-
-**Improvement:**
-1. Increase datasource connection pool in prisma schema: `connectionLimit = 20`
-2. Implement query queue/backpressure
-3. Use read replicas for SELECT-heavy endpoints
-4. Consider read-write splitting
-
----
-
-### In-Memory Database Fallback (Development)
-
-**Issue:** When Redis is unavailable, app falls back to in-memory storage (maps/arrays).
-
-**Files:** `src/shared/services/redis.service.ts` (fallback implementation)
-
-**Limit:**
-- Single process memory only
-- No persistence
-- Lost on restart
-- Cannot scale horizontally
-
-**Risk:** If deployment uses in-memory fallback in production, data loss is guaranteed at any restart.
-
-**Recommendation:**
-1. Make Redis mandatory in production (fail fast if unavailable)
-2. Use fallback only in development/testing
-3. Add environment check: require Redis in NODE_ENV=production
-
----
-
-## Dependencies at Risk
-
-### Firebase Admin SDK (Soft Dependency)
-
-**Risk:** Dynamic import pattern could fail silently.
-
-**Files:** `src/shared/services/fcm.service.ts` (line 14, dynamic import)
-
-**Pattern:**
-```typescript
-// Dynamic import of firebase-admin (optional dependency)
-// Falls back to no-op if not installed
+Reproducible:
+```bash
+grep -rEn "JWT_SECRET\s*\|\|\s*['\"]" src/ --include="*.ts" | grep -v __tests__
+# → src/modules/pricing/pricing.service.ts:78  (only one in production code)
 ```
 
-**Impact:**
-- If firebase-admin is missing in production, push notifications silently fail
-- No error during build/deploy
-- Discovered only when first notification attempt fails
+### 6.2 Direct `process.env.*` reads (149 in modules, 463 total)
 
-**Migration Plan:**
-1. Make firebase-admin a required dependency (move from optional to regular dependencies)
-2. Fail fast during server startup if FCM config is invalid
-3. Add health check endpoint that validates FCM connectivity
+Most are guarded by `feature-flags.ts` or `env.validation.ts`. The remaining direct reads are scattered across services and create *potential* drift between `env.validation.ts` (declared schema) and actual runtime keys.
 
----
+```bash
+grep -rEn "process\.env\." src/modules --include="*.ts" | grep -v __tests__ | wc -l
+# → 149
+```
 
-### Socket.io Version
+`scripts/verify-env-example.ts` (referenced in `package.json` as `lint:env`) is the existing safety net. **Verify it runs in CI.**
 
-**Current:** ^4.7.2 (package.json)
+### 6.3 `.env.example` significantly larger than `.env`
 
-**Risk:** Major version upgrades have breaking changes
+```
+.env.example: 352 lines, 108 KEY=… entries
+.env:         173 lines,  40 KEY=… entries
+```
 
-**Recommendation:**
-1. Pin to exact version or narrow range: ~4.7.2
-2. Test thoroughly before upgrading major versions
-3. Keep up with security patches in 4.x series
+Either `.env.example` is overprovisioned with new flags that nobody set in dev, or `.env` is missing flags. The `lint:env` script should catch this.
 
----
+### 6.4 Rate-limit coverage matrix
 
-## Missing Critical Features
+Routes with rate-limiting confirmed:
 
-### Database Migration System
+| Route | Rate limiter | File |
+|---|---|---|
+| `POST /auth/send-otp` | `authRateLimiter + otpRateLimiter` | `src/modules/auth/auth.routes.ts:29` |
+| `POST /driver-auth/send-otp` | `otpRateLimiter` | `src/modules/driver-auth/driver-auth.routes.ts:55` |
+| `POST /driver/onboarding/otp` | `otpRateLimiter` (3 places) | `src/modules/driver-onboarding/driver-onboarding.routes.ts` |
+| `POST /driver/(otp endpoints)` | `otpRateLimiter` (2 places) | `src/modules/driver/driver.routes.ts:108,352` |
+| `POST /custom-bookings/*` | `otpRateLimiter` | `src/modules/custom-booking/customBooking.routes.ts:52,187` |
+| `POST /bookings` (create) | per-customer `5/60s` | `src/modules/booking/booking.routes.ts:147,568` (in-route logic, not middleware) |
+| `POST /orders` (create) | per-user `5/60s` | `src/modules/order/order.routes.ts:144` |
+| `GET /transporter/dispatch/replay` | per-transporter 1/3s via Redis | `src/modules/transporter/transporter.routes.ts:1054` |
+| Global all routes | `rateLimiter` | `src/server.ts:420` |
 
-**Issue:** Only 1 migration file exists (add_indexes.sql), no migration tooling.
+Routes WITHOUT explicit rate limiting:
+- `/admin/*` — relies on `roleGuard(['admin'])` only — verify admin auth is bulletproof
+- `/profile/*` — relies on `authMiddleware`
+- `/tracking/*` — high-volume by design; uses `rateLimiter` global
+- `/notification/*`
 
-**Files:**
-- `prisma/migrations/` (only 1 directory)
-- `prisma/schema.prisma` (single source of truth)
+**Recommendation P2:** Add per-endpoint rate-limit annotations to admin and profile routes for defense-in-depth.
 
-**Problem:**
-- No schema versioning
-- add_indexes.sql is raw SQL, not tracked by Prisma
-- Rolling back schema changes requires manual work
-- Multi-environment deployments (staging/prod) have no rollback plan
+### 6.5 `helmet`, `cors`, security middleware
 
-**Recommendation:**
-1. Move all migrations through Prisma: `prisma migrate dev`
-2. Version schema in git
-3. Test migration up/down on every change
-4. Document migration process for team
-5. Use `prisma migrate deploy` in CI/CD
+Confirmed at `src/server.ts:313` (`cors`) and `src/server.ts:363` (`helmet`). Order of middleware is asserted at runtime by `src/server.ts:559–583` (`A01-005` invariant: rate-limiter before JSON parser).
 
----
+**OK — security headers and CORS are wired.**
 
-### Automated Testing
+### 6.6 `npm audit` summary
 
-**Issue:** Only 2 test files for entire codebase.
+```bash
+npm audit --production --json | grep -E "info|low|moderate|high|critical|total"
+# → info: 0, low: 2, moderate: 10, high: 0, critical: 1, total: 13
+```
 
-**Files:**
-- `src/__tests__/health.test.ts` (basic health check)
-- `src/__tests__/transporter-availability-toggle.test.ts` (single feature)
+**1 critical vulnerability** in production deps. Run `npm audit` to identify the package.
 
-**Coverage Gaps:**
-- No API contract tests
-- No broadcast lifecycle tests
-- No order state machine tests
-- No auth flow tests
-- No error handling tests
+### 6.7 Dependency version drift (`npm outdated`)
 
-**Impact:**
-- Regressions go undetected
-- Refactoring is risky
-- New developer confidence is low
+Major versions behind:
+- `@prisma/client`: 5.22.0 (latest 7.8.0) — 2 majors behind
+- `prisma`: 5.22.0 (latest 7.8.0) — 2 majors behind
+- `bcryptjs`: 2.4.3 (latest 3.0.3) — 1 major behind
+- `eslint`: 8.57.1 (latest 10.3.0) — 2 majors behind
+- `express`: 4.22.1 (latest 5.2.1) — 1 major behind
+- `helmet`: 7.2.0 (latest 8.1.0) — 1 major behind
+- `redis`: 4.7.1 (latest 5.12.1) — 1 major behind
+- `uuid`: 9.0.1 (latest 14.0.0) — 5 majors behind
+- `@types/node`: 20.19.32 (latest 25.6.0) — 5 majors behind
+- `@types/uuid`: 9.0.8 (latest 10.0.0)
+- AWS SDK clients: ~58 versions behind
+- `jest`: 29.7.0 (latest 30.3.0)
+- `typescript`: 5.9.3 (latest 6.0.3)
 
-**Priority Plan:**
-1. Add API contract tests for all endpoints (medium effort, high value)
-2. Add broadcast state machine tests (high effort, critical)
-3. Add auth flow tests including edge cases
-4. Add error scenario tests (network failures, timeouts)
-5. Aim for >80% coverage on critical paths
-
----
-
-### Input Validation Schema Documentation
-
-**Issue:** Zod schemas are inline in routes, not documented or centralized.
-
-**Files:**
-- `src/modules/order/order.routes.ts` (inline schemas)
-- `src/shared/utils/validation.utils.ts` (some shared schemas)
-
-**Gap:**
-- No clear "source of truth" for API request/response format
-- Schema changes not documented
-- Difficult for frontend teams to understand payload requirements
-
-**Recommendation:**
-1. Centralize validation schemas in `src/shared/schemas/` directory
-2. Generate OpenAPI/Swagger docs from schemas
-3. Document required vs optional fields
-4. Version schemas for API versioning
+**Recommendation P2:** Major upgrades require coordinated PRs. Critical: prisma upgrade because of §3.3 (empty schema + no migrations table — will be tricky).
 
 ---
 
-## Test Coverage Gaps
+## 7. Performance Fragility
 
-### Order Service
+### 7.1 Largest production files (over the 800-line guideline)
 
-**What's Not Tested:**
-- Multi-type order creation (tipper + container + open)
-- Truck request status transitions
-- Price calculation across multiple vehicle types
-- Order expiry and auto-cleanup
-- Concurrent order operations (idempotency)
+| Lines | File |
+|---:|---|
+| 3175 | `src/shared/services/redis.service.ts` |
+| 2903 | `src/shared/services/socket.service.ts` |
+| 2808 | `src/shared/services/queue.service.ts` |
+| 2698 | `src/modules/booking/booking.service.ts` |
+| 2521 | `src/modules/truck-hold/truck-hold.service.ts` |
+| 2416 | `src/modules/assignment/assignment.service.ts` |
+| 2313 | `src/modules/tracking/tracking.service.ts` |
+| 2086 | `src/shared/database/prisma.service.ts` |
+| 2073 | `src/modules/truck-hold/confirmed-hold.service.ts` |
+| 2008 | `src/modules/order/order.service.ts` |
+| 1738 | `src/shared/services/fcm.service.ts` |
+| 1550 | `src/modules/driver/driver.service.ts` |
 
-**Files:** `src/modules/order/order.service.ts` (1,558 lines, 0 tests)
+Total source is **77,543 lines** of `*.service.ts`. The CLAUDE.md guideline is 800 lines max; **12 files exceed 1500 lines**, four exceed 2500. These are the high-risk-of-bug, hard-to-review, hard-to-refactor zones.
 
-**Risk:** Breaking changes could go undetected. Production order failures uncovered by users.
+**Recommendation P2:** Split top three (`redis.service.ts`, `socket.service.ts`, `queue.service.ts`) — they're already partially split into subdirs (`src/shared/services/redis/`).
 
-**Priority:** Critical
+### 7.2 Old file split has an unfinished half-life
 
----
+Multiple "split" sub-routers exist but are not yet mounted. They contain `noop` placeholders that return `501 NOT_IMPLEMENTED`:
 
-### Broadcast Service
+```
+src/modules/order/order-crud.routes.ts           (36 lines, all noop, returns 501)
+src/modules/order/order-lifecycle.routes.ts      (37 lines, all noop, returns 501)
+src/modules/order/order-progress.routes.ts       (29 lines, all noop, returns 501)
+src/modules/transporter/transporter-dispatch.routes.ts  (24 lines, noop, returns 501)
+src/modules/transporter/transporter-profile.routes.ts   (28 lines, noop, returns 501)
+src/modules/booking/booking-crud.routes.ts       (389 lines — header says NOT MOUNTED IN SERVER.TS)
+src/modules/booking/booking-legacy.routes.ts     (218 lines — header says NOT MOUNTED IN SERVER.TS)
+```
 
-**What's Not Tested:**
-- Broadcast state machine (searching → held → assigned → completed)
-- Distributed lock acquisition/release
-- Idempotency cache behavior
-- Driver-to-transporter-to-customer notification flow
-- Broadcast expiry notifications
-- Race conditions in concurrent accepts
+The `booking-crud.routes.ts` and `booking-legacy.routes.ts` headers explicitly say:
+```typescript
+// TODO(L-08): This route file is not mounted in server.ts. Wire it when the booking module split is completed.
+```
 
-**Files:** `src/modules/broadcast/broadcast.service.ts` (1,139 lines, 0 tests)
+**Risk:** A junior dev sees the file, adds a route to it, deploys, and is surprised the route 404s. Tests in `routes-split.test.ts:1729` reference the empty stubs.
 
-**Risk:** Core business logic (booking system) has no regression tests. High-impact bugs could crash all booking flows.
+**Recommendation P1:** Either (a) finish the split and mount, or (b) delete the stub files and remove `routes-split.test.ts` references.
 
-**Priority:** Critical
+### 7.3 PgBouncer config not yet wired
 
----
+```bash
+ls docker/pgbouncer/    # docker-compose.yml, pgbouncer.ini, userlist.txt
+```
 
-### Redis Service
+`docker/pgbouncer/pgbouncer.ini` has `password=CHANGE_ME` placeholders and is documented to support 100K users via `pool_size=25`. Verify it is active in production deployment (`Dockerfile.production` doesn't reference it explicitly).
 
-**What's Not Tested:**
-- Geospatial queries (geoAdd, geoRadius)
-- Distributed locks (acquireLock, releaseLock)
-- Pub/sub message delivery
-- In-memory fallback correctness
-- Connection failure recovery
-- Pipeline transaction rollback
+### 7.4 24 MB of logs on disk
 
-**Files:** `src/shared/services/redis.service.ts` (1,801 lines, 0 tests)
+```bash
+du -sh logs/                          # → 24M
+ls logs/ | head                       # combined.log, combined1..3.log, error.log, error1.log
+```
 
-**Risk:** Caching/locking errors could corrupt state or cause data loss.
-
-**Priority:** High
-
----
-
-### Socket.io Integration
-
-**What's Not Tested:**
-- Connection authentication
-- Room-based message isolation
-- Broadcast message delivery
-- Socket disconnection cleanup
-- Concurrent connection limits
-- Cross-server message delivery via Redis pub/sub
-
-**Files:** `src/shared/services/socket.service.ts` (910 lines, 0 tests)
-
-**Risk:** Real-time updates may silently fail. Users won't receive notifications.
-
-**Priority:** High
+Log rotation is not set up at the app level. Winston is configured but writes to local filesystem in dev. In production this should be stdout → CloudWatch.
 
 ---
 
-### Authentication Flows
+## 8. Test Fragility
 
-**What's Not Tested:**
-- Customer OTP generation and verification
-- Driver OTP (sent to transporter phone)
-- JWT token generation and validation
-- Refresh token lifecycle
-- Token expiry and rotation
-- Invalid OTP rejection (max 3 attempts)
-- Concurrent login attempts
+### 8.1 Test fix commit churn
 
-**Files:**
-- `src/modules/auth/auth.service.ts`
-- `src/modules/driver-auth/driver-auth.service.ts`
+```bash
+git log --oneline --since="14 days ago" | wc -l                             # → 153
+git log --oneline --since="14 days ago" | grep -ci "fix(tests"              # → 6
+git log --oneline --since="30 days ago" | grep -ci "fix(tests"              # → much higher
+```
 
-**Risk:** Auth bypass, token leaks, or OTP reuse could compromise security.
+Recent commit log is dominated by `fix(tests/<file>): wire X mock` patterns:
+```
+c86a24d1 fix(tests/accept-atomicity): retarget D1-4 customer progress mirror channel + payload shape
+4ed0d087 fix(tests/confirmed-hold): wire withDbTimeout + tx $queryRaw for accept CAS
+2f27dec1 fix(tests/confirmed-hold): wire finalize-CAS updateMany for A02-006 Stage 2
+ac3e3492 fix(tests/cascade-dispatch): wire truckRequest.findUnique + retarget A15 isCascade to FCM
+559c7b71 fix(tests/flex-hold): wire updateMany + order.findUnique mocks for extend-CAS
+```
 
-**Priority:** Critical
+This is a textbook smell: **tests are tightly coupled to implementation details of mocks.** Every implementation change cascades into 3-5 test fixes. The test suite is brittle, not a safety net.
+
+### 8.2 Most-touched test files in 30 days
+
+| Touches | File |
+|---:|---|
+| 6 | `src/__tests__/durable-emit-contract.test.ts` |
+| 6 | `src/__tests__/assignment-queue-routes-stress.test.ts` |
+| 5 | `src/__tests__/phase7-state-machine-holds.test.ts` |
+| 5 | `src/__tests__/phase7-events-notifications.test.ts` |
+| 5 | `src/__tests__/fix-truck-hold-hardening.test.ts` |
+| 5 | `src/__tests__/fix-socket-service-hardening.test.ts` |
+| 5 | `src/__tests__/accept-atomicity.test.ts` |
+| 4 | (10 more files at this level) |
+
+These files are continuously rewritten because the service-mock surface keeps changing.
+
+**Recommendation P1:**
+1. Establish stable mock factories so tests don't pin to per-method `mockResolvedValueOnce` chains.
+2. Migrate stress tests away from heavy mocking towards integration tests against a real local Postgres + Redis (`docker-compose.yml` already provides them).
+3. Identify "load-bearing" e2e tests vs "drag" tests; consider deleting or quarantining flaky ones.
+
+### 8.3 Test count is enormous
+
+```bash
+find src/__tests__ -name "*.test.ts" | wc -l    # → 357
+find src -name "*.test.ts" | wc -l              # → 366
+```
+
+357 test files in a single `__tests__` directory. Files like `hawk-e2e-flow-stress.test.ts` (2460 lines) are bigger than most service files. **The test suite is itself a maintenance burden.**
+
+### 8.4 E2E coverage is minimal
+
+```bash
+ls e2e/
+# captain-weelo-captain.spec.ts
+# customer-weelo.spec.ts
+```
+
+Two files. Neither runs in default `npm test` (no `e2e` script in `package.json`).
 
 ---
 
-## Summary by Severity
+## 9. Duplicate / Parallel Implementations
 
-### 🔴 Critical (Immediate Fix Needed)
-1. **Missing Await on Async DB Calls** - Could cause data inconsistency
-2. **Race Condition in Order Expiry** - Duplicate notifications, state corruption
-3. **Fire-and-Forget Socket Emissions** - Real-time updates fail silently
-4. **Zero Tests on Core Services** - Order, Broadcast, Redis, Socket have no tests
+### 9.1 Two database directories
 
-### 🟡 High (Fix Soon)
-1. **Broadcast Service Complexity** - 1,139 lines, hard to maintain safely
-2. **Socket.io Memory Leak Risk** - Stale socket references accumulate
-3. **O(n) Broadcast Expiry Scan** - Degrades at scale (100k+ bookings)
-4. **Debug Logging of PII** - Phone numbers exposed in logs
+```
+src/database/                  # 1 file: recommended-indexes.sql (NOT imported anywhere)
+src/shared/database/           # 7 .ts files: prisma.service.ts, prisma-client.ts (deprecated), db.ts, read-router.ts, etc.
+```
 
-### 🟠 Medium (Plan for Next Sprint)
-1. **Stub Customer Implementations** - Wallet, settings not persistent
-2. **Missing Error Handling Consistency** - Generic Errors vs AppError
-3. **Incomplete Input Validation Masking** - Phone, email not masked
-4. **Database Connection Pool Limits** - Bottleneck at scale
+`src/database/` is dead. Nothing imports from it. Reproducible:
+
+```bash
+ls src/database/                                                      # → recommended-indexes.sql
+grep -rEn "from\s+['\"](\.\./)+database['\"]" src/ --include="*.ts"   # → no results outside of src/shared/
+grep -rEn "recommended-indexes" src/ --include="*.ts"                  # → no results
+```
+
+**Recommendation P1:** Move `src/database/recommended-indexes.sql` to `migrations/` then `rmdir src/database/`.
+
+### 9.2 Two config directories
+
+```
+src/config/                    # aws.config.ts, environment.ts, production.config.ts, secrets.ts
+src/core/config/               # env.validation.ts, hold-config.ts, index.ts, __tests__/
+```
+
+Both are actively imported (20 imports of `core/config`, 19 of `config/environment`, 36 of `config/*` total).
+
+```bash
+grep -rEn "import.*from.*['\"](\.\./)+core/config" src/ --include="*.ts" | grep -v __tests__ | wc -l    # → 20
+grep -rEn "import.*from.*['\"](\.\./)+config/environment" src/ --include="*.ts" | grep -v __tests__ | wc -l  # → 19
+```
+
+This split is intentional: `core/config/` is for new validated env, `config/environment.ts` is for the legacy `config` object. **But the split causes drift** — engineers add new env vars to whichever they touch first.
+
+**Recommendation P2:** Migrate `src/config/environment.ts` content into `src/core/config/`, deprecate the old path, then delete.
+
+### 9.3 Two Redis service implementations
+
+```
+src/shared/services/redis.service.ts       (3175 lines)
+src/shared/services/redis/redis.service.ts (1061 lines)
+```
+
+The subdirectory is the modern split. The top-level file is the legacy monolith. **Both exist.** Verify which is exported.
+
+### 9.4 Two FleetCache module shapes
+
+```
+src/shared/services/fleet-cache.service.ts          (legacy class — has @deprecated JSDoc tags at lines 78, 93, 97)
+src/shared/services/fleet-cache-read.service.ts     (function-based read API)
+src/shared/services/fleet-cache-write.service.ts    (function-based write API)
+src/shared/services/fleet-cache-types.ts            (shared types)
+```
+
+`fleet-cache.service.ts:78` says `@deprecated — callers should migrate to the free-function module`. **Migration is in progress.** Track progress and finish.
+
+### 9.5 Booking has THREE order paths
+
+```
+src/modules/booking/booking.service.ts                 (2698 lines — current)
+src/modules/booking/order.service.ts                   (1121 lines — internal booking version)
+src/modules/booking/legacy-order-create.service.ts     (318 lines — @deprecated)
+src/modules/booking/legacy-order-accept.service.ts     (525 lines — @deprecated)
+src/modules/booking/legacy-order-expiry.service.ts     (106 lines — @deprecated, runs setInterval)
+src/modules/booking/legacy-order-query.service.ts      (98 lines — @deprecated)
+src/modules/booking/legacy-order-timeout.service.ts    (144 lines — @deprecated)
+src/modules/booking/legacy-order-types.ts              (62 lines — @deprecated)
+src/modules/order/order.service.ts                     (2008 lines — canonical?)
+```
+
+**1,253 lines of @deprecated legacy booking code still running**, including `legacy-order-expiry.service.ts:40` which spins its own `setInterval`. `legacy-order-types.ts` is still imported by 3 sibling legacy files but nothing imports the legacy services from outside the booking module.
+
+**Recommendation P1:** Complete the deprecation. Verify no production traffic hits legacy paths, then delete.
+
+### 9.6 Two scripts to clean legacy OTP keys (and more)
+
+```
+scripts/cleanup-legacy-cache-otp-keys.ts
+scripts/cleanup-legacy-driver-onboard-keys.ts
+scripts/cleanup-legacy-driver-otp-keys.ts
+scripts/cleanup-legacy-otp-keys.ts
+scripts/cleanup-legacy-rate-keys.ts
+```
+
+Five separate cleanup scripts from prior key-format migrations. Each has 200+ lines of headers explaining the dual-write window context. Once their migration windows have closed, these should be deleted.
 
 ---
 
-*Concerns audit: 2026-02-19*
+## 10. TODOs, FIXMEs, HACKs (top hits)
+
+```bash
+grep -rn "TODO\|FIXME\|HACK\|XXX" src/ --include="*.ts" | wc -l
+# → 68 (excluding tests it's around 50)
+```
+
+Top 30 actionable in production code:
+
+```
+src/shared/database/prisma.service.ts:437        TODO: replace with prisma.$metrics.json() when Prisma >= 4.9 engine
+src/shared/config/feature-flags.ts:8             TODO: Migrate consumers to use isEnabled(FLAGS.xxx) instead of raw process.env checks
+src/shared/monitoring/observability-only-metrics.ts:31  TODO (audit within 1 sprint): …
+src/shared/services/socket.service.ts:23         TODO: Improvements from deleted src/shared/services/socket/ directory
+src/shared/services/queue.service.ts:2592        TODO A12-006 Part B §2.5 P4-D (Phase 7): Strip driverName
+src/shared/services/redis/redis.service.ts:50    TODO: Wire prefixKey() into all Redis operations when REDIS_KEY_PREFIX is set
+src/modules/order/order-lifecycle-outbox.service.ts:476  TODO(phase-future): hash-bucket rotation
+src/modules/order/order.service.ts:21            TODO(LEO-L2): add SQS/SNS integration
+src/modules/order/order.service.ts:1078,1281,1308,1373  4 more TODOs
+src/modules/order/order-broadcast.service.ts:1080  TODO(L-10): Track per-transporter non-response rate
+src/modules/order/order-cancel-policy.service.ts:172  TODO(M-18): Penalty amounts computed but not collected — integrate payment gateway
+src/modules/rating/rating.service.ts:22          TODO(L-12): Add driver→customer rating
+src/modules/booking/booking.service.ts:1513,1680  TODO: refactor to use fcmService.sendWithRetry
+src/modules/booking/booking-legacy.routes.ts:1   TODO(L-08): not mounted in server.ts
+src/modules/booking/booking-crud.routes.ts:1     TODO(L-08): not mounted in server.ts
+src/modules/driver/presence-flap.detector.ts:19  TODO(A11-005): Wire recordFlapIfWithinWindow
+src/modules/truck-hold/cascade-dispatch.service.ts:28  TODO(A02-007): add ESLint rule no-bare-prisma-in-withdbtimeout
+src/modules/truck-hold/confirmed-hold.service.ts:360  TODO(Phase-6-migration): in-memory sweep transitional pattern
+src/modules/truck-hold/truck-hold.service.ts:11  TODO: Migrate booking path to the two-phase hold system
+src/modules/tracking/tracking-history.service.ts:29  WARNING: In-memory state — lost on ECS restart. TODO: migrate to Redis
+src/modules/tracking/tracking.service.ts:216    TODO(L-15): Add admin review queue for flagged mock-GPS trips
+src/modules/broadcast/broadcast-dispatch.service.ts:105  TODO: Add expiresAt filter to getActiveOrders()
+src/server.ts:71                                  TODO: Create cache middleware
+```
+
+20 `@deprecated` annotations across the source (`grep -rn "@deprecated" src/ --include="*.ts" | wc -l → 20`).
+
+**Critical highlight:** `tracking-history.service.ts:29 — WARNING: In-memory state — lost on ECS restart. TODO: migrate to Redis.` This is exactly the pattern CLAUDE.md §5 warns against, still unfixed.
+
+`src/shared/jobs/cleanup-status-events.job.ts:1` has `// @ts-nocheck` — entire file bypasses TypeScript.
+
+**Recommendation P1:** Triage these TODOs into either tickets or deletions. The "TODO: migrate to Redis" one for tracking-history is highest-risk (drivers' tracking history can be lost on pod recycle).
+
+---
+
+## 11. Outdated Tooling / Vulnerable Dependencies
+
+See §6.6 (`npm audit` — 1 critical, 10 moderate, 2 low) and §6.7 (major version drift). 
+
+**Specific concern:** `bcryptjs@2.4.3` is one major behind. This is the password hashing library — verify the upgrade path doesn't break existing hashes.
+
+---
+
+## 12. Cleanup Recommendations (PRIORITIZED)
+
+### P0 — Production stability or security risk (do this first)
+
+1. **Restore `prisma/schema.prisma`** from git history. It is currently 0 bytes — see §3.3, §5.1. Risk: anyone running `npm run db:generate` or any `prisma migrate deploy` against a non-prod DB will fail or destroy schema.
+2. **Fix hardcoded JWT_SECRET fallback** in `src/modules/pricing/pricing.service.ts:78`. Replace `||` fallback with hard error. See §6.1.
+3. **Investigate the 1 critical npm audit vulnerability**: `npm audit --production`. See §6.6.
+4. **Delete `dist/`** (98 MB) — has macOS Finder duplication damage. 5 empty space-numbered subdirs prove the corruption. See §1.1.
+5. **Delete `package-lock 2.json`** at repo root (142 KB Finder duplicate). See §1.2.
+6. **Delete `.council-2026-04-26/`** (already empty on disk; commit deletion of the one tracked file). See §1.5.
+7. **Add `.code-review-graph/` and `graphify-out/` to `.gitignore`** and remove from disk (218 + 20 MB reclaimed). See §1.6.
+
+### P1 — Dead-code / folder cleanup (the user's main ask)
+
+8. **Commit the 36 staged D-status deletions** in `.planning/`, `.council-2026-04-24/`, `.council-2026-04-26/`, `docs/superpowers/`. See §2.
+9. **Delete `.council-2026-04-24/`** (1.4 MB of build/test logs). See §1.4.
+10. **Delete empty `.planning/` subdirectories**: `claude-team-final-index/`, `claude-revalidation-customer-flow/`, `final-verification/`, `master-execution-plan/`, `phases/`, `plan-reviews-2026-04-23/`, `re-review-2026-04-23/`, `research/`, `reviews/`, `transporter_to_driver_fix_plan/`. See §1.3.
+11. **Delete `src/database/`** (1 file, no imports). Move `recommended-indexes.sql` to `migrations/`. See §9.1.
+12. **Delete or finish 5 stub `*.routes.ts` files** that return 501 NOT_IMPLEMENTED. See §7.2.
+13. **Untrack 3 `.DS_Store` files** with `git rm --cached`. See §1.8.
+14. **Complete @deprecated booking-legacy migration** — delete the 6 `legacy-order-*` files (1,253 lines) once safe. See §9.5.
+15. **Audit ~109 timers** in production code for `.unref()` and leader-election guards. See §4.1.
+16. **Migrate `tracking-history.service.ts:29` from in-memory state to Redis.** Driver tracking history loss on pod recycle is real. See §10.
+17. **Stabilize the test mock surface** — recent commit log shows 6 `fix(tests/...)` commits in 14 days, 22+ in 30 days. Tests are coupled to implementation. See §8.
+18. **Pick ONE migration channel** (Prisma vs `migrations/M-*` vs `prisma/manual-migrations/`). Document execution order. See §5.2.
+
+### P2 — Nice-to-haves / lower risk
+
+19. Update CLAUDE.md to mark §3.1 (`/dispatch/replay` 404) and §3.2 (FleetCache JSON) as RESOLVED.
+20. Split top three large service files (`redis.service.ts`, `socket.service.ts`, `queue.service.ts`). See §7.1.
+21. Merge `src/config/` into `src/core/config/` and delete duplicate. See §9.2.
+22. Add per-endpoint rate limiting to admin and profile routes. See §6.4.
+23. Profile suspected N+1 query loops in production logs. See §5.3.
+24. Coordinate major dependency upgrades (Prisma 5→7, Express 4→5, Helmet 7→8, ESLint 8→10). See §6.7.
+25. Migrate `legacy-order-expiry.service.ts` setInterval to a durable queue (BullMQ or SQS). See §4.3.
+26. Delete `scripts/cleanup-legacy-*.ts` scripts whose dual-write windows have closed. See §9.6.
+27. Triage all 68 TODOs into tickets or deletions. See §10.
+28. Delete `coverage/` and `logs/` to reclaim 50 MB (gitignored, can be regenerated).
+29. Wire pgbouncer into production deployment per `docker/pgbouncer/pgbouncer.ini` (currently has `password=CHANGE_ME` placeholders). See §7.3.
+
+---
+
+*Concerns audit: 2026-05-04. Source-of-truth files: `CLAUDE.md`, `git status`, `.planning/arch-rewrite-2026-05-03/00-RECON/INVENTORY.md`. Reproduce any finding above with the included shell command.*
