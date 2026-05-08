@@ -37,6 +37,7 @@ import {
   broadcastToTransporters,
   emitBroadcastStateChanged,
 } from './order-broadcast.service';
+import pLimit, { LimitFunction } from 'p-limit';
 
 // ---------------------------------------------------------------------------
 // Constants (moved from order.service.ts)
@@ -44,8 +45,21 @@ import {
 
 export const FF_ORDER_DISPATCH_OUTBOX = process.env.FF_ORDER_DISPATCH_OUTBOX !== 'false';
 export const FF_ORDER_DISPATCH_STATUS_EVENTS = process.env.FF_ORDER_DISPATCH_STATUS_EVENTS !== 'false';
-export const ORDER_DISPATCH_OUTBOX_POLL_MS = Math.max(500, parseInt(process.env.ORDER_DISPATCH_OUTBOX_POLL_MS || '1500', 10) || 1500);
+// Fix #37 per index-20-validated.md §1.10: lower the silent 500ms floor to 100ms so
+// operators can set ORDER_DISPATCH_OUTBOX_POLL_MS=250 without it being silently swallowed.
+const POLL_MS_MIN = 100;
+const _rawPollMs = parseInt(process.env.ORDER_DISPATCH_OUTBOX_POLL_MS || '1500', 10) || 1500;
+if (process.env.ORDER_DISPATCH_OUTBOX_POLL_MS && _rawPollMs < POLL_MS_MIN) {
+  // eslint-disable-next-line no-console
+  console.warn('[DispatchOutbox] ORDER_DISPATCH_OUTBOX_POLL_MS below safety floor — clamping', {
+    requested: _rawPollMs, floor: POLL_MS_MIN,
+  });
+}
+export const ORDER_DISPATCH_OUTBOX_POLL_MS = Math.max(POLL_MS_MIN, _rawPollMs);
 export const ORDER_DISPATCH_OUTBOX_BATCH_SIZE = Math.max(1, parseInt(process.env.ORDER_DISPATCH_OUTBOX_BATCH_SIZE || '20', 10) || 20);
+// Fix #37 per index-20-validated.md §1.10: bounded parallelism within a batch.
+// Default 25 — 25 in-flight at once; env-overridable for canary ramp-up.
+export const ORDER_DISPATCH_OUTBOX_ROW_PARALLELISM = Math.max(1, parseInt(process.env.ORDER_DISPATCH_OUTBOX_ROW_PARALLELISM || '25', 10) || 25);
 
 // ---------------------------------------------------------------------------
 // Dispatch Outbox Functions
@@ -207,7 +221,7 @@ export async function buildDispatchAttemptContext(orderId: string): Promise<{
   const pickup = order.pickup;
   const requestFromOrder: CreateOrderRequest = {
     customerId: order.customerId,
-    customerName: order.customerName,
+    customerName: order.customerName, // PII-OK:internal-request-type — CreateOrderRequest dispatch plumbing; mask occurs at emit boundary
     customerPhone: maskPhoneForExternal(order.customerPhone),
     routePoints: order.routePoints,
     pickup: order.pickup,
@@ -464,9 +478,12 @@ export async function processDispatchOutboxRow(
 // heartbeat (leader-election.service.ts). The blind renewal could stomp a new
 // leader that had legitimately taken over during a GC pause, inviting duplicate
 // row processing.
+// Fix #37 per index-20-validated.md §1.10: bump TTL 60s→120s and heartbeat 20s→40s.
+// Worst case at BATCH_SIZE=200, DM throttle p99 5-8s/row: 8 waves × 8s = 64s which
+// exceeds the old 60s TTL and risks leader expiry mid-batch. 120s provides 47% slack.
 const OUTBOX_LEADER_KEY = 'outbox:leader';
-const OUTBOX_LEADER_TTL_SECONDS = Math.max(10, parseInt(process.env.OUTBOX_LEADER_TTL_SECONDS || '60', 10) || 60);
-const OUTBOX_LEADER_HEARTBEAT_MS = Math.max(5_000, parseInt(process.env.OUTBOX_LEADER_HEARTBEAT_MS || '20000', 10) || 20_000);
+const OUTBOX_LEADER_TTL_SECONDS = Math.max(10, parseInt(process.env.OUTBOX_LEADER_TTL_SECONDS || '120', 10) || 120);
+const OUTBOX_LEADER_HEARTBEAT_MS = Math.max(5_000, parseInt(process.env.OUTBOX_LEADER_HEARTBEAT_MS || '40000', 10) || 40_000);
 const FF_OUTBOX_LEADER_FENCING = process.env.FF_OUTBOX_LEADER_FENCING === 'true';
 const outboxInstanceId = `${process.pid}:${Date.now()}`;
 
@@ -529,7 +546,11 @@ export async function processDispatchOutboxBatch(limit = ORDER_DISPATCH_OUTBOX_B
   if (!isLeader) return;
 
   const rows = await claimReadyDispatchOutboxRows(limit);
-  for (const row of rows) {
+  // Fix #37 per index-20-validated.md §1.10: replace serial for-of with bounded
+  // parallel dispatch. pLimit caps concurrent in-flight rows at DISPATCH_ROW_PARALLELISM
+  // (default 25) so a single slow row does not block the rest of the batch.
+  const rowLimit: LimitFunction = pLimit(ORDER_DISPATCH_OUTBOX_ROW_PARALLELISM);
+  await Promise.all(rows.map((row) => rowLimit(async () => {
     try {
       await processDispatchOutboxRow(row);
     } catch (error: unknown) {
@@ -540,7 +561,7 @@ export async function processDispatchOutboxBatch(limit = ORDER_DISPATCH_OUTBOX_B
         error: message
       });
     }
-  }
+  })));
 
   // Legacy path: blind SET to "renew". F-A-56 notes this is unsafe if we
   // GC-paused past the TTL during the batch — a new leader would be stomped.

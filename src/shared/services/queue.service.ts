@@ -1615,7 +1615,10 @@ export class QueueService {
             ...metricLabelsBase,
             reason: 'lookup_error'
           });
-          logger.warn('broadcast.emit.skipped_inactive', {
+          // Fix #19c per index-20-validated.md §2.1.3: lookup_error is a transient
+          // signal ("we couldn't tell"), not a cancellation signal. Push to DLQ so
+          // the leader-elected drainer can replay once Prisma/Redis recovers.
+          logger.warn('broadcast.emit.dlq_pushed', {
             metric,
             dropReason: 'lookup_error',
             transporterId,
@@ -1623,6 +1626,35 @@ export class QueueService {
             event,
             error: error?.message || 'unknown'
           });
+          try {
+            const dlqEntry = JSON.stringify({
+              transporterId,
+              event,
+              data,
+              droppedAt: Date.now(),
+              reason: 'guard_lookup_error',
+              attempt: 1
+            });
+            // Single-Lua atomic LPUSH + LTRIM — cluster-safe (single KEYS[1]).
+            // Without atomicity a pod crash between lPush and lTrim leaves an
+            // unbounded list. tonumber(ARGV[2]) is the cap index (DLQ_MAX_SIZE-1).
+            await redisService.eval(
+              `redis.call('LPUSH', KEYS[1], ARGV[1]); redis.call('LTRIM', KEYS[1], 0, tonumber(ARGV[2])); return 1`,
+              ['dlq:broadcasts'],
+              [dlqEntry, String(DLQ_MAX_SIZE - 1)]
+            );
+          } catch (dlqErr: unknown) {
+            metrics.incrementCounter('dlq_push_failed_total', {
+              queue: 'broadcasts',
+              reason: 'guard_lookup_error'
+            });
+            logger.error('[CRITICAL] Guard-lookup-error broadcast dropped AND DLQ write failed', {
+              transporterId,
+              orderId,
+              event,
+              error: dlqErr instanceof Error ? dlqErr.message : String(dlqErr)
+            });
+          }
           return;
         } finally {
           metrics.observeHistogram(

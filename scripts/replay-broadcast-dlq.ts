@@ -34,8 +34,16 @@ import { metrics } from '../src/shared/monitoring/metrics.service';
 
 const DLQ_KEY = 'dlq:broadcasts';
 const INFLIGHT_KEY = 'dlq:broadcasts:inflight';
+const PERMANENT_KEY = 'dlq:broadcasts:permanent';
 const DRAINER_LOCK_KEY = 'dlq:drainer:lock';
 const DRAINER_LOCK_TTL_SECONDS = 60;
+
+// Max replay attempts before an entry is moved to the permanent dead-letter list.
+// Tunable via DLQ_MAX_REPLAY_ATTEMPTS env var. Applies to guard_lookup_error entries.
+const MAX_REPLAY_ATTEMPTS = parseInt(process.env.DLQ_MAX_REPLAY_ATTEMPTS || '5', 10);
+
+// Cap on the permanent DLQ list length — mirrors the DLQ_KEY cap in queue.service.ts.
+const DLQ_MAX_SIZE = parseInt(process.env.DLQ_MAX_SIZE || '5000', 10);
 
 const DEFAULT_MAX_ITERATIONS = 1000;
 const DAEMON_INTERVAL_MS = 30_000;
@@ -50,6 +58,8 @@ interface DlqEntry {
   data: unknown;
   droppedAt: number;
   reason?: string;
+  /** Retry counter set by the live-path producer and incremented by the drainer on each failed replay. */
+  attempt?: number;
 }
 
 export interface DrainOptions {
@@ -176,6 +186,106 @@ async function replayEntry(raw: string): Promise<ReplayOutcome> {
     return { ok: false, reason: 'malformed_entry', event: parsed.event };
   }
 
+  switch (parsed.reason) {
+    case 'guard_lookup_error':
+      return replayGuardLookupError(raw, parsed);
+    default:
+      return replayDefault(parsed);
+  }
+}
+
+/**
+ * Replay handler for entries with reason='guard_lookup_error' (pushed by
+ * queue.service.ts when getOrderStatusForQueueGuard throws a transient error).
+ *
+ * Uses bounded retry semantics:
+ *   - attempt < MAX_REPLAY_ATTEMPTS → try emit; on failure re-push with attempt+1 and signal ok=true
+ *     (LREM from inflight happens in drain() on ok=true)
+ *   - attempt >= MAX_REPLAY_ATTEMPTS → move to dlq:broadcasts:permanent, signal ok=true so LREM fires
+ *
+ * Crash safety: LMOVE already moved the entry into INFLIGHT_KEY before this
+ * function is called. On re-push we write back to DLQ_KEY and then signal ok
+ * so drain() calls LREM on INFLIGHT_KEY — no double-entry risk.
+ */
+async function replayGuardLookupError(raw: string, parsed: DlqEntry): Promise<ReplayOutcome> {
+  // Default attempt to 1 for legacy entries written before this field existed.
+  const attempt = parsed.attempt ?? 1;
+
+  if (attempt >= MAX_REPLAY_ATTEMPTS) {
+    const permanentEntry = JSON.stringify({
+      ...parsed,
+      finalFailureAt: Date.now(),
+      reason: `${parsed.reason}_max_replay_exceeded`,
+    });
+    try {
+      await redisService.lPush(PERMANENT_KEY, permanentEntry);
+      await redisService.lTrim(PERMANENT_KEY, 0, DLQ_MAX_SIZE - 1);
+      metrics.incrementCounter('dlq_permanent_total', {
+        queue: 'broadcasts',
+        reason: parsed.reason ?? 'unknown',
+      });
+    } catch (permErr: unknown) {
+      logger.error('[DLQ-Drainer] Failed to write to permanent dead-letter list', {
+        error: permErr instanceof Error ? permErr.message : String(permErr),
+        transporterId: parsed.transporterId,
+        event: parsed.event,
+      });
+    }
+    logger.error('[DLQ-Drainer] Broadcast moved to permanent dead-letter — max replay attempts exhausted', {
+      transporterId: parsed.transporterId,
+      event: parsed.event,
+      attempts: attempt,
+      reason: parsed.reason,
+    });
+    // Signal ok=true so drain() calls LREM on INFLIGHT_KEY to clean up.
+    return { ok: true, event: parsed.event };
+  }
+
+  try {
+    await queueService.queueBroadcastBatch(
+      [parsed.transporterId],
+      parsed.event,
+      parsed.data,
+      { bypassDepthGuard: true }
+    );
+    return { ok: true, event: parsed.event };
+  } catch (err: unknown) {
+    // Replay failed — re-enqueue with bumped attempt counter, then signal ok=true
+    // so drain() removes this copy from INFLIGHT_KEY (the re-enqueued copy
+    // is a new entry in DLQ_KEY with attempt+1, not a duplicate).
+    const retryEntry = JSON.stringify({ ...parsed, attempt: attempt + 1 });
+    try {
+      await redisService.lPush(DLQ_KEY, retryEntry);
+      await redisService.lTrim(DLQ_KEY, 0, DLQ_MAX_SIZE - 1);
+      metrics.incrementCounter('dlq_replay_failed_total', {
+        queue: 'broadcasts',
+        attempt: String(attempt + 1),
+      });
+    } catch (requeueErr: unknown) {
+      logger.error('[DLQ-Drainer] Failed to re-enqueue guard_lookup_error entry', {
+        error: requeueErr instanceof Error ? requeueErr.message : String(requeueErr),
+        transporterId: parsed.transporterId,
+        event: parsed.event,
+      });
+    }
+    logger.warn('[DLQ-Drainer] guard_lookup_error replay failed — re-enqueued with bumped attempt', {
+      transporterId: parsed.transporterId,
+      event: parsed.event,
+      attempt: attempt + 1,
+      error: err instanceof Error ? err.message.slice(0, 64) : 'replay_throw',
+    });
+    // Signal ok=true so LREM fires on the old INFLIGHT_KEY copy.
+    return { ok: true, event: parsed.event };
+  }
+}
+
+/**
+ * Default replay handler for entries without a recognised reason
+ * (e.g. depth_guard_overflow entries from #6, or legacy entries with no reason).
+ * On failure leaves the entry pinned in INFLIGHT_KEY for ops inspection — the
+ * original drainer behaviour preserved for non-lookup-error cases.
+ */
+async function replayDefault(parsed: DlqEntry): Promise<ReplayOutcome> {
   try {
     // Replay via the same `queueBroadcastBatch` path with the depth-cap
     // guard explicitly bypassed — recovery must not be re-DLQ'd in a
@@ -191,7 +301,7 @@ async function replayEntry(raw: string): Promise<ReplayOutcome> {
     return {
       ok: false,
       event: parsed.event,
-      reason: err instanceof Error ? err.message.slice(0, 64) : 'replay_throw'
+      reason: err instanceof Error ? err.message.slice(0, 64) : 'replay_throw',
     };
   }
 }
