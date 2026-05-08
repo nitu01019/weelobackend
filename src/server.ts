@@ -80,6 +80,7 @@ import { profileRouter } from './modules/profile/profile.routes';
 import { vehicleRouter } from './modules/vehicle/vehicle.routes';
 import { bookingRouter } from './modules/booking/booking.routes';
 import { assignmentRouter } from './modules/assignment/assignment.routes';
+import { tripRouter } from './modules/trip/trip-pii.routes';
 import { trackingRouter } from './modules/tracking/tracking.routes';
 import { podRouter } from './modules/tracking/pod.routes';
 import { pricingRouter } from './modules/pricing/pricing.routes';
@@ -97,6 +98,7 @@ import { healthRoutes } from './shared/routes/health.routes';
 import { metricsMiddleware, metrics } from './shared/monitoring/metrics.service';
 import { getClientIpChain } from './shared/utils/net.utils';
 import { assertRedisEvictionPolicy, RedisEvictionPolicyError } from './shared/monitoring/redis-eviction-assertion';
+import { assertBroadcastDeclineTableExists } from './shared/monitoring/broadcast-decline-table-assertion';
 import { fcmService } from './shared/services/fcm.service';
 import { redisService } from './shared/services/redis.service';
 import { startBookingExpiryChecker } from './modules/booking/booking.service';
@@ -492,6 +494,11 @@ app.use(`${API_PREFIX}/bookings`, bookingRouter);
 
 // Assignment routes (assign trucks to bookings)
 app.use(`${API_PREFIX}/assignments`, assignmentRouter);
+
+// Trip PII reveal (V11-NEW-10 / P5-8) — driver-only unmasked customer PII
+// for the captain Room. Mounted alongside /assignments since `tripId` is a
+// 1:1 alias for an assignment row.
+app.use(`${API_PREFIX}/trips`, tripRouter);
 
 // Tracking routes (live location)
 app.use(`${API_PREFIX}/tracking`, trackingRouter);
@@ -1072,6 +1079,56 @@ async function bootstrap(): Promise<void> {
   }
 
   // -------------------------------------------------------------------------
+  // F-PERF-02 / P9-3: Broadcast DLQ drainer.
+  // Reads from `dlq:broadcasts`, replays via queueBroadcastBatch with
+  // bypassDepthGuard. Leader-elected via redisService.acquireLock — peer
+  // pods short-circuit. Default-on; opt-out with FF_DLQ_DRAINER_ENABLED=false.
+  // Interval is .unref()'d so it never blocks graceful shutdown.
+  // -------------------------------------------------------------------------
+  if (process.env.FF_DLQ_DRAINER_ENABLED !== 'false') {
+    try {
+      const { drain: drainBroadcastDlq } = await import('../scripts/replay-broadcast-dlq');
+      const dlqInterval = setInterval(() => {
+        drainBroadcastDlq({ maxIterations: 100 }).catch((err: unknown) => {
+          logger.warn('[DLQ] drainer cycle failed', {
+            err: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }, 30_000);
+      dlqInterval.unref();
+      logger.info('[DLQ] broadcast drainer registered (30s interval, leader-elected)');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn(`[Startup] DLQ drainer failed to register (non-fatal): ${msg}`);
+    }
+  } else {
+    logger.info('[DLQ] broadcast drainer disabled via FF_DLQ_DRAINER_ENABLED=false');
+  }
+
+  // -------------------------------------------------------------------------
+  // Fix #6 (index-20-validated.md §1.3): DLQ broadcasts depth sidecar.
+  // 30s sampler: LLEN dlq:broadcasts{,:permanent,:inflight} -> CloudWatch
+  // PutMetricData + Prometheus gauge mirror. Required so the
+  // `weelo-dlq-broadcasts-depth-warn` alarm gates the FF_BATCH_QUEUE_DEPTH_GUARD
+  // flag flip; without it the alarm is INSUFFICIENT_DATA forever and an admit-
+  // and-DLQ flag flip with a stalled drainer silently drops the oldest entries.
+  // Default-on; opt-out with FF_DLQ_DEPTH_EMITTER_ENABLED=false.
+  // -------------------------------------------------------------------------
+  if (process.env.FF_DLQ_DEPTH_EMITTER_ENABLED !== 'false') {
+    try {
+      const { startDlqBroadcastsDepthEmitter } = await import(
+        './shared/services/dlq-broadcasts-depth-emitter'
+      );
+      startDlqBroadcastsDepthEmitter();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn(`[Startup] DLQ depth emitter failed to register (non-fatal): ${msg}`);
+    }
+  } else {
+    logger.info('[DLQDepthEmitter] disabled via FF_DLQ_DEPTH_EMITTER_ENABLED=false');
+  }
+
+  // -------------------------------------------------------------------------
   // BEGIN prefix-overlap assertion (F-B-03)
   // Fail-fast at boot if two Redis namespace owners share an overlapping prefix.
   // FleetCache owns `fleetcache:*`; tracking owns `fleet:*`. Prevents a future
@@ -1137,6 +1194,23 @@ async function bootstrap(): Promise<void> {
   // misconfigured deploy refuses traffic (fail-fast).
   // -------------------------------------------------------------------------
   await assertFcmUpgradeCampaignReadiness();
+
+  // -------------------------------------------------------------------------
+  // P0-4 / V3-M06: BroadcastDecline table assertion (WARN, not halt)
+  // -------------------------------------------------------------------------
+  // Verifies the analytics-side decline table exists. Missing table is a
+  // LOW-severity diagnostic finding (V3-M06): runtime decline persistence
+  // already degrades gracefully via Redis. Boot continues either way.
+  // -------------------------------------------------------------------------
+  try {
+    const { prismaClient: pcDecline } = await import('./shared/database/prisma.service');
+    await assertBroadcastDeclineTableExists(pcDecline);
+  } catch (err) {
+    // Defense-in-depth: even module import failure must not halt boot.
+    logger.warn('[V3-M06] BroadcastDecline assertion module failed to load — continuing boot', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 
   // -------------------------------------------------------------------------
   // 4. Start listening for HTTP traffic

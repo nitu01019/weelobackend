@@ -686,6 +686,12 @@ export const FLAGS = {
     description: 'Leader-election lock around delayed-job poller sweep (Wave-0 A)',
     defaultValue: true,
   },
+  PROCESSING_REAPER_LEADER_LOCK: {
+    env: 'FF_PROCESSING_REAPER_LEADER_LOCK',
+    category: 'ops' as const,
+    description: 'Leader-lock the BLMOVE :processing-list reaper so only one pod re-queues stale entries per tick.',
+    defaultValue: true,
+  },
 
   // === CATEGORY B: hold / flex revoke consistency ===
   HOLD_FINALIZE_CAS: {
@@ -752,11 +758,32 @@ export const FLAGS = {
     description: 'Kill-switch on POST /notifications/register-token — flip OFF to immediately reject new device-token registrations without redeploy. Existing DeviceToken rows + push delivery remain active. Returns 503 with code FCM_REGISTRATION_DISABLED when off (B1).',
     defaultValue: true,
   },
+  // F-FCM-01 (Phase 4): require client to send `previousToken` so the server can
+  // SREM the stale token before SADD'ing the new one. Default OFF to remain
+  // backward-compatible with legacy clients; flip ON after the Captain & Customer
+  // apps have shipped with the rotation contract. When ON, missing previousToken
+  // returns 400 with code FCM_PREVIOUS_TOKEN_REQUIRED.
+  FCM_PREVIOUS_TOKEN_REQUIRED: {
+    env: 'FF_FCM_PREVIOUS_TOKEN_REQUIRED',
+    category: 'release' as const,
+    description: 'Require previousToken on POST /notifications/register-token (F-FCM-01). When ON, missing previousToken returns 400; when OFF, missing field is permitted (legacy clients).',
+    defaultValue: false,
+  },
   FCM_UPGRADE_CAMPAIGN: {
     env: 'FF_FCM_UPGRADE_CAMPAIGN',
     category: 'ops' as const,
-    description: 'FCM upgrade-campaign pathway for stale-client remediation (Wave-0 D)',
+    description: 'FCM upgrade-campaign pathway for stale-client remediation (Wave-0 D). ANNOUNCE-only — emits notifyUpgradeRequired pings; does NOT suppress sends. Pair with FF_FCM_VERSION_GATE for hard suppression.',
     defaultValue: true,
+  },
+  // A05-028 — split flag for hard suppression of below-min-version FCM sends.
+  // Independent of FCM_UPGRADE_CAMPAIGN (announce-only). Keep OFF until ops is
+  // ready to drop traffic to legacy clients; ramp after FCM_UPGRADE_CAMPAIGN
+  // has communicated the upgrade for at least one full daily-active cycle.
+  FCM_VERSION_GATE: {
+    env: 'FF_FCM_VERSION_GATE',
+    category: 'release' as const,
+    description: 'Hard suppression of below-MIN_SUPPORTED_APP_VERSION FCM sends. Independent of FCM_UPGRADE_CAMPAIGN (which is announce-only).',
+    defaultValue: false,
   },
 
   // === CATEGORY E: audit + replica lag + network class ===
@@ -804,6 +831,57 @@ export const FLAGS = {
     env: 'FF_RATE_LIMIT_TIERED',
     category: 'release' as const,
     description: 'Tiered (basic/pro/enterprise) per-user rate limits keyed by User.tier (A01-009)',
+  },
+
+  // --- P7-16 / V11-NEW-09: phone-key hash dual-write window (transient) ---
+  // 24h dual-write migration: writes to BOTH legacy `rate:phone:<phone>:...`
+  // and new `rate:phoneHash:<hashPhoneForKey(phone)>:...` keys; reads return
+  // max(both) so a stuck legacy increment cannot bypass the limit. Default ON
+  // for the 24h window. After window closes: flip OFF (new-key-only path) and
+  // run scripts/cleanup-legacy-rate-keys.ts --commit to reclaim legacy keys.
+  // Skew between counters surfaces as `rate_limit_dual_write_skew_total`.
+  PHONE_KEY_HASH_DUAL_WRITE: {
+    env: 'FF_PHONE_KEY_HASH_DUAL_WRITE',
+    category: 'release' as const,
+    description: 'V11-NEW-09 24h dual-write window for phone-key hashed Redis rate-limit migration',
+    defaultValue: true,
+  },
+
+  // --- P7-16 follow-up (DPDP §8(3) + E.164 bypass): OTP key hash dual-write ---
+  // Sister flag to PHONE_KEY_HASH_DUAL_WRITE — closes the same gap for the OTP
+  // service Redis keys (`otp:{phone}:{role}`, `otp:verify:lock:{phone}:{role}`,
+  // `otp:cooldown:{phone}:{role}`) which were missed by the rate-limiter pass.
+  // 24h dual-write window: WRITE goes to BOTH the new
+  // `otp:phoneHash:{hashPhoneForKey(phone)}:{role}` family AND the legacy
+  // raw-phone family; READ tries the hashed key first and falls back to legacy
+  // when the new key is missing; DELETE removes both. Default ON for 24h.
+  // After window closes: flip OFF (hash-only path) and run
+  // scripts/cleanup-legacy-otp-keys.ts --commit to reclaim legacy keys.
+  // canonicalizeIndianPhone in pii.utils.ts also fixes the +91-bypass that
+  // let a single user toggle prefixes to bypass the cooldown bucket.
+  OTP_KEY_HASH_DUAL_WRITE: {
+    env: 'FF_OTP_KEY_HASH_DUAL_WRITE',
+    category: 'release' as const,
+    description: 'P7-16 follow-up — 24h dual-write window for OTP Redis-key hashed migration (DPDP §8(3) + E.164 bypass)',
+    defaultValue: true,
+  },
+
+  // --- V11-NEW-09 sweep (DPDP §8(3)): driver-onboard key hash dual-write ---
+  // Sister flag to OTP_KEY_HASH_DUAL_WRITE — closes the same gap for the
+  // driver onboarding Redis keys (`driver-onboard:{driverPhone}`) used by
+  // driver.routes.ts and driver-onboarding.routes.ts. SEPARATE 24h migration
+  // window from OTP so each cohort can be soaked / flipped independently.
+  // 24h dual-write window: WRITE goes to BOTH the new
+  // `driver-onboard:phoneHash:{hashPhoneForKey(phone)}` family AND the legacy
+  // raw-phone family; READ tries the hashed key first and falls back to legacy
+  // when the new key is missing; DELETE removes both. Default ON for 24h.
+  // After window closes: flip OFF (hash-only path) and run
+  // scripts/cleanup-legacy-driver-onboard-keys.ts --commit to reclaim legacy keys.
+  DRIVER_ONBOARD_KEY_HASH_DUAL_WRITE: {
+    env: 'FF_DRIVER_ONBOARD_KEY_HASH_DUAL_WRITE',
+    category: 'release' as const,
+    description: 'V11-NEW-09 sweep: dual-write driver-onboard:${phone}:* keys to phoneHash variants for 24h migration window. Disable + delete legacy keys after window closes.',
+    defaultValue: true,
   },
 } as const;
 

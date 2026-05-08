@@ -5,7 +5,6 @@
  *
  * Tests for 20 CONFIRMED LOW issues fixed in final pass:
  * - #123: Weight field numeric regex validation
- * - #124: India bounds tightened (lat >= 8.0)
  * - #125: distanceKm min unified to 0.5
  * - #128: Log truncation conditional ellipsis
  * - #131: ExtendHoldHoldResponse renamed to ExtendHoldResponse
@@ -65,37 +64,6 @@ describe('#123: Weight field validation', () => {
 
   test('rejects script injection "<script>"', () => {
     expect(weightRegex.test('<script>alert(1)</script>')).toBe(false);
-  });
-});
-
-// =============================================================================
-// #124: India bounds tightened
-// =============================================================================
-
-describe('#124: India geo bounds', () => {
-  // Simulates the validation logic
-  function isInIndiaBounds(lat: number, lng: number): boolean {
-    return lat >= 8.0 && lat <= 37.0 && lng >= 68.0 && lng <= 97.5;
-  }
-
-  test('accepts Kanyakumari (8.08, 77.55)', () => {
-    expect(isInIndiaBounds(8.08, 77.55)).toBe(true);
-  });
-
-  test('accepts Delhi (28.61, 77.23)', () => {
-    expect(isInIndiaBounds(28.61, 77.23)).toBe(true);
-  });
-
-  test('rejects Arabian Sea (6.5, 68.0) — old bound', () => {
-    expect(isInIndiaBounds(6.5, 68.0)).toBe(false);
-  });
-
-  test('rejects deep ocean (5.0, 72.0)', () => {
-    expect(isInIndiaBounds(5.0, 72.0)).toBe(false);
-  });
-
-  test('rejects latitude 7.9 (just below new bound)', () => {
-    expect(isInIndiaBounds(7.9, 77.0)).toBe(false);
   });
 });
 

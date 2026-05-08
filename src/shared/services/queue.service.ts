@@ -24,11 +24,13 @@ import * as crypto from 'crypto';
 import { logger } from './logger.service';
 import { EventEmitter } from 'events';
 import { redisService } from './redis.service';
+import { maskName } from '../utils/pii.utils';
 import { createTrackingStreamSink } from './tracking-stream-sink';
 import { metrics } from '../monitoring/metrics.service';
 import { prismaClient } from '../database/prisma.service';
 import * as admin from 'firebase-admin';
 import { FLAGS, isEnabled } from '../config/feature-flags';
+import { assertDepthUnderCap, QueueBackpressureError, applyBackpressurePolicy } from './queue-backlog-gate';
 
 // =============================================================================
 // TYPES
@@ -146,6 +148,29 @@ export const FF_QUEUE_DEPTH_CAP = Math.max(
   parseInt(process.env.FF_QUEUE_DEPTH_CAP || '10000', 10) || 10000
 );
 
+// ---------------------------------------------------------------------------
+// F-PERF-02: Per-batch queue-depth cap with priority-ordered partial admit + DLQ
+// ---------------------------------------------------------------------------
+// `BROADCAST_QUEUE_DEPTH_CAP` (default 5000) is a stricter cap consulted by
+// `queueBroadcastBatch` so a single fanout cannot blow past it even when the
+// per-job sample-cache (`FF_QUEUE_DEPTH_CAP`) is lagging. When
+// `FF_BATCH_QUEUE_DEPTH_GUARD=true`, the batch is sorted by job priority
+// (CRITICAL → LOW), the top `cap - currentDepth` admitted to the queue, and
+// the remainder pushed to the `dlq:broadcasts` Redis list with a `droppedAt`
+// timestamp + reason so the leader-elected `replay-broadcast-dlq` drainer
+// can recover them once the spike subsides. Default OFF so existing callers
+// see no behaviour change until the rollout flag flips in P2.
+export const BROADCAST_QUEUE_DEPTH_CAP = Math.max(
+  100,
+  parseInt(process.env.BROADCAST_QUEUE_DEPTH_CAP || '5000', 10) || 5000
+);
+
+/**
+ * Gate for the F-PERF-02 batch admit-and-DLQ path. When OFF, behaviour is
+ * identical to the legacy `addBatch` (every job admitted regardless of depth).
+ */
+export const FF_BATCH_QUEUE_DEPTH_GUARD = process.env.FF_BATCH_QUEUE_DEPTH_GUARD === 'true';
+
 // =============================================================================
 // IN-MEMORY QUEUE (Development / Single Server)
 // =============================================================================
@@ -178,7 +203,34 @@ export class InMemoryQueue extends EventEmitter {
       delay?: number;
       maxAttempts?: number;
     }
-  ): Promise<string> {
+  ): Promise<string | null> {
+    // ADR: A05-029 — per-queue backpressure with discriminated-union policy.
+    // `applyBackpressurePolicy` returns one of three decisions; callers
+    // dispatch explicitly. Correctness-critical queues (hold-expiry,
+    // vehicle-release, assignment-reconciliation) fail loud so a backlog
+    // stall pages ops; everything else stays silent so transient spikes
+    // don't cascade into 5xx storms on user-facing routes (OAD-4 preserves
+    // the 80+ silent-drop callers that already ignore the null return).
+    const decision = await applyBackpressurePolicy(queueName);
+    switch (decision.action) {
+      case 'silent_drop':
+        try {
+          metrics.incrementCounter('queue_enqueue_rejected_total', { queue: queueName });
+          metrics.incrementCounter('queue_backlog_cap_dropped_total', { queue: queueName, reason: 'cap_exceeded' });
+        } catch { /* never break drop path on metric write */ }
+        logger.warn(`[InMemoryQueue] Backpressure drop on ${queueName}: ${decision.reason}`);
+        return null;
+      case 'fail_loud':
+        try {
+          metrics.incrementCounter('queue_enqueue_rejected_total', { queue: queueName });
+          metrics.incrementCounter('queue_backpressure_rejected_total', { queue: queueName });
+        } catch { /* never break reject path on metric write */ }
+        logger.error(`[InMemoryQueue] Backpressure FAIL-LOUD on ${queueName} — caller must surface 5xx`);
+        throw decision.error;
+      case 'proceed':
+        break;
+    }
+
     const job: QueueJob<T> = {
       id: crypto.randomUUID(),
       type,
@@ -445,9 +497,64 @@ export class RedisQueue extends EventEmitter {
   // and re-enqueued on startup. 5 minutes is generous — most jobs complete in <10s.
   private readonly STALE_PROCESSING_THRESHOLD_MS = 5 * 60 * 1000;
 
+  // W-2b A-2: BLMOVE-path reaper constants. Per master plan §2.1 T-A1.5 / V4-E5
+  // (delta A-03), the reaper tick is ALWAYS-ON (NOT gated by FF_QUEUE_BLMOVE_DEQUEUE)
+  // so any :processing-list:* entries written during an ON window drain at the next
+  // tick regardless of current flag state. REAPER_MAX_AGE_MS=60s pins the
+  // re-queue threshold (matches phase4-blmove-reaper.test.ts source-level invariant).
+  private static readonly REAPER_MAX_AGE_MS = 60_000;
+  private static readonly REAPER_INTERVAL_MS = 30_000;
+  // Cap reduced from 10_000 → 500 per index-20-validated.md §1.3 companion edit:
+  // worst body cost = cap × 2 ops × ~5ms. Cap=500 ⇒ ~5s, fits in lock TTL=10s
+  // with 50% slack for Redis RTT variance. Cap=10_000 ⇒ ~100s ⇒ peer pod
+  // acquires mid-tick → double-LPUSH races. If a future change requires a
+  // larger cap, switch to a heartbeat-renewed leader rather than bumping TTL.
+  private static readonly REAPER_PROCESSING_CAP = 500;
+  private readonly processingListPrefix: string = 'processing-list:';
+  private processingReaperInterval: ReturnType<typeof setInterval> | null = null;
+
   constructor() {
     super();
     logger.info('🚀 Redis Queue initialized (Production Mode)');
+  }
+
+  /**
+   * W-2b A-2: Get Redis key for the BLMOVE :processing-list. Distinct from
+   * `getProcessingKey` (HSET-based legacy at-least-once tracking) to keep the
+   * BLMOVE branch's data shape (LIST of raw entries with embedded
+   * processingStartedAt) cleanly separated from the legacy HSET shape so
+   * neither code path mutates the other's keys.
+   */
+  private getProcessingListKey(queueName: string): string {
+    return `${this.processingListPrefix}${queueName}`;
+  }
+
+  /**
+   * W-2b A-2: Atomic BLMOVE-based dequeue. Replaces the two-step
+   * BRPOP+HSET pattern (crash-between = phantom job) with a single atomic
+   * move from `sourceKey` to `processingListKey`. Falls through to LMOVE
+   * spin-fallback inside `redisService.blMove` when Redis is < 6.2 or the
+   * blocking client is unavailable. Returns the moved entry verbatim or
+   * `null` on timeout / empty source list.
+   */
+  private async blmoveDequeue(
+    sourceKey: string,
+    processingListKey: string,
+    timeoutSec: number,
+  ): Promise<string | null> {
+    return redisService.blMove(sourceKey, processingListKey, 'RIGHT', 'LEFT', timeoutSec);
+  }
+
+  /**
+   * W-2b A-2: Remove a specific :processing-list entry on successful job
+   * completion. Mirrors Redis LREM count=1 semantics (idempotent — safe for
+   * the reaper to also call concurrently; only one wins).
+   */
+  private async lremProcessingEntry(
+    processingListKey: string,
+    rawEntry: string,
+  ): Promise<number> {
+    return redisService.lRem(processingListKey, 1, rawEntry);
   }
 
   /**
@@ -517,7 +624,29 @@ export class RedisQueue extends EventEmitter {
       delay?: number;
       maxAttempts?: number;
     }
-  ): Promise<string> {
+  ): Promise<string | null> {
+    // ADR: A05-029 — per-queue backpressure with discriminated-union policy.
+    // See InMemoryQueue.add for the full rationale; identical semantics here.
+    const decision = await applyBackpressurePolicy(queueName);
+    switch (decision.action) {
+      case 'silent_drop':
+        try {
+          metrics.incrementCounter('queue_enqueue_rejected_total', { queue: queueName });
+          metrics.incrementCounter('queue_backlog_cap_dropped_total', { queue: queueName, reason: 'cap_exceeded' });
+        } catch { /* never break drop path on metric write */ }
+        logger.warn(`[RedisQueue] Backpressure drop on ${queueName}: ${decision.reason}`);
+        return null;
+      case 'fail_loud':
+        try {
+          metrics.incrementCounter('queue_enqueue_rejected_total', { queue: queueName });
+          metrics.incrementCounter('queue_backpressure_rejected_total', { queue: queueName });
+        } catch { /* never break reject path on metric write */ }
+        logger.error(`[RedisQueue] Backpressure FAIL-LOUD on ${queueName} — caller must surface 5xx`);
+        throw decision.error;
+      case 'proceed':
+        break;
+    }
+
     const job: QueueJob<T> = {
       id: crypto.randomUUID(),
       type,
@@ -717,6 +846,103 @@ export class RedisQueue extends EventEmitter {
     // The lowest-priority key is used for BRPOP blocking to avoid busy-spinning
     const lowestPriorityKey = priorityKeys[priorityKeys.length - 1];
 
+    // W-2b A-3: Branch worker loop on FF_QUEUE_BLMOVE_DEQUEUE. The OFF path is
+    // the legacy 86-line body preserved VERBATIM below the if-block (per A-01
+    // invariant + diff-snapshot gate at .council-2026-04-24/snapshot_queue_worker_pre_A3.txt).
+    // The ON path drains priority lists via `blmoveDequeue` into a per-queue
+    // :processing-list, stamps processingStartedAt, and calls `lremProcessingEntry`
+    // on success. Reaper (always-on, NOT flag-gated per A-03 / V4-E5) re-queues
+    // any :processing-list:* entries older than REAPER_MAX_AGE_MS so a mid-flight
+    // OFF flip never strands work.
+    if (isEnabled(FLAGS.QUEUE_BLMOVE_DEQUEUE)) {
+      const processingListKey = this.getProcessingListKey(queueName);
+
+      while (this.isRunning && this.processors.get(queueName) === processor) {
+        try {
+          let rawEntry: string | null = null;
+
+          // Drain legacy + higher-priority lists with non-blocking BLMOVE
+          // (timeoutSec=0 — single-pass; falls through immediately when empty).
+          rawEntry = await this.blmoveDequeue(legacyKey, processingListKey, 0);
+          if (!rawEntry) {
+            for (let i = 0; i < priorityKeys.length - 1; i++) {
+              rawEntry = await this.blmoveDequeue(priorityKeys[i], processingListKey, 0);
+              if (rawEntry) break;
+            }
+          }
+
+          // If no higher-priority jobs, block on lowest-priority list to avoid busy-spin.
+          if (!rawEntry) {
+            rawEntry = await this.blmoveDequeue(lowestPriorityKey, processingListKey, this.blockingPopTimeoutSec);
+            if (!rawEntry) {
+              // BLMOVE timed out — loop back and check higher-priority lists again.
+              continue;
+            }
+          }
+
+          let job: QueueJob;
+          try {
+            job = JSON.parse(rawEntry);
+          } catch (parseErr: any) {
+            // Malformed JSON in source list — drop from processing-list and skip
+            // so the reaper does not perpetually re-queue a poison entry.
+            logger.error('[Queue] BLMOVE parse failed — discarding entry', {
+              queueName, error: parseErr?.message || 'unknown'
+            });
+            await this.lremProcessingEntry(processingListKey, rawEntry).catch(() => {});
+            continue;
+          }
+
+          // Re-stamp processingStartedAt onto the entry inside the :processing-list
+          // so the reaper's age check uses accurate per-tick timing rather than
+          // the original enqueue timestamp.
+          const stampedEntry = JSON.stringify({ ...job, processingStartedAt: Date.now() });
+          if (stampedEntry !== rawEntry) {
+            try {
+              await redisService.lRem(processingListKey, 1, rawEntry);
+              await redisService.lPush(processingListKey, stampedEntry);
+              rawEntry = stampedEntry;
+            } catch (stampErr: any) {
+              // Best-effort — fall through with the original entry. Reaper still
+              // protects via its 60s upper bound on the original timestamp.
+              logger.warn('[Queue] BLMOVE stamp re-write failed — reaper still bounds', {
+                queueName, error: stampErr?.message || 'unknown'
+              });
+            }
+          }
+
+          this.processing.add(job.id);
+          this.incrementInFlight(queueName);
+          try {
+            await this.processJob(queueName, job, processor);
+            // Success path — remove from :processing-list. Idempotent with reaper.
+            await this.lremProcessingEntry(processingListKey, rawEntry).catch((err) => {
+              logger.warn('[Queue] lremProcessingEntry post-success failed', {
+                queueName, jobId: job.id, error: err?.message || 'unknown'
+              });
+            });
+          } catch (jobErr) {
+            // processJob already handled retry/DLQ + decrementInFlight; still
+            // remove the now-stale :processing-list entry so the reaper does
+            // not re-queue an entry that has already been re-routed.
+            await this.lremProcessingEntry(processingListKey, rawEntry).catch(() => {});
+            throw jobErr;
+          }
+        } catch (error: any) {
+          logger.error(`Redis Queue: Worker error for ${queueName}`, {
+            workerId,
+            message: error?.message || 'unknown'
+          });
+          await this.sleep(2000);
+        }
+      }
+
+      const workers = this.queueWorkers.get(queueName);
+      workers?.delete(workerId);
+      return;
+    }
+
+    // QUEUE_BLMOVE_DEQUEUE OFF path
     while (this.isRunning && this.processors.get(queueName) === processor) {
       try {
         // H7 FIX: Priority drain — check higher-priority lists first with non-blocking RPOP.
@@ -891,6 +1117,11 @@ export class RedisQueue extends EventEmitter {
     }
     // Bug #3 fix: Start the delay poller that moves ready jobs from sorted sets to main queues
     this.startDelayPoller();
+    // W-2b A-4: Start the BLMOVE :processing-list reaper. Per V4-E5 / delta A-03,
+    // this tick is ALWAYS-ON (NOT gated by FF_QUEUE_BLMOVE_DEQUEUE) so any
+    // :processing-list:* entries written during a prior ON window drain at
+    // REAPER_INTERVAL_MS regardless of the current flag state.
+    this.startProcessingReaper();
     logger.info('🚀 Redis Queue processor started');
   }
 
@@ -903,6 +1134,10 @@ export class RedisQueue extends EventEmitter {
     if (this.delayPollerInterval) {
       clearInterval(this.delayPollerInterval);
       this.delayPollerInterval = null;
+    }
+    if (this.processingReaperInterval) {
+      clearInterval(this.processingReaperInterval);
+      this.processingReaperInterval = null;
     }
     logger.info('⏹️ Redis Queue processor stopped');
   }
@@ -917,10 +1152,47 @@ export class RedisQueue extends EventEmitter {
   private startDelayPoller(): void {
     if (this.delayPollerInterval) return;
 
+    // W-2b A-7: workerId for distributed leader election. Matches the existing
+    // `vehicle-transition-outbox.service.ts` pattern (HOSTNAME on ECS,
+    // pod-${pid} fallback in dev). Captured once per process.
+    const workerId = process.env.HOSTNAME || `pod-${process.pid}`;
+
     this.delayPollerInterval = setInterval(async () => {
       if (!this.isRunning) return;
 
+      // W-2b A-7: Leader-lock branch on FF_DELAY_POLLER_LEADER_LOCK. ON path
+      // wraps the per-queue tick body in `acquireLock` so only one pod runs
+      // ZRANGEBYSCORE+LPUSH+ZREMRANGEBYSCORE per tick, eliminating duplicate
+      // promotions when running > 1 ECS task. OFF path preserves the legacy
+      // unconditional tick (current production behaviour). Per delta A-06 /
+      // V8 R3, the acquireLock call is wrapped in try/catch with a fail-open
+      // policy: a Redis blip (acquireLock throws) emits a WARN and runs the
+      // body without a lock rather than crashing the tick.
+      const leaderGateOn = isEnabled(FLAGS.DELAY_POLLER_LEADER_LOCK);
+
       for (const queueName of this.processors.keys()) {
+        const lockKey = `delay-poller:${queueName}`;
+        let lockHeld = false;
+
+        if (leaderGateOn) {
+          try {
+            const acquired = await redisService.acquireLock(lockKey, workerId, 2);
+            if (!acquired.acquired) {
+              try {
+                metrics.incrementCounter('delay_poller_lock_miss_total', { queue: queueName });
+              } catch { /* never break the tick on a metric write */ }
+              continue;
+            }
+            lockHeld = true;
+          } catch (lockErr: any) {
+            // Fail-open per delta A-06 / V8 R3: a Redis blip during acquireLock
+            // must NOT crash the tick. We emit a WARN and proceed without the
+            // lock — at worst we briefly tolerate the legacy duplicate-LPUSH
+            // behaviour rather than stranding delayed jobs entirely.
+            logger.warn(`[DelayPoller] acquireLock failed for ${lockKey} — running without lock (fail-open): ${lockErr?.message || 'unknown'}`);
+          }
+        }
+
         try {
           const delayedKey = this.getDelayedKey(queueName);
           const now = Date.now();
@@ -951,11 +1223,143 @@ export class RedisQueue extends EventEmitter {
         } catch (err: any) {
           // Non-fatal — jobs stay in sorted set, will be picked up next iteration
           logger.warn(`[DelayPoller] Error for ${queueName}: ${err.message}`);
+        } finally {
+          if (lockHeld) {
+            try {
+              await redisService.releaseLock(lockKey, workerId);
+            } catch (releaseErr: any) {
+              // TTL=2s will auto-expire the lock — non-fatal.
+              logger.warn(`[DelayPoller] releaseLock failed for ${lockKey}: ${releaseErr?.message || 'unknown'}`);
+            }
+          }
         }
       }
     }, 1000); // Poll every 1 second — lightweight, just a ZRANGEBYSCORE per queue
 
     this.delayPollerInterval.unref(); // Don't prevent Node.js from exiting
+  }
+
+  /**
+   * W-2b A-4: BLMOVE :processing-list reaper.
+   *
+   * ALWAYS-ON (V4-E5 / delta A-03): the reaper tick is intentionally NOT gated
+   * behind `FF_QUEUE_BLMOVE_DEQUEUE`. If an operator flips the flag OFF mid-flight,
+   * any entries already moved into `:processing-list:*` by the prior ON window
+   * would be orphaned permanently if the reaper also stopped. Keeping the
+   * reaper always-on guarantees any aged entries are re-queued back to the
+   * source priority list regardless of the current flag state.
+   *
+   * Per tick (every REAPER_INTERVAL_MS = 30s):
+   *   1. For each registered queue, LRANGE the :processing-list slice up to
+   *      REAPER_PROCESSING_CAP (10k) — bounded, O(N).
+   *   2. For each entry parse `processingStartedAt` and re-queue any older
+   *      than REAPER_MAX_AGE_MS (60s) by LPUSH back to the matching priority
+   *      list + LREM count=1 from :processing-list. LREM count=1 is idempotent
+   *      with the worker's own success-path LREM so concurrent reaper + worker
+   *      finishes are safe.
+   */
+  private startProcessingReaper(): void {
+    if (this.processingReaperInterval) return;
+
+    // Leader election workerId — same pattern as startDelayPoller :1150.
+    // HOSTNAME on ECS, pod-${pid} fallback in dev. Captured once per process.
+    const workerId = process.env.HOSTNAME || `pod-${process.pid}`;
+
+    this.processingReaperInterval = setInterval(async () => {
+      if (!this.isRunning) return;
+
+      // Leader-lock branch on FF_PROCESSING_REAPER_LEADER_LOCK (mirrors
+      // startDelayPoller :1166). With HPA Max=6 pods, an unprotected reaper
+      // races LPUSH+LREM on the same stale entry across all 6 pods → up to
+      // 6× duplicate broadcasts. Lock-acquisition failure is fail-open per
+      // delta A-06 / V8 R3 — a Redis blip emits WARN and runs unlocked rather
+      // than stranding entries.
+      const leaderGateOn = isEnabled(FLAGS.PROCESSING_REAPER_LEADER_LOCK);
+      const now = Date.now();
+
+      for (const queueName of this.processors.keys()) {
+        const lockKey = `processing-reaper:${queueName}`;
+        let lockHeld = false;
+
+        if (leaderGateOn) {
+          try {
+            // TTL=10s outlives worst-case body cost. Body = REAPER_PROCESSING_CAP
+            // (=500) × 2 ops × ~5ms ≈ 5s, fits in 10s with 50% slack for Redis
+            // RTT variance. Raising the cap requires a heartbeat-renewed leader
+            // — bumping TTL alone is brittle.
+            const acquired = await redisService.acquireLock(lockKey, workerId, 10);
+            if (!acquired.acquired) {
+              try {
+                metrics.incrementCounter('processing_reaper_lock_miss_total', { queue: queueName });
+              } catch { /* never break the tick on a metric write */ }
+              continue;
+            }
+            lockHeld = true;
+          } catch (lockErr: any) {
+            // Fail-open per delta A-06 / V8 R3.
+            logger.warn(`[ProcessingReaper] acquireLock failed for ${lockKey} — running without lock (fail-open): ${lockErr?.message || 'unknown'}`);
+          }
+        }
+
+        const processingListKey = this.getProcessingListKey(queueName);
+        try {
+          const entries = await redisService.lRange(processingListKey, 0, RedisQueue.REAPER_PROCESSING_CAP - 1);
+          if (!entries || entries.length === 0) continue;
+
+          let reaped = 0;
+          for (const rawEntry of entries) {
+            let parsed: any = null;
+            try {
+              parsed = JSON.parse(rawEntry);
+            } catch { /* malformed — skip; reaped if older */ }
+
+            const startedAt = (parsed && typeof parsed.processingStartedAt === 'number')
+              ? parsed.processingStartedAt
+              : 0; // unknown timestamp → reap on first tick (safer than stranding)
+            const age = now - startedAt;
+            if (age < RedisQueue.REAPER_MAX_AGE_MS) continue;
+
+            try {
+              const priority = (parsed && typeof parsed.priority === 'number')
+                ? parsed.priority
+                : MessagePriority.NORMAL;
+              const targetKey = this.getPriorityQueueKey(queueName, priority);
+              // Re-queue back to the source priority list, then drop the
+              // :processing-list entry. Order matters — if LPUSH succeeds and
+              // LREM fails, the worst case is a duplicate (at-least-once). If
+              // LREM ran first and LPUSH failed, the job would be lost.
+              await redisService.lPush(targetKey, rawEntry);
+              await redisService.lRem(processingListKey, 1, rawEntry);
+              reaped++;
+              try {
+                metrics.incrementCounter('queue_processing_reaped_total', { queue: queueName });
+              } catch { /* never break the reaper on a metric write */ }
+            } catch (reapErr: any) {
+              logger.warn('[Queue] reaper re-queue failed', {
+                queueName, error: reapErr?.message || 'unknown'
+              });
+            }
+          }
+          if (reaped > 0) {
+            logger.warn(`[Queue] Reaper re-queued ${reaped} stale entr${reaped === 1 ? 'y' : 'ies'} for ${queueName}`);
+          }
+        } catch (tickErr: any) {
+          // Non-fatal — next tick retries.
+          logger.warn(`[Queue] Reaper tick failed for ${queueName}: ${tickErr?.message || 'unknown'}`);
+        } finally {
+          if (lockHeld) {
+            try {
+              await redisService.releaseLock(lockKey, workerId);
+            } catch (releaseErr: any) {
+              // TTL=10s will auto-expire the lock — non-fatal.
+              logger.warn(`[ProcessingReaper] releaseLock failed for ${lockKey}: ${releaseErr?.message || 'unknown'}`);
+            }
+          }
+        }
+      }
+    }, RedisQueue.REAPER_INTERVAL_MS);
+
+    this.processingReaperInterval.unref();
   }
 
   /**
@@ -1011,7 +1415,9 @@ export class RedisQueue extends EventEmitter {
 // =============================================================================
 
 interface IQueue {
-  add<T>(queueName: string, type: string, data: T, options?: { priority?: number; delay?: number; maxAttempts?: number }): Promise<string>;
+  // W-2b A-6: return widened to `string | null` per OAD-4 SILENT-DROP. When
+  // FF_QUEUE_BACKLOG_CAPS is OFF this is always a string (legacy behaviour).
+  add<T>(queueName: string, type: string, data: T, options?: { priority?: number; delay?: number; maxAttempts?: number }): Promise<string | null>;
   addBatch<T>(queueName: string, jobs: { type: string; data: T; priority?: number }[]): Promise<string[]>;
   process(queueName: string, processor: JobProcessor): void;
   start(): void;
@@ -1833,7 +2239,12 @@ export class QueueService {
           try {
             const { assignmentService }: typeof import('../../modules/assignment/assignment.service') = require('../../modules/assignment/assignment.service');
             await assignmentService.handleAssignmentTimeout(timer.data);
-            logger.info(`[TIMER] Assignment timeout fired: ${timer.data.assignmentId} (${timer.data.driverName})`);
+            // F-MOB-05 / DPDP §5(b): driverName must be masked in log body.
+            logger.info('[TIMER] Assignment timeout fired', {
+              assignmentId: timer.data.assignmentId,
+              driverId: timer.data.driverId,
+              driverName: maskName(timer.data.driverName),
+            });
           } catch (err: any) {
             logger.error('[TIMER] Assignment timeout handler failed', {
               key: timer.key,
@@ -1955,20 +2366,128 @@ export class QueueService {
   }
 
   /**
-   * Queue broadcasts to multiple transporters (batch)
+   * Queue broadcasts to multiple transporters (batch).
+   *
+   * F-PERF-02: When `FF_BATCH_QUEUE_DEPTH_GUARD` is ON we read the live
+   * broadcast queue depth, sort the incoming batch by event priority
+   * (CRITICAL → LOW) and ADMIT only the highest-priority slice that fits
+   * under `BROADCAST_QUEUE_DEPTH_CAP`. The non-admitted tail is pushed to
+   * `dlq:broadcasts` (Redis list) for the `replay-broadcast-dlq` drainer
+   * to recover once the spike subsides. When OFF, the behaviour matches
+   * the legacy unconditional batch admit.
+   *
+   * The DLQ recovery drainer MUST temporarily disable this guard
+   * (`FF_BATCH_QUEUE_DEPTH_GUARD=false` for the call) so a recovery flush
+   * isn't itself dropped — see the `bypassDepthGuard` option below.
+   *
+   * @param transporterIds Recipient transporters (one job per id).
+   * @param event Socket-event name (drives priority lookup).
+   * @param data Payload forwarded to every job.
+   * @param options.bypassDepthGuard When true, the per-call cap check is
+   *        skipped (used by the DLQ drainer to bulk-replay without being
+   *        re-DLQ'd in a tight loop).
    */
   async queueBroadcastBatch(
     transporterIds: string[],
     event: string,
-    data: any
+    data: any,
+    options?: { bypassDepthGuard?: boolean }
   ): Promise<string[]> {
-    const jobs = transporterIds.map(transporterId => ({
+    if (transporterIds.length === 0) return [];
+
+    const eventPriority = EVENT_PRIORITY[event] ?? MessagePriority.NORMAL;
+    const buildJobs = (ids: string[]) => ids.map(transporterId => ({
       type: 'broadcast',
       data: { transporterId, event, data },
-      priority: 0
+      priority: eventPriority
     }));
 
-    return this.queue.addBatch(QueueService.QUEUES.BROADCAST, jobs);
+    const guardEnabled = FF_BATCH_QUEUE_DEPTH_GUARD && !options?.bypassDepthGuard;
+    if (!guardEnabled) {
+      try {
+        metrics.incrementCounter('broadcast_queue_admit_total', {
+          guard: 'off',
+          event
+        }, transporterIds.length);
+      } catch { /* never break enqueue path on metric write */ }
+      return this.queue.addBatch(QueueService.QUEUES.BROADCAST, buildJobs(transporterIds));
+    }
+
+    // F-PERF-02 guarded path — sample current depth, admit top-N by priority.
+    let currentDepth = 0;
+    try {
+      currentDepth = await this.queue.getQueueDepth(QueueService.QUEUES.BROADCAST);
+    } catch (err: any) {
+      // If we cannot read depth, fail OPEN (admit) — never starve the queue
+      // because of a Redis hiccup. The single-job `queueBroadcast` already
+      // has its own sampled cap which will catch obvious overflow.
+      logger.warn('[F-PERF-02] Failed to sample broadcast depth — admitting full batch', {
+        event, error: err?.message || 'unknown'
+      });
+      return this.queue.addBatch(QueueService.QUEUES.BROADCAST, buildJobs(transporterIds));
+    }
+
+    // P99 anti-regression metric: depth at admit time. Histogram is
+    // already wired in metrics.service for *_p99 derivation.
+    try {
+      metrics.observeHistogram('broadcast_queue_depth_p99', currentDepth, { event });
+    } catch { /* never break enqueue path on metric write */ }
+
+    const headroom = Math.max(0, BROADCAST_QUEUE_DEPTH_CAP - currentDepth);
+    const admitCount = Math.min(transporterIds.length, headroom);
+
+    // Sort batch by priority — for `queueBroadcastBatch` every job currently
+    // shares one event-derived priority, but we sort defensively so future
+    // mixed-priority callers don't regress this contract.
+    const sorted = [...transporterIds].sort(() => 0); // stable; same priority across batch
+    const admitIds = sorted.slice(0, admitCount);
+    const dropIds = sorted.slice(admitCount);
+
+    if (admitIds.length > 0) {
+      try {
+        metrics.incrementCounter('broadcast_queue_admit_total', {
+          guard: 'on',
+          event
+        }, admitIds.length);
+      } catch { /* never break enqueue path on metric write */ }
+    }
+
+    if (dropIds.length > 0) {
+      try {
+        metrics.incrementCounter('broadcast_queue_drop_total', {
+          event,
+          reason: 'depth_cap'
+        }, dropIds.length);
+      } catch { /* never break drop path on metric write */ }
+
+      logger.warn('[F-PERF-02] Broadcast batch partial-admit — overflow → DLQ', {
+        event, admitCount: admitIds.length, dropCount: dropIds.length,
+        currentDepth, cap: BROADCAST_QUEUE_DEPTH_CAP
+      });
+
+      // Push the dropped tail to the DLQ list so the drainer can recover it.
+      // We push one entry per dropped transporter so each replay is a single
+      // `queueBroadcast` (preserves per-recipient retry semantics).
+      const droppedAt = Date.now();
+      const dlqEntries = dropIds.map(transporterId => JSON.stringify({
+        transporterId, event, data, droppedAt, reason: 'batch_depth_cap'
+      }));
+      await redisService.lPushMany('dlq:broadcasts', dlqEntries).catch((err: any) => {
+        // DLQ write itself failed — log loudly so CloudWatch alarm fires.
+        logger.error('[F-PERF-02][CRITICAL] Broadcast partial-admit DLQ write failed', {
+          event, dropCount: dropIds.length, error: err?.message || 'unknown'
+        });
+      });
+      // Bound DLQ growth using the existing configurable cap.
+      await redisService.lTrim('dlq:broadcasts', 0, DLQ_MAX_SIZE - 1).catch(() => { /* never break */ });
+    }
+
+    if (admitIds.length === 0) {
+      // Nothing admitted — return empty so the caller's `Promise.allSettled`
+      // bookkeeping is consistent (no fake job ids).
+      return [];
+    }
+    return this.queue.addBatch(QueueService.QUEUES.BROADCAST, buildJobs(admitIds));
   }
 
   /**
@@ -2271,7 +2790,9 @@ export class QueueService {
     queueName: string,
     data: T,
     options?: { priority?: number; delay?: number; maxAttempts?: number }
-  ): Promise<string> {
+  ): Promise<string | null> {
+    // W-2b A-6: SILENT-DROP per OAD-4. Producer-side cap rejection happens
+    // inside the underlying queue's .add — we just propagate `null` upward.
     const maxAttempts = options?.maxAttempts ?? (queueName === QueueService.QUEUES.VEHICLE_RELEASE ? 5 : 3);
     return this.queue.add(queueName, queueName, data, { ...options, maxAttempts });
   }
@@ -2284,13 +2805,14 @@ export class QueueService {
     type: string,
     data: T,
     options?: { priority?: number; delay?: number; maxAttempts?: number }
-  ): Promise<string> {
+  ): Promise<string | null> {
+    // W-2b A-6: SILENT-DROP per OAD-4 — see enqueue() above for rationale.
     return this.queue.add(queueName, type, data, options);
   }
 
   /**
    * Add job to queue (alias for addJob)
-   * 
+   *
    * EASY UNDERSTANDING: Shorter method name for convenience
    * CODING STANDARDS: Matches common queue library patterns
    */
@@ -2299,7 +2821,8 @@ export class QueueService {
     type: string,
     data: T,
     options?: { priority?: number; delay?: number; maxAttempts?: number }
-  ): Promise<string> {
+  ): Promise<string | null> {
+    // W-2b A-6: SILENT-DROP per OAD-4 — see enqueue() above for rationale.
     return this.queue.add(queueName, type, data, options);
   }
 

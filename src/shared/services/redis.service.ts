@@ -133,6 +133,11 @@ interface IRedisClient {
   rPop(key: string): Promise<string | null>;
   lLen(key: string): Promise<number>;
   brPop(key: string, timeoutSeconds: number): Promise<string | null>;
+  // W-2b A-1: Atomic verbatim-move + targeted remove for broadcast-dequeue
+  // safety. blMove uses BLMOVE on Redis >= 6.2 with LMOVE spin-fallback when
+  // probeBlmoveSupport() flips the capability flag false.
+  blMove(src: string, dst: string, srcDir: 'LEFT'|'RIGHT', dstDir: 'LEFT'|'RIGHT', timeoutSec: number): Promise<string | null>;
+  lRem(key: string, count: number, element: string): Promise<number>;
 
   // Sets
   sAdd(key: string, ...members: string[]): Promise<number>;
@@ -492,6 +497,89 @@ class InMemoryRedisClient implements IRedisClient {
     }
 
     return null;
+  }
+
+  /**
+   * W-2b A-1: In-memory blMove — verbatim atomic move from src→dst that
+   * mirrors Redis BLMOVE semantics. Polls every 100ms (spinWait) bounded by
+   * timeoutSec when src is empty. Stub for jest parity with RealRedisClient.
+   */
+  async blMove(
+    src: string,
+    dst: string,
+    srcDir: 'LEFT' | 'RIGHT',
+    dstDir: 'LEFT' | 'RIGHT',
+    timeoutSec: number,
+  ): Promise<string | null> {
+    const startTime = Date.now();
+    const timeoutMs = Math.max(0, timeoutSec) * 1000;
+
+    // Single-pass when timeoutSec === 0 (LMOVE-equivalent non-blocking attempt).
+    do {
+      const srcEntry = !this.isExpired(src) ? this.store.get(src) : undefined;
+      if (srcEntry && srcEntry.type === 'list' && srcEntry.value.length > 0) {
+        const value = srcDir === 'LEFT' ? srcEntry.value.shift() : srcEntry.value.pop();
+        if (value !== undefined) {
+          let dstEntry = this.store.get(dst);
+          if (!dstEntry || dstEntry.type !== 'list') {
+            dstEntry = { value: [] as string[], type: 'list' };
+            this.store.set(dst, dstEntry);
+          }
+          if (dstDir === 'LEFT') {
+            dstEntry.value.unshift(value);
+          } else {
+            dstEntry.value.push(value);
+          }
+          return value;
+        }
+      }
+      if (timeoutMs === 0) return null;
+      // 100ms spinWait between polls — matches RealRedis LMOVE fallback.
+      await new Promise(resolve => setTimeout(resolve, 100));
+    } while (Date.now() - startTime < timeoutMs);
+
+    return null;
+  }
+
+  /**
+   * W-2b A-1: In-memory lRem — removes occurrences of `element` from list.
+   * count > 0: head→tail, count < 0: tail→head, count === 0: remove all.
+   * Returns number of removed elements (matches Redis LREM).
+   */
+  async lRem(key: string, count: number, element: string): Promise<number> {
+    if (this.isExpired(key)) return 0;
+    const entry = this.store.get(key);
+    if (!entry || entry.type !== 'list') return 0;
+
+    let removed = 0;
+    if (count === 0) {
+      const before = entry.value.length;
+      entry.value = entry.value.filter(v => v !== element);
+      removed = before - entry.value.length;
+    } else if (count > 0) {
+      const next: string[] = [];
+      for (const v of entry.value) {
+        if (v === element && removed < count) {
+          removed++;
+          continue;
+        }
+        next.push(v);
+      }
+      entry.value = next;
+    } else {
+      const limit = -count;
+      const next: string[] = [];
+      for (let i = entry.value.length - 1; i >= 0; i--) {
+        const v = entry.value[i];
+        if (v === element && removed < limit) {
+          removed++;
+          continue;
+        }
+        next.unshift(v);
+      }
+      entry.value = next;
+    }
+    return removed;
   }
 
   // =========== Sets ===========
@@ -881,6 +969,10 @@ class RealRedisClient implements IRedisClient {
   private connected = false;
   private reconnecting = false;
   private subscriptions = new Map<string, (message: string) => void>();
+  // W-2b A-1: BLMOVE capability probe — null = not yet probed, true/false cached
+  // after first INFO server lookup. Reads `redis_version` and flips to LMOVE
+  // spin-fallback when server < 6.2.
+  private blmoveSupported: boolean | null = null;
 
   constructor(private config: RedisConfig) { }
 
@@ -1231,6 +1323,116 @@ class RealRedisClient implements IRedisClient {
     }
   }
 
+  /**
+   * W-2b A-1: Capability probe — detects whether the connected Redis server
+   * supports BLMOVE (introduced in 6.2.0). Reads `redis_version` from
+   * `INFO server` once, caches the result. Defaults to `false` (LMOVE
+   * spin-fallback) on parse/IO failure so callers stay on the safe path.
+   */
+  private async probeBlmoveSupport(): Promise<boolean> {
+    if (this.blmoveSupported !== null) return this.blmoveSupported;
+    try {
+      const info: string = await this.client.info('server');
+      const versionMatch = /redis_version:(\d+)\.(\d+)(?:\.(\d+))?/i.exec(info || '');
+      if (!versionMatch) {
+        this.blmoveSupported = false;
+        return false;
+      }
+      const major = parseInt(versionMatch[1], 10);
+      const minor = parseInt(versionMatch[2], 10);
+      // BLMOVE requires Redis >= 6.2
+      this.blmoveSupported = major > 6 || (major === 6 && minor >= 2);
+      logger.info(`[Redis] BLMOVE support probe: redis_version=${major}.${minor} → ${this.blmoveSupported}`);
+      return this.blmoveSupported;
+    } catch (err: any) {
+      logger.warn(`[Redis] BLMOVE capability probe failed; defaulting to LMOVE fallback: ${err.message}`);
+      this.blmoveSupported = false;
+      return false;
+    }
+  }
+
+  /**
+   * W-2b A-1: Atomic verbatim list-move with optional blocking. Prefers
+   * native BLMOVE on Redis >= 6.2 via the dedicated blocking client. When
+   * the capability probe reports server < 6.2 (or probe IO fails), falls
+   * back to non-blocking LMOVE in a spinWait loop bounded by `timeoutSec`,
+   * polling every 100ms — matches Redis BLMOVE return shape (`string|null`).
+   */
+  async blMove(
+    src: string,
+    dst: string,
+    srcDir: 'LEFT' | 'RIGHT',
+    dstDir: 'LEFT' | 'RIGHT',
+    timeoutSec: number,
+  ): Promise<string | null> {
+    const supported = await this.probeBlmoveSupport();
+    const safeTimeoutSec = Math.max(0, timeoutSec);
+
+    if (supported) {
+      // Use blocking client when timeoutSec > 0 — BLMOVE legitimately waits
+      // for seconds and the main client carries a 3s commandTimeout.
+      const useBlocking = safeTimeoutSec > 0 && this.blockingClient;
+      const target = useBlocking ? this.blockingClient : this.client;
+      try {
+        const result = await target.blmove(src, dst, srcDir, dstDir, safeTimeoutSec);
+        return result ?? null;
+      } catch (err: any) {
+        const errMsg = err?.message || String(err);
+        // ERR / unknown command → permanently downgrade to LMOVE fallback.
+        if (/unknown command|ERR/i.test(errMsg)) {
+          this.blmoveSupported = false;
+          logger.warn(`[Redis] BLMOVE rejected at runtime — downgrading to LMOVE spin-fallback: ${errMsg}`);
+          return this.lmoveSpinFallback(src, dst, srcDir, dstDir, safeTimeoutSec);
+        }
+        throw err;
+      }
+    }
+
+    return this.lmoveSpinFallback(src, dst, srcDir, dstDir, safeTimeoutSec);
+  }
+
+  /**
+   * W-2b A-1: Non-blocking LMOVE spin-fallback. Single-pass when
+   * timeoutSec === 0; otherwise polls LMOVE every 100ms until success or
+   * elapsed >= timeoutSec * 1000.
+   */
+  private async lmoveSpinFallback(
+    src: string,
+    dst: string,
+    srcDir: 'LEFT' | 'RIGHT',
+    dstDir: 'LEFT' | 'RIGHT',
+    timeoutSec: number,
+  ): Promise<string | null> {
+    const startTime = Date.now();
+    const timeoutMs = timeoutSec * 1000;
+
+    do {
+      try {
+        const result = await this.client.lmove(src, dst, srcDir, dstDir);
+        if (result !== null && result !== undefined) {
+          return result;
+        }
+      } catch (err: any) {
+        logger.warn(`[Redis] LMOVE fallback error: ${err.message}`);
+        return null;
+      }
+      if (timeoutMs === 0) return null;
+      // 100ms spinWait between polls — bounded, non-busy.
+      await new Promise(resolve => setTimeout(resolve, 100));
+    } while (Date.now() - startTime < timeoutMs);
+
+    return null;
+  }
+
+  /**
+   * W-2b A-1: Targeted list-element removal. Mirrors Redis LREM semantics:
+   * count > 0 removes from head, count < 0 from tail, count === 0 removes
+   * every occurrence. Returns the number of elements removed.
+   */
+  async lRem(key: string, count: number, element: string): Promise<number> {
+    return this.client.lrem(key, count, element);
+  }
+
   // =========== Sets ===========
 
   async sAdd(key: string, ...members: string[]): Promise<number> {
@@ -1522,6 +1724,81 @@ export const _jwtInvalidatePubSubEmitter = new EventEmitter();
 /** Tracks whether the jwt_invalidate Pub/Sub subscription is active. */
 let _jwtInvalidateSubscribed = false;
 
+// =============================================================================
+// JWT INVALIDATE ENVELOPE PARSER + NONCE DEDUPE (P1 GAP-2)
+// =============================================================================
+//
+// auth.service.ts publishes a JSON envelope:
+//   { userId: string, timestamp: number, nonce: string }
+// Older publishers (and any pre-rollout fleet members) send the bare userId
+// string. The parser below handles both shapes; the nonce LRU drops replays
+// of the same envelope (e.g., Redis replication echo, retry storms).
+//
+// The 100-entry LRU cap is intentional — the dedupe window is short (single
+// burst of replayed messages); we want to evict aggressively to keep memory
+// bounded while still catching genuine replays.
+
+interface JwtInvalidateEnvelope {
+  userId: string;
+  timestamp?: number;
+  nonce?: string;
+}
+
+const JWT_INVALIDATE_NONCE_CACHE_SIZE = 100;
+const _jwtInvalidateRecentNonces = new Set<string>();
+const _jwtInvalidateNonceOrder: string[] = [];
+
+/**
+ * Records a nonce as seen and returns true if it had already been seen.
+ * Caller skips processing on `true`. LRU-style eviction at 100 entries.
+ */
+function _markNonceSeenAndIsDuplicate(nonce: string): boolean {
+  if (_jwtInvalidateRecentNonces.has(nonce)) return true;
+  _jwtInvalidateRecentNonces.add(nonce);
+  _jwtInvalidateNonceOrder.push(nonce);
+  if (_jwtInvalidateNonceOrder.length > JWT_INVALIDATE_NONCE_CACHE_SIZE) {
+    const evicted = _jwtInvalidateNonceOrder.shift();
+    if (evicted !== undefined) _jwtInvalidateRecentNonces.delete(evicted);
+  }
+  return false;
+}
+
+/**
+ * Parses a jwt_invalidate Pub/Sub message.
+ * Returns a tuple `[userId, isDuplicate]`.
+ *
+ * `isDuplicate=true` indicates the caller should skip emitting / purging
+ * because we have already processed this exact envelope (nonce match).
+ *
+ * Backward-compat: if `message` is not valid JSON, falls back to treating
+ * the entire string as the userId. Logs a warn so the legacy path is
+ * observable during rollout. Bare-string messages cannot be deduped (no
+ * nonce) — they always pass through.
+ *
+ * Exported for unit tests and any out-of-process consumers.
+ */
+export function _parseJwtInvalidateMessage(
+  message: string
+): { userId: string; isDuplicate: boolean } {
+  // Try JSON envelope first.
+  try {
+    const parsed = JSON.parse(message);
+    if (parsed && typeof parsed === 'object' && typeof parsed.userId === 'string') {
+      const env = parsed as JwtInvalidateEnvelope;
+      const isDuplicate = env.nonce ? _markNonceSeenAndIsDuplicate(env.nonce) : false;
+      return { userId: env.userId, isDuplicate };
+    }
+    // Parsed-but-not-an-envelope: treat as legacy bare string.
+  } catch {
+    // Not JSON — fall through to bare-string handling.
+  }
+
+  logger.warn('[Redis] jwt_invalidate received legacy bare-string payload — upgrade publisher to JSON envelope', {
+    payloadPreview: message.length > 64 ? `${message.slice(0, 64)}…` : message,
+  });
+  return { userId: message, isDuplicate: false };
+}
+
 /**
  * P5-E health gate: returns true when the jwt_invalidate channel subscription
  * is active. Called by /health/ready to return 503 when the Pub/Sub connection
@@ -1642,13 +1919,24 @@ class RedisService {
         // invalidation across all ECS tasks. Subscription is best-effort; if it
         // fails, the cache will serve stale entries until the token's natural
         // expiry — logged as a warning but not fatal.
+        //
+        // P1 GAP-2: Messages are JSON envelopes { userId, timestamp, nonce }.
+        // Legacy bare-string messages still parse for backward-compat.
+        // Duplicate envelopes (same nonce) are dropped to prevent re-emit
+        // storms when Redis replicates / replays Pub/Sub messages.
         try {
           await realClient.subscribe('jwt_invalidate', (message: string) => {
             _jwtInvalidateSubscribed = true;
+            const { userId, isDuplicate } = _parseJwtInvalidateMessage(message);
+            if (isDuplicate) {
+              // Already processed — drop silently. Keep this branch hot-path
+              // light; the Set lookup is O(1).
+              return;
+            }
             // Emit to module-local listeners (e.g., auth.service.ts L1 purge)
-            _jwtInvalidatePubSubEmitter.emit('userId', message);
+            _jwtInvalidatePubSubEmitter.emit('userId', userId);
             // Also purge L2 asynchronously for this node
-            this.jwtCachePurgeUser(message).catch(() => {});
+            this.jwtCachePurgeUser(userId).catch(() => {});
           });
           _jwtInvalidateSubscribed = true;
           logger.info('[Redis] Subscribed to jwt_invalidate channel (A04-002)');
@@ -1877,6 +2165,27 @@ class RedisService {
    */
   async brPop(key: string, timeoutSeconds: number): Promise<string | null> {
     return this.client.brPop(key, timeoutSeconds);
+  }
+
+  /**
+   * W-2b A-1: Atomic verbatim-move from src→dst (BLMOVE / LMOVE fallback).
+   * Wrapper delegates to the underlying IRedisClient capability-probed impl.
+   */
+  async blMove(
+    src: string,
+    dst: string,
+    srcDir: 'LEFT' | 'RIGHT',
+    dstDir: 'LEFT' | 'RIGHT',
+    timeoutSec: number,
+  ): Promise<string | null> {
+    return this.client.blMove(src, dst, srcDir, dstDir, timeoutSec);
+  }
+
+  /**
+   * W-2b A-1: Targeted list-element removal (LREM passthrough).
+   */
+  async lRem(key: string, count: number, element: string): Promise<number> {
+    return this.client.lRem(key, count, element);
   }
 
   // ===========================================================================
@@ -2436,6 +2745,47 @@ class RedisService {
 
   async hIncrBy(key: string, field: string, increment: number): Promise<number> {
     return this.client.hIncrBy(key, field, increment);
+  }
+
+  /**
+   * F-CAS-06: atomic floor-guarded decrement.
+   *
+   * `HINCRBY key field -1` then floor at 0. Implemented as a Lua script so the
+   * decrement + clamp run as a single Redis operation — without this, a
+   * concurrent decrement could race the read-modify-write and push the field
+   * negative before the clamp runs.
+   *
+   * Eval failure (Redis unavailable, in-memory mode without Lua support, etc.)
+   * falls back to hIncrBy + a follow-up `HSET ... 0` clamp. The fallback is
+   * NOT atomic — under contention the counter may briefly read negative, but
+   * the steady-state floor is still 0. Confirmed-hold counters are
+   * reconciliation-corrected every 5 min by live-availability.service.ts, so
+   * the brief drift is acceptable.
+   *
+   * Returns the new value (always >= 0).
+   */
+  async hDecrFloor(key: string, field: string): Promise<number> {
+    const luaScript = `
+      local v = redis.call('HINCRBY', KEYS[1], ARGV[1], -1)
+      if v < 0 then
+        redis.call('HSET', KEYS[1], ARGV[1], 0)
+        return 0
+      end
+      return v
+    `;
+    try {
+      const result = await this.client.eval(luaScript, [key], [field]);
+      if (typeof result === 'number') return Math.max(0, result);
+      // In-memory fallback (eval returns null) — read-modify-write floor.
+    } catch {
+      // fall through to fallback
+    }
+    const next = await this.client.hIncrBy(key, field, -1);
+    if (next < 0) {
+      await this.client.hSet(key, field, '0').catch(() => {});
+      return 0;
+    }
+    return next;
   }
 
   async hMSet(key: string, data: Record<string, string>): Promise<void> {

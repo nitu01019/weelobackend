@@ -767,6 +767,23 @@ export function registerDefaultGauges(gauges: Map<string, GaugeMetric>): void {
       'outbox_size',
       'Current estimated size of the notification outbox (O(1) Redis counter — sampled every 30s) — A03-009',
     ),
+
+    // === Fix #6 (index-20-validated.md §1.3): DLQ broadcasts depth gauges ===
+    // Sampled every 30s by `dlq-broadcasts-depth-emitter.ts` via LLEN; mirrored
+    // to CloudWatch via PutMetricData so `weelo-dlq-broadcasts-depth-warn` can
+    // gate the FF_BATCH_QUEUE_DEPTH_GUARD flag flip pre-flight.
+    gauge( /* @observability-only */
+      'dlq_broadcasts_depth',
+      'LLEN dlq:broadcasts (active retry list, sampled 30s) — Fix #6 backpressure SLO',
+    ),
+    gauge( /* @observability-only */
+      'dlq_broadcasts_permanent_depth',
+      'LLEN dlq:broadcasts:permanent (dead-letter list, sampled 30s) — Fix #6 / #19c attempt-exhausted entries',
+    ),
+    gauge( /* @observability-only */
+      'dlq_broadcasts_inflight_depth',
+      'LLEN dlq:broadcasts:inflight (drainer in-flight, sampled 30s) — Fix #19c sequencing pre-flight',
+    ),
     // === A04-006: Socket.IO adapter per-partition stream depth gauges ===
     // Sampled every 5s via XLEN. One gauge per partition (16 partitions default).
     // stream naming: socket.io-{i} (matches @socket.io/redis-streams-adapter default streamName)

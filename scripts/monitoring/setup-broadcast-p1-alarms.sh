@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# OPERATOR: Source the same env the backend uses BEFORE running this script.
+#   source .env.production && bash scripts/monitoring/setup-broadcast-p1-alarms.sh
+# SOCKET_STREAM_PARTITIONS mismatch between this script and the running backend
+# will create gauge gaps (missing alarms on shards 16-31). See VERIFICATION_INDEX H2.
 # =============================================================================
 # WEELO CLOUDWATCH ALARMS — PHASE 3 BROADCAST RELIABILITY
 # =============================================================================
@@ -48,6 +52,13 @@
 #  weelo-p3-stream-partition-depth-N (×16)       socket_stream_partition_depth_N gauge > 80000 / 30s  P3-T38: per-partition stream depth
 #  weelo-p3-eventloop-lag                        nodejs_eventloop_lag_ms gauge (Maximum) > 50 / 2m   P3-T39: event loop saturation
 #  weelo-p3-socket-xadd-p99                      socket_adapter_xadd_ms p99 > 500ms / 30s        P3-T40: Redis Streams XADD latency
+#
+#  --- Fix #6 / Fix #19c (index-20-validated.md §1.3 / §1.6) DLQ depth alarms ---
+#
+#  weelo-dlq-broadcasts-depth-warn               dlq_broadcasts_depth > 100 / 2m                 Fix #6: drainer falling behind, early warning
+#  weelo-dlq-broadcasts-depth-crit               dlq_broadcasts_depth > 500 / 5m                 Fix #6: sustained backlog, scale drainer
+#  weelo-dlq-broadcasts-depth-saturation         dlq_broadcasts_depth >= 4500 / 1m               Fix #6: block-flip gate (lTrim drop risk)
+#  weelo-dlq-broadcasts-permanent-depth-warn     dlq_broadcasts_permanent_depth > 0 / 5m         Fix #19c: attempt-exhausted dead-letters
 # -----------------------------------------------------------------------------
 
 set -euo pipefail
@@ -492,7 +503,7 @@ put_gauge_max_alarm \
 # A depth > 80k means XREAD consumers are lagging, causing stale broadcast delivery.
 # We create one alarm per gauge metric so CloudWatch can pinpoint the hot shard.
 # -----------------------------------------------------------------------------
-for i in $(seq 0 15); do
+for i in $(seq 0 $((${SOCKET_STREAM_PARTITIONS:-32} - 1))); do
   put_gauge_max_alarm \
     "weelo-p3-stream-partition-depth-${i}" \
     "socket_stream_partition_depth_${i}" \
@@ -512,12 +523,12 @@ done
 # -----------------------------------------------------------------------------
 put_gauge_max_alarm \
   "weelo-p3-eventloop-lag" \
-  "nodejs_eventloop_lag_ms" \
+  "nodejs_eventloop_lag_p99_ms" \
   "50" \
   "60" \
   "2" \
   "${ALARM_SNS_TOPIC_ARN}" \
-  "[P2] A12-001/T39 — nodejs_eventloop_lag_ms > 50ms (Maximum) over 2m. Node.js event loop saturation: blocking I/O or CPU-bound work. Investigate CPU metrics, GC traces, and sync operations."
+  "[P2] A12-001/T39 — nodejs_eventloop_lag_p99_ms > 50ms (Maximum) over 2m. Node.js event loop saturation: blocking I/O or CPU-bound work. Investigate CPU metrics, GC traces, and sync operations."
 
 # -----------------------------------------------------------------------------
 # P3-T40 — socket_adapter_xadd_ms p99 > 500ms / 30s.
@@ -534,8 +545,94 @@ put_histogram_p99_alarm \
   "${ALARM_SNS_TOPIC_ARN}" \
   "[P2] A13-011/T40 — socket_adapter_xadd_ms p99 > 500ms over 30s. Redis Streams XADD latency SLO breach: ElastiCache memory pressure or network latency. Check Redis metrics."
 
+# -----------------------------------------------------------------------------
+# M5 — socket_replay_truncated_total rate > 10/min / 5min (§8.4 addition).
+# Counts reconnects where the 200-entry replay cap truncated the unacked queue.
+# Sustained rate > 10/min means many drivers are returning from long offline
+# windows with > 200 unacked events; clients must run sync-from-latest to
+# reconcile. Aligned with M5 SLA severity (P3 SLO bucket).
+# threshold=50 (10/min × 5m period); evaluation_periods=1 (single 5m datapoint).
+# -----------------------------------------------------------------------------
+put_counter_alarm \
+  "weelo-p3-socket-replay-truncated" \
+  "socket_replay_truncated_total" \
+  "50" \
+  "300" \
+  "1" \
+  "${ALARM_SNS_P3_TOPIC_ARN}" \
+  "[P3] M5 — socket_replay_truncated_total rate > 10/min over 5m. Reconnect replay hit 200-entry cap; drivers with > 200 unacked events must run sync-from-latest. See VERIFICATION_INDEX M5."
+
+# =============================================================================
+# Fix #6 / Fix #19c (index-20-validated.md §1.3 / §1.6) — DLQ broadcasts depth.
+# Sidecar `src/shared/services/dlq-broadcasts-depth-emitter.ts` samples LLEN
+# every 30s and publishes via PutMetricData. Three escalating thresholds gate
+# the FF_BATCH_QUEUE_DEPTH_GUARD flag flip:
+#   - warn @ 100 / 2m  → early signal, drainer rate < admit rate
+#   - crit @ 500 / 5m  → scale the drainer or block the flip
+#   - sat  @ 4500 / 1m → lTrim drops oldest at 5000; HARD block-flip gate
+#
+# Metric source: in-process sidecar (NOT a metric-filter), so these alarms
+# transition out of INSUFFICIENT_DATA within 60s of pod warm-up.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Alarm — Fix #6 warn: dlq_broadcasts_depth > 100 sustained 2m.
+# Drainer rate < admit rate; investigate before backlog accelerates.
+# -----------------------------------------------------------------------------
+put_gauge_max_alarm \
+  "weelo-dlq-broadcasts-depth-warn" \
+  "dlq_broadcasts_depth" \
+  "100" \
+  "60" \
+  "2" \
+  "${ALARM_SNS_P3_TOPIC_ARN}" \
+  "[P3] Fix #6 — dlq_broadcasts_depth > 100 sustained 2m. DLQ drainer rate < admit rate. Check dlq_drained_total vs dlq_pushed_total; scale drainer before saturation."
+
+# -----------------------------------------------------------------------------
+# Alarm — Fix #6 crit: dlq_broadcasts_depth > 500 sustained 5m.
+# Sustained backlog; will saturate at 5000 (lTrim cap) within minutes at peak.
+# -----------------------------------------------------------------------------
+put_gauge_max_alarm \
+  "weelo-dlq-broadcasts-depth-crit" \
+  "dlq_broadcasts_depth" \
+  "500" \
+  "60" \
+  "5" \
+  "${ALARM_SNS_TOPIC_ARN}" \
+  "[P2] Fix #6 — dlq_broadcasts_depth > 500 sustained 5m. Sustained DLQ backlog; lTrim drop imminent at 5000. Scale drainer NOW or roll back FF_BATCH_QUEUE_DEPTH_GUARD."
+
+# -----------------------------------------------------------------------------
+# Alarm — Fix #6 saturation: dlq_broadcasts_depth >= 4500 over 60s.
+# Within 10% of lTrim cap (DLQ_MAX_SIZE=5000, queue.service.ts:2433). At 500 RPS
+# x 50 transporter fanout the DLQ saturates in ~250ms once drainer stalls →
+# silent loss begins. HARD block-flip gate: do NOT flip FF_BATCH_QUEUE_DEPTH_GUARD
+# while this alarm has fired in the last 24h.
+# -----------------------------------------------------------------------------
+put_gauge_max_alarm \
+  "weelo-dlq-broadcasts-depth-saturation" \
+  "dlq_broadcasts_depth" \
+  "4500" \
+  "60" \
+  "1" \
+  "${ALARM_SNS_TOPIC_ARN}" \
+  "[P1] Fix #6 — dlq_broadcasts_depth >= 4500 over 60s. lTrim(0, 4999) about to drop oldest entries; silent broadcast loss imminent. Block-flip gate per index-20-validated.md §2.1.1 Pillar 4."
+
+# -----------------------------------------------------------------------------
+# Alarm — Fix #19c: dlq_broadcasts_permanent_depth > 0 over 5m.
+# Drainer moved entries to permanent dead-letter (attempt >= MAX_REPLAY_ATTEMPTS).
+# Each entry is a permanent broadcast loss; requires human triage.
+# -----------------------------------------------------------------------------
+put_gauge_max_alarm \
+  "weelo-dlq-broadcasts-permanent-depth-warn" \
+  "dlq_broadcasts_permanent_depth" \
+  "0" \
+  "60" \
+  "5" \
+  "${ALARM_SNS_TOPIC_ARN}" \
+  "[P2] Fix #19c — dlq_broadcasts_permanent_depth > 0 over 5m. Attempt-exhausted broadcasts dead-lettered; permanent loss without human triage. LRANGE dlq:broadcasts:permanent for context."
+
 echo "[T1.7+P3] Phase 1 + Phase 3 broadcast alarms configured in ${AWS_REGION}, namespace=${CW_NAMESPACE}."
-echo "[T1.7+P3] Total alarm groups: 9 baseline + 12 P3 SLO + 16 partition-depth = 37 alarms."
+echo "[T1.7+P3] Total alarm groups: 9 baseline + 12 P3 SLO + 16 partition-depth + 4 DLQ depth = 41 alarms."
 echo "[T1.7] Apply dashboard:"
 echo "       aws cloudwatch put-dashboard \\"
 echo "         --dashboard-name weelo-broadcast-baseline-p1 \\"
