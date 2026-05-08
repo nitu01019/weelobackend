@@ -18,6 +18,7 @@ import { prismaClient, withDbTimeout, OrderStatus, AssignmentStatus, VehicleStat
 import { logger } from '../../shared/services/logger.service';
 import { redisService } from '../../shared/services/redis.service';
 import { generateVehicleKey } from '../../shared/services/vehicle-key.service';
+import { FLAGS, isEnabled } from '../../shared/config/feature-flags';
 import { AppError } from '../../shared/types/error.types';
 import { metrics } from '../../shared/monitoring/metrics.service';
 import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
@@ -492,6 +493,25 @@ export async function cancelOrder(
           vehicleSubtype: a.vehicleSubtype || '',
           previousStatus: vehicleStatusMap.get(a.vehicleId!) || 'in_transit'
         }));
+
+      // F-A-64 (Fix #44): VehicleTransitionOutbox — in-TX INSERT mirrors accept-path,
+      // shares commit boundary with the Vehicle.status update above. Legacy post-TX
+      // hook (below, gated flag-off) silently drops Redis failures and leaves
+      // live-availability desynced (STUCK_DRIVER_BUG). Poller in
+      // `vehicle-transition-outbox.service.ts` drains this table.
+      if (isEnabled(FLAGS.VEHICLE_TRANSITION_OUTBOX)) {
+        for (const rv of releasedVehicleData) {
+          const vKey = generateVehicleKey(rv.vehicleType, rv.vehicleSubtype);
+          await tx.$executeRaw`
+            INSERT INTO "VehicleTransitionOutbox"
+              ("vehicleId", "vehicleKey", "transporterId",
+               "fromStatus", "toStatus", "reason")
+            VALUES
+              (${rv.vehicleId}, ${vKey || null}, ${rv.transporterId},
+               ${rv.previousStatus}, ${'available'}, ${'orderCancel'})
+          `;
+        }
+      }
     }
 
     await tx.orderDispatchOutbox.updateMany({
@@ -657,13 +677,18 @@ export async function cancelOrder(
 
     // Live availability + fleet cache: vehicles released back to available AFTER transaction committed
     // A4#8: Use actual previous status instead of hardcoded 'in_transit'
-    const { onVehicleTransition } = require('../../shared/services/vehicle-lifecycle.service');
-    for (const rv of releasedVehicleData) {
-      const vKey = generateVehicleKey(rv.vehicleType, rv.vehicleSubtype);
-      onVehicleTransition(
-        rv.transporterId, rv.vehicleId, vKey,
-        rv.previousStatus, 'available', 'orderCancel'
-      ).catch((err: any) => logger.warn('[ORDER] Vehicle transition sync failed', { error: err?.message }));
+    // F-A-64 (Fix #44): when VEHICLE_TRANSITION_OUTBOX flag is ON, in-TX outbox INSERT (above)
+    // takes ownership and the leader-elected poller drains it. Legacy fire-and-forget runs
+    // only when flag is OFF to preserve current behavior pre-rollout.
+    if (!isEnabled(FLAGS.VEHICLE_TRANSITION_OUTBOX)) {
+      const { onVehicleTransition } = require('../../shared/services/vehicle-lifecycle.service');
+      for (const rv of releasedVehicleData) {
+        const vKey = generateVehicleKey(rv.vehicleType, rv.vehicleSubtype);
+        onVehicleTransition(
+          rv.transporterId, rv.vehicleId, vKey,
+          rv.previousStatus, 'available', 'orderCancel'
+        ).catch((err: unknown) => logger.warn('[ORDER] Vehicle transition sync failed', { error: err instanceof Error ? err.message : String(err) }));
+      }
     }
 
     metrics.incrementCounter('holds_released_on_cancel_total', {

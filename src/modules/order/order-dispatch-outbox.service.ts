@@ -479,16 +479,16 @@ export async function processDispatchOutboxRow(
 // heartbeat (leader-election.service.ts). The blind renewal could stomp a new
 // leader that had legitimately taken over during a GC pause, inviting duplicate
 // row processing.
-// Fix #37 per index-20-validated.md §1.10: TTL bump 60→120s + heartbeat 20→40s
-// is DEFERRED until B-N-13 split-key canonicalization lands (§1.10 line 1315 +
-// §4.1). Without B-N-13, legacy path uses `lock:outbox:leader` while fenced path
-// uses raw `outbox:leader` — bumping TTL would double the rolling-deploy 2-leader
-// window from up to 60s to up to 120s (~30k dup dispatches at 300-500 RPS).
-// Restored to 60/20000 defaults until B-N-13 is in place. V&T-partial Capella +
-// Aldebaran caught this sequencing hazard at HEAD cdb1266c.
+// Fix #37 per index-20-validated.md §1.10 Pillar-1: TTL bumped 60→120s and
+// heartbeat 20→40s. DM throttle p99 5–8s × 8 batch waves ≈ 64s, which exceeds
+// the prior 60s TTL and risks leader expiry mid-batch under sustained load.
+// 120s gives ~47% slack over the worst-case wave window. Safe now that B-N-13
+// canonicalized both legacy and fenced paths to raw `outbox:leader` via
+// `acquireLeader(OUTBOX_LEADER_KEY, ...)`, eliminating the prior 2-leader
+// rolling-deploy hazard that previously gated this bump.
 const OUTBOX_LEADER_KEY = 'outbox:leader';
-const OUTBOX_LEADER_TTL_SECONDS = Math.max(10, parseInt(process.env.OUTBOX_LEADER_TTL_SECONDS || '60', 10) || 60);
-const OUTBOX_LEADER_HEARTBEAT_MS = Math.max(5_000, parseInt(process.env.OUTBOX_LEADER_HEARTBEAT_MS || '20000', 10) || 20_000);
+const OUTBOX_LEADER_TTL_SECONDS = Math.max(10, parseInt(process.env.OUTBOX_LEADER_TTL_SECONDS || '120', 10) || 120);
+const OUTBOX_LEADER_HEARTBEAT_MS = Math.max(5_000, parseInt(process.env.OUTBOX_LEADER_HEARTBEAT_MS || '40000', 10) || 40_000);
 const FF_OUTBOX_LEADER_FENCING = process.env.FF_OUTBOX_LEADER_FENCING === 'true';
 const outboxInstanceId = `${process.pid}:${Date.now()}`;
 
@@ -529,22 +529,46 @@ export async function processDispatchOutboxBatch(limit = ORDER_DISPATCH_OUTBOX_B
           metrics.incrementCounter('outbox_leader_heartbeat_started_total');
         }
       }
-    } catch {
-      logger.warn('[DispatchOutbox] Leader election (fenced) Redis call failed — proceeding as fallback');
-      isLeader = true;
+    } catch (error: unknown) {
+      // Fix #20 per index-20-validated.md §1.5 lines 667-788 + §4.1 line 2186:
+      // FAIL-CLOSED. A Redis error here means we cannot prove we hold the
+      // leader lease, and the previous fail-OPEN behaviour ('proceeding as
+      // fallback' + isLeader=true) split-brained the outbox poller into
+      // every-pod-is-leader mode during Redis blips. Surrender the cycle:
+      // log + emit metric + RETURN. Behavioural day-1 (NOT FF-gated).
+      logger.warn('[OUTBOX_LEADER] Redis error during election — failing CLOSED', {
+        path: 'fenced',
+        error,
+      });
+      metrics.incrementCounter('outbox_leader_election_redis_error_total', { path: 'fenced' });
+      return;
     }
   } else {
-    // Legacy path: acquireLock-style election + blind renewal. Preserved behind
-    // the default-OFF flag so rollout can be canaried.
+    // Legacy path: SET-NX-EX election on the canonical raw `outbox:leader` key.
+    // B-N-13 per index-20-validated.md §1.5 lines 671-678: previously called
+    // `redisService.acquireLock()` which auto-prefixes `lock:`, so the legacy
+    // path wrote `lock:outbox:leader` while the fenced path wrote raw
+    // `outbox:leader`. During rolling deploy this produced TWO leaders for one
+    // full TTL window. Routed through `acquireLeader()` for a single physical key.
     try {
-      const leaderLock = await redisService.acquireLock(OUTBOX_LEADER_KEY, outboxInstanceId, OUTBOX_LEADER_TTL_SECONDS);
-      if (!leaderLock.acquired) {
+      const acquired = await acquireLeader(OUTBOX_LEADER_KEY, outboxInstanceId, OUTBOX_LEADER_TTL_SECONDS);
+      if (!acquired) {
         return;
       }
       isLeader = true;
-    } catch {
-      logger.warn('[DispatchOutbox] Leader election Redis call failed — proceeding as fallback');
-      isLeader = true;
+    } catch (error: unknown) {
+      // Fix #20 per index-20-validated.md §1.5 lines 667-788 + §4.1 line 2186:
+      // FAIL-CLOSED. Same reasoning as the fenced branch above — when the
+      // legacy SET-NX-EX call throws we have no claim on the lock, so
+      // proceeding would race against any other pod that did acquire it.
+      // Surrender the cycle: log + emit metric + RETURN. Behavioural day-1
+      // (NOT FF-gated).
+      logger.warn('[OUTBOX_LEADER] Redis error during election — failing CLOSED', {
+        path: 'legacy',
+        error,
+      });
+      metrics.incrementCounter('outbox_leader_election_redis_error_total', { path: 'legacy' });
+      return;
     }
   }
 

@@ -118,6 +118,18 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
     // (FF_CREATE_ORDER_CONSOLIDATED) path is the dominant success route.
     counter('order_dispatch_outcome_captured_total', 'Order dispatch outcome captured by source (immediate vs poller)'),
 
+    // Fix #20 (index-20-validated.md §1.5 lines 667-788) — Outbox leader
+    // election fail-CLOSED counter. Increments any time a Redis call inside
+    // the leader-election try block throws, in which case we surrender the
+    // poll cycle rather than fail-OPEN. Labels: path = fenced | legacy
+    // (fenced = FF_OUTBOX_LEADER_FENCING enabled, legacy = SET-NX-EX path).
+    // Sustained non-zero rate ⇒ Redis instability is starving the outbox
+    // poller; alert at >5/min for 5m.
+    counter(
+      'outbox_leader_election_redis_error_total',
+      'Outbox leader election Redis errors that triggered fail-CLOSED surrender (labels: path=fenced|legacy)',
+    ),
+
     // W0-4 — FCM push priority canary (labels: priority, type).
     // Observability for W0-1's fix (commit 4d071a1 regression). Lets us see
     // the live high/normal breakdown per notification type so a silent flip

@@ -2884,7 +2884,8 @@ class RedisService {
    * @returns { acquired: boolean, ttl?: number }
    */
   async acquireLock(lockKey: string, holderId: string, ttlSeconds: number): Promise<LockResult> {
-    const key = `lock:${lockKey}`;
+    const normalized = lockKey.startsWith('lock:') ? lockKey.slice(5) : lockKey;
+    const key = `lock:${normalized}`;
 
     // Use SET NX (set if not exists) with expiry
     const result = await this.client.eval(
@@ -2960,7 +2961,8 @@ class RedisService {
    * Only releases if the holder matches (prevents accidental release)
    */
   async releaseLock(lockKey: string, holderId: string): Promise<boolean> {
-    const key = `lock:${lockKey}`;
+    const normalized = lockKey.startsWith('lock:') ? lockKey.slice(5) : lockKey;
+    const key = `lock:${normalized}`;
 
     // Only delete if holder matches
     const result = await this.client.eval(
@@ -2999,7 +3001,8 @@ class RedisService {
    * Check if lock is held by specific holder
    */
   async isLockHeldBy(lockKey: string, holderId: string): Promise<boolean> {
-    const key = `lock:${lockKey}`;
+    const normalized = lockKey.startsWith('lock:') ? lockKey.slice(5) : lockKey;
+    const key = `lock:${normalized}`;
     const holder = await this.client.get(key);
     return holder === holderId;
   }
@@ -3008,7 +3011,8 @@ class RedisService {
    * Get lock holder
    */
   async getLockHolder(lockKey: string): Promise<string | null> {
-    const key = `lock:${lockKey}`;
+    const normalized = lockKey.startsWith('lock:') ? lockKey.slice(5) : lockKey;
+    const key = `lock:${normalized}`;
     return this.client.get(key);
   }
 
