@@ -224,9 +224,9 @@ class TrackingService {
         redisService.set(`mock_gps:${data.tripId}`, 'true', TTL.TRIP).catch(() => {});
 
         // H-24 FIX: Tiered spoof enforcement — drop points after 5+ mock detections per trip
+        // Fix #31: Atomic Lua INCR+EXPIRE — single RTT, self-heals TTL=-1.
         const mockCountKey = `spoof:trip_count:${data.tripId}`;
-        const mockCount = await redisService.incr(mockCountKey);
-        if (mockCount === 1) await redisService.expire(mockCountKey, 86400);
+        const { count: mockCount } = await redisService.incrementWithTTLAndRemaining(mockCountKey, 86400);
 
         if (mockCount >= 5) {
           logger.warn('[SPOOF] Throttling mock GPS — count exceeded threshold', {

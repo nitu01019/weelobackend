@@ -25,6 +25,8 @@ const mockRedisService = {
   acquireLock: jest.fn().mockResolvedValue({ acquired: true }),
   releaseLock: jest.fn().mockResolvedValue(true),
   checkRateLimit: jest.fn().mockResolvedValue({ allowed: true, resetIn: 0 }),
+  setTimerIfAbsent: jest.fn().mockResolvedValue(true),
+  incrementWithTTLAndRemaining: jest.fn().mockResolvedValue({ count: 1, ttl: 60 }),
 };
 
 const mockPrismaClient = {
@@ -85,6 +87,11 @@ const mockEnforceCancelRebookCooldown = jest.fn().mockResolvedValue(undefined);
 // Module-level mocks
 jest.mock('../shared/services/redis.service', () => ({
   redisService: mockRedisService,
+  timerBatchLimit: jest.fn(() => 100),
+  timerShardZset: jest.fn(() => 'timers:pending:{_misc}'),
+  timerShardPrefixTag: jest.fn(() => '_misc'),
+  timerDlqZset: jest.fn(() => 'dlq:timers:evicted:{_misc}'),
+  timerPrefixToShardZset: jest.fn(() => 'timers:pending:{_misc}'),
 }));
 
 jest.mock('../shared/database/prisma.service', () => ({

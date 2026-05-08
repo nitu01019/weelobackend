@@ -96,12 +96,11 @@ import {
 export async function acquireOrderBackpressure(ctx: OrderCreateContext): Promise<void> {
   // Fix B11: Redis-based system-wide backpressure -- shed load before heavy work
   try {
-    const inflight = await redisService.incrBy(ctx.backpressureKey, 1);
+    // Fix #31: Atomic Lua INCR+EXPIRE — eliminates pod-crash-between-INCR-and-EXPIRE
+    // window that orphaned the key with TTL=-1.
+    const { count: inflight } = await redisService.incrementWithTTLAndRemaining(ctx.backpressureKey, 300);
     // Fix #34/#73: Track that Redis counter was incremented
     ctx.redisBackpressureIncremented = true;
-    // Set TTL on first use (safety net for stale counters)
-    // H-P6 FIX: Log backpressure TTL refresh failures instead of silently ignoring
-    await redisService.expire(ctx.backpressureKey, 300).catch((err: unknown) => { logger.warn('[ORDER] Backpressure TTL refresh failed', { error: err instanceof Error ? err.message : String(err) }); });
     if (inflight > ctx.maxConcurrentOrders) {
       await redisService.incrBy(ctx.backpressureKey, -1).catch((err: unknown) => { logger.warn('[ORDER] Backpressure decrement failed', { error: err instanceof Error ? err.message : String(err) }); });
       // Fix #34/#73: Rejection already decremented, so reset flag

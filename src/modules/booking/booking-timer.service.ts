@@ -14,7 +14,7 @@
 import { db } from '../../shared/database/db';
 import { prismaClient } from '../../shared/database/prisma.service';
 import { logger } from '../../shared/services/logger.service';
-import { redisService } from '../../shared/services/redis.service';
+import { redisService, timerBatchLimit } from '../../shared/services/redis.service';
 import { BOOKING_CONFIG, BookingTimerData, RadiusStepTimerData } from './booking.types';
 
 // Forward reference — set by the facade after all modules load
@@ -67,7 +67,7 @@ function startBookingExpiryChecker(): void {
  * Uses Redis distributed lock to prevent multiple instances processing the same booking
  */
 async function processExpiredBookings(): Promise<void> {
-  const expiredTimers = await redisService.getExpiredTimers<BookingTimerData>('timer:booking:');
+  const expiredTimers = await redisService.getExpiredTimers<BookingTimerData>('timer:booking:', timerBatchLimit());
 
   for (const timer of expiredTimers) {
     // Per-booking unified lock: both expiry and radius expansion contend on the same key.
@@ -156,7 +156,7 @@ async function sweepExpiredBookingsFromDB(): Promise<void> {
  * to new transporters in the expanded radius.
  */
 async function processRadiusExpansionTimers(): Promise<void> {
-  const expiredTimers = await redisService.getExpiredTimers<RadiusStepTimerData>('timer:radius:');
+  const expiredTimers = await redisService.getExpiredTimers<RadiusStepTimerData>('timer:radius:', timerBatchLimit());
 
   for (const timer of expiredTimers) {
     // Per-booking unified lock: same key as processExpiredBookings ensures mutual exclusion.

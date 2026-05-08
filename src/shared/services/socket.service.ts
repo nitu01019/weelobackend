@@ -93,6 +93,44 @@ async function withSocketDbLimit<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+// =============================================================================
+// Fix #17: room:members:{roomKey} SADD tracking (24h TTL)
+// =============================================================================
+// Mirrors local socket.join() membership into a Redis set so cross-pod replay
+// (gated by FF_CROSS_POD_ROOM_REPLAY in Phase 3) can enumerate room members
+// authoritatively. Best-effort — Redis failures must not break joins/emits.
+// =============================================================================
+const ROOM_MEMBERS_TTL_SECONDS = 86400; // 24h, matches dispatch-zset TTL convention
+
+async function trackRoomMembership(roomKey: string, userId: string): Promise<void> {
+  if (!userId || !roomKey) return;
+  const memberSet = `room:members:${roomKey}`;
+  await redisService.sAdd(memberSet, userId).catch((err: unknown) =>
+    logger.warn(`[ROOM_MEMBERS] sAdd failed for ${memberSet}`, {
+      error: err instanceof Error ? err.message : String(err)
+    })
+  );
+  await redisService.expire(memberSet, ROOM_MEMBERS_TTL_SECONDS).catch(() => { /* TTL refresh best-effort */ });
+}
+
+// emit-time companion: enumerate local userIds in the target room and idempotently
+// SADD each into room:members:{roomKey}. Local-only enumeration is fine because
+// remote pods will SADD their own users when their join handlers run. TTL refreshed
+// once per emit so an active room never expires while it's still being used.
+async function trackEmitRoomMembership(roomKey: string): Promise<void> {
+  if (!roomKey || !io) return;
+  const userIds = enumerateRoomUserIds(roomKey);
+  if (userIds.length === 0) return;
+  const memberSet = `room:members:${roomKey}`;
+  await redisService.sAdd(memberSet, ...userIds).catch((err: unknown) =>
+    logger.warn(`[ROOM_MEMBERS] emit sAdd failed for ${memberSet}`, {
+      error: err instanceof Error ? err.message : String(err),
+      memberCount: userIds.length
+    })
+  );
+  await redisService.expire(memberSet, ROOM_MEMBERS_TTL_SECONDS).catch(() => { /* TTL refresh best-effort */ });
+}
+
 // Track user connections
 const userSockets = new Map<string, Set<string>>();  // userId -> Set of socketIds
 const socketUsers = new Map<string, string>();        // socketId -> userId
@@ -408,21 +446,27 @@ export function initializeSocket(server: HttpServer): Server {
 
     // Join user's personal room
     socket.join(`user:${userId}`);
+    await trackRoomMembership(`user:${userId}`, userId);
     socket.join(`role:${role}`);
+    await trackRoomMembership(`role:${role}`, userId);
 
     // H8 FIX: Auto-join transporter/driver room on connection
     // Captain app's SocketConnectionManager.joinRoom() has zero callers,
     // so the server must auto-join based on JWT role
     if (role === 'transporter') {
       socket.join(`transporter:${userId}`);
+      await trackRoomMembership(`transporter:${userId}`, userId);
     } else if (role === 'driver') {
       socket.join(`driver:${userId}`);
+      await trackRoomMembership(`driver:${userId}`, userId);
       // Also join the transporter's room if driver has a transporterId
       if (socket.data.transporterId) {
         socket.join(`transporter:${socket.data.transporterId}`);
+        await trackRoomMembership(`transporter:${socket.data.transporterId}`, userId);
       }
     } else if (role === 'customer') {
       socket.join(`customer:${userId}`);
+      await trackRoomMembership(`customer:${userId}`, userId);
     }
 
     // H14 FIX: Auto-join active booking/order rooms on connection
@@ -447,8 +491,14 @@ export function initializeSocket(server: HttpServer): Server {
             take: 10 // Limit to prevent excessive joins
           });
           for (const a of activeAssignments) {
-            if (a.bookingId) socket.join(`booking:${a.bookingId}`);
-            if (a.orderId) socket.join(`order:${a.orderId}`);
+            if (a.bookingId) {
+              socket.join(`booking:${a.bookingId}`);
+              await trackRoomMembership(`booking:${a.bookingId}`, userId);
+            }
+            if (a.orderId) {
+              socket.join(`order:${a.orderId}`);
+              await trackRoomMembership(`order:${a.orderId}`, userId);
+            }
           }
         } else if (role === 'customer') {
           // Find active bookings/orders for this customer
@@ -462,6 +512,7 @@ export function initializeSocket(server: HttpServer): Server {
           });
           for (const b of activeBookings) {
             socket.join(`booking:${b.id}`);
+            await trackRoomMembership(`booking:${b.id}`, userId);
           }
 
           const activeOrders = await prismaClient.order.findMany({
@@ -474,6 +525,7 @@ export function initializeSocket(server: HttpServer): Server {
           });
           for (const o of activeOrders) {
             socket.join(`order:${o.id}`);
+            await trackRoomMembership(`order:${o.id}`, userId);
           }
 
           // C-16 FIX: Auto-join customer to trip:{tripId} rooms for active assignments
@@ -500,6 +552,7 @@ export function initializeSocket(server: HttpServer): Server {
               for (const trip of activeTrips) {
                 if (trip.tripId) {
                   socket.join(`trip:${trip.tripId}`);
+                  await trackRoomMembership(`trip:${trip.tripId}`, userId);
                 }
               }
 
@@ -567,6 +620,7 @@ export function initializeSocket(server: HttpServer): Server {
           }
         }
         socket.join(`booking:${bookingId}`);
+        await trackRoomMembership(`booking:${bookingId}`, userId);
         logger.debug(`User ${userId} joined booking room: ${bookingId}`);
       } catch (err: any) {
         logger.warn(`[Socket] join_booking ownership check failed, denying: ${err?.message}`);
@@ -610,6 +664,7 @@ export function initializeSocket(server: HttpServer): Server {
       }
 
       await socket.join(`transporter:${transporterId}`);
+      await trackRoomMembership(`transporter:${transporterId}`, userId);
       logger.debug(`Socket ${socket.id} joined transporter:${transporterId}`);
     });
 
@@ -1028,6 +1083,7 @@ export function initializeSocket(server: HttpServer): Server {
                 const s = io?.sockets.sockets.get(sid);
                 if (s) s.join(orderRoom);
               }
+              await trackRoomMembership(orderRoom, userId);
             }
           }
 
@@ -1099,6 +1155,7 @@ export function initializeSocket(server: HttpServer): Server {
           }
         }
         socket.join(`order:${orderId}`);
+        await trackRoomMembership(`order:${orderId}`, userId);
         logger.debug(`User ${userId} joined order room: ${orderId}`);
       } catch (err: any) {
         logger.warn(`[Socket] join_order ownership check failed, denying: ${err?.message}`);
@@ -1169,6 +1226,7 @@ export function initializeSocket(server: HttpServer): Server {
         }
 
         socket.join(`trip:${tripId}`);
+        await trackRoomMembership(`trip:${tripId}`, userId);
         logger.debug(`User ${userId} joined trip room: ${tripId}`);
       } catch (err: any) {
         logger.warn(`[Socket] join_trip ownership check failed, denying: ${err?.message}`);
@@ -2463,6 +2521,10 @@ export function emitToRoom(room: string, event: string, data: any): void {
     persistRoomEnvelopes(userIds, event, data).catch(() => { /* already logged per-user */ });
   }
 
+  // Fix #17: idempotent SADD into room:members:{room} for cross-pod replay
+  // (gated by FF_CROSS_POD_ROOM_REPLAY in Phase 3). Best-effort — never blocks emit.
+  trackEmitRoomMembership(room).catch(() => { /* already logged */ });
+
   io.to(room).emit(event, withSocketMeta(data));
 
   logger.debug(`Emitted ${event} to room ${room}`);
@@ -2483,6 +2545,9 @@ export function emitToAllTransporters(event: string, data: any): void {
     const userIds = enumerateRoomUserIds('role:transporter');
     persistRoomEnvelopes(userIds, event, data).catch(() => { /* already logged per-user */ });
   }
+
+  // Fix #17: refresh room:members:role:transporter for cross-pod replay (Phase 3 flag).
+  trackEmitRoomMembership('role:transporter').catch(() => { /* already logged */ });
 
   io.to('role:transporter').emit(event, withSocketMeta(data));
   logger.debug(`Broadcast ${event} to transporters`);
@@ -2508,6 +2573,9 @@ export function emitToTransporterDrivers(transporterId: string, event: string, d
     const userIds = enumerateRoomUserIds(`transporter:${transporterId}`);
     persistRoomEnvelopes(userIds, event, data).catch(() => { /* already logged per-user */ });
   }
+
+  // Fix #17: refresh room:members:transporter:{id} for cross-pod replay (Phase 3 flag).
+  trackEmitRoomMembership(`transporter:${transporterId}`).catch(() => { /* already logged */ });
 
   // Emit to all drivers in transporter room
   io.to(`transporter:${transporterId}`).emit(event, withSocketMeta(data));

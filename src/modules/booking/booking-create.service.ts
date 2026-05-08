@@ -222,10 +222,9 @@ export class BookingCreateService {
     // FIX A5#27: Redis concurrency counter — backpressure to prevent system overload
     // FIX #49: BOOKING_CONCURRENCY_LIMIT and BACKPRESSURE_TTL_SECONDS are now module-level constants
     try {
-      const inflight = await redisService.incr(ctx.concurrencyKey);
+      // Fix #31: Atomic Lua INCR+EXPIRE — TTL set on first call, self-heals TTL=-1.
+      const { count: inflight } = await redisService.incrementWithTTLAndRemaining(ctx.concurrencyKey, BACKPRESSURE_TTL_SECONDS);
       ctx.incremented = true;
-      // TTL as crash safety net only (finally handles normal decrement)
-      await redisService.expire(ctx.concurrencyKey, BACKPRESSURE_TTL_SECONDS).catch(() => {});
       if (inflight > BOOKING_CONCURRENCY_LIMIT) {
         await redisService.incrBy(ctx.concurrencyKey, -1).catch(() => {});
         ctx.incremented = false;

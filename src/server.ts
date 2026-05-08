@@ -1043,11 +1043,13 @@ async function bootstrap(): Promise<void> {
   // set if a previous instance crashed between reading and processing a timer.
   // This re-adds them so the 2-second polling loop picks them up immediately.
   try {
-    const { recoverOrphanedStepTimers } = await import('./modules/order/order-timer.service');
+    const { recoverOrphanedStepTimers, startOrphanRecovery } = await import('./modules/order/order-timer.service');
     const recovered = await recoverOrphanedStepTimers();
     if (recovered > 0) {
       logger.info(`[Startup] C-8: Recovered ${recovered} orphaned order timer(s)`);
     }
+    // NEW#2: Periodic recovery catches any keys that arrive between startup and the next tick.
+    startOrphanRecovery();
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     logger.warn(`[Startup] C-8 timer recovery failed (non-fatal): ${msg}`);
@@ -1126,6 +1128,35 @@ async function bootstrap(): Promise<void> {
     }
   } else {
     logger.info('[DLQDepthEmitter] disabled via FF_DLQ_DEPTH_EMITTER_ENABLED=false');
+  }
+
+  // -------------------------------------------------------------------------
+  // Fix #36: Timer ZSET eviction DLQ drainer.
+  // Re-queues entries from the per-prefix `dlq:timers:evicted:{prefix}` ZSETs
+  // (populated by setTimer's cap-overflow Lua at redis.service.ts:2644/:2859)
+  // back into the per-prefix shard ZSETs via redisService.setTimer.
+  // Leader-elected via distinct lock 'lock:timer-evictions:drainer:lock' —
+  // peer pods short-circuit. Default-on; opt-out with FF_TIMER_DLQ_DRAINER_ENABLED=false.
+  // -------------------------------------------------------------------------
+  if (process.env.FF_TIMER_DLQ_DRAINER_ENABLED !== 'false') {
+    try {
+      const { drain: drainTimerDlq } = await import('../scripts/replay-timer-evictions');
+      const drainBatch = parseInt(process.env.TIMER_DLQ_DRAIN_BATCH_SIZE || '100', 10) || 100;
+      const timerDlqInterval = setInterval(() => {
+        drainTimerDlq({ maxIterations: drainBatch }).catch((err: unknown) => {
+          logger.warn('[TimerDLQ] drainer cycle failed', {
+            err: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }, parseInt(process.env.TIMER_DLQ_DRAIN_INTERVAL_MS || '30000', 10));
+      timerDlqInterval.unref();
+      logger.info('[TimerDLQ] timer eviction drainer registered (leader-elected)');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn(`[Startup] Timer DLQ drainer failed to register (non-fatal): ${msg}`);
+    }
+  } else {
+    logger.info('[TimerDLQ] timer eviction drainer disabled via FF_TIMER_DLQ_DRAINER_ENABLED=false');
   }
 
   // -------------------------------------------------------------------------

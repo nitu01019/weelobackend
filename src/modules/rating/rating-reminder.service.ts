@@ -5,7 +5,7 @@
  * and queueService for push notification delivery.
  */
 import { logger } from '../../shared/services/logger.service';
-import { redisService } from '../../shared/services/redis.service';
+import { redisService, timerBatchLimit } from '../../shared/services/redis.service';
 import { queueService } from '../../shared/services/queue.service';
 
 const REMINDER_DELAYS_MS = [
@@ -76,7 +76,7 @@ export async function processExpiredRatingReminders(): Promise<void> {
       driverName: string;
       vehicleNumber: string;
       delayMs: number;
-    }>(TIMER_PREFIX);
+    }>(TIMER_PREFIX, timerBatchLimit());
 
     for (const timer of expired) {
       try {

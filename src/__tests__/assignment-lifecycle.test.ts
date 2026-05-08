@@ -142,7 +142,14 @@ jest.mock('../shared/services/redis.service', () => ({
     get: jest.fn().mockResolvedValue(null),
     acquireLock: (...args: any[]) => mockRedisAcquireLock(...args),
     releaseLock: (...args: any[]) => mockRedisReleaseLock(...args),
+    setTimerIfAbsent: jest.fn().mockResolvedValue(true),
+    incrementWithTTLAndRemaining: jest.fn().mockResolvedValue({ count: 1, ttl: 60 }),
   },
+  timerBatchLimit: jest.fn(() => 100),
+  timerShardZset: jest.fn(() => 'timers:pending:{_misc}'),
+  timerShardPrefixTag: jest.fn(() => '_misc'),
+  timerDlqZset: jest.fn(() => 'dlq:timers:evicted:{_misc}'),
+  timerPrefixToShardZset: jest.fn(() => 'timers:pending:{_misc}'),
 }));
 
 // --- LiveAvailability mock ---

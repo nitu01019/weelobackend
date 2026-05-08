@@ -296,12 +296,9 @@ export async function reassignDriver(input: ReassignDriverInput): Promise<Reassi
   // 6. POST-TRANSACTION: Redis/cache sync (non-fatal)
   // =========================================================================
 
-  // 6a. Increment reassign counter
+  // 6a. Fix #31: Atomic Lua INCR+EXPIRE — single RTT, self-heals TTL=-1 keys.
   try {
-    const newCount = await redisService.incr(chainKey);
-    if (newCount === 1) {
-      await redisService.expire(chainKey, REASSIGN_COUNTER_TTL_SECONDS);
-    }
+    await redisService.incrementWithTTLAndRemaining(chainKey, REASSIGN_COUNTER_TTL_SECONDS);
   } catch (err) {
     logger.warn('[reassignDriver] Failed to increment reassign counter (non-fatal)', {
       chainKey, error: err instanceof Error ? err.message : String(err),

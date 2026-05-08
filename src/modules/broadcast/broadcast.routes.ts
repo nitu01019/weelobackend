@@ -82,8 +82,8 @@ async function acceptRateLimiter(req: Request, _res: Response, next: NextFunctio
   if (!userId) return next();
   const key = `rl:broadcast-accept:${userId}`;
   try {
-    const count = await redisService.incr(key);
-    if (count === 1) await redisService.expire(key, 60);
+    // Fix #31: Atomic Lua INCR+EXPIRE — single RTT, self-heals TTL=-1.
+    const { count } = await redisService.incrementWithTTLAndRemaining(key, 60);
     if (count > 10) {
       return next(new AppError(429, 'RATE_LIMITED', 'Too many accept attempts. Please wait a moment.'));
     }

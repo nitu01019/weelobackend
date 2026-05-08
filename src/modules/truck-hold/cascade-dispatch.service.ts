@@ -111,9 +111,13 @@ class CascadeDispatchService {
     } = ctx;
 
     try {
-      // Increment retry counter
-      const retryCount = await redisService.incr(CASCADE_RETRY_KEY(truckRequestId));
-      await redisService.expire(CASCADE_RETRY_KEY(truckRequestId), CASCADE_KEY_TTL);
+      // Fix #31: Atomic Lua INCR+EXPIRE — single RTT, self-heals TTL=-1.
+      // (Previous EXPIRE-on-every-call refreshed TTL, but cost an extra RTT;
+      // self-heal still covers the legacy stuck-key case.)
+      const { count: retryCount } = await redisService.incrementWithTTLAndRemaining(
+        CASCADE_RETRY_KEY(truckRequestId),
+        CASCADE_KEY_TTL,
+      );
 
       if (retryCount > MAX_CASCADE_RETRIES) {
         logger.info(

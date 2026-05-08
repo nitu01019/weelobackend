@@ -19,7 +19,7 @@
  * =============================================================================
  */
 
-import { redisService } from '../../shared/services/redis.service';
+import { redisService, timerBatchLimit, timerShardZset } from '../../shared/services/redis.service';
 import { logger } from '../../shared/services/logger.service';
 import { processProgressiveBroadcastStep } from './order-broadcast.service';
 
@@ -42,6 +42,18 @@ export const ORDER_STEP_TIMER_PREFIX = 'timer:order-broadcast-step:';
 export const ORDER_STEP_TIMER_LOCK_PREFIX = 'lock:order-broadcast-step:';
 // M-21 FIX: Make timer poll interval configurable via env var (default 2s unchanged)
 const ORDER_TIMER_CHECK_INTERVAL_MS = parseInt(process.env.TIMER_POLL_INTERVAL_MS || '2000', 10) || 2_000;
+// Fix #1: Batch limit uses shared helper (TIMER_BATCH_LIMIT env, default 100, max TIMER_BATCH_LIMIT_MAX=500)
+const ORDER_TIMER_BATCH_LIMIT = timerBatchLimit();
+// NEW#2: Orphan recovery runs every 5m by default; raise to 60s under heavy crash scenarios
+const TIMER_ORPHAN_RECOVERY_INTERVAL_MS = parseInt(process.env.TIMER_ORPHAN_RECOVERY_INTERVAL_MS || '300000', 10) || 300_000;
+
+// Fix #1: Pod-stable jitter so N pods don't all hit the ZSET simultaneously
+function podPollOffsetMs(intervalMs: number): number {
+  const host = process.env.HOSTNAME || process.env.ECS_TASK_ID || `pid-${process.pid}`;
+  let h = 0;
+  for (let i = 0; i < host.length; i++) h = ((h << 5) - h + host.charCodeAt(i)) | 0;
+  return Math.abs(h) % Math.max(1, intervalMs);
+}
 
 let orderTimerCheckerInterval: NodeJS.Timeout | null = null;
 
@@ -99,7 +111,7 @@ export async function processExpiredTimers(): Promise<void> {
 
 export async function processExpiredOrderTimers(): Promise<void> {
   const expiredTimers = await redisService.getExpiredTimers<{ orderId: string }>(
-    ORDER_EXPIRY_TIMER_PREFIX
+    ORDER_EXPIRY_TIMER_PREFIX, ORDER_TIMER_BATCH_LIMIT
   );
   for (const timer of expiredTimers) {
     const orderId = timer.data?.orderId;
@@ -129,7 +141,7 @@ export async function processExpiredBroadcastStepTimers(): Promise<void> {
     stepIndex: number;
     scheduledAtMs?: number;
     stepWindowMs?: number;
-  }>(ORDER_STEP_TIMER_PREFIX);
+  }>(ORDER_STEP_TIMER_PREFIX, ORDER_TIMER_BATCH_LIMIT);
   for (const timer of expiredTimers) {
     const data = timer.data;
     if (!data?.orderId || !data.vehicleType || data.stepIndex == null) {
@@ -184,14 +196,20 @@ export async function processExpiredBroadcastStepTimers(): Promise<void> {
 
 export function startOrderTimerChecker(): void {
   if (orderTimerCheckerInterval) return;
-  orderTimerCheckerInterval = setInterval(async () => {
-    try {
-      await processExpiredTimers();
-    } catch (error: unknown) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      logger.warn(`[ORDER TIMER] Failed to process timers: ${errorMessage}`);
-    }
-  }, ORDER_TIMER_CHECK_INTERVAL_MS);
+  const offset = podPollOffsetMs(ORDER_TIMER_CHECK_INTERVAL_MS);
+  setTimeout(() => {
+    if (orderTimerCheckerInterval) return;
+    orderTimerCheckerInterval = setInterval(async () => {
+      try {
+        await processExpiredTimers();
+      } catch (error: unknown) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        logger.warn(`[ORDER TIMER] Failed to process timers: ${errorMessage}`);
+      }
+    }, ORDER_TIMER_CHECK_INTERVAL_MS);
+    orderTimerCheckerInterval.unref();
+  }, offset).unref();
+  logger.info(`[ORDER TIMER] Started — interval=${ORDER_TIMER_CHECK_INTERVAL_MS}ms, batchLimit=${ORDER_TIMER_BATCH_LIMIT}, podOffset=${offset}ms`);
 }
 
 export function stopOrderTimerChecker(): void {
@@ -226,17 +244,21 @@ async function recoverOrphanedTimersByPrefix(prefix: string, label: string): Pro
 
   logger.info(`[C-8 Recovery] Found ${keys.length} ${label} key(s) in Redis, checking for orphans`);
 
+  const zscoreLua = `return redis.call('zscore', KEYS[1], ARGV[1])`;
+  const useLegacy = process.env.FF_TIMER_LEGACY_ZSET_ENABLED !== 'false';
+
   for (const key of keys) {
     try {
-      // Check if this key is already in the sorted set via Lua ZSCORE
-      const score = await redisService.eval(
-        `return redis.call('zscore', KEYS[1], ARGV[1])`,
-        ['timers:pending'],
-        [key]
-      ).catch(() => null);
+      const shardZset = timerShardZset(key);
 
-      // If score exists the key is already tracked -- skip
-      if (score !== null && score !== undefined) continue;
+      // Key is tracked if it appears in EITHER the shard ZSET or legacy timers:pending
+      const shardScore = await redisService.eval(zscoreLua, [shardZset], [key]).catch(() => null);
+      const legacyScore = useLegacy
+        ? await redisService.eval(zscoreLua, ['timers:pending'], [key]).catch(() => null)
+        : null;
+
+      if ((shardScore !== null && shardScore !== undefined) ||
+          (legacyScore !== null && legacyScore !== undefined)) continue;
 
       // Read the timer data to get the expiresAt timestamp
       const raw = await redisService.get(key);
@@ -246,7 +268,6 @@ async function recoverOrphanedTimersByPrefix(prefix: string, label: string): Pro
       try {
         timer = JSON.parse(raw);
       } catch {
-        // Corrupt key -- delete it
         await redisService.del(key).catch(() => {});
         continue;
       }
@@ -257,8 +278,11 @@ async function recoverOrphanedTimersByPrefix(prefix: string, label: string): Pro
         continue;
       }
 
-      // Re-add to sorted set so processExpiredTimers picks it up
-      await redisService.zAdd('timers:pending', expiresAtMs, key);
+      // NEW#2: Re-add to shard ZSET (and legacy during dual-write window)
+      await redisService.zAdd(shardZset, expiresAtMs, key);
+      if (useLegacy) {
+        await redisService.zAdd('timers:pending', expiresAtMs, key);
+      }
 
       recovered++;
       logger.info(`[C-8 Recovery] Re-queued orphaned ${label}: ${key}`);
@@ -271,34 +295,64 @@ async function recoverOrphanedTimersByPrefix(prefix: string, label: string): Pro
   return recovered;
 }
 
+// NEW#2: All timer prefixes to scan during orphan recovery.
+// Kept in sync with TIMER_PREFIX_TO_SHARD in redis.service.ts.
+const ALL_TIMER_PREFIXES: ReadonlyArray<readonly [string, string]> = [
+  ['timer:order-broadcast-step:', 'step timer'],
+  ['timer:order-expiry:',         'expiry timer'],
+  ['timer:assignment-timeout:',   'assignment-timeout timer'],
+  ['timer:booking-order:',        'booking-order timer'],
+  ['timer:booking:',              'booking timer'],
+  ['timer:radius:',               'radius timer'],
+  ['timer:rating-reminder:',      'rating-reminder timer'],
+];
+
 /**
- * C-8 FIX: Scan for orphaned order timer keys (both step timers and expiry
- * timers) that exist in Redis but are not in the `timers:pending` sorted set.
- * Re-adds them so the polling loop picks them up within 2 seconds.
+ * C-8 FIX + NEW#2: Scan for orphaned timer keys across ALL 7 timer prefixes.
+ * Checks both the shard ZSET and legacy timers:pending; re-adds to both during
+ * the dual-write window (FF_TIMER_LEGACY_ZSET_ENABLED=true).
  *
- * Call this once during server startup, after Redis is connected.
+ * Safe to call repeatedly — idempotent: already-tracked keys are skipped.
  */
 export async function recoverOrphanedStepTimers(): Promise<number> {
-  try {
-    const stepRecovered = await recoverOrphanedTimersByPrefix(
-      ORDER_STEP_TIMER_PREFIX, 'step timer'
-    );
-    const expiryRecovered = await recoverOrphanedTimersByPrefix(
-      ORDER_EXPIRY_TIMER_PREFIX, 'expiry timer'
-    );
-    const total = stepRecovered + expiryRecovered;
+  let total = 0;
+  const counts: string[] = [];
 
-    if (total > 0) {
-      logger.info(`[C-8 Recovery] Recovered ${total} orphaned timer(s) (${stepRecovered} step, ${expiryRecovered} expiry)`);
-    } else {
-      logger.info('[C-8 Recovery] No orphaned order timers found');
+  for (const [prefix, label] of ALL_TIMER_PREFIXES) {
+    try {
+      const n = await recoverOrphanedTimersByPrefix(prefix, label);
+      if (n > 0) counts.push(`${n} ${label}`);
+      total += n;
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn(`[C-8 Recovery] Scan failed for ${label}: ${msg}`);
     }
-    return total;
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    logger.warn(`[C-8 Recovery] Scan failed (timers will fire via next poll): ${msg}`);
-    return 0;
   }
+
+  if (total > 0) {
+    logger.info(`[C-8 Recovery] Recovered ${total} orphaned timer(s): ${counts.join(', ')}`);
+  } else {
+    logger.info('[C-8 Recovery] No orphaned timers found across all 7 prefixes');
+  }
+  return total;
+}
+
+let orphanRecoveryInterval: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * NEW#2: Start periodic orphan recovery.  Runs recoverOrphanedStepTimers on
+ * an interval (TIMER_ORPHAN_RECOVERY_INTERVAL_MS, default 300s).  Idempotent
+ * — calling more than once is safe.
+ */
+export function startOrphanRecovery(): void {
+  if (orphanRecoveryInterval) return;
+  orphanRecoveryInterval = setInterval(() => {
+    recoverOrphanedStepTimers().catch((err: unknown) => {
+      logger.warn(`[C-8 Recovery] Periodic scan error: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }, TIMER_ORPHAN_RECOVERY_INTERVAL_MS);
+  orphanRecoveryInterval.unref();
+  logger.info(`[ORDER TIMER] Orphan recovery started — interval=${TIMER_ORPHAN_RECOVERY_INTERVAL_MS}ms`);
 }
 
 // Auto-start on module load (same behavior as before extraction)

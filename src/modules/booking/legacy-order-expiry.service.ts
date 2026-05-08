@@ -6,7 +6,7 @@
  */
 
 import { logger } from '../../shared/services/logger.service';
-import { redisService } from '../../shared/services/redis.service';
+import { redisService, timerBatchLimit } from '../../shared/services/redis.service';
 import { ORDER_CONFIG, OrderTimerData } from './legacy-order-types';
 
 // =============================================================================
@@ -56,7 +56,7 @@ export function startOrderExpiryChecker(): void {
  * CODING STANDARDS: Same pattern as processExpiredBookings() in booking.service.ts
  */
 async function processExpiredOrders(): Promise<void> {
-  const expiredTimers = await redisService.getExpiredTimers<OrderTimerData>('timer:booking-order:');
+  const expiredTimers = await redisService.getExpiredTimers<OrderTimerData>('timer:booking-order:', timerBatchLimit());
 
   // Fix H-A3: Phase 1 deprecation logging -- track usage so we know when to remove this file.
   if (expiredTimers.length > 0) {

@@ -620,10 +620,9 @@ class OrderService {
     // drift when Redis succeeds for increment but fails for decrement (or vice versa).
     let usedInMemoryFallback = false;
     try {
-      const inflight = await redisService.incrBy(BACKPRESSURE_KEY, 1);
-      // Set TTL on first use (safety net for stale counters)
-      // H-P6 FIX: Log backpressure TTL refresh failures instead of silently ignoring
-      await redisService.expire(BACKPRESSURE_KEY, 300).catch((err: unknown) => { logger.warn('[ORDER] Backpressure TTL refresh failed', { error: err instanceof Error ? err.message : String(err) }); });
+      // Fix #31: Atomic Lua INCR+EXPIRE — closes pod-crash-between-INCR-and-EXPIRE window
+      // that orphaned the key with TTL=-1 and produced permanent 503 SYSTEM_BUSY.
+      const { count: inflight } = await redisService.incrementWithTTLAndRemaining(BACKPRESSURE_KEY, 300);
       if (inflight > MAX_CONCURRENT_ORDERS) {
         await redisService.incrBy(BACKPRESSURE_KEY, -1).catch((err: unknown) => { logger.warn('[ORDER] Backpressure decrement failed', { error: err instanceof Error ? err.message : String(err) }); });
         logger.warn('[ORDER] System backpressure: too many concurrent order creates', { inflight, max: MAX_CONCURRENT_ORDERS });

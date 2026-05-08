@@ -708,6 +708,34 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
       'rate_limit_denied_total',
       'Requests denied by tiered rate limiter, by user tier (A01-009)'
     ),
+
+    // === Timer pipeline (Aether Lua-block rewrite — §1.1 #1 + §1.9 #36 + §5.1 NEW#1 + §2.1.4 #21) ===
+    // timer_shard_set_total{prefix}: incremented every time setTimer / setTimerIfAbsent
+    // successfully ZADDs into a per-prefix shard ZSET (timers:pending:{prefix}).
+    // `prefix` label is one of the 7 timer prefixes (order-expiry, order-broadcast-step,
+    // assignment-timeout, booking-order, booking, radius, rating-reminder) or `_misc`.
+    counter(
+      'timer_shard_set_total',
+      'Timer ZADDs into per-prefix shard ZSET, labeled by prefix (NEW#1)'
+    ),
+
+    // timer_evicted_to_dlq_total{prefix}: incremented per evicted member when
+    // the shard ZSET overflows TIMER_SHARD_MAX_LEN. Eviction redirects the
+    // popped member to dlq:timers:evicted:{prefix} in the same atomic Lua.
+    counter(
+      'timer_evicted_to_dlq_total',
+      'Timers evicted from a shard ZSET into its per-prefix DLQ, labeled by prefix (Fix #36)'
+    ),
+
+    // timer_dlq_drained_total{prefix, outcome}: emitted per DLQ member handled
+    // by scripts/replay-timer-evictions.ts. Outcomes:
+    //   - 'requeued'        timer GET-key alive + expiresAt in future → setTimer re-added
+    //   - 'discarded'       GET returned null OR expiresAt past → dropped
+    //   - 'requeue_failed'  setTimer threw → entry left in ZSET for next tick
+    counter(
+      'timer_dlq_drained_total',
+      'Timer DLQ outcomes per prefix (requeued|discarded|requeue_failed) — Fix #36'
+    ),
   ];
 
   for (const def of defs) {

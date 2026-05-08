@@ -123,10 +123,8 @@ export async function registerCancelRebookChurn(customerId: string): Promise<voi
   const countKey = `cancel:rebook:count:${customerId}`;
   const cooldownKey = `cancel:rebook:cooldown:${customerId}`;
   try {
-    const newCount = await redisService.incr(countKey);
-    if (newCount === 1) {
-      await redisService.expire(countKey, 120).catch(() => false);
-    }
+    // Fix #31: Atomic Lua INCR+EXPIRE — single RTT, self-heals TTL=-1 keys.
+    const { count: newCount } = await redisService.incrementWithTTLAndRemaining(countKey, 120);
     if (newCount > 6) {
       await redisService.set(cooldownKey, '120', 120);
     } else if (newCount > 3) {

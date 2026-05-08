@@ -33,7 +33,7 @@ import { AppError } from '../../shared/types/error.types';
 import { logger } from '../../shared/services/logger.service';
 import { emitToUser, emitToBooking, SocketEvent } from '../../shared/services/socket.service';
 import { queueService } from '../../shared/services/queue.service';
-import { redisService } from '../../shared/services/redis.service';
+import { redisService, timerBatchLimit } from '../../shared/services/redis.service';
 import { CreateOrderInput, TruckSelection } from './booking.schema';
 import { transporterOnlineService } from '../../shared/services/transporter-online.service';
 import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
@@ -133,7 +133,7 @@ function startOrderExpiryChecker(): void {
  * CODING STANDARDS: Same pattern as processExpiredBookings() in booking.service.ts
  */
 async function processExpiredOrders(): Promise<void> {
-  const expiredTimers = await redisService.getExpiredTimers<OrderTimerData>('timer:booking-order:');
+  const expiredTimers = await redisService.getExpiredTimers<OrderTimerData>('timer:booking-order:', timerBatchLimit());
 
   // Fix H-A3: Phase 1 deprecation logging — track usage so we know when to remove this file.
   if (expiredTimers.length > 0) {

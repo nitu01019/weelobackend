@@ -6,7 +6,7 @@
  */
 
 import { logger } from '../services/logger.service';
-import { redisService } from '../services/redis.service';
+import { redisService, timerBatchLimit } from '../services/redis.service';
 
 export function startAssignmentTimeoutPoller(): void {
   const poller = setInterval(async () => {
@@ -23,7 +23,7 @@ export function startAssignmentTimeoutPoller(): void {
         createdAt: string;
         orderId?: string;
         truckRequestId?: string;
-      }>('timer:assignment-timeout:');
+      }>('timer:assignment-timeout:', timerBatchLimit());
 
       for (const timer of expiredTimers) {
         // FIX #22: Per-timer distributed lock prevents duplicate processing across ECS instances.

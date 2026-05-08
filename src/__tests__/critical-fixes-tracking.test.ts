@@ -89,7 +89,14 @@ jest.mock('../shared/services/redis.service', () => ({
     sIsMember: jest.fn().mockResolvedValue(false),
     scanIterator: (...args: unknown[]) => mockRedisScanIterator(...args),
     sAddWithExpire: jest.fn().mockResolvedValue(undefined),
+    setTimerIfAbsent: jest.fn().mockResolvedValue(true),
+    incrementWithTTLAndRemaining: jest.fn().mockResolvedValue({ count: 1, ttl: 60 }),
   },
+  timerBatchLimit: jest.fn(() => 100),
+  timerShardZset: jest.fn(() => 'timers:pending:{_misc}'),
+  timerShardPrefixTag: jest.fn(() => '_misc'),
+  timerDlqZset: jest.fn(() => 'dlq:timers:evicted:{_misc}'),
+  timerPrefixToShardZset: jest.fn(() => 'timers:pending:{_misc}'),
 }));
 
 // Socket service mock

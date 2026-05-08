@@ -40,7 +40,7 @@ import { availabilityService } from '../../shared/services/availability.service'
 import { generateVehicleKey } from '../../shared/services/vehicle-key.service';
 import { progressiveRadiusMatcher, PROGRESSIVE_RADIUS_STEPS } from '../order/progressive-radius-matcher';
 import { transporterOnlineService } from '../../shared/services/transporter-online.service';
-import { redisService } from '../../shared/services/redis.service';
+import { redisService, timerBatchLimit } from '../../shared/services/redis.service';
 import { liveAvailabilityService } from '../../shared/services/live-availability.service';
 import { releaseVehicle } from '../../shared/services/vehicle-lifecycle.service';
 import { haversineDistanceKm } from '../../shared/utils/geospatial.utils';
@@ -169,7 +169,7 @@ function startBookingExpiryChecker(): void {
  * Uses Redis distributed lock to prevent multiple instances processing the same booking
  */
 async function processExpiredBookings(): Promise<void> {
-  const expiredTimers = await redisService.getExpiredTimers<BookingTimerData>('timer:booking:');
+  const expiredTimers = await redisService.getExpiredTimers<BookingTimerData>('timer:booking:', timerBatchLimit());
 
   for (const timer of expiredTimers) {
     // Per-booking unified lock: both expiry and radius expansion contend on the same key.
@@ -270,7 +270,7 @@ export function stopBookingExpiryChecker(): void {
  * to new transporters in the expanded radius.
  */
 async function processRadiusExpansionTimers(): Promise<void> {
-  const expiredTimers = await redisService.getExpiredTimers<RadiusStepTimerData>('timer:radius:');
+  const expiredTimers = await redisService.getExpiredTimers<RadiusStepTimerData>('timer:radius:', timerBatchLimit());
 
   for (const timer of expiredTimers) {
     // Per-booking unified lock: same key as processExpiredBookings ensures mutual exclusion.
@@ -335,10 +335,9 @@ class BookingService {
     const concurrencyKey = 'booking:create:inflight';
     let incremented = false;
     try {
-      const inflight = await redisService.incr(concurrencyKey);
+      // Fix #31: Atomic Lua INCR+EXPIRE — TTL set on first call, self-heals TTL=-1.
+      const { count: inflight } = await redisService.incrementWithTTLAndRemaining(concurrencyKey, BACKPRESSURE_TTL_SECONDS);
       incremented = true;
-      // TTL as crash safety net only (finally handles normal decrement)
-      await redisService.expire(concurrencyKey, BACKPRESSURE_TTL_SECONDS).catch(() => {});
       if (inflight > BOOKING_CONCURRENCY_LIMIT) {
         await redisService.incrBy(concurrencyKey, -1).catch(() => {});
         incremented = false;

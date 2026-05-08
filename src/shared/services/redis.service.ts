@@ -1809,12 +1809,85 @@ export function isJwtInvalidateSubscribed(): boolean {
 }
 
 // =============================================================================
+// TIMER BATCH LIMIT HELPER (Fix #1)
+// =============================================================================
+
+/**
+ * Returns the effective timer scan batch limit, clamped between 1 and
+ * TIMER_BATCH_LIMIT_MAX (default 500). Callers may pass an explicit limit;
+ * omitting or passing 0/NaN falls back to TIMER_BATCH_LIMIT env (default 100).
+ */
+export function timerBatchLimit(explicitLimit?: number): number {
+  const max = parseInt(process.env.TIMER_BATCH_LIMIT_MAX || '500', 10) || 500;
+  const envDefault = parseInt(process.env.TIMER_BATCH_LIMIT || '100', 10) || 100;
+  const requested = Number.isFinite(explicitLimit as number) && (explicitLimit as number) > 0
+    ? (explicitLimit as number)
+    : envDefault;
+  return Math.max(1, Math.min(requested, max));
+}
+
+// NEW#1 (§5.1): Per-prefix shard ZSET routing.  Hash-tag braces ({prefix}) lock the
+// shard ZSET to one Redis-cluster slot when REDIS_CLUSTER=true.  Today
+// REDIS_CLUSTER=false (redis.service.ts:906) so braces are cosmetic, but the moment
+// cluster mode is enabled every `timer:*` PRODUCER must also wrap the prefix segment
+// in `{}` (e.g. `timer:{order-broadcast-step}:foo:bar`) so the 2-key
+// `setTimerIfAbsent` Lua hashes both the timer key AND the shard ZSET to the same
+// slot — see §2.1.4 #21 + Appendix A.
+const TIMER_PREFIX_TO_SHARD: ReadonlyArray<readonly [string, string, string]> = [
+  // [keyPrefix,                shardZset,                                 labelTag]
+  ['timer:order-expiry:',         'timers:pending:{order-expiry}',         'order-expiry'],
+  ['timer:order-broadcast-step:', 'timers:pending:{order-broadcast-step}', 'order-broadcast-step'],
+  ['timer:assignment-timeout:',   'timers:pending:{assignment-timeout}',   'assignment-timeout'],
+  ['timer:booking-order:',        'timers:pending:{booking-order}',        'booking-order'],
+  ['timer:booking:',              'timers:pending:{booking}',              'booking'],
+  ['timer:radius:',               'timers:pending:{radius}',               'radius'],
+  ['timer:rating-reminder:',      'timers:pending:{rating-reminder}',      'rating-reminder'],
+];
+const TIMER_SHARD_FALLBACK = 'timers:pending:{_misc}';
+const TIMER_SHARD_FALLBACK_TAG = '_misc';
+
+export function timerShardZset(timerKey: string): string {
+  for (const [prefix, shard] of TIMER_PREFIX_TO_SHARD) {
+    if (timerKey.startsWith(prefix)) return shard;
+  }
+  return TIMER_SHARD_FALLBACK;
+}
+
+/**
+ * NEW#1: Returns the prefix-label tag (e.g. `order-expiry`) for a given timer key.
+ * Used as a metric label and to derive the per-prefix DLQ ZSET name.
+ */
+export function timerShardPrefixTag(timerKey: string): string {
+  for (const [prefix, , tag] of TIMER_PREFIX_TO_SHARD) {
+    if (timerKey.startsWith(prefix)) return tag;
+  }
+  return TIMER_SHARD_FALLBACK_TAG;
+}
+
+/**
+ * Fix #36: Per-prefix DLQ ZSET name. Member=timerKey, score=originalExpiresAtMs.
+ * Hash-tag wraps the prefix label so the DLQ ZSET stays in a deterministic cluster slot.
+ */
+export function timerDlqZset(prefixTag: string): string {
+  return `dlq:timers:evicted:{${prefixTag}}`;
+}
+
+// NEW#1: Derive the shard ZSET for getExpiredTimers from the caller's timerPrefix.
+// Matches the same prefix table used by timerShardZset().
+export function timerPrefixToShardZset(timerPrefix: string): string {
+  for (const [prefix, shard] of TIMER_PREFIX_TO_SHARD) {
+    if (prefix === timerPrefix) return shard;
+  }
+  return TIMER_SHARD_FALLBACK;
+}
+
+// =============================================================================
 // REDIS SERVICE (Main Entry Point)
 // =============================================================================
 
 /**
  * Main Redis Service - Use this throughout the application
- * 
+ *
  * Automatically uses:
  * - Real Redis when REDIS_ENABLED=true and REDIS_URL is set
  * - In-memory fallback for development
@@ -2553,20 +2626,95 @@ class RedisService {
     // #55 FIX: Use safeStringify to avoid crash on circular objects
     await this.client.set(timerKey, safeStringify(timerData), ttlSeconds + 60); // Extra 60s buffer
 
-    // Fix C6/F-5-2: Lua script does ZADD + cap at 10000 entries + 30-day safety TTL
-    await this.client.eval(
-      `redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
-       redis.call('ZREMRANGEBYRANK', KEYS[1], 0, -10001)
-       if redis.call('TTL', KEYS[1]) == -1 then
-         redis.call('EXPIRE', KEYS[1], 2592000)
-       end
-       return 1`,
-      ['timers:pending'],
-      [expiresAt.getTime().toString(), timerKey]
+    // NEW#1 (§5.1) + Fix #36 (§1.9): atomic ZADD-to-shard + cap-and-evict-to-DLQ.
+    // SHARD: per-prefix ZSET so cap eviction in one prefix never starves another
+    //        (the audit's #1 starvation root cause).  Single key → cluster-safe (B-N-6).
+    // DLQ:   per-prefix ZSET `dlq:timers:evicted:{prefix}` keyed by timerKey,
+    //        scored by original expiresAtMs.  Drainer (Zephyr's scope) re-queues
+    //        them when the underlying GET-key still exists.
+    // CAP:   TIMER_SHARD_MAX_LEN env (default 5000).  Doc §1.9 hardcoded 10000;
+    //        lead override = 5000 since each prefix is now its own ZSET.
+    // EXPIRE: same atomic Lua sets 7-day EXPIRE on the DLQ ZSET — without this,
+    //         a DLQ ZSET that is overflowed-once and never drained would persist
+    //         forever (hazard 3 from team-lead brief).
+    const shardZset = timerShardZset(timerKey);
+    const prefixTag = timerShardPrefixTag(timerKey);
+    const dlqZset = timerDlqZset(prefixTag);
+    const shardMaxLen = Math.max(1, parseInt(process.env.TIMER_SHARD_MAX_LEN || '5000', 10) || 5000);
+    const dlqExpireSec = Math.max(60, parseInt(process.env.TIMER_DLQ_EXPIRE_SECONDS || '604800', 10) || 604800);
+
+    // Single-key Lua (KEYS[1]=shardZset).  KEYS[2]=dlqZset (also single-tag, same
+    // logical Redis instance — both keyed by `{prefixTag}` so they hash to the
+    // same slot when REDIS_CLUSTER=true).  ARGV[1]=score, ARGV[2]=member,
+    // ARGV[3]=cap, ARGV[4]=dlq-expire-seconds.
+    const luaZaddWithDlq = `
+      redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
+      local evicted = {}
+      local cap = tonumber(ARGV[3])
+      local card = redis.call('ZCARD', KEYS[1])
+      if card > cap then
+        local overflow = card - cap
+        evicted = redis.call('ZRANGE', KEYS[1], 0, overflow - 1, 'WITHSCORES')
+        redis.call('ZREMRANGEBYRANK', KEYS[1], 0, overflow - 1)
+        if #evicted > 0 then
+          for i = 1, #evicted, 2 do
+            redis.call('ZADD', KEYS[2], evicted[i + 1], evicted[i])
+          end
+          redis.call('EXPIRE', KEYS[2], tonumber(ARGV[4]))
+        end
+      end
+      if redis.call('TTL', KEYS[1]) == -1 then
+        redis.call('EXPIRE', KEYS[1], 2592000)
+      end
+      return evicted
+    `;
+
+    const evictedRaw = await this.client.eval(
+      luaZaddWithDlq,
+      [shardZset, dlqZset],
+      [expiresAt.getTime().toString(), timerKey, shardMaxLen.toString(), dlqExpireSec.toString()]
     ).catch(() => {
-      // Fallback for in-memory mode - just use sAdd
+      // In-memory fallback — no atomic Lua available; just record into the legacy
+      // catch-all set so getExpiredTimers' SCAN fallback path still finds it.
       this.client.sAdd('timers:pending:set', timerKey);
+      return null;
     });
+
+    // Increment shard-set counter on every successful ZADD (success path = eval
+    // returned an array, even an empty one).  `prefixTag` keeps cardinality small.
+    if (Array.isArray(evictedRaw)) {
+      try { const { metrics } = require('../monitoring/metrics.service'); metrics.incrementCounter('timer_shard_set_total', { prefix: prefixTag }); } catch { /* metrics not available */ }
+    }
+
+    // NEW#1 dual-write to legacy `timers:pending` while FF_TIMER_LEGACY_ZSET_ENABLED.
+    // Required for rolling deploys: pods on the OLD code still read from
+    // `timers:pending`, so a timer set by a NEW pod must also land there until
+    // every pod has restarted.  Flip flag off ~24-30h post-cutover (doc §5.1).
+    // Cap+DLQ logic intentionally OMITTED here — the legacy ZSET is being phased
+    // out, so we don't want to also pollute a separate legacy DLQ.  Best-effort.
+    if (process.env.FF_TIMER_LEGACY_ZSET_ENABLED !== 'false') {
+      await this.client.eval(
+        `redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
+         redis.call('ZREMRANGEBYRANK', KEYS[1], 0, -10001)
+         if redis.call('TTL', KEYS[1]) == -1 then
+           redis.call('EXPIRE', KEYS[1], 2592000)
+         end
+         return 1`,
+        ['timers:pending'],
+        [expiresAt.getTime().toString(), timerKey]
+      ).catch(() => { /* legacy is best-effort */ });
+    }
+
+    // Per-prefix DLQ counter — increment once per evicted member so dashboards
+    // can show "DLQ pressure by prefix" (the original §1.9 audit signal).
+    if (Array.isArray(evictedRaw) && evictedRaw.length > 0) {
+      const evictedCount = evictedRaw.length / 2;  // [member, score, member, score, ...]
+      try {
+        const { metrics } = require('../monitoring/metrics.service');
+        metrics.incrementCounter('timer_evicted_to_dlq_total', { prefix: prefixTag }, evictedCount);
+      } catch { /* metrics not available */ }
+      logger.warn(`[TIMER ZSET] Evicted ${evictedCount} timer(s) from ${shardZset} (cap=${shardMaxLen}); pushed to ${dlqZset}`);
+    }
   }
 
   /**
@@ -2575,16 +2723,26 @@ class RedisService {
    * @param timerPrefix Prefix to filter timers (e.g., "timer:booking:")
    * @returns Array of expired timer data
    */
-  async getExpiredTimers<T>(timerPrefix: string): Promise<Array<{ key: string; data: T; expiresAt: string }>> {
+  async getExpiredTimers<T>(timerPrefix: string, limit?: number): Promise<Array<{ key: string; data: T; expiresAt: string }>> {
     const now = Date.now();
     const expired: Array<{ key: string; data: T; expiresAt: string }> = [];
 
+    // Fix #1 (§1.1): batch limit is now caller-overridable, env-clamped.
+    // ARGV-typed LIMIT lets each caller (broadcast-step poller vs assignment-timeout
+    // poller etc.) set its own cap without one prefix starving another at 300+ RPS.
+    const effectiveLimit = timerBatchLimit(limit);
+
     try {
-      // Get expired timers from sorted set (capped at 100 per cycle to prevent runaway scans)
+      // NEW#1 (§5.1): canonical reader is the per-prefix shard ZSET.  Each prefix
+      // gets its own LIMIT slice — no cross-prefix bleed, no cross-prefix
+      // starvation (the bug that #1's LIMIT-raise alone could not fix).
+      const shardZset = timerPrefixToShardZset(timerPrefix);
+      const useLegacy = process.env.FF_TIMER_LEGACY_ZSET_ENABLED !== 'false';
+
       const expiredKeys = await this.client.eval(
-        `return redis.call('zrangebyscore', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, 100)`,
-        ['timers:pending'],
-        [now.toString()]
+        `return redis.call('zrangebyscore', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]))`,
+        [shardZset],
+        [now.toString(), effectiveLimit.toString()]
       ) as string[] | null;
 
       if (expiredKeys && Array.isArray(expiredKeys)) {
@@ -2603,17 +2761,18 @@ class RedisService {
                 });
               }
             } catch (e) {
-              // Invalid JSON, remove it
               await this.client.del(key);
             }
           }
 
-          // Remove from sorted set
-          await this.client.eval(
-            `redis.call('zrem', KEYS[1], ARGV[1])`,
-            ['timers:pending'],
-            [key]
-          ).catch(() => { });
+          // ZREM from shard (canonical) AND legacy (dual-write window) so neither
+          // ZSET accumulates stragglers after a timer fires.  Legacy ZREM is
+          // skipped once the dual-write flag is flipped off.
+          const zremLua = `redis.call('zrem', KEYS[1], ARGV[1])`;
+          await this.client.eval(zremLua, [shardZset], [key]).catch(() => { });
+          if (useLegacy) {
+            await this.client.eval(zremLua, ['timers:pending'], [key]).catch(() => { });
+          }
         }
       }
     } catch (e) {
@@ -2650,12 +2809,12 @@ class RedisService {
   async cancelTimer(timerKey: string): Promise<boolean> {
     const deleted = await this.client.del(timerKey);
 
-    // Remove from sorted set
-    await this.client.eval(
-      `redis.call('zrem', KEYS[1], ARGV[1])`,
-      ['timers:pending'],
-      [timerKey]
-    ).catch(() => {
+    // NEW#1: ZREM from both shard ZSET and legacy timers:pending.
+    // Prevents ghost-fire after the timer key's TTL expires if only one ZSET is cleaned.
+    const shardZset = timerShardZset(timerKey);
+    const zremLua = `redis.call('zrem', KEYS[1], ARGV[1])`;
+    await this.client.eval(zremLua, [shardZset], [timerKey]).catch(() => { });
+    await this.client.eval(zremLua, ['timers:pending'], [timerKey]).catch(() => {
       this.client.sRem('timers:pending:set', timerKey);
     });
 
@@ -2667,6 +2826,111 @@ class RedisService {
    */
   async hasTimer(timerKey: string): Promise<boolean> {
     return this.client.exists(timerKey);
+  }
+
+  /**
+   * Fix #21 (§2.1.4): atomic claim-or-skip for a timer key.  Closes the
+   * `hasTimer(...) → setTimer(...)` TOCTOU at order-broadcast.service.ts:1272-1275
+   * where two pods racing the same step boundary both see false and both
+   * schedule a duplicate firing.
+   *
+   * Single Lua: SET NX (claim the GET key) + ZADD to the per-prefix shard ZSET +
+   * cap-and-evict-to-DLQ.  Returns true iff the caller won the race.
+   *
+   * Cluster-compat (B-N-6): the Lua takes 2 KEYS — the timer GET key and the
+   * shard ZSET.  These hash to the same Redis-cluster slot ONLY if BOTH share
+   * the same `{tag}` braces.  Today REDIS_CLUSTER=false (redis.service.ts:906)
+   * so braces on the shard ZSET alone are cosmetic.  When cluster mode is
+   * enabled, every `timer:*` PRODUCER must also wrap the prefix in `{}`
+   * (e.g. `timer:{order-broadcast-step}:foo:bar`) — adding `{}` to only one
+   * key gives CROSSSLOT.  Cross-checked against Appendix A — Script 2.
+   */
+  async setTimerIfAbsent<T>(timerKey: string, data: T, expiresAt: Date): Promise<boolean> {
+    const ttlSeconds = Math.max(1, Math.ceil((expiresAt.getTime() - Date.now()) / 1000));
+    const timerData = {
+      data,
+      expiresAt: expiresAt.toISOString(),
+      createdAt: new Date().toISOString()
+    };
+    const shardZset = timerShardZset(timerKey);
+    const prefixTag = timerShardPrefixTag(timerKey);
+    const dlqZset = timerDlqZset(prefixTag);
+    const shardMaxLen = Math.max(1, parseInt(process.env.TIMER_SHARD_MAX_LEN || '5000', 10) || 5000);
+    const dlqExpireSec = Math.max(60, parseInt(process.env.TIMER_DLQ_EXPIRE_SECONDS || '604800', 10) || 604800);
+
+    // Atomic 2-key Lua.  KEYS[1]=timer GET key, KEYS[2]=shard ZSET.  Same
+    // overflow-to-DLQ semantics as `setTimer` so a heavy-write claim path
+    // cannot evict a timer without observability.
+    const luaSetIfAbsent = `
+      local set = redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2])
+      if set then
+        redis.call('ZADD', KEYS[2], ARGV[3], KEYS[1])
+        local cap = tonumber(ARGV[4])
+        local card = redis.call('ZCARD', KEYS[2])
+        if card > cap then
+          local overflow = card - cap
+          local evicted = redis.call('ZRANGE', KEYS[2], 0, overflow - 1, 'WITHSCORES')
+          redis.call('ZREMRANGEBYRANK', KEYS[2], 0, overflow - 1)
+          if #evicted > 0 then
+            for i = 1, #evicted, 2 do
+              redis.call('ZADD', KEYS[3], evicted[i + 1], evicted[i])
+            end
+            redis.call('EXPIRE', KEYS[3], tonumber(ARGV[6]))
+          end
+        end
+        if redis.call('TTL', KEYS[2]) == -1 then
+          redis.call('EXPIRE', KEYS[2], 2592000)
+        end
+        return 1
+      end
+      return 0
+    `;
+
+    try {
+      const result = await this.client.eval(
+        luaSetIfAbsent,
+        [timerKey, shardZset, dlqZset],
+        [
+          safeStringify(timerData),         // ARGV[1]: timer payload
+          String(ttlSeconds + 60),          // ARGV[2]: GET-key EX (matches setTimer's +60 buffer)
+          expiresAt.getTime().toString(),   // ARGV[3]: ZADD score
+          shardMaxLen.toString(),           // ARGV[4]: shard cap
+          '',                               // ARGV[5]: reserved (kept for forward-compat)
+          dlqExpireSec.toString()           // ARGV[6]: DLQ EXPIRE seconds
+        ]
+      );
+      const claimed = Number(result) === 1;
+
+      if (claimed) {
+        try { const { metrics } = require('../monitoring/metrics.service'); metrics.incrementCounter('timer_shard_set_total', { prefix: prefixTag }); } catch { /* metrics not available */ }
+
+        // Dual-write to legacy `timers:pending` only when we won the claim.
+        // Best-effort — the legacy ZSET is being phased out.
+        if (process.env.FF_TIMER_LEGACY_ZSET_ENABLED !== 'false') {
+          await this.client.eval(
+            `redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
+             redis.call('ZREMRANGEBYRANK', KEYS[1], 0, -10001)
+             if redis.call('TTL', KEYS[1]) == -1 then
+               redis.call('EXPIRE', KEYS[1], 2592000)
+             end
+             return 1`,
+            ['timers:pending'],
+            [expiresAt.getTime().toString(), timerKey]
+          ).catch(() => { /* legacy is best-effort */ });
+        }
+      }
+
+      return claimed;
+    } catch (err: unknown) {
+      // Non-atomic fallback for in-memory clients or Lua-unsupported environments.
+      // Lose the TOCTOU guarantee, but the system stays correct under normal
+      // operation since the in-memory client is single-process anyway.
+      logger.warn(`[setTimerIfAbsent] Lua eval failed, falling back non-atomic: ${err instanceof Error ? err.message : String(err)}`);
+      const exists = await this.client.exists(timerKey);
+      if (exists) return false;
+      await this.setTimer(timerKey, data, expiresAt);
+      return true;
+    }
   }
 
   // ===========================================================================

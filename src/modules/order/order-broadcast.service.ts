@@ -1212,10 +1212,7 @@ export async function scheduleNextProgressiveStep(
   if (!step) return;
 
   const timerKey = orderBroadcastStepTimerKey(orderId, vehicleType, vehicleSubtype, stepIndex);
-  const alreadyScheduled = await redisService.hasTimer(timerKey).catch(() => false);
-  if (alreadyScheduled) return;
-
-  await redisService.setTimer(
+  const claimed = await redisService.setTimerIfAbsent(
     timerKey,
     {
       orderId,
@@ -1226,7 +1223,10 @@ export async function scheduleNextProgressiveStep(
       stepWindowMs: step.windowMs
     },
     new Date(Date.now() + step.windowMs)
-  );
+  ).catch(() => false);
+  if (!claimed) {
+    return;
+  }
 }
 
 /**

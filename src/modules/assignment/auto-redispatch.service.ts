@@ -200,11 +200,8 @@ export async function tryAutoRedispatch(params: AutoRedispatchParams): Promise<b
         }),
       ]);
 
-      // Increment redispatch counter with TTL
-      const newCount = await redisService.incr(redisKey);
-      if (newCount === 1) {
-        await redisService.expire(redisKey, REDISPATCH_COUNTER_TTL_SECONDS);
-      }
+      // Fix #31: Atomic Lua INCR+EXPIRE — single RTT, self-heals TTL=-1 keys.
+      const { count: newCount } = await redisService.incrementWithTTLAndRemaining(redisKey, REDISPATCH_COUNTER_TTL_SECONDS);
 
       logger.info('[AUTO-REDISPATCH] Order-path redispatch complete', {
         orderId,
@@ -238,12 +235,8 @@ export async function tryAutoRedispatch(params: AutoRedispatchParams): Promise<b
     driverId: candidateDriver.id,
   });
 
-  // 5. Increment redispatch counter with TTL
-  const newCount = await redisService.incr(redisKey);
-  if (newCount === 1) {
-    // First increment — set TTL
-    await redisService.expire(redisKey, REDISPATCH_COUNTER_TTL_SECONDS);
-  }
+  // 5. Fix #31: Atomic Lua INCR+EXPIRE — single RTT, self-heals TTL=-1 keys.
+  const { count: newCount } = await redisService.incrementWithTTLAndRemaining(redisKey, REDISPATCH_COUNTER_TTL_SECONDS);
 
   logger.info(
     `[AUTO-REDISPATCH] Successfully re-dispatched: ${streamId} → driver ${candidateDriver.name} ` +

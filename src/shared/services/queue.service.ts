@@ -23,7 +23,7 @@
 import * as crypto from 'crypto';
 import { logger } from './logger.service';
 import { EventEmitter } from 'events';
-import { redisService } from './redis.service';
+import { redisService, timerBatchLimit } from './redis.service';
 import { maskName } from '../utils/pii.utils';
 import { createTrackingStreamSink } from './tracking-stream-sink';
 import { metrics } from '../monitoring/metrics.service';
@@ -2255,7 +2255,7 @@ export class QueueService {
           createdAt: string;
           orderId?: string;
           truckRequestId?: string;
-        }>('timer:assignment-timeout:');
+        }>('timer:assignment-timeout:', timerBatchLimit());
 
         for (const timer of expiredTimers) {
           // FIX #22: Per-timer distributed lock prevents duplicate processing across ECS instances.

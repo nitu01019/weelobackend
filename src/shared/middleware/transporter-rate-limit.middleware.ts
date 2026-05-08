@@ -149,13 +149,10 @@ export function transporterRateLimit(action: keyof typeof RATE_LIMITS) {
         });
       }
 
-      // Increment counter
-      const current = await redisService.incr(counterKey);
-
-      // Set expiry on first request
-      if (current === 1) {
-        await redisService.expire(counterKey, limit.window);
-      }
+      // Fix #31: Atomic Lua INCR+EXPIRE — single RTT, self-heals TTL=-1.
+      // Critical for security counters: prevents an orphaned no-TTL counter from
+      // bypassing the rate limit indefinitely.
+      const { count: current, ttl: counterTtl } = await redisService.incrementWithTTLAndRemaining(counterKey, limit.window);
 
       // Check if limit exceeded
       if (current > limit.max) {
@@ -175,7 +172,7 @@ export function transporterRateLimit(action: keyof typeof RATE_LIMITS) {
       const remaining = Math.max(0, limit.max - current);
       res.setHeader('X-RateLimit-Limit', limit.max.toString());
       res.setHeader('X-RateLimit-Remaining', remaining.toString());
-      res.setHeader('X-RateLimit-Reset', (await redisService.ttl(counterKey)).toString());
+      res.setHeader('X-RateLimit-Reset', counterTtl.toString());
 
       // Proceed with request
       next();

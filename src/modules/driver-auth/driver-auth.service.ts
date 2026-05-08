@@ -148,10 +148,8 @@ class DriverAuthService {
     // 3. Per-transporter SMS rate limit (max 20 OTPs per hour)
     const smsRateKey = `sms_rate:transporter:${transporter.id}`;
     try {
-      const count = await redisService.incr(smsRateKey);
-      if (count === 1) {
-        await redisService.expire(smsRateKey, 3600);
-      }
+      // Fix #31: Atomic Lua INCR+EXPIRE — closes crash window that orphaned SMS rate keys with TTL=-1.
+      const { count } = await redisService.incrementWithTTLAndRemaining(smsRateKey, 3600);
       if (count > 20) {
         logger.warn('[DRIVER AUTH] Transporter SMS rate limit exceeded', {
           transporterId: transporter.id,
