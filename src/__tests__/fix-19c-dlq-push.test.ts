@@ -287,7 +287,7 @@ describe('Fix #19c — Guard-lookup-error DLQ push', () => {
       // Locate the relevant catch block (lookup_error path) — use a larger window
       const catchStart = src.indexOf('} catch (error: any) {', src.indexOf('lookupOutcome'));
       expect(catchStart).toBeGreaterThan(0);
-      const catchRegion = src.substring(catchStart, catchStart + 2000);
+      const catchRegion = src.substring(catchStart, catchStart + 3500);
 
       // The catch block must guard emitToUser behind cancelledOrderQueueGuardFailOpen
       expect(catchRegion).toContain('cancelledOrderQueueGuardFailOpen');
@@ -333,7 +333,7 @@ describe('Fix #19c — Guard-lookup-error DLQ push', () => {
         'utf-8'
       );
       const catchIdx = src.indexOf('} catch (error: any) {', src.indexOf('lookupOutcome'));
-      const catchBlock = src.substring(catchIdx, catchIdx + 2000);
+      const catchBlock = src.substring(catchIdx, catchIdx + 3500);
 
       // There must be a `return;` after emitToUser in the fail-open branch
       const emitIdx = catchBlock.indexOf('emitToUser(transporterId');

@@ -991,8 +991,6 @@ export async function broadcastVehicleTypePayload(
       continue;
     }
 
-    alreadyNotifiedSet.add(transporterId);
-
     const trucksYouCanProvide = Math.min(availability.available, trucksStillNeeded);
     // Per-transporter pickup distance from Distance Matrix API (already computed)
     const pickupData = candidateDistanceMap?.get(transporterId);
@@ -1002,7 +1000,11 @@ export async function broadcastVehicleTypePayload(
         transporterId,
         candidateMapSize: candidateDistanceMap?.size ?? 0
       });
+      continue;
     }
+
+    alreadyNotifiedSet.add(transporterId);
+
     const personalizedBroadcast = {
       ...extendedBroadcast,
       trucksYouCanProvide,
@@ -1011,8 +1013,8 @@ export async function broadcastVehicleTypePayload(
       yourTotalTrucks: availability.totalOwned,
       trucksStillNeeded,
       trucksNeededOfThisType: trucksStillNeeded,
-      pickupDistanceKm: pickupData?.distanceKm ?? 0,
-      pickupEtaMinutes: Math.ceil((pickupData?.etaSeconds ?? 0) / 60),
+      pickupDistanceKm: pickupData.distanceKm,
+      pickupEtaMinutes: Math.ceil(pickupData.etaSeconds / 60),
       isPersonalized: true,
       personalizedFor: transporterId
     };

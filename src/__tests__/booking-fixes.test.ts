@@ -139,6 +139,7 @@ jest.mock('../shared/database/prisma.service', () => {
       upsert: jest.fn().mockResolvedValue({ customerId: 'customer-001', cancelCount7d: 1 }),
     },
     $queryRaw: (...args: any[]) => mockQueryRaw(...args),
+    $executeRaw: jest.fn().mockResolvedValue(undefined),
   };
   return {
     prismaClient: {
@@ -772,13 +773,14 @@ describe('P9 — Vehicle lock in acceptBroadcast', () => {
   it('acceptBroadcast sets vehicle to on_hold inside transaction', async () => {
     setupAcceptMocks();
 
-    const { broadcastService } = require('../modules/broadcast/broadcast.service');
+    const { acceptBroadcast } = require('../modules/broadcast/broadcast-accept.service');
 
-    const result = await broadcastService.acceptBroadcast('broadcast-001', {
+    const result = await acceptBroadcast('broadcast-001', {
       driverId: 'driver-001',
       vehicleId: 'vehicle-001',
       actorUserId: 'transporter-001',
       actorRole: 'transporter',
+      idempotencyKey: 'idem-p9-vehicle-lock',
     });
 
     expect(result.status).toBe('assigned');
@@ -803,14 +805,15 @@ describe('P9 — Vehicle lock in acceptBroadcast', () => {
     // Vehicle lock returns count=0 — already taken
     mockVehicleUpdateMany.mockResolvedValue({ count: 0 });
 
-    const { broadcastService } = require('../modules/broadcast/broadcast.service');
+    const { acceptBroadcast } = require('../modules/broadcast/broadcast-accept.service');
 
     await expect(
-      broadcastService.acceptBroadcast('broadcast-001', {
+      acceptBroadcast('broadcast-001', {
         driverId: 'driver-001',
         vehicleId: 'vehicle-001',
         actorUserId: 'transporter-001',
         actorRole: 'transporter',
+        idempotencyKey: 'idem-p9-vehicle-on-hold',
       })
     ).rejects.toThrow(/vehicle.*unavailable|no longer available/i);
   });
@@ -819,13 +822,14 @@ describe('P9 — Vehicle lock in acceptBroadcast', () => {
     // First accept succeeds
     setupAcceptMocks();
 
-    const { broadcastService } = require('../modules/broadcast/broadcast.service');
+    const { acceptBroadcast } = require('../modules/broadcast/broadcast-accept.service');
 
-    const result1 = await broadcastService.acceptBroadcast('broadcast-001', {
+    const result1 = await acceptBroadcast('broadcast-001', {
       driverId: 'driver-001',
       vehicleId: 'vehicle-001',
       actorUserId: 'transporter-001',
       actorRole: 'transporter',
+      idempotencyKey: 'idem-p9-race-t1',
     });
     expect(result1.status).toBe('assigned');
 
@@ -866,11 +870,12 @@ describe('P9 — Vehicle lock in acceptBroadcast', () => {
     mockVehicleUpdateMany.mockResolvedValue({ count: 0 });
 
     await expect(
-      broadcastService.acceptBroadcast('broadcast-001', {
+      acceptBroadcast('broadcast-001', {
         driverId: 'driver-002',
         vehicleId: 'vehicle-001',
         actorUserId: 'transporter-002',
         actorRole: 'transporter',
+        idempotencyKey: 'idem-p9-race-t2',
       })
     ).rejects.toThrow(/vehicle.*unavailable|no longer available/i);
   });
@@ -878,13 +883,14 @@ describe('P9 — Vehicle lock in acceptBroadcast', () => {
   it('vehicle status check is inside Serializable TX', async () => {
     setupAcceptMocks();
 
-    const { broadcastService } = require('../modules/broadcast/broadcast.service');
+    const { acceptBroadcast } = require('../modules/broadcast/broadcast-accept.service');
 
-    await broadcastService.acceptBroadcast('broadcast-001', {
+    await acceptBroadcast('broadcast-001', {
       driverId: 'driver-001',
       vehicleId: 'vehicle-001',
       actorUserId: 'transporter-001',
       actorRole: 'transporter',
+      idempotencyKey: 'idem-p9-serial-tx',
     });
 
     // withDbTimeout is called with Serializable isolation level

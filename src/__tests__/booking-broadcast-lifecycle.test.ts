@@ -134,6 +134,7 @@ const mockWithDbTimeout = jest.fn().mockImplementation(async (fn: any, _opts?: a
     },
     vehicle: { findUnique: mockVehicleFindUnique, update: mockVehicleUpdate, updateMany: mockVehicleUpdateMany },
     user: { findUnique: mockUserFindUnique, findMany: mockUserFindMany },
+    $executeRaw: jest.fn().mockResolvedValue(undefined),
   };
   return fn(fakeTx);
 });
@@ -360,6 +361,7 @@ jest.mock('../modules/pricing/vehicle-catalog', () => ({
 
 import { bookingService } from '../modules/booking/booking.service';
 import { broadcastService } from '../modules/broadcast/broadcast.service';
+import { acceptBroadcast } from '../modules/broadcast/broadcast-accept.service';
 import { AppError } from '../shared/types/error.types';
 import { TERMINAL_BOOKING_STATUSES, isValidTransition, BOOKING_VALID_TRANSITIONS } from '../core/state-machines';
 
@@ -829,7 +831,7 @@ describe('Broadcast Accept', () => {
   test('20. transporter accepts broadcast succeeds if online', async () => {
     setupAcceptMocks();
 
-    const result = await broadcastService.acceptBroadcast('booking-001', baseAcceptParams);
+    const result = await acceptBroadcast('booking-001', { ...baseAcceptParams, idempotencyKey: 'idem-test-20' });
 
     expect(result).toBeDefined();
     expect(result.status).toBe('assigned');
@@ -844,7 +846,7 @@ describe('Broadcast Accept', () => {
 
     // The broadcast service does not check transporter online status before accepting.
     // The accept proceeds normally regardless of online status.
-    const result = await broadcastService.acceptBroadcast('booking-001', baseAcceptParams);
+    const result = await acceptBroadcast('booking-001', { ...baseAcceptParams, idempotencyKey: 'idem-test-21' });
 
     expect(result).toBeDefined();
     expect(result.status).toBe('assigned');
@@ -854,7 +856,7 @@ describe('Broadcast Accept', () => {
     setupAcceptMocks();
     mockRedisExists.mockResolvedValue(0); // driver NOT present
 
-    const result = await broadcastService.acceptBroadcast('booking-001', baseAcceptParams);
+    const result = await acceptBroadcast('booking-001', { ...baseAcceptParams, idempotencyKey: 'idem-test-22' });
 
     // Should still succeed (soft warn, not hard block)
     expect(result.status).toBe('assigned');
@@ -864,7 +866,7 @@ describe('Broadcast Accept', () => {
     setupAcceptMocks();
     mockRedisExists.mockRejectedValue(new Error('Redis connection refused'));
 
-    const result = await broadcastService.acceptBroadcast('booking-001', baseAcceptParams);
+    const result = await acceptBroadcast('booking-001', { ...baseAcceptParams, idempotencyKey: 'idem-test-23' });
 
     // Should still succeed
     expect(result.status).toBe('assigned');
@@ -874,7 +876,7 @@ describe('Broadcast Accept', () => {
     mockRedisAcquireLock.mockResolvedValue({ acquired: false });
 
     await expect(
-      broadcastService.acceptBroadcast('booking-001', baseAcceptParams)
+      acceptBroadcast('booking-001', { ...baseAcceptParams, idempotencyKey: 'idem-test-24' })
     ).rejects.toMatchObject({
       statusCode: 429,
       code: 'LOCK_CONTENTION',
@@ -910,7 +912,7 @@ describe('Broadcast Accept', () => {
       };
     });
 
-    const result = await broadcastService.acceptBroadcast('booking-001', baseAcceptParams);
+    const result = await acceptBroadcast('booking-001', { ...baseAcceptParams, idempotencyKey: 'idem-test-25' });
 
     expect(result.status).toBe('assigned');
     expect(callCount).toBe(3);
@@ -927,7 +929,7 @@ describe('Broadcast Accept', () => {
     };
     mockRedisGetJSON.mockResolvedValueOnce(cachedResult);
 
-    const result = await broadcastService.acceptBroadcast('booking-001', {
+    const result = await acceptBroadcast('booking-001', {
       ...baseAcceptParams,
       idempotencyKey: 'idem-accept-1',
     });

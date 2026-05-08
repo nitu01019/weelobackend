@@ -1635,6 +1635,11 @@ export class QueueService {
               reason: 'guard_lookup_error',
               attempt: 1
             });
+            try {
+              metrics.incrementCounter('dlq_pushed_total', {
+                queue: 'broadcast_guard_lookup_error'
+              });
+            } catch { /* never break */ }
             // Single-Lua atomic LPUSH + LTRIM — cluster-safe (single KEYS[1]).
             // Without atomicity a pod crash between lPush and lTrim leaves an
             // unbounded list. tonumber(ARGV[2]) is the cap index (DLQ_MAX_SIZE-1).
@@ -1827,9 +1832,63 @@ export class QueueService {
 
     // FCM batch processor - sends to up to 500 drivers in ONE API call
     // Circuit breaker wraps entire batch — when open, skips batch FCM entirely
+    //
+    // NEW#3 phantom-key fix (index-20-validated.md §5.3 line 2497):
+    // Legacy `redisService.del('fcm_token:${token}')` writes hit a phantom key
+    // that no producer ever creates — silent no-op. Canonical token storage is
+    // the SET `fcm:tokens:${userId}` (fcm.service.ts:132), mutated only via
+    // `fcmService.removeToken(userId, token)` (fcm.service.ts:662 → SREM).
+    // Consumer now accepts BOTH the legacy `{tokens: string[]}` shape AND the
+    // Round-6 widened `{recipients: Array<{userId, token}>}` shape so it ships
+    // before the producer flip (deploy order at §5.3 lines 2588-2592). Dead-
+    // token cleanup is gated on the 2 unambiguous FCM codes only (§5.3 lines
+    // 2561-2566) and only fires when `userId` is present.
     this.queue.process(QueueService.QUEUES.FCM_BATCH, async (job) => {
       const { fcmCircuit }: typeof import('./circuit-breaker.service') = require('./circuit-breaker.service');
-      const { tokens, notification } = job.data;
+      const data = job.data as {
+        recipients?: Array<{ userId: string; token: string }>;
+        tokens?: string[];
+        notification: { title: string; body: string; data?: Record<string, any> };
+      };
+      const recipients: Array<{ userId: string | undefined; token: string }> =
+        Array.isArray(data.recipients)
+          ? data.recipients.filter(r => r && typeof r.token === 'string' && r.token.length > 0)
+          : (Array.isArray(data.tokens) ? data.tokens : [])
+              .filter((t): t is string => typeof t === 'string' && t.length > 0)
+              .map((token) => ({ token, userId: undefined }));
+      const { notification } = data;
+      if (recipients.length === 0) return;
+
+      const tokens = recipients.map(r => r.token);
+      const userIdByToken = new Map<string, string>(
+        recipients
+          .filter((r): r is { userId: string; token: string } => typeof r.userId === 'string' && r.userId.length > 0)
+          .map(r => [r.token, r.userId])
+      );
+
+      // §5.3 lines 2563-2566: ONLY 2 unambiguous "token is dead" FCM codes.
+      // Do NOT widen to messaging/invalid-argument — that fires on payload
+      // bugs and would wipe every token in the batch.
+      const DEAD_TOKEN_CODES = new Set([
+        'messaging/registration-token-not-registered',
+        'messaging/invalid-registration-token',
+      ]);
+
+      const cleanupDeadToken = async (token: string): Promise<void> => {
+        const userId = userIdByToken.get(token);
+        if (!userId) {
+          // Legacy {tokens} payload — no userId available. Log and skip;
+          // canonical removeToken requires userId for SREM fcm:tokens:{userId}.
+          logger.warn('[FCM_BATCH] cannot clean dead token — userId missing (legacy payload)');
+          return;
+        }
+        try {
+          const fcmService = (await import('./fcm.service')).fcmService;
+          await fcmService.removeToken(userId, token);
+        } catch (err: unknown) {
+          logger.warn('[FCM_BATCH] removeToken failed', { userId, err: err instanceof Error ? err.message : String(err) });
+        }
+      };
 
       await fcmCircuit.tryWithFallback(
         async () => {
@@ -1852,10 +1911,10 @@ export class QueueService {
                   priority: 'high',
                   data: notification.data
                 });
-              } catch (err) {
-                if (err?.code === 'messaging/registration-token-not-registered') {
-                  // Token invalid, remove from Redis
-                  await redisService.del(`fcm_token:${token}`);
+              } catch (err: unknown) {
+                const code = err && typeof err === 'object' && 'code' in err ? (err as { code?: string }).code : undefined;
+                if (code && DEAD_TOKEN_CODES.has(code)) {
+                  await cleanupDeadToken(token);
                 }
               }
             }
@@ -1887,11 +1946,11 @@ export class QueueService {
 
             logger.info(`[FCM_BATCH] Sent to ${tokens.length} drivers: ${successCount} succeeded, ${failureCount} failed`);
 
-            // Remove invalid tokens from Redis
+            // Remove invalid tokens from canonical SET via fcmService.removeToken
             for (let i = 0; i < tokens.length; i++) {
-              if (batchResponse.responses[i] && !batchResponse.responses[i].success &&
-                  batchResponse.responses[i].error?.code === 'messaging/registration-token-not-registered') {
-                await redisService.del(`fcm_token:${tokens[i]}`);
+              const resp = batchResponse.responses[i];
+              if (resp && !resp.success && DEAD_TOKEN_CODES.has(resp.error?.code)) {
+                await cleanupDeadToken(tokens[i]);
               }
             }
           }

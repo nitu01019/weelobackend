@@ -127,6 +127,7 @@ jest.mock('../shared/database/prisma.service', () => {
       findUnique: (...args: any[]) => mockUserFindUnique(...args),
     },
     $queryRaw: (...args: any[]) => mockQueryRaw(...args),
+    $executeRaw: jest.fn().mockResolvedValue(undefined),
   };
   return {
     prismaClient: {
@@ -601,13 +602,14 @@ describe('FIX 2 — PII redaction in broadcast payloads', () => {
     // Setup accept mocks for a full accept flow
     setupAcceptMocks();
 
-    const { broadcastService } = require('../modules/broadcast/broadcast.service');
+    const { acceptBroadcast: accept } = require('../modules/broadcast/broadcast-accept.service');
 
-    const result = await broadcastService.acceptBroadcast('broadcast-001', {
+    const result = await accept('broadcast-001', {
       driverId: 'driver-001',
       vehicleId: 'vehicle-001',
       actorUserId: 'transporter-001',
       actorRole: 'transporter',
+      idempotencyKey: 'idem-fix2-post-accept',
     });
 
     expect(result.status).toBe('assigned');
@@ -618,8 +620,9 @@ describe('FIX 2 — PII redaction in broadcast payloads', () => {
     );
     expect(tripAssignedCalls.length).toBeGreaterThan(0);
     const driverNotification = tripAssignedCalls[0][2];
-    // Post-accept: real phone should be present (line 760: booking.customerPhone)
-    expect(driverNotification.customerPhone).toBe('9876543210');
+    // Post-accept: canonical broadcast-accept.service.ts masks phone for external emission.
+    // Last 4 digits preserved per maskPhoneForExternal contract.
+    expect(driverNotification.customerPhone).toMatch(/^\*+\d{4}$/);
   });
 
   it('createBroadcast booking record has customerPhone = empty string (line 957)', async () => {
@@ -794,13 +797,14 @@ describe('FIX 4 — Cache TX invalidation after broadcast accept', () => {
   it('after broadcast accept, redisService.del is called with correct cache key', async () => {
     setupAcceptMocks();
 
-    const { broadcastService } = require('../modules/broadcast/broadcast.service');
+    const { acceptBroadcast: accept } = require('../modules/broadcast/broadcast-accept.service');
 
-    await broadcastService.acceptBroadcast('broadcast-001', {
+    await accept('broadcast-001', {
       driverId: 'driver-001',
       vehicleId: 'vehicle-001',
       actorUserId: 'transporter-001',
       actorRole: 'transporter',
+      idempotencyKey: 'idem-fix4-cache-del',
     });
 
     // FIX 4: Manual cache invalidation with the transporter's vehicle cache key
@@ -812,13 +816,14 @@ describe('FIX 4 — Cache TX invalidation after broadcast accept', () => {
   it('cache invalidation uses driver.transporterId from TX result', async () => {
     setupAcceptMocks();
 
-    const { broadcastService } = require('../modules/broadcast/broadcast.service');
+    const { acceptBroadcast: accept } = require('../modules/broadcast/broadcast-accept.service');
 
-    await broadcastService.acceptBroadcast('broadcast-001', {
+    await accept('broadcast-001', {
       driverId: 'driver-001',
       vehicleId: 'vehicle-001',
       actorUserId: 'transporter-001',
       actorRole: 'transporter',
+      idempotencyKey: 'idem-fix4-transporter-id',
     });
 
     // The del call should use the driver's transporterId, not the actorUserId
@@ -836,15 +841,16 @@ describe('FIX 4 — Cache TX invalidation after broadcast accept', () => {
     // Make Redis del reject
     mockRedisDel.mockRejectedValue(new Error('Redis connection lost'));
 
-    const { broadcastService } = require('../modules/broadcast/broadcast.service');
+    const { acceptBroadcast: accept } = require('../modules/broadcast/broadcast-accept.service');
 
     // The accept should NOT throw even though Redis del fails
     // because the fix uses .catch(() => {}) for fire-and-forget
-    const result = await broadcastService.acceptBroadcast('broadcast-001', {
+    const result = await accept('broadcast-001', {
       driverId: 'driver-001',
       vehicleId: 'vehicle-001',
       actorUserId: 'transporter-001',
       actorRole: 'transporter',
+      idempotencyKey: 'idem-fix4-fire-forget',
     });
 
     // Accept still succeeds

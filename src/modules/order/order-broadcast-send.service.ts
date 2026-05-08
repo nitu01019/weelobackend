@@ -679,6 +679,7 @@ export async function broadcastVehicleTypePayload(
         transporterId,
         candidateMapSize: candidateDistanceMap?.size ?? 0
       });
+      continue;
     }
     const personalizedBroadcast = {
       ...extendedBroadcast,
@@ -688,8 +689,8 @@ export async function broadcastVehicleTypePayload(
       yourTotalTrucks: availability.totalOwned,
       trucksStillNeeded,
       trucksNeededOfThisType: trucksStillNeeded,
-      pickupDistanceKm: pickupData?.distanceKm ?? 0,
-      pickupEtaMinutes: Math.ceil((pickupData?.etaSeconds ?? 0) / 60),
+      pickupDistanceKm: pickupData.distanceKm,
+      pickupEtaMinutes: Math.ceil(pickupData.etaSeconds / 60),
       isPersonalized: true,
       personalizedFor: transporterId
     };
