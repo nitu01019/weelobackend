@@ -60,8 +60,12 @@ import { createHash } from 'crypto';
 import { logger } from './logger.service';
 import { redisService } from './redis.service';
 import { prismaClient } from '../database/prisma.service';
+import { Prisma } from '@prisma/client';
 import { HOLD_CONFIG } from '../../core/config/hold-config';
 import { FLAGS, isEnabled } from '../config/feature-flags';
+import { notifyUpgradeRequired } from './fcm-upgrade-campaign';
+import { shouldSkipForVersion } from './fcm-version-gate';
+import { maskName } from '../utils/pii.utils';
 
 // Notification types - must match mobile apps
 export const NotificationType = {
@@ -71,6 +75,41 @@ export const NotificationType = {
   PAYMENT: 'payment_received',
   GENERAL: 'general'
 } as const;
+
+// =============================================================================
+// W-5 D3.T3 (A05-015 / Wave-0 D) — Firebase error-code normalization
+// =============================================================================
+// Maps the 10 well-known Firebase Admin SDK `messaging/*` error codes onto a
+// closed enum of 7 categories. Used as the `category` label on
+// `fcm_send_failure_total{category=<normalized>}` so the label cardinality is
+// bounded (Prom OOMs at >1000 unique label values; raw FB codes can drift).
+// Pure function — no I/O, no clock. Safe to import everywhere.
+// =============================================================================
+export type FcmErrorCategory =
+  | 'INVALID_TOKEN'
+  | 'NOT_REGISTERED'
+  | 'INVALID_ARGUMENT'
+  | 'QUOTA_EXCEEDED'
+  | 'SERVER_UNAVAILABLE'
+  | 'SERVER_ERROR'
+  | 'AUTH_ERROR';
+
+const FCM_ERROR_CODE_MAP: Record<string, FcmErrorCategory> = {
+  'messaging/invalid-registration-token': 'INVALID_TOKEN',
+  'messaging/registration-token-not-registered': 'NOT_REGISTERED',
+  'messaging/invalid-argument': 'INVALID_ARGUMENT',
+  'messaging/quota-exceeded': 'QUOTA_EXCEEDED',
+  'messaging/server-unavailable': 'SERVER_UNAVAILABLE',
+  'messaging/internal-error': 'SERVER_ERROR',
+  'messaging/unknown-error': 'SERVER_ERROR',
+  'messaging/too-many-topics': 'QUOTA_EXCEEDED',
+  'messaging/invalid-apns-credentials': 'AUTH_ERROR',
+  'messaging/mismatched-credential': 'AUTH_ERROR',
+};
+
+export function normalizeFirebaseErrorCode(fbCode: string): FcmErrorCategory {
+  return FCM_ERROR_CODE_MAP[fbCode] ?? 'SERVER_ERROR';
+}
 
 // =============================================================================
 // FCM TOKEN STORAGE
@@ -466,13 +505,36 @@ class FCMService {
    * 
    * EASY UNDERSTANDING: SADD = Set Add. If token already exists, it's a no-op.
    */
-  async registerToken(userId: string, token: string, platform: string = 'android'): Promise<boolean> {
+  async registerToken(
+    userId: string,
+    token: string,
+    platform: string = 'android',
+    appVersionCode?: number | null,
+    installId?: string | null,
+    previousToken?: string | null
+  ): Promise<boolean> {
     let redisOk = false;
 
     // Try Redis first (primary storage)
     if (this.isRedisAvailable()) {
       try {
         const key = FCM_TOKEN_KEY(userId);
+        // F-FCM-01 (Phase 4): symmetric token rotation. SREM the stale
+        // previousToken BEFORE SADD'ing the new token. Order matters — if SADD
+        // throws after SREM succeeds the user has zero tokens for one request
+        // cycle (acceptable; better than two divergent tokens). previousToken
+        // and token are different values so SREM cannot drop the new entry.
+        if (typeof previousToken === 'string' && previousToken.length > 0 && previousToken !== token) {
+          try {
+            await redisService.sRem(key, previousToken);
+          } catch (sremErr: unknown) {
+            // Non-fatal — best-effort prune of stale token. Fall through to SADD.
+            logger.warn(`FCM: Redis sRem(previousToken) failed during rotation`, {
+              userId,
+              error: sremErr instanceof Error ? sremErr.message : String(sremErr),
+            });
+          }
+        }
         await redisService.sAdd(key, token);
         await redisService.expire(key, FCM_TOKEN_TTL_SECONDS);
         logger.info(`FCM: Token registered for user ${userId} [Redis]`);
@@ -490,15 +552,98 @@ class FCMService {
 
     // Fix H15: Always persist to DB as durable fallback (even if Redis succeeded).
     // If Redis loses data (restart/eviction), getTokens() recovers from here.
+    //
+    // ADR: A05-027 — dual-strategy upsert for mixed-fleet rollout.
+    //   - New clients send installId → upsert keys off (userId, installId)
+    //     (matches partial unique applied via A05-022 SQL).
+    //   - Legacy clients (no installId, pre-rollout binaries) → upsert keys
+    //     off the existing UNIQUE(token) so multi-device legacy users no
+    //     longer collapse onto a single 'legacy' sentinel row.
+    //
+    // A05-015: appVersionCode written only when the caller supplied it;
+    // null/undefined skips the column so callers on the legacy 3-arg
+    // signature stay backward-compatible.
     try {
-      await prismaClient.deviceToken.upsert({
-        where: { userId_token: { userId, token } },
-        update: { lastSeenAt: new Date() },
-        create: { userId, token, platform, lastSeenAt: new Date() }
-      });
-    } catch (dbErr: any) {
+      const versionPatch =
+        typeof appVersionCode === 'number' ? { appVersionCode } : {};
+      const hasInstallId =
+        typeof installId === 'string' && installId.length > 0 && installId !== 'legacy';
+      const now = new Date();
+
+      if (hasInstallId) {
+        // New-client path: stable per-install identity. The Prisma `@@unique
+        // ([userId, installId])` directive was intentionally removed (council
+        // finding from code-quality review — see Phase 2 Task 2.A) so we
+        // can't `upsert` keyed on a synthetic compound. Instead we do a
+        // find-then-update/create with a race-fallback that re-reads on
+        // unique-violation. The DB-side partial unique
+        // (DeviceToken_userId_installId_partial_key WHERE installId IS NOT
+        // NULL AND installId <> 'legacy') guarantees at most one active row
+        // per device, even under concurrent registration.
+        const installIdValue = installId as string;
+        const existing = await prismaClient.deviceToken.findFirst({
+          where: { userId, installId: installIdValue },
+          select: { id: true },
+        });
+        if (existing) {
+          await prismaClient.deviceToken.update({
+            where: { id: existing.id },
+            data: { token, platform, lastSeenAt: now, ...versionPatch },
+          });
+        } else {
+          try {
+            await prismaClient.deviceToken.create({
+              data: {
+                userId,
+                token,
+                platform,
+                installId: installIdValue,
+                lastSeenAt: now,
+                ...versionPatch,
+              },
+            });
+          } catch (createErr: unknown) {
+            // Race fallback — narrowed to Prisma's UNIQUE-violation (P2002)
+            // so genuine connection / constraint / disk errors propagate
+            // instead of being silently swallowed by the re-read path.
+            const isUniqueViolation =
+              createErr instanceof Prisma.PrismaClientKnownRequestError &&
+              createErr.code === 'P2002';
+            if (!isUniqueViolation) throw createErr;
+            const raced = await prismaClient.deviceToken.findFirst({
+              where: { userId, installId: installIdValue },
+              select: { id: true },
+            });
+            if (!raced) throw createErr;
+            await prismaClient.deviceToken.update({
+              where: { id: raced.id },
+              data: { token, platform, lastSeenAt: now, ...versionPatch },
+            });
+          }
+        }
+      } else {
+        // Legacy-client path: per-token uniqueness (existing @unique(token)).
+        // installId stored as NULL so the partial unique excludes it; refresh
+        // re-attaches the row to the current userId if it migrated devices.
+        await prismaClient.deviceToken.upsert({
+          where: { userId_token: { userId, token } },
+          update: { platform, lastSeenAt: now, ...versionPatch },
+          create: {
+            userId,
+            token,
+            platform,
+            installId: null,
+            lastSeenAt: now,
+            ...versionPatch,
+          },
+        });
+      }
+    } catch (dbErr: unknown) {
       // Non-fatal: DB fallback is best-effort. Redis is primary.
-      logger.warn('FCM: DB fallback write failed', { userId, error: dbErr.message });
+      logger.warn('FCM: DB fallback write failed', {
+        userId,
+        error: dbErr instanceof Error ? dbErr.message : String(dbErr),
+      });
     }
 
     if (!redisOk && !this.isRedisAvailable()) {
@@ -1044,8 +1189,14 @@ class FCMService {
     // so the counter and the outgoing payload can never drift. The counter
     // lets us verify in prod that W0-1's high-priority fix is actually
     // reaching Android drivers.
-    const effectivePriority: 'high' | 'normal' =
-      notification.priority === 'high' ? 'high' : 'normal';
+    // H3 / A05-017: When FF_FCM_PRIORITY_HIGH_DEFAULT is ON (default=true per
+    // H3 council verdict) unset producers default to 'high' so customer-
+    // direction FCMs wake devices through Doze/OEM-throttle. When OFF the
+    // original legacy behaviour (unset → 'normal') is preserved exactly.
+    const priorityHighDefault = isEnabled(FLAGS.FCM_PRIORITY_HIGH_DEFAULT);
+    const effectivePriority: 'high' | 'normal' = priorityHighDefault
+      ? (notification.priority ?? 'high')
+      : (notification.priority === 'high' ? 'high' : 'normal');
     try {
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const { metrics } = require('../monitoring/metrics.service');
@@ -1116,7 +1267,7 @@ class FCMService {
         ...(isFullScreen ? { fullScreen: 'true' } : {}),
       },
       android: {
-        priority: notification.priority === 'high' ? 'high' : 'normal',
+        priority: effectivePriority,
         ttl: `${ttlSeconds}s`,
         ...(collapseKey ? { collapseKey } : {}),
         // A03-002: Android data-only payloads must not include android.notification.
@@ -1133,7 +1284,7 @@ class FCMService {
       apns: {
         headers: {
           'apns-expiration': String(apnsExpiration),
-          ...(notification.priority === 'high' ? { 'apns-priority': '10' } : { 'apns-priority': '5' }),
+          ...(effectivePriority === 'high' ? { 'apns-priority': '10' } : { 'apns-priority': '5' }),
           ...(collapseKey ? { 'apns-collapse-id': collapseKey } : {}),
         },
         payload: {
@@ -1232,8 +1383,13 @@ class FCMService {
       body: `${broadcast.trucksNeeded} ${broadcast.vehicleType} truck(s) needed • ₹${broadcast.farePerTruck}/truck • ${broadcast.pickupCity} → ${broadcast.dropCity}`,
       priority: 'high',
       data: {
+        // F-FCM-02 (Phase 4 P4-2 gate 6): payloadVersion mirrors the socket
+        // emit pair so cross-channel dedup at the Captain client can collapse
+        // socket+FCM duplicates by `${type}:${broadcastId}:${payloadVersion}`.
+        payloadVersion: '1',
         broadcastId: broadcast.broadcastId,
-        customerName: broadcast.customerName,
+        // V6-NEW-01 (Phase 4 P0-1): mask customerName at the FCM data builder.
+        customerName: maskName(broadcast.customerName),
         vehicleType: broadcast.vehicleType,
         trucksNeeded: broadcast.trucksNeeded,
         farePerTruck: broadcast.farePerTruck,
@@ -1363,10 +1519,72 @@ class FCMService {
         if (!tokenToUser.has(t)) tokenToUser.set(t, userIds[i]);
       }
     }
-    const allTokens = Array.from(tokenToUser.keys());
+    let allTokens = Array.from(tokenToUser.keys());
 
     if (allTokens.length === 0) {
       return { successCount: 0, failureCount: 0, revokedCount: 0, rateLimited: false };
+    }
+
+    // ADR: A05-028 — split FCM_UPGRADE_CAMPAIGN (announce-only) from
+    // FCM_VERSION_GATE (hard suppression). Either flag enables the version
+    // lookup; only FCM_VERSION_GATE causes a send to be skipped.
+    //   announce  + suppress  → notify and skip
+    //   announce  + no-suppress → notify, send anyway (campaign telemetry)
+    //   no-announce + suppress  → silent suppress (rare ops mode)
+    //   no-announce + no-suppress → original byte-identical path
+    const announceUpgrade = isEnabled(FLAGS.FCM_UPGRADE_CAMPAIGN);
+    const enforceVersionGate = isEnabled(FLAGS.FCM_VERSION_GATE);
+    if (announceUpgrade || enforceVersionGate) {
+      const minRaw = Number(process.env.MIN_SUPPORTED_APP_VERSION ?? 0);
+      const minSupported = Number.isFinite(minRaw) && minRaw > 0 ? minRaw : 0;
+      if (minSupported > 0) {
+        try {
+          const recs = (await prismaClient.deviceToken.findMany({
+            where: { token: { in: allTokens } } as any,
+            select: { token: true, appVersionCode: true } as any,
+          })) as unknown as Array<{ token: string; appVersionCode?: number | null }>;
+          const versionByToken = new Map<string, number | null | undefined>();
+          for (const r of recs) versionByToken.set(r.token, r.appVersionCode);
+          const keep: string[] = [];
+          for (const token of allTokens) {
+            const gate = shouldSkipForVersion({
+              appVersionCode: versionByToken.get(token) ?? null,
+            });
+            if (gate.skipped && gate.reason === 'below_min_version') {
+              const userId = tokenToUser.get(token);
+              if (announceUpgrade) {
+                notifyUpgradeRequired({
+                  userId,
+                  token,
+                  appVersionCode: versionByToken.get(token) ?? null,
+                  minSupportedVersion: minSupported,
+                }).catch((err: unknown) => logger.warn('[FCM] upgrade-campaign notice failed', {
+                  err: err instanceof Error ? err.message : String(err),
+                }));
+              }
+              if (enforceVersionGate) {
+                try {
+                  // eslint-disable-next-line @typescript-eslint/no-var-requires
+                  const { metrics } = require('../monitoring/metrics.service');
+                  metrics.incrementCounter('fcm_version_gate_suppressed_total', {
+                    campaign: announceUpgrade ? 'on' : 'off',
+                  });
+                } catch { /* metrics non-fatal */ }
+                continue;
+              }
+            }
+            keep.push(token);
+          }
+          allTokens = keep;
+        } catch (err: unknown) {
+          logger.warn('[FCM] upgrade-campaign gate lookup failed — sending all tokens', {
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      if (allTokens.length === 0) {
+        return { successCount: 0, failureCount: 0, revokedCount: 0, rateLimited: false };
+      }
     }
 
     // Step 3: Egress token-bucket gate
@@ -1399,6 +1617,15 @@ class FCMService {
             const resp = result.responses[j];
             if (!resp?.error) continue;
             const code: string = resp.error.code ?? '';
+            // W-5 D3.T3: bounded-cardinality category label for failure metric.
+            try {
+              // eslint-disable-next-line @typescript-eslint/no-var-requires
+              const { metrics } = require('../monitoring/metrics.service');
+              metrics.incrementCounter('fcm_send_failure_total', {
+                type: notification.type,
+                category: normalizeFirebaseErrorCode(code),
+              });
+            } catch { /* metrics non-fatal */ }
             if (FCMService.NON_RETRYABLE_FCM_ERRORS.has(code)) {
               const userId = tokenToUser.get(chunk[j]);
               // Soft-revoke in DB — excludes from next getTokens() DB fallback
@@ -1419,6 +1646,15 @@ class FCMService {
       } catch (chunkErr: any) {
         const code = chunkErr?.code ?? chunkErr?.errorInfo?.code ?? '';
         logger.error('[FCM] sendToUsersMulticast chunk error', { chunkIndex: i, code });
+        // W-5 D3.T3: emit category label for chunk-level failure too.
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-var-requires
+          const { metrics } = require('../monitoring/metrics.service');
+          metrics.incrementCounter('fcm_send_failure_total', {
+            type: notification.type,
+            category: normalizeFirebaseErrorCode(code),
+          }, chunk.length);
+        } catch { /* metrics non-fatal */ }
         failureCount += chunk.length;
       }
     }
