@@ -37,7 +37,8 @@ import {
   broadcastToTransporters,
   emitBroadcastStateChanged,
 } from './order-broadcast.service';
-import pLimit, { LimitFunction } from 'p-limit';
+import pLimit from 'p-limit';
+type LimitFunction = ReturnType<typeof pLimit>;
 
 // ---------------------------------------------------------------------------
 // Constants (moved from order.service.ts)
