@@ -10,27 +10,33 @@
 
 `DB_CONNECTION_LIMIT` is **not set** in the currently deployed ECS task definition environment. When absent, `prisma.service.ts:283` falls back to a hardcode default of **25 connections per pod**.
 
-The capacity math (from `prisma.service.ts:282`, cross-referenced with §7C 0.4 of `index-20-validated.md` lines 2998–3028):
+The capacity math per §1.2 Step 4 (lines 337–345) — recomputed in Round 6 with the corrected 224 BRPOP holders (16 broadcast workers × 11 default queues + 48 tracking workers × 1 tracking queue per `queue.service.ts:1405-1418`). **Per-pod conn = 125 Prisma + 224 BRPOP = 349 conn/pod**. The Prisma in-flight math alone underestimates total RDS load.
 
 ```
-in_flight = λ × W
-         = 833 tx/s × 0.6 s P99
-         = ~500 concurrent transactions
+Per-pod = 125 Prisma (DB_CONNECTION_LIMIT) + 224 BRPOP holders = 349 conn/pod
 
-4 ECS pods × 125 connections = 500 total
-500 / 1,600 max_connections (r6g.large) = 31%   ← safe headroom
+Option A (recommended)  — db.r6g.xlarge (max_connections ≈ 3,201):
+  HPA Max=5: 5 × 349 = 1,745 / 3,201 = 54.5% utilisation (45% headroom).
+  70% SLO gate = 2,240 connections.
+
+Option B (fallback)     — db.r6g.large + HPA Max=4 (max_connections ≈ 1,600):
+  4 × 349 = 1,396 / 1,600 = 87% utilisation (13% headroom — no HPA surge).
+  70% SLO gate = 1,120 connections.
+
+NOT VIABLE — db.r6g.large + HPA Max=5: 5 × 349 = 1,745 / 1,600 = 109% OVER CAP
+  (connection-refused on 5th pod under saturation).
 ```
 
 At the **current** default of 25 per pod:
 
 ```
-4 pods × 25 = 100 connections
-100 / 500 in_flight demand = severe pool starvation under load
+4 pods × 25 = 100 connections (Prisma only; BRPOP still ~224/pod)
+Prisma in-flight demand alone = ~500 tx → severe pool starvation under load.
 ```
 
 Without this fix, Phase 2 Fix #2's worker ramp will saturate the Prisma connection pool, causing cascading 503s and pool timeout errors (`DB_POOL_TIMEOUT` fires at 5 s, returning 503 to users). The `.env.production.example` line 31 documents the correct value as 125, but it was never injected into the task definition.
 
-**Reference:** `index-20-validated.md` §7C 0.4 (lines 2998–3028); `src/shared/database/prisma.service.ts:282–283`.
+**Reference:** `index-20-validated.md` §1.2 Step 4 (lines 337–345) + §7C 0.4 (lines 2998–3028); `src/shared/database/prisma.service.ts:282–283`. The chosen Option (A/B) MUST be recorded in the deployment log and matched in `rds-upgrade.md` (RDS class) and `hpa-cap.md` (HPA MaxReplicas) before applying this runbook.
 
 ---
 
@@ -198,4 +204,9 @@ aws logs get-log-events \
 | **Must complete AFTER** | Nothing — this is a Wk0 blocker that gates all Phase 2 scale-out work |
 | **Notify** | Team lead + whoever owns Phase 2 Fix #2 when Gate 0.4 is confirmed passed |
 
-**Staging note:** Staging intentionally keeps `DB_CONNECTION_LIMIT=25` to match the `db.t4g.micro` budget (87 max_connections). Do NOT apply `value: "125"` to the staging task definition; the math only holds for production's `db.r6g.large` (1,600 max_connections). See `prisma.service.ts:277–283`.
+**Staging note:** Staging intentionally keeps `DB_CONNECTION_LIMIT=25` to match the `db.t4g.micro` budget (87 max_connections). Do NOT apply `value: "125"` to the staging task definition; the math only holds for production's `db.r6g.xlarge` (3,201 max_connections). See `prisma.service.ts:277–283`.
+
+**Companion runbooks:**
+- `rds-upgrade.md` — must run first to upgrade to db.r6g.xlarge (provides the 3,201 max_connections)
+- `hpa-cap.md` — companion: HPA MaxReplicas must be set to 5 (Option A) or 4 (Option B) to match the per-pod connection math above
+- `worker-ramp-step1.md` — this runbook must be verified complete before starting the worker ramp
