@@ -47,6 +47,10 @@ const RegisterTokenSchema = z.object({
   // to 'legacy' so the unique constraint stays satisfied for all legacy devices
   // until the apps start sending a real per-install identifier.
   installId: z.string().min(1).max(64).optional(),
+  // F-FCM-01 (Phase 4): client-provided stale token to prune before SADD'ing
+  // the new token. Optional by default; required when FF_FCM_PREVIOUS_TOKEN_REQUIRED
+  // is ON (post Captain/Customer rollout). Min length matches `token` for symmetry.
+  previousToken: z.string().min(10).optional(),
 });
 
 // =============================================================================
@@ -81,7 +85,7 @@ router.post('/register-token', authMiddleware, async (req: Request, res: Respons
     }
 
     const validation = RegisterTokenSchema.safeParse(req.body);
-    
+
     if (!validation.success) {
       return res.status(400).json({
         success: false,
@@ -92,21 +96,40 @@ router.post('/register-token', authMiddleware, async (req: Request, res: Respons
       });
     }
 
-    const { token, deviceType, deviceId, appVersionCode, installId } = validation.data;
+    const { token, deviceType, deviceId, appVersionCode, installId, previousToken } = validation.data;
     const userId = req.user!.userId;
     const userRole = req.user!.role;
+
+    // F-FCM-01 (Phase 4): when FF_FCM_PREVIOUS_TOKEN_REQUIRED is ON, every
+    // registration must carry the previous token so the server can SREM it
+    // BEFORE SADD'ing the new value. Default OFF for backward-compat with
+    // legacy clients; flip ON after the Captain & Customer apps ship the
+    // rotation contract.
+    if (isEnabled(FLAGS.FCM_PREVIOUS_TOKEN_REQUIRED) && !previousToken) {
+      metrics.incrementCounter('fcm_registration_blocked_total', { reason: 'previous_token_missing' });
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'FCM_PREVIOUS_TOKEN_REQUIRED',
+          message: 'previousToken is required for token rotation',
+        },
+      });
+    }
 
     // Register token (Redis-backed for scalability across ECS instances)
     // A05-015 (Phase 3.2): pass optional appVersionCode through to fcm.service,
     // which persists it on the DeviceToken row and observes the Phase 3.3 histogram.
     // A05-005 (F-3): pass optional installId for per-device dedup; service falls
     // back to 'legacy' so older clients still satisfy the (userId, installId) UNIQUE.
+    // F-FCM-01: pass optional previousToken through so the service SREM's the
+    // stale token before SADD'ing the new one (symmetric rotation).
     await fcmService.registerToken(
       userId,
       token,
       deviceType || 'android',
       appVersionCode,
-      installId
+      installId,
+      previousToken
     );
 
     // A05-014: Subscribe to role-based topics.
