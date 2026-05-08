@@ -479,12 +479,16 @@ export async function processDispatchOutboxRow(
 // heartbeat (leader-election.service.ts). The blind renewal could stomp a new
 // leader that had legitimately taken over during a GC pause, inviting duplicate
 // row processing.
-// Fix #37 per index-20-validated.md §1.10: bump TTL 60s→120s and heartbeat 20s→40s.
-// Worst case at BATCH_SIZE=200, DM throttle p99 5-8s/row: 8 waves × 8s = 64s which
-// exceeds the old 60s TTL and risks leader expiry mid-batch. 120s provides 47% slack.
+// Fix #37 per index-20-validated.md §1.10: TTL bump 60→120s + heartbeat 20→40s
+// is DEFERRED until B-N-13 split-key canonicalization lands (§1.10 line 1315 +
+// §4.1). Without B-N-13, legacy path uses `lock:outbox:leader` while fenced path
+// uses raw `outbox:leader` — bumping TTL would double the rolling-deploy 2-leader
+// window from up to 60s to up to 120s (~30k dup dispatches at 300-500 RPS).
+// Restored to 60/20000 defaults until B-N-13 is in place. V&T-partial Capella +
+// Aldebaran caught this sequencing hazard at HEAD cdb1266c.
 const OUTBOX_LEADER_KEY = 'outbox:leader';
-const OUTBOX_LEADER_TTL_SECONDS = Math.max(10, parseInt(process.env.OUTBOX_LEADER_TTL_SECONDS || '120', 10) || 120);
-const OUTBOX_LEADER_HEARTBEAT_MS = Math.max(5_000, parseInt(process.env.OUTBOX_LEADER_HEARTBEAT_MS || '40000', 10) || 40_000);
+const OUTBOX_LEADER_TTL_SECONDS = Math.max(10, parseInt(process.env.OUTBOX_LEADER_TTL_SECONDS || '60', 10) || 60);
+const OUTBOX_LEADER_HEARTBEAT_MS = Math.max(5_000, parseInt(process.env.OUTBOX_LEADER_HEARTBEAT_MS || '20000', 10) || 20_000);
 const FF_OUTBOX_LEADER_FENCING = process.env.FF_OUTBOX_LEADER_FENCING === 'true';
 const outboxInstanceId = `${process.pid}:${Date.now()}`;
 
