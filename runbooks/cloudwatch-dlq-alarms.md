@@ -175,11 +175,15 @@ Silent broadcast loss is now guaranteed unless the failure cause clears
 within ~60 s — depth-saturation alone might be recoverable by scaling the
 drainer, but the composite is not.
 
-> **Replaces a stale composite.** The previous composite combined a
-> non-existent metric (`dlq_drainer_last_success_ts`) with a non-canonical
-> name (`weelo-dlq-broadcasts-depth-high`). This version uses two existing
-> alarms: the canonical `-saturation` from `setup-broadcast-p1-alarms.sh`
-> and the new `-replay-failed` defined above.
+> **Replaces a stale composite.** The previous composite combined the
+> depth-high alarm with a non-existent-metric alarm
+> (`weelo-dlq-drainer-last-success-age` against `dlq_drainer_last_success_ts`,
+> which does NOT exist in code at HEAD `d97b5907`). This version uses two
+> alarms that target metrics actually emitted at HEAD: the canonical
+> `-saturation` from `setup-broadcast-p1-alarms.sh` (which targets the
+> sidecar gauge `dlq_broadcasts_depth`) and the new `-replay-failed`
+> defined above (which targets the drainer counter
+> `broadcast_dlq_replay_failed_total`).
 
 ```bash
 aws cloudwatch put-composite-alarm \
@@ -416,13 +420,38 @@ thresholds delay detection of a leak that compounds over time.
 
 ## Verification
 
-After running all four `put-metric-alarm` / `put-composite-alarm` commands:
+After running the three `put-metric-alarm` blocks (Alarms 1, 2, 4) and the
+one `put-composite-alarm` block (Alarm 3), plus
+`bash scripts/monitoring/setup-broadcast-p1-alarms.sh` for the canonical
+depth-tier alarms:
 
 ```bash
 aws cloudwatch describe-alarms \
   --alarm-name-prefix "weelo-dlq-" \
   --region "${AWS_REGION:-ap-south-1}" \
-  --query 'MetricAlarms[*].{Name:AlarmName,State:StateValue} | sort_by(@, &Name)'
+  --query '[MetricAlarms[*].{Name:AlarmName,State:StateValue}, CompositeAlarms[*].{Name:AlarmName,State:StateValue}]'
 ```
 
-Expected: all four alarms in `OK` or `INSUFFICIENT_DATA`. `INSUFFICIENT_DATA` is acceptable if the sidecar metric-emitter is not yet running; it will resolve to `OK` within 60 s of the first `dlq_broadcasts_depth` datapoint arriving (§7C 1.2 line 3091: "NOT INSUFFICIENT_DATA — that means the sidecar isn't emitting; go back to 1.1").
+Expected: 8 entries total — the 4 supplementary alarms from this runbook
+(`weelo-dlq-broadcasts-depth-high`, `weelo-dlq-drainer-replay-failed`,
+`weelo-dlq-broadcasts-saturation-and-failing`,
+`weelo-dlq-broadcasts-inflight-leak`) plus the 4 canonical depth-tier
+alarms from `setup-broadcast-p1-alarms.sh`
+(`weelo-dlq-broadcasts-depth-warn`/`-crit`/`-saturation`/`-permanent-depth-warn`).
+All in `OK` or `INSUFFICIENT_DATA`. `INSUFFICIENT_DATA` is acceptable if
+(a) the sidecar metric-emitter is not yet running (gauge alarms will
+resolve to `OK` within 60 s of the first `dlq_broadcasts_depth` datapoint
+arriving), or (b) the metric-filter / EMF pipeline is not yet wired
+(counter alarms — Alarm 2 — sit until the pipeline ships counters).
+Per §7C 1.2 line 3091: "NOT INSUFFICIENT_DATA — that means the sidecar
+isn't emitting; go back to 1.1".
+
+---
+
+## Cross-References
+
+- [`scripts/monitoring/setup-broadcast-p1-alarms.sh`](../scripts/monitoring/setup-broadcast-p1-alarms.sh) — creates the 4 canonical depth-tier alarms this runbook supplements (verbatim per `index-20-validated.md` §7C 1.2 / §2.1.1).
+- `scripts/replay-broadcast-dlq.ts` — drainer source for `broadcast_dlq_replay_failed_total` (line 137) and the internal Prometheus-only `broadcast_dlq_depth` gauge (line 150). Verified at HEAD `d97b5907`.
+- `src/shared/services/dlq-broadcasts-depth-emitter.ts` — sidecar source for the CloudWatch-mirrored gauges `dlq_broadcasts_depth`, `dlq_broadcasts_permanent_depth`, `dlq_broadcasts_inflight_depth` (every 30 s, `PutMetricData`).
+- `src/shared/monitoring/metrics-definitions.ts:816–825` — pre-registered DLQ depth gauge definitions (active / permanent / inflight).
+- `src/shared/services/queue.service.ts` — counter source for `dlq_pushed_total` (admit rate; multiple call sites).

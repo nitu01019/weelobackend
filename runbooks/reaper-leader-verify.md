@@ -204,7 +204,7 @@ echo "Rolled back to unlocked reaper. New TD: $NEW_TD"
 Same procedure as Option A but set `FF_QUEUE_BLMOVE_DEQUEUE=false`.
 This disables the entire BLMOVE dequeue branch — no reaper runs, no `:processing-list` is
 written. Jobs use the legacy BRPOP path. Stale entries from the BLMOVE window will be
-drained by `recoverStaleProcessingJobs` at next boot.
+drained by `recoverStaleProcessingJobs` at next pod boot (`queue.service.ts:795`).
 
 ### Option C — Full task-def revert (last resort)
 

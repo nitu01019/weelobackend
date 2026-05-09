@@ -28,9 +28,10 @@ Do NOT flip Fix #17 before Fix #6 is stable. Do NOT flip Fix #17 before the SADD
 
 **Hard dependencies before flipping:**
 - Wk0 steps 0.1–0.5 complete (RDS upgraded, DB_CONNECTION_LIMIT=125, bundle PR merged)
-- DLQ depth sidecar emitting (`dlq-sidecar-verify.md` runbook passed)
-- All 4 `weelo-dlq-*` CloudWatch alarms in OK state (`cloudwatch-dlq-alarms.md` runbook complete + `setup-broadcast-p1-alarms.sh` run)
-- Drainer pre-flight checks below pass
+- DLQ depth sidecar emitting (`runbooks/dlq-sidecar-verify.md` runbook passed)
+- Drainer registered + leader-lock held + LLEN < 100 (`runbooks/dlq-drainer-preflight.md` Checks 1–5 all PASS)
+- All 4 `weelo-dlq-*` CloudWatch alarms in OK state (`runbooks/cloudwatch-dlq-alarms.md` runbook complete + `setup-broadcast-p1-alarms.sh` run)
+- Drainer pre-flight checks below pass (this runbook is canonical; `runbooks/ff-depth-guard-flip.md` is deprecated and points here)
 
 ### Pre-flight checklist (§2.1.1 — run in order; stop if any fails)
 
@@ -167,20 +168,33 @@ echo "Rolled back to revision ${PREV_REVISION}"
 
 ---
 
-## Fix #16 — Verify reaper single-leader post-deploy
+## Fix #16 — Verify reaper single-leader post-deploy (canonical)
 
-**What it does:** The BLMOVE processing-reaper (`queue.service.ts:startProcessingReaper()`) is protected by `acquireLock('processing-reaper:${queue}', workerId, 10)` gated by `FF_PROCESSING_REAPER_LEADER_LOCK` (defaultValue=true). Without this lock, HPA Max=6 pods race → ~8–10 duplicate broadcasts/sec at 400–500 RPS.
+**What it does:** The BLMOVE processing-reaper (`queue.service.ts:startProcessingReaper()` at HEAD `d97b5907:1261`) is protected by `acquireLock('processing-reaper:${queue}', workerId, 10)` gated by `FF_PROCESSING_REAPER_LEADER_LOCK` (defaultValue=true at HEAD `d97b5907:src/shared/config/feature-flags.ts:689-694`). Without this lock, HPA Max=6 pods race → ~8–10 duplicate broadcasts/sec at 400–500 RPS.
 
 **Operator action at deploy time: NONE.** The flag defaults ON in the bundle PR. This section is verification only — confirm leader election is working after the bundle PR lands.
 
-**Source:** §7C Step 5 / §1.3. At HEAD `8f400201` the reaper does not exist; risk surface opens the moment the bundle PR merges.
+**Source:** `index-20-validated.md` §1.3 (lines 373–513) / §7C Step 5. At HEAD `d97b5907` the reaper IS committed at `queue.service.ts:1261-1361` (replaces the prior NOT-AT-HEAD note that referenced `8f400201`); the leader-lock surface is live.
+
+**Companion-edit pre-deploy check (§1.3 line 407):** `REAPER_PROCESSING_CAP` MUST be 500 (not 10_000) so worst-case body (500 × 2 ops × ~5 ms ≈ 5 s) fits inside the 10 s lock TTL with 50 % slack. Verify before deploy:
+
+```bash
+git show HEAD:src/shared/services/queue.service.ts | grep -nE "REAPER_PROCESSING_CAP\s*=\s*500"
+# Expected: a single match at queue.service.ts:512 — `private static readonly REAPER_PROCESSING_CAP = 500;`
+# If this prints 10_000 or 1_000: STOP — bumping the cap without a heartbeat-renewed leader lets a peer pod
+# acquire mid-tick and double-LPUSH races. Either revert the cap or move the lock to a heartbeat-renewed pattern.
+```
 
 ### Post-deploy verification (§7C hard gate 5)
 
-Run within 5 min of the bundle PR deploy stabilising:
+Run within 5 min of the bundle PR deploy stabilising. The four checks below correspond 1:1 to §1.3 Pillar 4 (log line, lock-miss counter, broadcast dedup, Redis spot-check).
+
+> **Metric publication path.** `processing_reaper_lock_miss_total` is registered via `metrics.incrementCounter()` auto-create at `queue.service.ts:1293` and exposed only on the in-process Prometheus endpoint `/metrics`. There is **no `PutMetricData` publisher** for this counter at HEAD `d97b5907` (only `dlq-broadcasts-depth-emitter.ts` pushes to CloudWatch). Verify via `/metrics` curl, NOT `aws cloudwatch get-metric-statistics`. Same applies to `broadcast_dedup_total` if it is auto-registered without an emitter — check `metrics-definitions.ts` if in doubt. (If a CW pipeline is added later, switch to `aws cloudwatch get-metric-statistics --namespace Weelo/Backend`.)
 
 ```bash
-# 1. Confirm reaper leader-lock traces appear in logs (leader pod)
+# 1. Confirm reaper leader-lock traces appear in logs (leader pod). The reaper logs
+#    "[ProcessingReaper] acquireLock failed" on followers and silently runs the body
+#    on the leader, so grep for both shapes plus the [Queue] reaper completion line.
 STREAM=$(aws logs describe-log-streams \
   --log-group-name weelobackendtask \
   --order-by LastEventTime --descending --max-items 1 \
@@ -193,54 +207,80 @@ aws logs get-log-events \
   --region ap-south-1 \
   --query 'events[*].message' --output text \
   | tr '\t' '\n' \
-  | grep -i "processing-reaper\|reaper.*leader\|acquireLock.*processing-reaper"
-# Expected: at least one "acquired" lock line per 30 s interval on the leader pod
+  | grep -iE "ProcessingReaper|Reaper re-queued|acquireLock.*processing-reaper"
+# Expected on leader pod: "[Queue] Reaper re-queued N stale entries for ${queue}" (only when stale entries exist)
+# Expected on follower pods: "[ProcessingReaper] acquireLock failed" OR silent skip + lock-miss metric
 
-# 2. Confirm follower pods skip (lock-miss counter is non-zero)
-aws cloudwatch get-metric-statistics \
-  --namespace "Weelo/Backend" \
-  --metric-name "processing_reaper_lock_miss_total" \
-  --statistics Sum \
-  --period 300 \
-  --start-time "$(date -u -v-30M +%FT%TZ 2>/dev/null || date -u --date='30 minutes ago' +%FT%TZ)" \
-  --end-time "$(date -u +%FT%TZ)" \
-  --region ap-south-1
-# Expected: Sum > 0 (follower pods are correctly skipping)
+# 2. Confirm follower pods skip — read processing_reaper_lock_miss_total via /metrics
+#    (Prometheus exposition; auto-registered counter with `queue` label).
+#    Endpoint is gated by HEALTH_ADMIN_TOKEN header. Hit each running task IP directly.
+TOKEN="${HEALTH_ADMIN_TOKEN:?set HEALTH_ADMIN_TOKEN}"
+TASK_IPS=$(aws ecs list-tasks --cluster "$ECS_CLUSTER" --service-name "$ECS_SERVICE" --region ap-south-1 \
+  --query 'taskArns' --output text \
+  | xargs -n1 -I{} aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks {} --region ap-south-1 \
+  --query 'tasks[].attachments[].details[?name==`privateIPv4Address`].value' --output text)
+for ip in $TASK_IPS; do
+  echo "=== pod $ip ==="
+  curl -sS -H "x-health-token: $TOKEN" "http://${ip}:3000/metrics" \
+    | grep -E '^processing_reaper_lock_miss_total\{' || echo "  (no samples — pod may be the leader)"
+done
+# Expected across the fleet: at least N-1 of N pods report processing_reaper_lock_miss_total{queue="..."} > 0
+#                          one pod (the leader) may report no samples for that queue.
+# A Sum of 0 across ALL pods after 5+ minutes means either only 1 pod is running (check ECS desired count)
+# or FF_PROCESSING_REAPER_LEADER_LOCK is off.
 
-# 3. Confirm no broadcast dedup spike
-aws cloudwatch get-metric-statistics \
-  --namespace "Weelo/Backend" \
-  --metric-name "broadcast_dedup_total" \
-  --statistics Sum \
-  --period 300 \
-  --start-time "$(date -u -v-30M +%FT%TZ 2>/dev/null || date -u --date='30 minutes ago' +%FT%TZ)" \
-  --end-time "$(date -u +%FT%TZ)" \
-  --region ap-south-1
-# Expected: flat or near-zero compared to pre-deploy baseline
+# 3. Confirm no broadcast dedup spike (also a Prometheus-only counter at HEAD).
+for ip in $TASK_IPS; do
+  curl -sS -H "x-health-token: $TOKEN" "http://${ip}:3000/metrics" \
+    | grep -E '^broadcast_dedup_total\{' || true
+done
+# Expected: rate flat vs pre-deploy baseline. A 2–6× spike means the leader-lock is NOT preventing duplicate
+# reaps — proceed to rollback (Option A first).
 
-# 4. Spot-check Redis leader key directly
-# acquireLock('processing-reaper:${queue}') stores key as lock:processing-reaper:${queue}
-# Check all 3 registered queues:
-redis-cli -h <prod-redis-host> -p 6379 GET 'lock:processing-reaper:booking:resume-broadcast'
-redis-cli -h <prod-redis-host> -p 6379 GET 'lock:processing-reaper:hold:finalize-retry'
-redis-cli -h <prod-redis-host> -p 6379 GET 'lock:processing-reaper:hold-expiry'
-# Expected: non-nil on each (one pod holds the lock per queue)
-redis-cli -h <prod-redis-host> -p 6379 PTTL 'lock:processing-reaper:booking:resume-broadcast'
-# Expected: 1000–10000 (key live, TTL=10s, refreshed each tick)
+# 4. Spot-check Redis leader key directly. The reaper holds the lock only DURING tick-body execution
+#    (TTL=10s, interval=30s) — between ticks the key is released and PTTL returns -2.
+#    Time the spot-check immediately after a "[Queue] Reaper re-queued" log line, OR run a tight loop:
+for queue in 'booking:resume-broadcast' 'hold:finalize-retry' 'hold-expiry'; do
+  echo "=== queue $queue ==="
+  for i in 1 2 3 4 5; do
+    redis-cli -h <prod-redis-host> -p 6379 GET "lock:processing-reaper:${queue}"
+    redis-cli -h <prod-redis-host> -p 6379 PTTL "lock:processing-reaper:${queue}"
+    sleep 6
+  done
+done
+# Expected: at least ONE of the 5 samples per queue shows a non-nil UUID + PTTL between 1000 and 10000 ms.
+# All-nil is consistent with leader-pod ticks landing between samples — fall back to Step 1 log evidence.
 ```
 
-**Pass criteria (hard gate 5):** `processing_reaper_lock_miss_total` is non-zero on follower pods, reaper is draining stale `:processing-list` entries on the leader, and broadcast dedup metrics show no spike vs baseline.
+**Pass criteria (§1.3 Pillar 4 / hard gate 5)** — all four must be true after a 30 min soak:
 
-### Rollback (if duplicate broadcasts detected)
+- [ ] Step 1: `[Queue] Reaper re-queued` or `[ProcessingReaper]` log line appears on at least one pod (leader is executing the tick body).
+- [ ] Step 2: `processing_reaper_lock_miss_total{queue=...}` Sum > 0 on **at least one follower pod** (proves leader election is running, not all pods are winning the lock).
+- [ ] Step 3: Redis `lock:processing-reaper:${queue}` returns a non-nil UUID at least once during a 5-sample 6 s spot-check window.
+- [ ] Step 4: `broadcast_dedup_total` rate is flat (within ±10 %) vs pre-deploy baseline.
+
+### Rollback (3-tier per §1.3 lines 230–240)
+
+Tiered from least-disruptive (env flip) to last-resort (full revision revert). Try A → B → C only as needed.
 
 ```bash
-# Option A — disable leader lock only (reaper runs unlocked; safe at low pod count)
-# Set FF_PROCESSING_REAPER_LEADER_LOCK=false in task-def and redeploy
+# Option A — disable leader lock only (reaper runs unlocked; safe at pod count ≤ 2)
+#            Set FF_PROCESSING_REAPER_LEADER_LOCK=false in task-def and redeploy
+#            Same patch-and-register procedure as Fix #6 above.
 
-# Option B — disable BLMOVE branch entirely
-# Set FF_QUEUE_BLMOVE_DEQUEUE=false in task-def and redeploy
+# Option B — disable the BLMOVE branch entirely (no reaper runs, no :processing-list is written)
+#            Set FF_QUEUE_BLMOVE_DEQUEUE=false in task-def and redeploy.
+#            Stale :processing-list entries from the BLMOVE window are drained by
+#            recoverStaleProcessingJobs at next pod boot (queue.service.ts:795).
 
-# Option C — full task-def rollback (same procedure as Fix #6 hard rollback above)
+# Option C — full task-def revision revert (last resort; same procedure as Fix #6 hard rollback)
+aws ecs update-service \
+  --cluster "$ECS_CLUSTER" \
+  --service "$ECS_SERVICE" \
+  --task-definition "weelobackendtask:${PREV_REVISION}" \
+  --force-new-deployment \
+  --region ap-south-1
+aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --region ap-south-1
 ```
 
 ---
