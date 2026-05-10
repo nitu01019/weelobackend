@@ -51,13 +51,22 @@ export const FF_ORDER_DISPATCH_STATUS_EVENTS = process.env.FF_ORDER_DISPATCH_STA
 const POLL_MS_MIN = 100;
 const _rawPollMs = parseInt(process.env.ORDER_DISPATCH_OUTBOX_POLL_MS || '1500', 10) || 1500;
 if (process.env.ORDER_DISPATCH_OUTBOX_POLL_MS && _rawPollMs < POLL_MS_MIN) {
-  // eslint-disable-next-line no-console
-  console.warn('[DispatchOutbox] ORDER_DISPATCH_OUTBOX_POLL_MS below safety floor — clamping', {
+  logger.warn('[DispatchOutbox] ORDER_DISPATCH_OUTBOX_POLL_MS below safety floor — clamping', {
     requested: _rawPollMs, floor: POLL_MS_MIN,
   });
 }
 export const ORDER_DISPATCH_OUTBOX_POLL_MS = Math.max(POLL_MS_MIN, _rawPollMs);
-export const ORDER_DISPATCH_OUTBOX_BATCH_SIZE = Math.max(1, parseInt(process.env.ORDER_DISPATCH_OUTBOX_BATCH_SIZE || '20', 10) || 20);
+// Fix #37 per index-20-validated.md §1.10 P2 Step 3: BATCH_DEFAULT=50 canary,
+// BATCH_MAX_FOR_120S_TTL=200 ceiling with warn-cap. Operator must verify p99 before raising past 200.
+const BATCH_DEFAULT = 50;
+const BATCH_MAX_FOR_120S_TTL = 200;
+const _rawBatch = parseInt(process.env.ORDER_DISPATCH_OUTBOX_BATCH_SIZE || String(BATCH_DEFAULT), 10) || BATCH_DEFAULT;
+if (_rawBatch > BATCH_MAX_FOR_120S_TTL) {
+  logger.warn('[DispatchOutbox] BATCH_SIZE above safe ceiling for 120s TTL — operator must verify p99', {
+    requested: _rawBatch, recommended_max: BATCH_MAX_FOR_120S_TTL,
+  });
+}
+export const ORDER_DISPATCH_OUTBOX_BATCH_SIZE = Math.max(1, _rawBatch);
 // Fix #37 per index-20-validated.md §1.10: bounded parallelism within a batch.
 // Default 25 — 25 in-flight at once; env-overridable for canary ramp-up.
 export const ORDER_DISPATCH_OUTBOX_ROW_PARALLELISM = Math.max(1, parseInt(process.env.ORDER_DISPATCH_OUTBOX_ROW_PARALLELISM || '25', 10) || 25);

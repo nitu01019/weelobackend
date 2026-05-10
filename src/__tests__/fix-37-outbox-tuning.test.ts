@@ -147,12 +147,12 @@ describe('Fix #37 Step 1 — POLL_MS floor warn-and-clamp at 100ms', () => {
     expect(result.warnFired).toBe(true);
   });
 
-  it('T1b: SOURCE console.warn contains safety floor message', () => {
+  it('T1b: SOURCE logger.warn contains safety floor message', () => {
     const src = readOutboxSource();
     // The warn message from Jade's patch
     expect(src).toContain('below safety floor');
-    // Warn is emitted via console.warn (not logger.warn — avoids circular dep at module load)
-    expect(src).toContain('console.warn(');
+    // Per SOTH §1.10 P2 Step 1: logger.warn (logger is imported at top; no circular dep)
+    expect(src).toContain('logger.warn(');
   });
 
   it('T2: POLL_MS=250 → exported=250, no warn', () => {

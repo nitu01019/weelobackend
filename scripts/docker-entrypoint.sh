@@ -53,11 +53,11 @@ if [ -n "$DATABASE_URL" ] && echo "$DATABASE_URL" | grep -q "^postgres"; then
     npx prisma migrate resolve --applied "20260329_add_on_hold_status_and_vehicle_index" 2>&1 || true
     echo "✅ Baseline complete — all known migrations marked as applied"
 
-    # Step 2: Deploy any NEW migrations added after the baseline
-    npx prisma migrate deploy 2>&1 || {
-        echo "❌ Prisma migrate deploy failed — aborting startup to prevent broken state"
-        exit 1
-    }
+    # CLAUDE.md CRITICAL RULE #1: NEVER run `prisma migrate deploy` on production.
+    # Production DB has no `_prisma_migrations` table (set up via `db push` originally).
+    # Schema changes MUST be applied via direct psql with BEGIN/COMMIT.
+    # The `migrate resolve --applied` calls above baseline migration state idempotently
+    # without touching the schema. See M-007 runbook for the operator-only psql pattern.
     
     # Create OtpStore table (for cross-task OTP fallback when Redis is unavailable)
     # This table is NOT managed by Prisma — it's a simple key-value store for OTPs
