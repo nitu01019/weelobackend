@@ -939,6 +939,7 @@ export async function broadcastVehicleTypePayload(
   const enqueueAcceptedTransporters: string[] = [];
   const enqueueFailedTransporters: string[] = [];
   let skippedNoAvailable = 0;
+  let skippedMissingPickupData = 0;
 
   // H6 FIX: Cache each transporter's personalized payload so retries send the same
   // per-transporter data (trucksYouCanProvide, pickupDistanceKm, etc.) instead of
@@ -1000,6 +1001,8 @@ export async function broadcastVehicleTypePayload(
         transporterId,
         candidateMapSize: candidateDistanceMap?.size ?? 0
       });
+      metrics.incrementCounter('broadcast_pickup_data_missing_total', { vehicleType });
+      skippedMissingPickupData++;
       continue;
     }
 
@@ -1194,6 +1197,7 @@ export async function broadcastVehicleTypePayload(
     acceptedCount: enqueueAcceptedTransporters.length,
     failedCount: enqueueFailedTransporters.length,
     skippedNoAvailable,
+    skippedMissingPickupData,
     strictMode: FF_BROADCAST_STRICT_SENT_ACCOUNTING
   });
 

@@ -90,6 +90,7 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
     counter('broadcast_candidates_found', 'Number of candidate transporters found per vehicle type and step'),
     counter('broadcast_fanout_total', 'Total transporters fanned out per broadcast by vehicle type'),
     counter('broadcast_skipped_no_available', 'Broadcasts skipped because no transporters were available'),
+    counter('broadcast_pickup_data_missing_total', 'Broadcasts skipped because per-transporter pickup distance was missing in candidateDistanceMap'),
 
     // Phase 6: Delivery channels
     counter('broadcast_delivery_enqueued', 'Broadcast delivery jobs enqueued by channel (socket, fcm) and priority'),
@@ -408,6 +409,19 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
     counter(
       'redis_lock_release_failed_total',
       'Redis distributed lock release failures by originating op',
+    ),
+
+    // Fix #12 (index-20-validated.md §2.3.1 lines 1993-2003) — Idempotent
+    // lock-prefix strip observability. Increments whenever a caller passes a
+    // pre-prefixed `lock:foo` shape into one of the 4 lock primitives
+    // (acquireLock | releaseLock | isLockHeldBy | getLockHolder), which the
+    // strip then collapses to `lock:foo` (preventing the pre-fix
+    // `lock:lock:foo` split-mutex). Label `method` identifies the call site.
+    // Sustained non-zero rate ⇒ ~20 production callers still pass pre-prefix
+    // and need source-level cleanup (Phase 1 of the 3-phase rollout).
+    counter(
+      'redis_double_prefix_lock_hits_total',
+      'Redis lock keys passed with pre-existing `lock:` prefix and stripped by the idempotent normalizer (labels: method = acquireLock|releaseLock|isLockHeldBy|getLockHolder)',
     ),
 
     // === P4 F2.NEW-4: Vehicle release failure observability ===

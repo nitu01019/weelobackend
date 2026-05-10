@@ -251,50 +251,44 @@ describe('Fix #37 Step 3 — p-limit parallel dispatch within batch', () => {
     expect(src).toContain('pLimit(ORDER_DISPATCH_OUTBOX_ROW_PARALLELISM)');
   });
 
-  it('T10: p-limit concurrency semantics — fakePLimit enforces N-concurrent bound', async () => {
-    // Verify the concurrency-bounding semantics that pLimit provides.
-    // The actual runtime wiring is structural (T9). This test validates the
-    // p-limit contract itself holds at the configured parallelism level.
+  it('T10: real p-limit module enforces N-concurrent bound for N+5 tasks', async () => {
+    // Runtime test using the ACTUAL p-limit module from node_modules (not a
+    // hand-rolled fake). This proves the dependency the source relies on
+    // genuinely caps in-flight execution at N regardless of how many tasks are
+    // submitted. Failure here means either p-limit is broken/missing or its
+    // contract diverged from what order-dispatch-outbox.service.ts assumes.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const pLimit = require('p-limit');
+    expect(typeof pLimit).toBe('function');
+
+    const N = 4;
+    const TOTAL = N + 5; // submit more than the cap to force queueing
+    let inFlight = 0;
     let maxConcurrent = 0;
-    let currentConcurrent = 0;
 
-    const fakePLimit = (n: number) => {
-      let running = 0;
-      const queue: Array<() => void> = [];
-
-      const run = async (fn: () => Promise<any>) => {
-        if (running >= n) {
-          await new Promise<void>((resolve) => queue.push(resolve));
-        }
-        running++;
-        currentConcurrent++;
-        if (currentConcurrent > maxConcurrent) maxConcurrent = currentConcurrent;
-        try {
-          return await fn();
-        } finally {
-          running--;
-          currentConcurrent--;
-          if (queue.length > 0) queue.shift()!();
-        }
-      };
-      return run;
-    };
-
-    const CONFIGURED_PARALLELISM = 25; // matches ORDER_DISPATCH_OUTBOX_ROW_PARALLELISM default
-
-    const limit = fakePLimit(3); // use smaller bound for test speed
-    const results: number[] = [];
-    const tasks = Array.from({ length: 9 }, (_, i) =>
+    const limit = pLimit(N);
+    const tasks = Array.from({ length: TOTAL }, (_, i) =>
       limit(async () => {
+        inFlight++;
+        if (inFlight > maxConcurrent) maxConcurrent = inFlight;
+        // Yield several macrotasks so any unbounded scheduling would race here.
         await new Promise((r) => setTimeout(r, 5));
-        results.push(i);
+        inFlight--;
+        return i;
       })
     );
-    await Promise.all(tasks);
-    expect(maxConcurrent).toBeLessThanOrEqual(3);
-    expect(results).toHaveLength(9);
-    // Verify default parallelism is 25
-    expect(CONFIGURED_PARALLELISM).toBe(25);
+
+    const results = await Promise.all(tasks);
+
+    expect(results).toHaveLength(TOTAL);
+    expect(results.sort((a, b) => a - b)).toEqual(
+      Array.from({ length: TOTAL }, (_, i) => i)
+    );
+    // Core invariant: at no observed tick did concurrency exceed the cap.
+    expect(maxConcurrent).toBeLessThanOrEqual(N);
+    // Sanity: cap was actually exercised (otherwise the bound is vacuous).
+    expect(maxConcurrent).toBeGreaterThan(1);
+    expect(inFlight).toBe(0);
   });
 });
 

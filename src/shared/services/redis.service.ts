@@ -3150,6 +3150,12 @@ class RedisService {
   async acquireLock(lockKey: string, holderId: string, ttlSeconds: number): Promise<LockResult> {
     const normalized = lockKey.startsWith('lock:') ? lockKey.slice(5) : lockKey;
     const key = `lock:${normalized}`;
+    if (lockKey !== normalized) {
+      try {
+        const { metrics } = require('../monitoring/metrics.service');
+        metrics.incrementCounter('redis_double_prefix_lock_hits_total', { method: 'acquireLock' });
+      } catch { /* metrics not loaded */ }
+    }
 
     // Use SET NX (set if not exists) with expiry
     const result = await this.client.eval(
@@ -3227,6 +3233,12 @@ class RedisService {
   async releaseLock(lockKey: string, holderId: string): Promise<boolean> {
     const normalized = lockKey.startsWith('lock:') ? lockKey.slice(5) : lockKey;
     const key = `lock:${normalized}`;
+    if (lockKey !== normalized) {
+      try {
+        const { metrics } = require('../monitoring/metrics.service');
+        metrics.incrementCounter('redis_double_prefix_lock_hits_total', { method: 'releaseLock' });
+      } catch { /* metrics not loaded */ }
+    }
 
     // Only delete if holder matches
     const result = await this.client.eval(
@@ -3267,6 +3279,12 @@ class RedisService {
   async isLockHeldBy(lockKey: string, holderId: string): Promise<boolean> {
     const normalized = lockKey.startsWith('lock:') ? lockKey.slice(5) : lockKey;
     const key = `lock:${normalized}`;
+    if (lockKey !== normalized) {
+      try {
+        const { metrics } = require('../monitoring/metrics.service');
+        metrics.incrementCounter('redis_double_prefix_lock_hits_total', { method: 'isLockHeldBy' });
+      } catch { /* metrics not loaded */ }
+    }
     const holder = await this.client.get(key);
     return holder === holderId;
   }
@@ -3277,6 +3295,12 @@ class RedisService {
   async getLockHolder(lockKey: string): Promise<string | null> {
     const normalized = lockKey.startsWith('lock:') ? lockKey.slice(5) : lockKey;
     const key = `lock:${normalized}`;
+    if (lockKey !== normalized) {
+      try {
+        const { metrics } = require('../monitoring/metrics.service');
+        metrics.incrementCounter('redis_double_prefix_lock_hits_total', { method: 'getLockHolder' });
+      } catch { /* metrics not loaded */ }
+    }
     return this.client.get(key);
   }
 

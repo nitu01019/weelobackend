@@ -105,12 +105,13 @@ const ROOM_MEMBERS_TTL_SECONDS = 86400; // 24h, matches dispatch-zset TTL conven
 async function trackRoomMembership(roomKey: string, userId: string): Promise<void> {
   if (!userId || !roomKey) return;
   const memberSet = `room:members:${roomKey}`;
-  await redisService.sAdd(memberSet, userId).catch((err: unknown) =>
-    logger.warn(`[ROOM_MEMBERS] sAdd failed for ${memberSet}`, {
+  // Atomic SADD+EXPIRE via Lua — eliminates orphan-set leak window if pod crashes
+  // between separate SADD and EXPIRE calls (LINE Engineering pattern).
+  await redisService.sAddWithExpire(memberSet, ROOM_MEMBERS_TTL_SECONDS, userId).catch((err: unknown) =>
+    logger.warn(`[ROOM_MEMBERS] sAddWithExpire failed for ${memberSet}`, {
       error: err instanceof Error ? err.message : String(err)
     })
   );
-  await redisService.expire(memberSet, ROOM_MEMBERS_TTL_SECONDS).catch(() => { /* TTL refresh best-effort */ });
 }
 
 // emit-time companion: enumerate local userIds in the target room and idempotently
@@ -122,13 +123,13 @@ async function trackEmitRoomMembership(roomKey: string): Promise<void> {
   const userIds = enumerateRoomUserIds(roomKey);
   if (userIds.length === 0) return;
   const memberSet = `room:members:${roomKey}`;
-  await redisService.sAdd(memberSet, ...userIds).catch((err: unknown) =>
-    logger.warn(`[ROOM_MEMBERS] emit sAdd failed for ${memberSet}`, {
+  // Atomic SADD+EXPIRE via Lua — single round-trip, no orphan-set risk on crash.
+  await redisService.sAddWithExpire(memberSet, ROOM_MEMBERS_TTL_SECONDS, ...userIds).catch((err: unknown) =>
+    logger.warn(`[ROOM_MEMBERS] emit sAddWithExpire failed for ${memberSet}`, {
       error: err instanceof Error ? err.message : String(err),
       memberCount: userIds.length
     })
   );
-  await redisService.expire(memberSet, ROOM_MEMBERS_TTL_SECONDS).catch(() => { /* TTL refresh best-effort */ });
 }
 
 // Track user connections

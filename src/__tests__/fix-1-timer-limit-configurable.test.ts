@@ -208,25 +208,60 @@ describe('Fix #1 — TIMER_BATCH_LIMIT configurable + ARGV LIMIT', () => {
     const path = require('path');
     const ROOT = path.resolve(__dirname, '..');
 
-    const expectedCallers = [
-      'modules/order/order-timer.service.ts',
-      'modules/booking/booking-timer.service.ts',
-      'modules/booking/booking.service.ts',
-      'modules/booking/order.service.ts',
-      'modules/booking/legacy-order-expiry.service.ts',
-      'modules/rating/rating-reminder.service.ts',
-      'shared/queue-processors/assignment-timeout-poller.ts',
-      'shared/services/queue.service.ts',
+    // Per-file invocation counts (Yarrow wiring, SOTH §1.1 P2 Fix #13):
+    //   booking-timer.service.ts:    2 calls
+    //   booking.service.ts:          2 calls
+    //   redis.service.ts:            2 internal (helper default + getExpiredTimers default)
+    //   all other 6 callers:         1 call each
+    // External callers sum: 10. Combined with 2 internal = 12 total invocations.
+    const callerExpectations: Array<[string, number]> = [
+      ['modules/order/order-timer.service.ts', 1],
+      ['modules/booking/booking-timer.service.ts', 2],
+      ['modules/booking/booking.service.ts', 2],
+      ['modules/booking/order.service.ts', 1],
+      ['modules/booking/legacy-order-expiry.service.ts', 1],
+      ['modules/rating/rating-reminder.service.ts', 1],
+      ['shared/queue-processors/assignment-timeout-poller.ts', 1],
+      ['shared/services/queue.service.ts', 1],
     ];
 
-    test.each(expectedCallers)('%s imports timerBatchLimit', (rel) => {
+    test.each(callerExpectations)('%s imports timerBatchLimit', (rel) => {
       const src = fs.readFileSync(path.join(ROOT, rel), 'utf8');
       expect(src).toMatch(/import\s*{[^}]*timerBatchLimit[^}]*}\s*from/);
     });
 
-    test.each(expectedCallers)('%s invokes timerBatchLimit()', (rel) => {
-      const src = fs.readFileSync(path.join(ROOT, rel), 'utf8');
-      expect(src).toMatch(/timerBatchLimit\s*\(/);
+    test.each(callerExpectations)(
+      '%s invokes timerBatchLimit() exactly %i time(s)',
+      (rel, expectedCount) => {
+        const src = fs.readFileSync(path.join(ROOT, rel), 'utf8');
+        const matches = src.match(/timerBatchLimit\s*\(/g) ?? [];
+        // Per-file invocation count must match Yarrow's wiring brief exactly.
+        // Looser ">=" assertions previously masked accidental call removal; this
+        // explicit equality catches drift in either direction.
+        expect(matches.length).toBe(expectedCount);
+      }
+    );
+
+    test('redis.service.ts contains exactly 2 internal timerBatchLimit() invocations', () => {
+      const src = fs.readFileSync(path.join(ROOT, 'shared/services/redis.service.ts'), 'utf8');
+      const matches = src.match(/timerBatchLimit\s*\(/g) ?? [];
+      // Helper definition (`export function timerBatchLimit(...)`) is excluded
+      // from the count because the regex requires "timerBatchLimit(" with no
+      // preceding "function ". Two internal call sites are expected:
+      //   1) the helper's recursive/default invocation, and
+      //   2) getExpiredTimers' fallback when no explicit limit is passed.
+      expect(matches.length).toBe(2);
+    });
+
+    test('total external invocations across all 8 caller files = 10', () => {
+      // Sentinel: protects the 11-invocation budget from §1.1 P2 by summing
+      // every caller file. Together with the redis.service internal-2 check
+      // above this proves the documented 11-call wiring is intact.
+      const total = callerExpectations.reduce((sum, [rel, _]) => {
+        const src = fs.readFileSync(path.join(ROOT, rel), 'utf8');
+        return sum + (src.match(/timerBatchLimit\s*\(/g)?.length ?? 0);
+      }, 0);
+      expect(total).toBe(10);
     });
   });
 });
