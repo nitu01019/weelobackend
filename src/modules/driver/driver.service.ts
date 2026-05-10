@@ -17,7 +17,8 @@ import { redisService } from '../../shared/services/redis.service';
 import { safeJsonParse } from '../../shared/utils/safe-json.utils';
 import { CreateDriverInput } from './driver.schema';
 import { prismaClient } from '../../shared/database/prisma.service';
-import { maskPhoneForExternal, maskPhoneForLog } from '../../shared/utils/pii.utils';
+import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
+import { maskPhoneForLog } from '../../shared/utils/pii.utils';
 import { DRIVER_PRESENCE_TTL_SECONDS as PRESENCE_TTL_SECONDS } from '../../shared/config/presence.config';
 
 // =============================================================================

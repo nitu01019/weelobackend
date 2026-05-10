@@ -602,7 +602,7 @@ export async function acceptTruckRequest(
       vehicleType: vehicleType || '',
       farePerTruck: String(fcmPayloadObj.farePerTruck),
       distanceKm: String(fcmPayloadObj.distanceKm),
-      customerPhone: fcmPayloadObj.customerPhone,
+      customerPhone: maskPhoneForExternal(fcmPayloadObj.customerPhone || ''),
       assignedAt: now,
       expiresAt: fcmExpiresAtIso,
       status: 'trip_assigned'

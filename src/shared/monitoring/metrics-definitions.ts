@@ -90,7 +90,10 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
     counter('broadcast_candidates_found', 'Number of candidate transporters found per vehicle type and step'),
     counter('broadcast_fanout_total', 'Total transporters fanned out per broadcast by vehicle type'),
     counter('broadcast_skipped_no_available', 'Broadcasts skipped because no transporters were available'),
-    counter('broadcast_pickup_data_missing_total', 'Broadcasts skipped because per-transporter pickup distance was missing in candidateDistanceMap'),
+    counter( /* @observability-only */
+      'broadcast_pickup_data_missing_total',
+      'Broadcasts skipped because per-transporter pickup distance was missing in candidateDistanceMap'
+    ),
 
     // Phase 6: Delivery channels
     counter('broadcast_delivery_enqueued', 'Broadcast delivery jobs enqueued by channel (socket, fcm) and priority'),
@@ -419,7 +422,7 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
     // `lock:lock:foo` split-mutex). Label `method` identifies the call site.
     // Sustained non-zero rate ⇒ ~20 production callers still pass pre-prefix
     // and need source-level cleanup (Phase 1 of the 3-phase rollout).
-    counter(
+    counter( /* @observability-only */
       'redis_double_prefix_lock_hits_total',
       'Redis lock keys passed with pre-existing `lock:` prefix and stripped by the idempotent normalizer (labels: method = acquireLock|releaseLock|isLockHeldBy|getLockHolder)',
     ),
@@ -756,7 +759,7 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
     // ZSET after slipping out of the tracking ZSETs (crash between ZREM and
     // successful processing). Sustained non-zero rate ⇒ workers are crashing
     // mid-process; alert at >10/min for 15m. — NEW#2.
-    counter(
+    counter( /* @observability-only */
       'timer_orphan_recovered_total',
       'Orphan timer keys re-queued to shard/legacy ZSETs by periodic recovery scan (NEW#2)'
     ),

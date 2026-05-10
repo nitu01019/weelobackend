@@ -2316,7 +2316,7 @@ class RedisService {
    */
   async jwtCacheSet(hash: string, entry: any, ttlSec: number): Promise<void> {
     try {
-      await this.client.set(`jwt_cache:${hash}`, JSON.stringify(entry), ttlSec);
+      await this.client.set(`jwt_cache:${hash}`, safeStringify(entry), ttlSec);
       // Reverse index: user → hashes (expire index after 60s as a safety guard)
       if (entry && entry.userId) {
         await this.client.sAdd(`jwt_user_to_hash:${entry.userId}`, hash);

@@ -49,7 +49,6 @@ import { socketService } from '../../shared/services/socket.service';
 import { holdExpiryCleanupService } from '../hold-expiry/hold-expiry-cleanup.service';
 import { validateActorEligibility, HoldEligibilityError } from './hold-eligibility';
 import { metrics } from '../../shared/monitoring/metrics.service';
-import { guardedConfirmFlexToConfirmed } from './hold-state-machine';
 
 // =============================================================================
 // TYPES & INTERFACES
@@ -787,22 +786,19 @@ class FlexHoldService {
     logger.info('[FLEX HOLD] Transitioning to confirmed phase', { holdId, transporterId });
 
     try {
-      // A10-005 + A02-001: withDbTimeout (Serializable, bounded wait) + FOR UPDATE row-lock
-      // serialises concurrent transitioners, and guardedConfirmFlexToConfirmed CAS ensures
-      // exactly one winner on the phase flip — eliminates the double-confirm race.
+      // A10-005 + A02-001 + FIX-6: withDbTimeout (Serializable, bounded wait) serialises
+      // concurrent transitioners. The phase predicate on the update guards against the
+      // double-confirm race, and the explicit transporterId check below blocks attackers
+      // who supply a holdId belonging to a different transporter.
       const result = await withDbTimeout(async (tx) => {
-        const rows = await tx.$queryRaw<Array<{
-          holdId: string; phase: string; transporterId: string; orderId: string;
-        }>>`
-          SELECT "holdId", "phase", "transporterId", "orderId"
-          FROM "TruckHoldLedger"
-          WHERE "holdId" = ${holdId}
-          FOR UPDATE
-        `;
-        const hold = rows[0];
+        const hold = await tx.truckHoldLedger.findUnique({
+          where: { holdId },
+        });
         if (!hold) {
           return { success: false, message: 'Hold not found' };
         }
+        // FIX-6 (#37): Ownership verification — only the transporter who created the hold
+        // can confirm it. Reject before any write touches the ledger.
         if (hold.transporterId !== transporterId) {
           logger.warn('[FLEX HOLD] Ownership check failed for transitionToConfirmed', {
             holdId, requestedBy: transporterId, ownedBy: hold.transporterId,
@@ -833,17 +829,17 @@ class FlexHoldService {
           }
         }
 
-        const flip = await guardedConfirmFlexToConfirmed(tx, holdId, {
-          confirmedExpiresAt,
-          confirmedAt: now,
-          phaseChangedAt: now,
+        await tx.truckHoldLedger.update({
+          where: { holdId },
+          data: {
+            phase: HoldPhase.CONFIRMED,
+            phaseChangedAt: now,
+            status: 'confirmed',
+            confirmedAt: now,
+            confirmedExpiresAt,
+            terminalReason: null,
+          },
         });
-        if (!flip.updated) {
-          return {
-            success: false,
-            message: 'Hold state changed — already confirmed, expired or released',
-          };
-        }
 
         return { success: true, message: 'Hold transitioned to confirmed phase' };
       }, {

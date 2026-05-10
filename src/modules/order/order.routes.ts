@@ -32,7 +32,8 @@ import { prismaClient } from '../../shared/database/prisma.service';
 import { createOrderSchema } from '../booking/booking.schema';
 // FIX F-1-4: Use shared utils instead of inline duplicates
 import { normalizeOrderLifecycleState, normalizeOrderStatus } from '../../shared/utils/order-lifecycle.utils';
-import { maskPhoneForExternal, maskPhoneForLog } from '../../shared/utils/pii.utils';
+import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
+import { maskPhoneForLog } from '../../shared/utils/pii.utils';
 
 const router = Router();
 

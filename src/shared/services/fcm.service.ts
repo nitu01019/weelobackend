@@ -932,16 +932,20 @@ class FCMService {
          error?.code === 'messaging/invalid-registration-token')
       ) {
         logger.info(`FCM: Removing dead token for user ${userId}`);
+        this.removeToken(userId, tokens[0]).catch((err) => logger.warn('[FCM] Token cleanup failed', { userId, error: err instanceof Error ? err.message : String(err) }));
         // P7-T06 (A05-004): Soft-revoke the token in DB so the revokedAt filter
         // immediately excludes it from future getTokens() DB fallback calls.
         // removeToken deletes the DB row; revokedAt update is belt-and-braces
         // for any concurrent reader that obtained the token before the delete.
-        prismaClient.deviceToken.updateMany({
-          where: { userId, token: tokens[0] } as any,
-          // P7-T06: revokedAt column added via direct SQL — cast data as any (Prisma types predate column).
-          data: { revokedAt: new Date() } as any,
-        }).catch((err: Error) => logger.warn('[FCM] revokedAt update failed', { userId, error: err.message }));
-        this.removeToken(userId, tokens[0]).catch((err) => logger.warn('[FCM] Token cleanup failed', { userId, error: err instanceof Error ? err.message : String(err) }));
+        try {
+          Promise.resolve(prismaClient.deviceToken.updateMany({
+            where: { userId, token: tokens[0] } as any,
+            // P7-T06: revokedAt column added via direct SQL — cast data as any (Prisma types predate column).
+            data: { revokedAt: new Date() } as any,
+          })).catch((err: Error) => logger.warn('[FCM] revokedAt update failed', { userId, error: err.message }));
+        } catch (err: any) {
+          logger.warn('[FCM] revokedAt update failed', { userId, error: err?.message ?? String(err) });
+        }
       }
       logger.error('FCM: Failed to send notification', error);
       return false;

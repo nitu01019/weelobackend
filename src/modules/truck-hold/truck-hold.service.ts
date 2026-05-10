@@ -1726,7 +1726,7 @@ class TruckHoldService {
           farePerTruck: String(fcmPayloadObj.farePerTruck),
           fare: String(fcmPayloadObj.farePerTruck),
           distanceKm: String(fcmPayloadObj.distanceKm),
-          customerPhone: fcmPayloadObj.customerPhone,
+          customerPhone: maskPhoneForExternal(fcmPayloadObj.customerPhone ?? ''),
           assignedAt: now,
           expiresAt: expiresAtIso,
         };

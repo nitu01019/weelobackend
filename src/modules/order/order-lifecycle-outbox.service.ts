@@ -769,7 +769,7 @@ export async function dispatchTripAssignedFanoutFromOutbox(payload: TripAssigned
     distanceKm: payload.distanceKm,
     farePerTruck: payload.farePerTruck,
     customerName: payload.customerName,
-    customerPhone: payload.customerPhone, // producer already masked
+    customerPhone: maskPhoneForExternal(payload.customerPhone ?? ''), // defensive — producer already masked
     assignedAt: payload.assignedAt,
     expiresAt: payload.expiresAt,
     message: payload.message,
@@ -828,7 +828,7 @@ export async function dispatchTripAssignedFanoutFromOutbox(payload: TripAssigned
     farePerTruck: Number(payload.farePerTruck ?? 0),
     distanceKm: Number(payload.distanceKm ?? 0),
     customerName: payload.customerName ?? '',
-    customerPhone: payload.customerPhone ?? '',
+    customerPhone: maskPhoneForExternal(payload.customerPhone ?? ''),
     assignedAt: payload.assignedAt,
     expiresAt: payload.expiresAt,
     message: payload.message || `New trip assigned! ${fcmPickupNested.address || 'Pickup'} → ${fcmDropNested.address || 'Drop'}`,
@@ -854,7 +854,7 @@ export async function dispatchTripAssignedFanoutFromOutbox(payload: TripAssigned
     farePerTruck: String(fcmPayloadObj.farePerTruck),
     distanceKm: String(payload.distanceKm ?? 0),
     customerName: payload.customerName ?? '',
-    customerPhone: payload.customerPhone ?? '',
+    customerPhone: maskPhoneForExternal(payload.customerPhone ?? ''),
     assignedAt: payload.assignedAt,
     expiresAt: payload.expiresAt,
   };
