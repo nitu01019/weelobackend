@@ -545,17 +545,19 @@ export async function processDispatchOutboxBatch(limit = ORDER_DISPATCH_OUTBOX_B
     }
   } else {
     // Legacy path: SET-NX-EX election on the canonical raw `outbox:leader` key.
-    // B-N-13 per index-20-validated.md §1.5 lines 671-678: previously called
-    // `redisService.acquireLock()` which auto-prefixes `lock:`, so the legacy
-    // path wrote `lock:outbox:leader` while the fenced path wrote raw
-    // `outbox:leader`. During rolling deploy this produced TWO leaders for one
-    // full TTL window. Routed through `acquireLeader()` for a single physical key.
+    // MUST renew-first; bare acquireLeader on every tick would return false
+    // against our own lease (NX semantics in leader-election.service.ts:88),
+    // throttling drain frequency to TTL (60-120s) — the exact regression Team
+    // D flagged as BREAKING for #20 in index-20-validated.md §1.5 lines 711-724.
     try {
-      const acquired = await acquireLeader(OUTBOX_LEADER_KEY, outboxInstanceId, OUTBOX_LEADER_TTL_SECONDS);
-      if (!acquired) {
-        return;
+      const stillOwner = await renewLeader(OUTBOX_LEADER_KEY, outboxInstanceId, OUTBOX_LEADER_TTL_SECONDS);
+      if (stillOwner) {
+        isLeader = true;
+      } else {
+        const acquired = await acquireLeader(OUTBOX_LEADER_KEY, outboxInstanceId, OUTBOX_LEADER_TTL_SECONDS);
+        if (!acquired) return;
+        isLeader = true;
       }
-      isLeader = true;
     } catch (error: unknown) {
       // Fix #20 per index-20-validated.md §1.5 lines 667-788 + §4.1 line 2186:
       // FAIL-CLOSED. Same reasoning as the fenced branch above — when the
@@ -592,17 +594,9 @@ export async function processDispatchOutboxBatch(limit = ORDER_DISPATCH_OUTBOX_B
     }
   })));
 
-  // Legacy path: blind SET to "renew". F-A-56 notes this is unsafe if we
-  // GC-paused past the TTL during the batch — a new leader would be stomped.
-  // Under the fenced path, the independent heartbeat handles renewal with
-  // atomic CAS and this block is skipped entirely.
-  if (!FF_OUTBOX_LEADER_FENCING) {
-    try {
-      await redisService.set(OUTBOX_LEADER_KEY, outboxInstanceId, OUTBOX_LEADER_TTL_SECONDS);
-    } catch {
-      // Non-critical — lock will expire and be re-acquired next cycle
-    }
-  }
+  // F-A-56 per index-20-validated.md §1.5 line 740: blind post-batch SET
+  // removed. Renewal happens via heartbeat (fenced) or next-tick renewLeader
+  // (legacy) — both safe against GC-pause-past-TTL stomping.
 }
 
 export async function processDispatchOutboxImmediately(

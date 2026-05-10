@@ -21,6 +21,7 @@
 
 import { redisService, timerBatchLimit, timerShardZset } from '../../shared/services/redis.service';
 import { logger } from '../../shared/services/logger.service';
+import { metrics } from '../../shared/monitoring/metrics.service';
 import { processProgressiveBroadcastStep } from './order-broadcast.service';
 
 // ---------------------------------------------------------------------------
@@ -46,6 +47,14 @@ const ORDER_TIMER_CHECK_INTERVAL_MS = parseInt(process.env.TIMER_POLL_INTERVAL_M
 const ORDER_TIMER_BATCH_LIMIT = timerBatchLimit();
 // NEW#2: Orphan recovery runs every 5m by default; raise to 60s under heavy crash scenarios
 const TIMER_ORPHAN_RECOVERY_INTERVAL_MS = parseInt(process.env.TIMER_ORPHAN_RECOVERY_INTERVAL_MS || '300000', 10) || 300_000;
+
+// NEW#2: Leader-lock so peer pods don't double-scan the same 7-prefix sweep.
+// `acquireLock` prepends `lock:` internally — never include `lock:` here.
+// TTL=600s covers the worst-case scan (10K keys × 3 round-trips × 7 prefixes
+// at 300-500 RPS can exceed 120s). Heartbeat between prefixes keeps the lock
+// alive for a full pass.
+const ORPHAN_RECOVERY_LOCK_KEY = 'timer:orphan-recovery';
+const ORPHAN_RECOVERY_LOCK_TTL_SEC = 600;
 
 // Fix #1: Pod-stable jitter so N pods don't all hit the ZSET simultaneously
 function podPollOffsetMs(intervalMs: number): number {
@@ -313,28 +322,52 @@ const ALL_TIMER_PREFIXES: ReadonlyArray<readonly [string, string]> = [
  * the dual-write window (FF_TIMER_LEGACY_ZSET_ENABLED=true).
  *
  * Safe to call repeatedly — idempotent: already-tracked keys are skipped.
+ *
+ * NEW#2 leader-lock: only one pod scans at a time. Without this, N pods all
+ * SCAN+ZSCORE on every interval — wasted Redis ops + duplicate ZADDs as each
+ * pod re-queues the same key concurrently.
  */
 export async function recoverOrphanedStepTimers(): Promise<number> {
-  let total = 0;
-  const counts: string[] = [];
+  const workerId = process.env.HOSTNAME || process.env.ECS_TASK_ID || `pid-${process.pid}`;
+  const lock = await redisService.acquireLock(
+    ORPHAN_RECOVERY_LOCK_KEY,
+    workerId,
+    ORPHAN_RECOVERY_LOCK_TTL_SEC,
+  );
+  if (!lock.acquired) return 0;
 
-  for (const [prefix, label] of ALL_TIMER_PREFIXES) {
-    try {
-      const n = await recoverOrphanedTimersByPrefix(prefix, label);
-      if (n > 0) counts.push(`${n} ${label}`);
-      total += n;
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      logger.warn(`[C-8 Recovery] Scan failed for ${label}: ${msg}`);
+  try {
+    let total = 0;
+    const counts: string[] = [];
+
+    for (const [prefix, label] of ALL_TIMER_PREFIXES) {
+      try {
+        const n = await recoverOrphanedTimersByPrefix(prefix, label);
+        if (n > 0) counts.push(`${n} ${label}`);
+        total += n;
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn(`[C-8 Recovery] Scan failed for ${label}: ${msg}`);
+      }
+      // Heartbeat: re-extend the lock between prefixes so a long 7-prefix scan
+      // never outlives a single TTL window. acquireLock with the same holderId
+      // refreshes the existing lock's expiry. Best-effort; if extend fails,
+      // the lock will eventually expire and a peer can pick up the rest.
+      await redisService
+        .acquireLock(ORPHAN_RECOVERY_LOCK_KEY, workerId, ORPHAN_RECOVERY_LOCK_TTL_SEC)
+        .catch(() => {});
     }
-  }
 
-  if (total > 0) {
-    logger.info(`[C-8 Recovery] Recovered ${total} orphaned timer(s): ${counts.join(', ')}`);
-  } else {
-    logger.info('[C-8 Recovery] No orphaned timers found across all 7 prefixes');
+    if (total > 0) {
+      logger.info(`[C-8 Recovery] Recovered ${total} orphaned timer(s): ${counts.join(', ')}`);
+      metrics.incrementCounter('timer_orphan_recovered_total', {}, total);
+    } else {
+      logger.info('[C-8 Recovery] No orphaned timers found across all 7 prefixes');
+    }
+    return total;
+  } finally {
+    await redisService.releaseLock(ORPHAN_RECOVERY_LOCK_KEY, workerId).catch(() => {});
   }
-  return total;
 }
 
 let orphanRecoveryInterval: ReturnType<typeof setInterval> | null = null;
@@ -346,6 +379,9 @@ let orphanRecoveryInterval: ReturnType<typeof setInterval> | null = null;
  */
 export function startOrphanRecovery(): void {
   if (orphanRecoveryInterval) return;
+  // NEW#2 rollback lever — `FF_TIMER_ORPHAN_RECOVERY_ENABLED=false` skips the
+  // periodic scheduler. Boot-time one-shot recovery still runs (additive, safe).
+  if (process.env.FF_TIMER_ORPHAN_RECOVERY_ENABLED === 'false') return;
   orphanRecoveryInterval = setInterval(() => {
     recoverOrphanedStepTimers().catch((err: unknown) => {
       logger.warn(`[C-8 Recovery] Periodic scan error: ${err instanceof Error ? err.message : String(err)}`);

@@ -741,6 +741,27 @@ export function initializeSocket(server: HttpServer): Server {
         for (const [key] of recentJoinAttempts) {
           if (key.startsWith(`${userId}:`)) recentJoinAttempts.delete(key);
         }
+
+        // Fix #5 (P0): SREM cleanup for cross-pod room replay (SOTH §1.4:571-582)
+        // Symmetric to trackRoomMembership() SADD on join — every room family that
+        // gets sAdd on join must get sRem on disconnect, otherwise FF_CROSS_POD_ROOM_REPLAY
+        // enumerators will leak ghost members and broadcast to disconnected users.
+        try {
+          const joinedRooms = Array.from(socket.rooms || []);
+          for (const room of joinedRooms) {
+            if (room === socket.id) continue;
+            if (room.startsWith('order:') || room.startsWith('booking:') || room.startsWith('trip:') ||
+                room.startsWith('transporter:') || room.startsWith('driver:') || room.startsWith('customer:')) {
+              redisService.sRem(`room:members:${room}`, userId).catch(() => { /* best-effort cleanup */ });
+            }
+          }
+        } catch (err) {
+          logger.warn('[SocketDisconnect] room SREM cleanup failed', {
+            socketId: socket.id,
+            userId,
+            error: err instanceof Error ? err.message : String(err)
+          });
+        }
       }
       socketUsers.delete(socket.id);
     });

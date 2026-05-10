@@ -736,6 +736,16 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
       'timer_dlq_drained_total',
       'Timer DLQ outcomes per prefix (requeued|discarded|requeue_failed) — Fix #36'
     ),
+
+    // timer_orphan_recovered_total: incremented (by N) per scan of
+    // recoverOrphanedStepTimers() when N>0 timers were re-added to a shard
+    // ZSET after slipping out of the tracking ZSETs (crash between ZREM and
+    // successful processing). Sustained non-zero rate ⇒ workers are crashing
+    // mid-process; alert at >10/min for 15m. — NEW#2.
+    counter(
+      'timer_orphan_recovered_total',
+      'Orphan timer keys re-queued to shard/legacy ZSETs by periodic recovery scan (NEW#2)'
+    ),
   ];
 
   for (const def of defs) {
