@@ -561,54 +561,54 @@ describe('FIX-35: Backpressure counter drift prevention', () => {
   beforeEach(resetAllMocks);
 
   it('should decrement Redis counter (not in-memory) when Redis path succeeds', async () => {
-    // Redis works fine for both increment and decrement
-    mockRedisService.incrBy.mockResolvedValue(1);
+    // Redis works fine for both Lua-acquire and incrBy-decrement
+    mockRedisService.incrementWithTTLAndRemaining.mockResolvedValue({ count: 1, ttl: 300 });
+    mockRedisService.incrBy.mockResolvedValue(0);
 
     const request = makeBaseRequest();
     await orderService.createOrder(request);
 
-    // Redis incrBy should be called for both increment (+1) and decrement (-1)
-    const incrByCalls = mockRedisService.incrBy.mock.calls;
-    const backpressureCalls = incrByCalls.filter(
+    // Acquire goes through atomic Lua helper (Fix #31)
+    const acquireCalls = mockRedisService.incrementWithTTLAndRemaining.mock.calls.filter(
       (call: any[]) => call[0] === 'order:create:inflight'
     );
+    expect(acquireCalls.length).toBeGreaterThanOrEqual(1);
 
-    // Should have at least the initial +1 and the finally -1
-    expect(backpressureCalls.length).toBeGreaterThanOrEqual(2);
-    // First call is +1 (acquire)
-    expect(backpressureCalls[0][1]).toBe(1);
-    // Last call should be -1 (release in finally)
-    const lastCall = backpressureCalls[backpressureCalls.length - 1];
-    expect(lastCall[1]).toBe(-1);
+    // Release goes through incrBy(-1) in finally
+    const incrByCalls = mockRedisService.incrBy.mock.calls;
+    const releaseCalls = incrByCalls.filter(
+      (call: any[]) => call[0] === 'order:create:inflight' && call[1] === -1
+    );
+    expect(releaseCalls.length).toBeGreaterThanOrEqual(1);
   });
 
   it('should decrement in-memory counter when Redis fails and in-memory fallback is used', async () => {
-    // Redis incrBy fails — triggers in-memory fallback
-    mockRedisService.incrBy.mockRejectedValue(new Error('Redis connection lost'));
+    // Lua-acquire fails — triggers in-memory fallback (Fix #31 + FIX-35)
+    mockRedisService.incrementWithTTLAndRemaining.mockRejectedValue(new Error('Redis connection lost'));
 
     const request = makeBaseRequest();
     await orderService.createOrder(request);
 
-    // The in-memory counter should have been incremented then decremented
+    // The in-memory counter should have been incremented then decremented.
     // Since we can't directly observe the module-level variable, we verify
-    // that the Redis decrement was NOT called in finally (since usedInMemoryFallback = true)
+    // that the Redis incrBy(-1) was NOT called in finally (usedInMemoryFallback = true)
     const incrByCalls = mockRedisService.incrBy.mock.calls;
     const finallyDecrementCalls = incrByCalls.filter(
       (call: any[]) => call[0] === 'order:create:inflight' && call[1] === -1
     );
-    // Should NOT have Redis -1 in finally when in-memory fallback was used
     expect(finallyDecrementCalls).toHaveLength(0);
   });
 
   it('should NOT decrement in-memory counter when Redis path was used (no drift)', async () => {
-    // Redis works fine
-    mockRedisService.incrBy.mockResolvedValue(1);
+    // Lua-acquire works fine, incrBy works for finally release
+    mockRedisService.incrementWithTTLAndRemaining.mockResolvedValue({ count: 1, ttl: 300 });
+    mockRedisService.incrBy.mockResolvedValue(0);
 
     const request = makeBaseRequest();
     await orderService.createOrder(request);
 
     // With Redis working, usedInMemoryFallback should be false.
-    // The finally block should call Redis decrement, not in-memory.
+    // The finally block should call Redis incrBy(-1) decrement, not in-memory.
     const incrByCalls = mockRedisService.incrBy.mock.calls;
     const redisDecrementCalls = incrByCalls.filter(
       (call: any[]) => call[0] === 'order:create:inflight' && call[1] === -1
@@ -640,7 +640,8 @@ describe('FIX-35: Backpressure counter drift prevention', () => {
   });
 
   it('should log in-memory fallback usage when Redis backpressure fails', async () => {
-    mockRedisService.incrBy.mockRejectedValue(new Error('Redis connection reset'));
+    // Lua-acquire fails — triggers fallback warn log
+    mockRedisService.incrementWithTTLAndRemaining.mockRejectedValue(new Error('Redis connection reset'));
 
     const request = makeBaseRequest();
     await orderService.createOrder(request);
@@ -687,8 +688,8 @@ describe('Integration: Combined fix behaviors', () => {
   });
 
   it('should handle all three fixes correctly when Redis fails and no supply', async () => {
-    // Redis fails: triggers in-memory backpressure (FIX-35)
-    mockRedisService.incrBy.mockRejectedValue(new Error('Redis timeout'));
+    // Redis fails: Lua-acquire rejection triggers in-memory backpressure (FIX-35 + Fix #31)
+    mockRedisService.incrementWithTTLAndRemaining.mockRejectedValue(new Error('Redis timeout'));
     // Google fails: triggers haversine floor (FIX-8)
     mockGoogleMapsService.calculateRoute.mockRejectedValue(new Error('Google error'));
     // No transporters (FIX-14)
