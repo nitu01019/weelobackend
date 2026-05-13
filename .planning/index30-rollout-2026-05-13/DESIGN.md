@@ -78,9 +78,11 @@
 
 ---
 
-## §3 — Per-Phase Pipeline (7 Gates)
+## §3 — Per-Phase Pipeline (8 Gates)
 
-Every Phase 1-7 follows this exact sequence. Total per-phase time: ~2-3 hours.
+> **Revised 2026-05-13:** added explicit **Gate 2 — Multi-Angle Logic Audit** between Team Spawn and Codex. User flagged that the original 7 gates checked code quality, independent opinion, adversarial breakage, behavior, and syntax — but never explicitly walked each fix's logic through scenarios to confirm the LOGIC works. Gate 2 is positive verification (confirming logic holds), distinct from Gate 4 red-team (negative — trying to break).
+
+Every Phase 1-7 follows this exact sequence. Total per-phase time: **~2.5-3.5 hours** (was ~2-3h; +30min for new Gate 2).
 
 ### Gate 1 — Team Spawn (1 team of 8)
 
@@ -112,9 +114,49 @@ Hard rules (in every builder prompt):
 - Cite file:line for every claim. Verify at `git show HEAD:`.
 - No source edits in attestation prose; only Solution code goes to `src/`.
 
-### Gate 2 — Codex Review (independent model voice)
+### Gate 2 — Multi-Angle Logic Audit (NEW — 4 parallel sub-agents)
 
-After `TeamDelete`:
+After `TeamDelete` but BEFORE Codex/red-team. Lead dispatches 4 parallel sub-agents (one per fix in the phase), each performing a deliberate logic walk-through.
+
+For each fix, the auditor traces the LOGIC through 6 scenarios + 2 cross-checks:
+
+| # | Scenario | What to confirm |
+|:--:|---|---|
+| 1 | Happy path | Normal request/normal load — expected behavior holds |
+| 2 | Edge case (boundary) | Empty/null/max/zero — code handles it |
+| 3 | Edge case (this fix's specific) | The EXACT scenario the source doc's "How it manifests" describes |
+| 4 | Error path | Redis timeout / Postgres lock_not_available / network partition / NOSCRIPT |
+| 5 | Concurrent path | Two pods/requests on the same key 0.5ms apart |
+| 6 | Restart path | Pod SIGTERM mid-operation |
+| A | Rationale match | Applied code does what the Solution's Rationale paragraph claims |
+| B | "How to verify" valid | The Solution's verify test exercises the new code path (not a tautology) |
+
+For each scenario: state expected behavior → trace code at HEAD → cite file:line where invariant is preserved → output PASS or NEEDS-LOGIC-FIX.
+
+Per-fix output (terse, structured):
+
+```
+Fix #N Logic Audit — HEAD <sha>
+────────────────────────────────
+Scenario 1 (Happy):       PASS — preserved by <file:line>
+Scenario 2 (Edge bound):  PASS — preserved by <file:line>
+Scenario 3 (How manif.):  PASS — preserved by <file:line>
+Scenario 4 (Error):       PASS — preserved by <file:line>
+Scenario 5 (Concurrent):  PASS — preserved by <file:line>
+Scenario 6 (Restart):     PASS — preserved by <file:line>
+Rationale match:          PASS — <one-line>
+"How to verify" valid:    PASS — <test name>
+────────────────────────────────
+Verdict: LOGIC-PASS
+```
+
+If ANY auditor returns NEEDS-LOGIC-FIX, lead Edits locally and re-runs only that auditor. Re-runs do NOT respawn the team.
+
+**Why this gate exists:** Source doc has 89 attestations stamped "97% confidence" but per memory `feedback_synthesis_stamp_hallucination`, stamps can hallucinate PASS. Round-9 itself caught the deprecated-file-target bug on #6 — a fix had been validated 8 rounds but targeted a file the active code path no longer used. A deliberate logic walk-through at our HEAD catches this class of bug pre-commit.
+
+### Gate 3 — Codex Review (independent model voice)
+
+After Gate 2:
 1. **`codex review`** on cumulative diff — pass/fail. Codex sees the diff fresh; no echo chamber.
 2. **`codex challenge`** on diff — adversarial mode tries to break it with ≥3 concrete scenarios.
 
@@ -122,7 +164,7 @@ If FAIL or CHALLENGE finds bug: fix locally via Edit, re-run only the failed Cod
 
 **Why both modes:** Round-9 Phase 4 — Codex-Delta caught the `#30 Dockerfile.production` BLOCK that all 4 Claude rounds missed. Different model lineage = different blind spots.
 
-### Gate 3 — Red-Team (4 parallel Agent dispatches, lead-driven)
+### Gate 4 — Red-Team (4 parallel Agent dispatches, lead-driven)
 
 | Attacker | Lens | Sample scenarios |
 |---|---|---|
@@ -135,7 +177,7 @@ Each attacker returns: `VERDICT (PASS/NEEDS-FIX) + scenarios + file:line defeats
 
 Dispatched in a single message with 4 parallel `Agent` tool calls (per dispatching-parallel-agents discipline).
 
-### Gate 4 — Full Local Test Suite
+### Gate 5 — Full Local Test Suite
 
 Lead runs sequentially:
 1. `npm run build` (= `tsc` per package.json)
@@ -145,7 +187,7 @@ Lead runs sequentially:
 
 All must pass. **No `it.skip()`, no `// @ts-ignore`** to mask failures (per memory `feedback_pearl_stash_blindspot`).
 
-### Gate 5 — Manual Line-Drift Check
+### Gate 6 — Manual Line-Drift Check
 
 Lead reads each Edit'd file at HEAD:
 - Anchor still matches the Solution's "What's there now"
@@ -153,7 +195,7 @@ Lead reads each Edit'd file at HEAD:
 - No dup function definitions (single source of truth)
 - Imports resolve (no `Cannot find module`)
 
-### Gate 6 — Commit
+### Gate 7 — Commit
 
 ```bash
 git add <touched files only — explicit listing, never -A or .>
@@ -166,7 +208,7 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 
 Conventional commit format. Specific file paths to `git add` — never `git add -A` or `.` (per CLAUDE.md global rule).
 
-### Gate 7 — Post-Commit Verification
+### Gate 8 — Post-Commit Verification
 
 Per memory `feedback_pearl_stash_blindspot`:
 1. **Re-run tsc + jest at POST-commit HEAD** (NOT `git stash`; real HEAD).
@@ -236,9 +278,9 @@ Codex CLI v0.125.0 (`/opt/homebrew/bin/codex`).
 
 | Mode | When | Command (conceptual) |
 |---|---|---|
-| `codex review` | Gate 2a — independent diff review | `codex review <diff>` → PASS/FAIL gate |
-| `codex challenge` | Gate 2b — adversarial mode | `codex challenge <diff>` → ≥3 scenarios |
-| `codex consult` | Gate 2c (optional) — cross-fix Q&A | `codex consult "does Phase N's #X break Phase N-1's #Y?"` |
+| `codex review` | Gate 3a — independent diff review | `codex review <diff>` → PASS/FAIL gate |
+| `codex challenge` | Gate 3b — adversarial mode | `codex challenge <diff>` → ≥3 scenarios |
+| `codex consult` | Gate 3c (optional) — cross-fix Q&A | `codex consult "does Phase N's #X break Phase N-1's #Y?"` |
 
 Actual invocation per gstack `/codex` skill conventions (lead invokes via Bash with appropriate args).
 
@@ -251,11 +293,12 @@ Actual invocation per gstack `/codex` skill conventions (lead invokes via Bash w
 | Gate failure | Action |
 |---|---|
 | Gate 1 (builder drift) | Lead updates Solution in doc; re-dispatches builder |
-| Gate 2 (Codex FAIL/CHALLENGE) | Fix locally; re-run only Codex |
-| Gate 3 (red-team NEEDS-FIX) | Fix locally; re-run only failing attacker |
-| Gate 4 (test/tsc fail) | Fix ROOT CAUSE; never `it.skip()` / `// @ts-ignore` |
-| Gate 5 (line drift / dup import) | Manual Edit; re-run Gate 4 |
-| Gate 6/7 (post-commit issue) | `git revert <commit>`; root-cause; new commit |
+| Gate 2 (Logic NEEDS-FIX) | Fix locally; re-run only failing auditor |
+| Gate 3 (Codex FAIL/CHALLENGE) | Fix locally; re-run only Codex |
+| Gate 4 (red-team NEEDS-FIX) | Fix locally; re-run only failing attacker |
+| Gate 5 (test/tsc fail) | Fix ROOT CAUSE; never `it.skip()` / `// @ts-ignore` |
+| Gate 6 (line drift / dup import) | Manual Edit; re-run Gate 5 |
+| Gate 7/8 (post-commit issue) | `git revert <commit>`; root-cause; new commit |
 
 **Phase rollback:** Each phase = one commit. `git revert <phase-N-sha>` cleanly undoes phase without touching others.
 
@@ -275,7 +318,7 @@ Per user decision: **Ship backend now, FE-tolerant additive**.
 | #13 | New `eventId` field on existing socket payloads; Moshi/Codable default = ignore unknown fields | Customer dedup ring-buffer |
 | #29 | New `Accept-Version` header support; header optional, absence = latest version | Captain Android version-pinning |
 
-**FE notification:** Gate 7 writes a comment on each FE-coord PR @mentioning the FE team owners.
+**FE notification:** Gate 8 writes a comment on each FE-coord PR @mentioning the FE team owners.
 
 ---
 
@@ -299,7 +342,7 @@ After all 7 phases land, lead runs a Phase 8 verification round (lead-only, no t
 | Risk | Mitigation |
 |---|---|
 | Solution targets deprecated file (Mara's #6 catch) | Builder's anchor protocol step 6: verify file actively imported before Edit |
-| Phase N breaks Phase N-1's fix | Gate 3 cross-fix attacker; Gate 4 runs FULL suite (not just new tests) |
+| Phase N breaks Phase N-1's fix | Gate 4 cross-fix attacker; Gate 5 runs FULL suite (not just new tests) |
 | One specialist dominates context | TaskCreate up-front with 4 distinct task subjects; specialists self-claim by subject (per memory `feedback_taskcreate_id_scramble`) |
 | Synthesis-stamp hallucination (memory) | Lead verifies after every gate independently; never trusts "PASS" without file:line evidence |
 | Long phase → context exhaustion | Each phase = fresh team (independent context); lead's session stays gate-focused |
@@ -315,12 +358,13 @@ After all 7 phases land, lead runs a Phase 8 verification round (lead-only, no t
 |---|---|
 | Phase planning | `superpowers:brainstorming` (this doc) → `superpowers:writing-plans` → `superpowers:executing-plans` |
 | Gate 1 (team) | `TeamCreate`, `TaskCreate`, `Agent` with `team_name`+`name`+`subagent_type="general-purpose"`, `SendMessage`, `TaskUpdate`, `TeamDelete` |
-| Gate 2 (Codex) | `/codex` skill (gstack), `codex review`, `codex challenge` |
-| Gate 3 (red-team) | `Agent` parallel dispatch with `general-purpose` subagent_type |
-| Gate 4 (tests) | `Bash` for `npm test`, `npm run build`, `npm run lint` |
-| Gate 5 (line drift) | `Read`, `Grep` |
-| Gate 6 (commit) | `Bash` for `git add` / `git commit` with HEREDOC |
-| Gate 7 (post-commit) | `Bash` for `git push`, `gh pr create`; `Edit` for `index-30-validated.md` stamp |
+| Gate 2 (logic audit) | `Agent` parallel dispatch (4 sub-agents, one per fix) with `general-purpose` subagent_type |
+| Gate 3 (Codex) | `/codex` skill (gstack), `codex review`, `codex challenge` |
+| Gate 4 (red-team) | `Agent` parallel dispatch with `general-purpose` subagent_type |
+| Gate 5 (tests) | `Bash` for `npm test`, `npm run build`, `npm run lint` |
+| Gate 6 (line drift) | `Read`, `Grep` |
+| Gate 7 (commit) | `Bash` for `git add` / `git commit` with HEREDOC |
+| Gate 8 (post-commit) | `Bash` for `git push`, `gh pr create`; `Edit` for `index-30-validated.md` stamp |
 
 ---
 
