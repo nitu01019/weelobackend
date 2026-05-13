@@ -37,8 +37,8 @@ FROM --platform=linux/amd64 node:20-alpine
 
 # NOTE: GOOGLE_MAPS_API_KEY is injected at runtime via ECS Task Definition
 # environment variables — do NOT bake secrets into the image layer.
-# Install runtime dependencies
-RUN apk add --no-cache openssl curl
+# Install runtime dependencies (aws-cli needed for S3 firebase SA download — docker-entrypoint.sh:25)
+RUN apk add --no-cache openssl curl aws-cli
 
 # Create non-root user
 RUN addgroup -g 1001 -S nodejs && \

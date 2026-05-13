@@ -65,8 +65,8 @@ RUN npm ci --legacy-peer-deps --omit=dev
 # -----------------------------------------------------------------------------
 FROM node:20-alpine AS production
 
-# Install OpenSSL for Prisma runtime + wget for healthcheck
-RUN apk add --no-cache openssl
+# Install OpenSSL for Prisma runtime + wget for healthcheck + aws-cli for S3 firebase SA download (docker-entrypoint.sh:25)
+RUN apk add --no-cache openssl aws-cli
 
 # Security: Run as non-root user
 RUN addgroup -g 1001 -S nodejs && \
