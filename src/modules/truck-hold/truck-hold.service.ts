@@ -296,15 +296,23 @@ class HoldStore {
 
       for (const truckId of sortedTruckIds) {
         const lockKey = REDIS_KEYS.TRUCK_LOCK(truckId);
+        // Estela #23 EDIT 3.E — Opt-in Full-Jitter retry for user-facing mutation.
+        // 4 attempts (retries=3) within a 400ms deadline gives 4G mobile clients
+        // ~4 retry windows before bailing. acquireBudgetMs=50 reserves time for
+        // the FINAL acquireLockOnce Redis RTT (Eris R7). The cleanup-then-return
+        // path below is RETAINED — per-truck retries do NOT solve multi-truck
+        // atomicity (truck-1 may acquire, truck-2 may fail after retries).
         const lockResult = await redisService.acquireLock(
           lockKey, // Standardized: lock: prefix for all distributed locks
           hold.transporterId,
-          CONFIG.HOLD_DURATION_SECONDS
+          CONFIG.HOLD_DURATION_SECONDS,
+          { retries: 3, baseDelayMs: 25, maxDelayMs: 250, deadlineMs: 400, acquireBudgetMs: 50 }
         );
         lockResults.push(lockResult.acquired);
 
         if (!lockResult.acquired) {
-          // Someone else got this truck - release any locks we got (in same sorted order)
+          // Someone else got this truck - release any locks we got (in same sorted order).
+          // Per-truck Full-Jitter retries above replace the prior hardcoded 50ms sleep.
           for (let i = 0; i < lockResults.length - 1; i++) {
             if (lockResults[i]) {
               await redisService.releaseLock(
@@ -313,9 +321,7 @@ class HoldStore {
               );
             }
           }
-          // 50ms backoff before caller can retry (reduces contention)
-          await new Promise(resolve => setTimeout(resolve, 50));
-          logger.warn(`[HoldStore] Failed to acquire lock for truck ${truckId}`);
+          logger.warn(`[HoldStore] Failed to acquire lock for truck ${truckId} after retries`);
           return false;
         }
       }

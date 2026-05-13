@@ -47,7 +47,15 @@
  */
 
 import { logger } from './logger.service';
+import { setTimeout as sleepPromise } from 'node:timers/promises';
 import { config } from '../../config/environment';
+import {
+  HOT_PATH_SCRIPTS,
+  IoredisWithHotPathScripts,
+  wireHotPathCommands,
+  assertHotPathWired,
+  getScriptLua,
+} from './redis/define-commands';
 
 // =============================================================================
 // UTILITIES
@@ -95,6 +103,32 @@ interface GeoMember {
 interface LockResult {
   acquired: boolean;
   ttl?: number;
+}
+
+// Estela #23 — Optional retry/backoff/deadline for acquireLock.
+//
+// AWS Marc Brooker FULL JITTER (NOT Equal Jitter): delay = random() * min(cap, base * 2^attempt).
+// Brooker Monte-Carlo (4 contenders, 200K trials): Equal Jitter collides 92.66% on
+// attempt-0 vs Full Jitter 66.53% — 28pp improvement.
+// https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+//
+// Default `retries:0` preserves bit-for-bit behavior for all existing call-sites.
+// `deadlineMs` is MANDATORY when retries>0 (runtime-asserted).
+// `signal` (Node 18+ AbortSignal) lets request-deadline middleware cancel
+// the closure mid-backoff so the timer is not leaked past response close.
+// `random` / `now` / `sleep` are test seams that default to Math.random /
+// Date.now / node:timers/promises setTimeout in production.
+interface AcquireLockOpts {
+  retries?: number;        // default 0 — preserves behavior for existing call-sites
+  baseDelayMs?: number;    // default 25
+  maxDelayMs?: number;     // default 250
+  deadlineMs?: number;     // MANDATORY when retries > 0
+  acquireBudgetMs?: number;// default 50 — reserved for the FINAL acquireLockOnce RTT (Eris #23, Loki R7 VALIDATED)
+  signal?: AbortSignal;    // request-deadline cancellation
+  // Test seams (default to production globals):
+  random?: () => number;
+  now?: () => number;
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 }
 
 type RedisValue = string | number | Buffer;
@@ -866,11 +900,21 @@ class RealRedisClient implements IRedisClient {
   private connected = false;
   private reconnecting = false;
   private subscriptions = new Map<string, (message: string) => void>();
+  // Eris #3 — defineCommand-wired EVALSHA-capable view of `this.client`.
+  // Set after `wireHotPathCommands` returns `skipped===null` AND `assertHotPathWired`
+  // narrows the type. Stays `null` when FF_REDIS_DEFINE_COMMAND_HOTPATH != "true",
+  // so wrappers fall back to plain EVAL of the registered Lua body.
+  private hotPathCmds: IoredisWithHotPathScripts | null = null;
 
   constructor(private config: RedisConfig) { }
 
   getRawClient(): any {
     return this.client;
+  }
+
+  /** Eris #3 — surface the wired view for the parent RedisService wrappers. */
+  getHotPathCmds(): IoredisWithHotPathScripts | null {
+    return this.hotPathCmds;
   }
 
   async connect(): Promise<void> {
@@ -937,6 +981,11 @@ class RealRedisClient implements IRedisClient {
 
         logger.info(`[Redis] Cluster mode initialized (${nodes.length} nodes, TLS: ${useTls})`);
 
+        // Eris #3 — wire defineCommand on the MAIN client only (subscriber is pub/sub only).
+        // Runs only when FF_REDIS_DEFINE_COMMAND_HOTPATH=true; otherwise hotPathCmds stays null
+        // and all callers fall back to plain EVAL of the registered Lua bodies.
+        this.wireDefineCommandHotPath('cluster');
+
       } else {
         // =====================================================================
         // SINGLE NODE MODE — Default, existing behavior (unchanged)
@@ -1000,6 +1049,10 @@ class RealRedisClient implements IRedisClient {
         this.blockingClient.on('error', (err: Error) => {
           logger.error(`[Redis] Blocking client error: ${err.message}`);
         });
+
+        // Eris #3 — wire defineCommand on the MAIN client only (subscriber/blockingClient
+        // never send Lua at HEAD). Runs only when FF_REDIS_DEFINE_COMMAND_HOTPATH=true.
+        this.wireDefineCommandHotPath('single-node');
       }
 
       // Event handlers
@@ -1415,22 +1468,70 @@ class RealRedisClient implements IRedisClient {
     return new RealRedisTransaction(this.client.multi());
   }
 
+  // =========== defineCommand wiring (Eris #3) ===========
+
+  /**
+   * Eris #3 — Wire defineCommand hot-path scripts onto `this.client`. Idempotent
+   * across reconnects (ioredis silently overwrites duplicates). Skips silently
+   * when FF_REDIS_DEFINE_COMMAND_HOTPATH != "true" (rollback path).
+   */
+  private wireDefineCommandHotPath(mode: 'cluster' | 'single-node'): void {
+    try {
+      const result = wireHotPathCommands(this.client);
+      if (result.skipped === null) {
+        assertHotPathWired(this.client);
+        this.hotPathCmds = this.client as unknown as IoredisWithHotPathScripts;
+        logger.info(`[Redis] defineCommand wired (${result.wired} scripts, ${mode})`);
+      } else if (result.skipped === 'feature-flag-off') {
+        this.hotPathCmds = null;
+        logger.info('[Redis] defineCommand wiring SKIPPED (FF_REDIS_DEFINE_COMMAND_HOTPATH != "true")');
+      } else {
+        // 'no-define-command' — defensive; ioredis 5.9.2 always has it.
+        this.hotPathCmds = null;
+        logger.warn(`[Redis] defineCommand unavailable on ${mode} client — falling back to plain EVAL`);
+      }
+    } catch (err: unknown) {
+      // Wiring throw (e.g., non-empty keyPrefix) must not crash boot — fall back to plain EVAL.
+      this.hotPathCmds = null;
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error(`[Redis] defineCommand wiring failed (${mode}): ${msg} — falling back to plain EVAL`);
+    }
+  }
+
   // =========== Lua Scripts ===========
 
   async eval(script: string, keys: string[], args: string[]): Promise<any> {
     return this.client.eval(script, keys.length, ...keys, ...args);
   }
 
+  /**
+   * Atomic SADD + EXPIRE via Lua (LINE Engineering pattern).
+   * Prevents orphaned sets without TTL if crash occurs between separate calls.
+   * Eris #3 — uses `weeloSAddWithExpire` named method (EVALSHA) when wired,
+   * falls back to plain EVAL of the registered Lua body otherwise.
+   */
   async sAddWithExpire(key: string, ttlSeconds: number, ...members: string[]): Promise<void> {
     if (members.length === 0) return;
-    // Atomic SADD + EXPIRE via Lua (LINE Engineering pattern).
-    // Prevents orphaned sets without TTL if crash occurs between separate calls.
-    const luaScript = `
-      for i = 2, #ARGV do redis.call('SADD', KEYS[1], ARGV[i]) end
-      redis.call('EXPIRE', KEYS[1], ARGV[1])
-      return 1
-    `;
-    await this.eval(luaScript, [key], [String(ttlSeconds), ...members]);
+    if (this.hotPathCmds !== null) {
+      try {
+        this.recordEvalShaPath('weeloSAddWithExpire', 'named');
+        await this.hotPathCmds.weeloSAddWithExpire(key, String(ttlSeconds), ...members);
+        return;
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn(`[Redis] weeloSAddWithExpire named-method failed; retrying via EVAL: ${msg}`);
+      }
+    }
+    this.recordEvalShaPath('weeloSAddWithExpire', this.hotPathCmds === null ? 'flag-off' : 'fallback');
+    await this.eval(getScriptLua('weeloSAddWithExpire'), [key], [String(ttlSeconds), ...members]);
+  }
+
+  /** Eris #3 — bounded metric write; never throws. */
+  private recordEvalShaPath(name: string, path: 'named' | 'fallback' | 'flag-off'): void {
+    try {
+      const { metrics } = require('../monitoring/metrics.service');
+      metrics.incrementCounter('redis_evalsha_path_total', { name, path });
+    } catch { /* metrics module not loaded */ }
   }
 }
 
@@ -1487,6 +1588,11 @@ class RedisService {
   private useRedis = false;
   public isDegraded: boolean = false;
   private reconnectProbeTimer: ReturnType<typeof setInterval> | null = null;
+  // Eris #3 — Wired defineCommand view captured from RealRedisClient.getHotPathCmds().
+  // `null` when (a) FF_REDIS_DEFINE_COMMAND_HOTPATH != "true" (rollback), or
+  // (b) the underlying client is InMemoryRedisClient (dev mode). Wrappers branch
+  // on `null` to fall back to plain EVAL of the registered Lua body.
+  private hotPathCmds: IoredisWithHotPathScripts | null = null;
 
   // M-15 FIX: Environment-aware Redis key prefix.
   // Prevents key collisions when dev/staging/prod share the same Redis instance.
@@ -1551,6 +1657,8 @@ class RedisService {
         this.client = realClient;
         this.useRedis = true;
         this.isDegraded = false;
+        // Eris #3 — capture wired defineCommand view (null when FF off or unsupported).
+        this.hotPathCmds = realClient.getHotPathCmds();
 
         // FIX F-5-10b: Attach runtime event handlers to reset/set isDegraded
         // on Redis disconnect/reconnect. Without this, isDegraded stays true
@@ -2101,77 +2209,164 @@ class RedisService {
 
   /**
    * Get all expired timers (for processing)
-   * 
+   *
+   * Estela #2 — Per-pod poll-spread coordination via leader-gate. At N pods × M
+   * prefixes the shard-reader thunders ZRANGEBYSCORE on every tick. The
+   * acquireLock('timer-poller:timers:pending', workerId, 15s) gate ensures at
+   * most ONE pod runs the batched fetch+ZREM per tick; losers return [] and
+   * peer-pods retry on the next tick. Fail-open mirror of the DelayPoller
+   * pattern at queue.service.ts: a Redis blip during acquireLock must NOT crash
+   * the tick — we WARN and proceed without the lock.
+   *
+   * Batch wins preserved:
+   *   - ZRANGEBYSCORE  → 1 RT (existing eval, kept verbatim)
+   *   - MGET           → 1 RT instead of N serial GETs (was the worst N+1)
+   *   - Pipelined ZREM → 1 RT for the canonical ZSET drop
+   *
+   * Wire impact: NONE. Return shape Array<{key,data,expiresAt}> unchanged.
+   *
    * @param timerPrefix Prefix to filter timers (e.g., "timer:booking:")
    * @returns Array of expired timer data
    */
   async getExpiredTimers<T>(timerPrefix: string): Promise<Array<{ key: string; data: T; expiresAt: string }>> {
+    const shardZset = 'timers:pending';
+    const lockKey = `timer-poller:${shardZset}`;
+    const workerId = process.env.HOSTNAME || `pod-${process.pid}`;
+    const LEADER_GATE_ON = process.env.FF_TIMER_POLLER_LEADER_LOCK !== 'false';
+    const LOCK_TTL_SEC = Math.max(
+      5,
+      parseInt(process.env.TIMER_POLLER_LOCK_TTL_SEC || '15', 10) || 15,
+    );
+
+    let lockHeld = false;
+    if (LEADER_GATE_ON) {
+      try {
+        const result = await this.acquireLock(lockKey, workerId, LOCK_TTL_SEC);
+        if (!result.acquired) {
+          try {
+            const { metrics } = require('../monitoring/metrics.service');
+            metrics.incrementCounter('timer_poller_lock_miss_total', { prefix: timerPrefix });
+          } catch { /* never break the tick on a metric write */ }
+          return [];
+        }
+        lockHeld = true;
+      } catch (lockErr: unknown) {
+        // Fail-open mirror of DelayPoller in queue.service.ts. A Redis blip
+        // during acquireLock must NOT crash the tick. We emit a WARN and
+        // proceed without the lock — at worst we briefly tolerate duplicate
+        // peer-pod fetches rather than stranding timers entirely.
+        const msg = lockErr instanceof Error ? lockErr.message : 'unknown';
+        logger.warn(`[TimerPoller] acquireLock failed for ${lockKey} — running without lock (fail-open): ${msg}`);
+      }
+    }
+
     const now = Date.now();
     const expired: Array<{ key: string; data: T; expiresAt: string }> = [];
 
     try {
-      // Get expired timers from sorted set (capped at 100 per cycle to prevent runaway scans)
-      const expiredKeys = await this.client.eval(
-        `return redis.call('zrangebyscore', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, 100)`,
-        ['timers:pending'],
-        [now.toString()]
-      ) as string[] | null;
+      // (1) ZRANGEBYSCORE — single round-trip. Eris #3: routed through
+      // weeloGetExpiredTimersOrFallback so production traffic uses EVALSHA via
+      // defineCommand. Limit (`100`) is now ARGV[2] of the registered Lua.
+      const expiredKeysRaw = await this.weeloGetExpiredTimersOrFallback(
+        shardZset,
+        now.toString(),
+        '100',
+      );
 
-      if (expiredKeys && Array.isArray(expiredKeys)) {
-        for (const key of expiredKeys) {
-          if (!key.startsWith(timerPrefix)) continue;
+      const expiredKeys = Array.isArray(expiredKeysRaw) ? expiredKeysRaw : [];
+      if (expiredKeys.length === 0) return expired;
 
-          const timerJson = await this.client.get(key);
-          if (timerJson) {
-            try {
-              const timer = JSON.parse(timerJson);
-              if (new Date(timer.expiresAt).getTime() <= now) {
-                expired.push({
-                  key,
-                  data: timer.data as T,
-                  expiresAt: timer.expiresAt
-                });
-              }
-            } catch (e) {
-              // Invalid JSON, remove it
-              await this.client.del(key);
-            }
+      const filtered = expiredKeys.filter(k => k.startsWith(timerPrefix));
+      if (filtered.length === 0) return expired;
+
+      // (2) Batched MGET — collapses N serial GETs to one network round-trip.
+      // Cast through `unknown` because the IRedisClient interface does not list
+      // `mget`; ioredis exposes it on the real client. InMemoryRedisClient does
+      // not — the outer catch returns [] and the next tick retries.
+      const rawClient = this.client as unknown as {
+        mget?: (...keys: string[]) => Promise<Array<string | null>>;
+        pipeline?: () => {
+          zrem: (key: string, member: string) => unknown;
+          del: (key: string) => unknown;
+          exec: () => Promise<unknown>;
+        };
+      };
+      let jsons: Array<string | null>;
+      if (typeof rawClient.mget === 'function') {
+        const mgetResult = await rawClient.mget(...filtered);
+        jsons = Array.isArray(mgetResult) ? mgetResult : [];
+      } else {
+        // InMemory / mock fallback — sequential GETs preserve dev-mode behavior.
+        jsons = await Promise.all(filtered.map(k => this.client.get(k)));
+      }
+
+      const corruptKeys: string[] = [];
+      for (let i = 0; i < filtered.length; i++) {
+        const key = filtered[i];
+        const json = jsons[i];
+        if (!json) continue;
+        try {
+          const timer = JSON.parse(json) as { expiresAt: string; data: T };
+          if (new Date(timer.expiresAt).getTime() <= now) {
+            expired.push({ key, data: timer.data, expiresAt: timer.expiresAt });
           }
-
-          // Remove from sorted set
-          await this.client.eval(
-            `redis.call('zrem', KEYS[1], ARGV[1])`,
-            ['timers:pending'],
-            [key]
-          ).catch(() => { });
+        } catch {
+          corruptKeys.push(key);
         }
       }
-    } catch (e) {
-      // Fallback: scan keys matching prefix (uses SCAN, not KEYS)
-      const keys: string[] = [];
-      for await (const k of this.client.scanIterator(`${timerPrefix}*`)) {
-        keys.push(k);
+
+      // (3) Pipelined ZREM + DEL for corrupt keys — single network turn.
+      // Falls back to per-key eval when the client doesn't expose pipeline().
+      if (typeof rawClient.pipeline === 'function') {
+        const pipe = rawClient.pipeline();
+        for (const key of filtered) {
+          pipe.zrem(shardZset, key);
+        }
+        for (const key of corruptKeys) {
+          pipe.del(key);
+        }
+        try {
+          await pipe.exec();
+        } catch (pipeErr: unknown) {
+          const msg = pipeErr instanceof Error ? pipeErr.message : 'unknown';
+          logger.warn(`[TimerPoller] pipeline exec failed for ${shardZset}: ${msg}`);
+        }
+      } else {
+        for (const key of filtered) {
+          // Eris #3: routed through weeloZremTimerOrFallback so production
+          // traffic uses EVALSHA via defineCommand on InMemoryRedisClient miss.
+          await this.weeloZremTimerOrFallback(shardZset, key).catch(() => { });
+        }
+        for (const key of corruptKeys) {
+          await this.client.del(key).catch(() => { });
+        }
       }
-      for (const key of keys) {
-        const timerJson = await this.client.get(key);
-        if (timerJson) {
-          try {
-            const timer = JSON.parse(timerJson);
-            if (new Date(timer.expiresAt).getTime() <= now) {
-              expired.push({
-                key,
-                data: timer.data as T,
-                expiresAt: timer.expiresAt
-              });
-            }
-          } catch (e) {
-            await this.client.del(key);
-          }
+
+      return expired;
+    } catch (evalErr: unknown) {
+      // Esme R7 LOW amendment: surface the error via a dedicated counter rather
+      // than silently swallow it. Return [] so the tick is a no-op (peer pods
+      // retry on the next tick). SCAN fallback is intentionally dropped — the
+      // shard ZSET is canonical, a SCAN on prefix returns the same key set we
+      // just failed to read via ZRANGEBYSCORE, so it cannot actually recover.
+      try {
+        const { metrics } = require('../monitoring/metrics.service');
+        metrics.incrementCounter('timer_poller_eval_error_total', { prefix: timerPrefix });
+      } catch { /* never break the tick on a metric write */ }
+      const msg = evalErr instanceof Error ? evalErr.message : String(evalErr);
+      logger.warn(`[TimerPoller] getExpiredTimers eval failed for ${shardZset}: ${msg}`);
+      return [];
+    } finally {
+      if (lockHeld) {
+        try {
+          await this.releaseLock(lockKey, workerId);
+        } catch (releaseErr: unknown) {
+          // TTL auto-expires the lock — non-fatal.
+          const msg = releaseErr instanceof Error ? releaseErr.message : 'unknown';
+          logger.warn(`[TimerPoller] releaseLock failed for ${lockKey}: ${msg}`);
         }
       }
     }
-
-    return expired;
   }
 
   /**
@@ -2180,12 +2375,10 @@ class RedisService {
   async cancelTimer(timerKey: string): Promise<boolean> {
     const deleted = await this.client.del(timerKey);
 
-    // Remove from sorted set
-    await this.client.eval(
-      `redis.call('zrem', KEYS[1], ARGV[1])`,
-      ['timers:pending'],
-      [timerKey]
-    ).catch(() => {
+    // Remove from sorted set — Eris #3: routed through weeloZremTimerOrFallback
+    // so production traffic uses EVALSHA via defineCommand. The .catch() preserves
+    // the pre-existing fallback to in-memory set semantics on eval failure.
+    await this.weeloZremTimerOrFallback('timers:pending', timerKey).catch(() => {
       this.client.sRem('timers:pending:set', timerKey);
     });
 
@@ -2372,28 +2565,194 @@ class RedisService {
    * @param ttlSeconds - Lock expiry time in seconds (e.g., 15)
    * @returns { acquired: boolean, ttl?: number }
    */
-  async acquireLock(lockKey: string, holderId: string, ttlSeconds: number): Promise<LockResult> {
+  async acquireLock(
+    lockKey: string,
+    holderId: string,
+    ttlSeconds: number,
+    opts?: AcquireLockOpts
+  ): Promise<LockResult> {
+    const {
+      retries = 0,
+      baseDelayMs = 25,
+      maxDelayMs = 250,
+      deadlineMs,
+      acquireBudgetMs = 50, // Eris #23 — reserve enough for the final acquireLockOnce Redis RTT under load
+      signal,
+      random = Math.random,
+      now = Date.now,
+      sleep = (ms: number, sig?: AbortSignal) => sleepPromise(ms, undefined, { signal: sig }),
+    } = opts ?? {};
+
+    if (retries > 0 && !deadlineMs) {
+      throw new Error('acquireLock: deadlineMs required when retries > 0');
+    }
+
+    // Fast-path: retries=0 (default) — exactly one acquire attempt, no jitter overhead.
+    if (retries === 0) {
+      return this.acquireLockOnce(lockKey, holderId, ttlSeconds);
+    }
+
+    const startedAt = now();
+    let lastResult: LockResult = { acquired: false };
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      if (signal?.aborted) return { acquired: false };
+
+      lastResult = await this.acquireLockOnce(lockKey, holderId, ttlSeconds);
+      if (lastResult.acquired) return lastResult;
+      if (attempt === retries) return lastResult;
+      if (deadlineMs !== undefined && now() - startedAt >= deadlineMs) return lastResult;
+
+      // AWS Full Jitter (NOT Equal Jitter — Brooker showed Equal clusters retries
+      // and is the loser on both work-done and time-elapsed):
+      //   delay = random() * min(cap, base * 2^attempt)
+      const expBackoff = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempt));
+      const jittered = random() * expBackoff;
+
+      // Clamp sleep against remaining deadline so the LAST attempt's backoff
+      // does not burn the entire budget and skip the final acquire call.
+      // `acquireBudgetMs` (default 50ms) reserves time for the final acquireLockOnce
+      // Redis RTT — Eris #23 / Loki R7 VALIDATED: at random()=1.0 + 100ms RTT,
+      // {retries:3, baseDelayMs:50, deadlineMs:500} overran by 95ms with the prior 5ms guard.
+      const remainingMs = deadlineMs !== undefined ? deadlineMs - (now() - startedAt) : Infinity;
+      const sleepMs = Math.min(jittered, Math.max(0, remainingMs - acquireBudgetMs));
+      if (sleepMs <= 0) return lastResult;
+
+      try {
+        await sleep(sleepMs, signal);
+      } catch (err) {
+        // AbortError from node:timers/promises when signal aborts mid-backoff
+        if ((err as { name?: string } | null)?.name === 'AbortError') {
+          return { acquired: false };
+        }
+        throw err;
+      }
+    }
+    return lastResult;
+  }
+
+  // =========== Eris #3 — defineCommand hot-path wrappers ===========
+
+  /** Eris #3 — bounded metric write; never throws. */
+  private recordEvalShaPath(name: string, path: 'named' | 'fallback' | 'flag-off'): void {
+    try {
+      const { metrics } = require('../monitoring/metrics.service');
+      metrics.incrementCounter('redis_evalsha_path_total', { name, path });
+    } catch { /* metrics module not loaded */ }
+  }
+
+  /**
+   * Eris #3 — weeloGetExpiredTimers wrapper. Uses EVALSHA via defineCommand
+   * when wired, falls back to plain EVAL of the registered Lua body otherwise.
+   */
+  private async weeloGetExpiredTimersOrFallback(
+    key: string, nowMs: string, limit: string,
+  ): Promise<string[] | null> {
+    if (this.hotPathCmds !== null) {
+      try {
+        this.recordEvalShaPath('weeloGetExpiredTimers', 'named');
+        return await this.hotPathCmds.weeloGetExpiredTimers(key, nowMs, limit);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn(`[Redis] weeloGetExpiredTimers named-method failed; retrying via EVAL: ${msg}`);
+      }
+    }
+    this.recordEvalShaPath('weeloGetExpiredTimers', this.hotPathCmds === null ? 'flag-off' : 'fallback');
+    return (await this.client.eval(
+      getScriptLua('weeloGetExpiredTimers'), [key], [nowMs, limit],
+    )) as string[] | null;
+  }
+
+  /**
+   * Eris #3 — weeloZremTimer wrapper. Uses EVALSHA via defineCommand when wired,
+   * falls back to plain EVAL otherwise. Coerces `null → 0` on fallback for the
+   * pre-#3 literal that returned nothing (per HOT_PATH_SCRIPTS[1] comment).
+   */
+  private async weeloZremTimerOrFallback(key: string, member: string): Promise<number> {
+    if (this.hotPathCmds !== null) {
+      try {
+        this.recordEvalShaPath('weeloZremTimer', 'named');
+        return await this.hotPathCmds.weeloZremTimer(key, member);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn(`[Redis] weeloZremTimer named-method failed; retrying via EVAL: ${msg}`);
+      }
+    }
+    this.recordEvalShaPath('weeloZremTimer', this.hotPathCmds === null ? 'flag-off' : 'fallback');
+    const result = (await this.client.eval(
+      getScriptLua('weeloZremTimer'), [key], [member],
+    )) as number | null;
+    return typeof result === 'number' ? result : 0;
+  }
+
+  /**
+   * Eris #3 — weeloAcquireLock wrapper. Falls back to plain EVAL of the registered
+   * Lua body, NOT to the non-atomic in-memory branch (atomicity preserved on rollback).
+   */
+  private async weeloAcquireLockOrFallback(
+    key: string, holderId: string, ttlSec: string,
+  ): Promise<0 | 1 | null> {
+    if (this.hotPathCmds !== null) {
+      try {
+        this.recordEvalShaPath('weeloAcquireLock', 'named');
+        return await this.hotPathCmds.weeloAcquireLock(key, holderId, ttlSec);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn(`[Redis] weeloAcquireLock named-method failed; retrying via EVAL: ${msg}`);
+      }
+    }
+    this.recordEvalShaPath('weeloAcquireLock', this.hotPathCmds === null ? 'flag-off' : 'fallback');
+    return (await this.client.eval(
+      getScriptLua('weeloAcquireLock'), [key], [holderId, ttlSec],
+    )) as 0 | 1 | null;
+  }
+
+  /**
+   * Eris #3 — weeloReleaseLock wrapper. Returns the underlying Lua result
+   * (1 on successful DEL, 0 on holder mismatch, null on in-memory eval miss).
+   */
+  private async weeloReleaseLockOrFallback(
+    key: string, holderId: string,
+  ): Promise<number | null> {
+    if (this.hotPathCmds !== null) {
+      try {
+        this.recordEvalShaPath('weeloReleaseLock', 'named');
+        return await this.hotPathCmds.weeloReleaseLock(key, holderId);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn(`[Redis] weeloReleaseLock named-method failed; retrying via EVAL: ${msg}`);
+      }
+    }
+    this.recordEvalShaPath('weeloReleaseLock', this.hotPathCmds === null ? 'flag-off' : 'fallback');
+    return (await this.client.eval(
+      getScriptLua('weeloReleaseLock'), [key], [holderId],
+    )) as number | null;
+  }
+
+  /**
+   * Estela #23 — Single-shot lock acquire (extracted from pre-#23 acquireLock body).
+   * Called from the public acquireLock for both retries=0 fast-path and the retry loop.
+   * Identical semantics to the pre-#23 acquireLock so existing call-sites remain
+   * bit-for-bit unchanged when no opts are passed.
+   */
+  private async acquireLockOnce(lockKey: string, holderId: string, ttlSeconds: number): Promise<LockResult> {
     const key = `lock:${lockKey}`;
 
-    // Use SET NX (set if not exists) with expiry
-    const result = await this.client.eval(
-      `
-      if redis.call('exists', KEYS[1]) == 0 then
-        redis.call('setex', KEYS[1], ARGV[2], ARGV[1])
-        return 1
-      elseif redis.call('get', KEYS[1]) == ARGV[1] then
-        redis.call('expire', KEYS[1], ARGV[2])
-        return 1
-      else
-        return 0
-      end
-      `,
-      [key],
-      [holderId, ttlSeconds.toString()]
+    // Use SET NX (set if not exists) with expiry — Eris #3: routed through
+    // weeloAcquireLockOrFallback so production traffic uses EVALSHA via
+    // defineCommand when FF_REDIS_DEFINE_COMMAND_HOTPATH=true; fallback path
+    // is plain EVAL of the byte-identical Lua body (atomicity preserved).
+    const result = await this.weeloAcquireLockOrFallback(
+      key,
+      holderId,
+      ttlSeconds.toString(),
     );
 
-    // FIX F-5-10: Tiered degradation — Redis Lua → PG advisory → reject
-    // Lua eval succeeded — use its result directly
+    // Estela #22 / Karim R5-B: Option-A DELETE of tier-2 PG advisory fallback.
+    // Prisma `$queryRaw` runs each query as its own implicit transaction, so the
+    // prior `pg_try_advisory_xact_lock` auto-released at TX end — callers were
+    // granted `acquired:true` for a lock that no longer existed (phantom-grant
+    // silent correctness loss with no metric). On Redis-down we now fail-closed.
+    // Lua eval succeeded — use its result directly.
     if (result !== null) {
       return {
         acquired: result === 1,
@@ -2401,35 +2760,26 @@ class RedisService {
       };
     }
 
-    // Fallback: Lua returned null (in-memory mode or eval failure)
+    // Fallback: Lua returned null (in-memory mode or eval failure).
     try {
       const { metrics } = require('../monitoring/metrics.service');
       metrics.incrementCounter('redis_lock_fallback_total');
     } catch { /* metrics not available */ }
 
     if (this.isDegraded) {
-      // Tier 2: PostgreSQL advisory lock — ACID-backed distributed coordination
+      // Redis is down AND we are in degraded mode — fail-closed. Do NOT attempt
+      // a PG-advisory tier-2 path: Prisma $queryRaw runs in an implicit transaction,
+      // so pg_try_advisory_xact_lock would auto-release immediately on TX end,
+      // producing phantom-lock grants. Returning {acquired:false} makes callers
+      // surface a clean 409/503 (per Finding #7) rather than corrupt shared state.
       try {
-        const { prismaClient } = require('../database/prisma.service');
-        const pgResult = await prismaClient.$queryRaw<Array<{ locked: boolean }>>`
-          SELECT pg_try_advisory_xact_lock(hashtext(${key})) AS locked
-        `;
-        const acquired = pgResult?.[0]?.locked === true;
-        if (acquired) {
-          await this.client.set(key, holderId, ttlSeconds).catch(() => {});
-          logger.warn('[Redis] Lock acquired via PostgreSQL advisory lock (degraded mode)', {
-            lockKey: key, holderId
-          });
-        }
-        return { acquired, ttl: acquired ? ttlSeconds : undefined };
-      } catch (pgError: unknown) {
-        // Tier 3: Both Redis AND PostgreSQL unavailable — reject, never silently proceed
-        const pgMsg = pgError instanceof Error ? pgError.message : String(pgError);
-        logger.error('[Redis] PG advisory lock failed — rejecting lock request (Tier 3)', {
-          lockKey: key, holderId, error: pgMsg
-        });
-        return { acquired: false };
-      }
+        const { metrics } = require('../monitoring/metrics.service');
+        metrics.incrementCounter('redis_lock_degraded_reject_total');
+      } catch { /* metrics not available */ }
+      logger.error('[Redis] Lock request rejected: Redis degraded and tier-2 fallback removed (Estela #22, Karim R5-B)', {
+        lockKey: key, holderId
+      });
+      return { acquired: false };
     }
 
     // Non-degraded in-memory mode (dev/test only, single process)
@@ -2451,28 +2801,15 @@ class RedisService {
   async releaseLock(lockKey: string, holderId: string): Promise<boolean> {
     const key = `lock:${lockKey}`;
 
-    // Only delete if holder matches
-    const result = await this.client.eval(
-      `
-      if redis.call('get', KEYS[1]) == ARGV[1] then
-        return redis.call('del', KEYS[1])
-      else
-        return 0
-      end
-      `,
-      [key],
-      [holderId]
-    );
+    // Only delete if holder matches — Eris #3: routed through
+    // weeloReleaseLockOrFallback so production traffic uses EVALSHA via
+    // defineCommand when FF_REDIS_DEFINE_COMMAND_HOTPATH=true.
+    const result = await this.weeloReleaseLockOrFallback(key, holderId);
 
-    // Fallback for in-memory mode
+    // Estela #22 / Karim R5-B: tier-2 PG advisory path was removed in acquireLock
+    // (phantom-lock bug). Releasing a lock we never acquired is a no-op; the
+    // previous unconditional `pg_advisory_unlock` was dead code.
     if (result === null) {
-      // FIX F-5-10: Release PG advisory lock if in degraded mode
-      if (this.isDegraded) {
-        try {
-          const { prismaClient } = require('../database/prisma.service');
-          await prismaClient.$queryRaw`SELECT pg_advisory_unlock(hashtext(${key}))`;
-        } catch { /* PG release failure — lock auto-released on connection close */ }
-      }
       const existing = await this.client.get(key);
       if (existing === holderId) {
         await this.client.del(key);
@@ -2482,6 +2819,119 @@ class RedisService {
     }
 
     return result === 1;
+  }
+
+  /**
+   * Estela #22 — Extend a distributed lock with millisecond precision (PEXPIRE).
+   * Lua CAS so only the current holder can extend; returns false if a peer holds
+   * the lock or the lock has already expired. Lets callers tighten TTL below 1s
+   * for short critical sections such as driver-accept on a 200ms latency budget.
+   */
+  async extendLock(lockKey: string, holderId: string, ttlMs: number): Promise<boolean> {
+    // Eris #22 — Redis PEXPIRE with ms<=0 DELETES the key (Redis EXPIRE-family docs).
+    // Reject non-positive/NaN TTL to prevent extendLock-as-delete footgun. Harmonizes
+    // with in-memory fallback's `Math.max(1, ...)` guard below. Loki R7 VALIDATED.
+    if (!Number.isFinite(ttlMs) || ttlMs <= 0) {
+      try {
+        const { metrics } = require('../monitoring/metrics.service');
+        metrics.incrementCounter('redis_lock_extend_failed_total', { reason: 'invalid_ttl' });
+      } catch { /* metrics not available */ }
+      return false;
+    }
+
+    const normalized = lockKey.startsWith('lock:') ? lockKey.slice(5) : lockKey;
+    const key = `lock:${normalized}`;
+    if (lockKey !== normalized) {
+      try {
+        const { metrics } = require('../monitoring/metrics.service');
+        metrics.incrementCounter('redis_double_prefix_lock_hits_total', { method: 'extendLock' });
+      } catch { /* metrics not available */ }
+    }
+
+    const result = await this.client.eval(
+      `
+      if redis.call('get', KEYS[1]) == ARGV[1] then
+        return redis.call('pexpire', KEYS[1], ARGV[2])
+      else
+        return 0
+      end
+      `,
+      [key],
+      [holderId, ttlMs.toString()]
+    );
+
+    if (result === null) {
+      // In-memory fallback only — never touch tier-2 (removed per #22 Option-A).
+      const existing = await this.client.get(key);
+      if (existing === holderId) {
+        await this.client.expire(key, Math.max(1, Math.ceil(ttlMs / 1000)));
+        return true;
+      }
+      try {
+        const { metrics } = require('../monitoring/metrics.service');
+        metrics.incrementCounter('redis_lock_extend_failed_total', { reason: 'fallback_not_held' });
+      } catch { /* metrics not available */ }
+      return false;
+    }
+
+    // ioredis can return BigInt(0) for some configurations; handle both shapes.
+    const numeric = typeof result === 'bigint' ? Number(result) : (result as number);
+    if (numeric === 1) return true;
+    try {
+      const { metrics } = require('../monitoring/metrics.service');
+      metrics.incrementCounter('redis_lock_extend_failed_total', { reason: 'not_held' });
+    } catch { /* metrics not available */ }
+    return false;
+  }
+
+  /**
+   * Estela #22 / Diego D-2 — Redisson-style watchdog wrapper.
+   *
+   * Acquires `lockKey` and runs `fn` while a background interval renews the
+   * lease at TTL/3 cadence (Redisson canonical recipe). Closes the Kleppmann
+   * §"lock-released-mid-critical-section under process pause" hazard for
+   * callers whose critical section can outlive a single TTL window (e.g.
+   * recoverOrphanedStepTimers' 7-prefix scan, audit-retention leader sweep).
+   *
+   * The renewer is `.unref()`-ed so it never holds the event loop open during
+   * graceful drain. On return/throw of `fn`, the watchdog is cleared BEFORE
+   * `releaseLock` so a slow release does not race a late renew.
+   */
+  async withWatchdog<T>(
+    lockKey: string,
+    holderId: string,
+    ttlSeconds: number,
+    fn: () => Promise<T>
+  ): Promise<{ acquired: false } | { acquired: true; result: T }> {
+    const lock = await this.acquireLock(lockKey, holderId, ttlSeconds);
+    if (!lock.acquired) return { acquired: false };
+
+    const ttlMs = ttlSeconds * 1000;
+    const renewMs = Math.max(1000, Math.floor(ttlMs / 3)); // Redisson canonical TTL/3
+    let stopped = false;
+
+    const renewer = setInterval(async () => {
+      if (stopped) return;
+      const extended = await this.extendLock(lockKey, holderId, ttlMs).catch(() => false);
+      if (!extended) {
+        // Strip-to-prefix cardinality cap — lockKey can carry per-truck IDs.
+        const prefixLabel = lockKey.split(':')[0] || 'unknown';
+        try {
+          const { metrics } = require('../monitoring/metrics.service');
+          metrics.incrementCounter('redis_lock_watchdog_lost_total', { prefix: prefixLabel });
+        } catch { /* metrics not available */ }
+      }
+    }, renewMs);
+    renewer.unref();
+
+    try {
+      const result = await fn();
+      return { acquired: true, result };
+    } finally {
+      stopped = true;
+      clearInterval(renewer);
+      await this.releaseLock(lockKey, holderId).catch(() => { /* TTL handles auto-release */ });
+    }
   }
 
   /**
@@ -2600,4 +3050,4 @@ class RedisService {
 export const redisService = new RedisService();
 
 // Export types for consumers
-export { GeoMember, LockResult, IRedisClient };
+export { GeoMember, LockResult, AcquireLockOpts, IRedisClient };
