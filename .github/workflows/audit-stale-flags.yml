@@ -1,0 +1,30 @@
+name: Stale Flag Audit
+on:
+  schedule:
+    - cron: '0 13 * * 1'         # Weekly Monday 13:00 UTC = 18:30 IST
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: Run audit
+        env:
+          SLACK_FLAG_AUDIT_WEBHOOK: ${{ secrets.SLACK_FLAG_AUDIT_WEBHOOK }}
+        run: npx ts-node scripts/audit-stale-flags.ts
+      # Petra R8 #28 LOW: `if: always()` ensures the JSON artifact uploads even when
+      # the audit script exits non-zero (INVALID sunsetAt date sets process.exitCode=1).
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stale-flags-report
+          path: stale-flags-report.json
+          if-no-files-found: ignore
