@@ -1,3 +1,6 @@
+SET LOCAL lock_timeout = '3s';
+SET LOCAL statement_timeout = '60s';
+
 -- Add new enum values for broadcast lifecycle states
 ALTER TYPE "BookingStatus" ADD VALUE IF NOT EXISTS 'created' BEFORE 'active';
 ALTER TYPE "BookingStatus" ADD VALUE IF NOT EXISTS 'broadcasting' BEFORE 'active';

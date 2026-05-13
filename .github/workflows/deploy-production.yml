@@ -14,7 +14,57 @@ env:
   ALB_URL: http://weelo-alb-380596483.ap-south-1.elb.amazonaws.com
 
 jobs:
+  test-flag-matrix:
+    name: Feature-flag profile matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        flag_profile: [all_default, all_on, all_off]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: Run jest under profile=${{ matrix.flag_profile }}
+        continue-on-error: true  # Pandora R6-C #27 (Set VALIDATED 2026-05-12): observe-only window — see Petra caveat below
+        run: |
+          if [ "${{ matrix.flag_profile }}" = "all_on" ];  then export FF_ALL_ON=1;  fi
+          if [ "${{ matrix.flag_profile }}" = "all_off" ]; then export FF_ALL_OFF=1; fi
+          npx jest --coverage --forceExit
+        env:
+          NODE_ENV: test
+      - name: Enforce per-profile coverage gate
+        run: |
+          # Per-profile gate: 80% for all_default, 70% for all_on/all_off (some flags
+          # gate code paths that legitimately remain unexercised under the opposite global).
+          # Petra R8 #27 LOW: DO NOT FLIP THIS GATE ON DAY ZERO. Run `npm test -- --coverage`
+          # against HEAD + record `coverage/coverage-summary.json .total.lines.pct`
+          # for each of the 3 profiles (all_default / all_on / all_off). Land the matrix
+          # in observe-only mode (no `exit 1`) for 2 weeks, log each profile's actual
+          # baseline to PR descriptions, THEN flip these thresholds to 5 points below
+          # the worst-observed baseline. Pinning 80/70 cold-start would either (a) block
+          # every deploy if baselines are below those numbers, or (b) be cosmetic if
+          # baselines are above. Either way the gate is wrong without empirical anchor.
+          # Pandora R6-C #27 (Set VALIDATED 2026-05-12): jest step above is
+          # `continue-on-error: true` because 64 test mutation sites across 22 files at
+          # HEAD ee4cd6e8 (`git grep -nE 'process\.env\.FF_[A-Z_]+ = ' HEAD -- 'src/__tests__/*.ts'`)
+          # set per-flag FF env to 'false' to exercise OFF branches; under FF_ALL_ON=1
+          # the isEnabled returns true BEFORE per-flag env consult, so jest
+          # fails and `needs: test-flag-matrix` would hard-block deploys. Migration prereq
+          # before flipping `continue-on-error: false`: convert sites to
+          # `jest.replaceProperty(process.env, 'FF_X', 'false')`.
+          THRESHOLD=80
+          if [ "${{ matrix.flag_profile }}" != "all_default" ]; then THRESHOLD=70; fi
+          LINES=$(jq -r '.total.lines.pct' coverage/coverage-summary.json)
+          awk -v l="$LINES" -v t="$THRESHOLD" 'BEGIN{exit !(l>=t)}' || {
+            echo "FAIL: coverage $LINES% below profile threshold $THRESHOLD%"; exit 1; }
+
   deploy:
+    needs: test-flag-matrix
     name: Build, Push & Deploy
     runs-on: ubuntu-latest
     timeout-minutes: 30

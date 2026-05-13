@@ -1,3 +1,6 @@
+SET LOCAL lock_timeout = '3s';
+SET LOCAL statement_timeout = '60s';
+
 -- Phase 4 hold/accept reliability core
 
 CREATE TABLE IF NOT EXISTS "TruckHoldLedger" (

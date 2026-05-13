@@ -1,3 +1,6 @@
+SET LOCAL lock_timeout = '3s';
+SET LOCAL statement_timeout = '60s';
+
 -- Phase 5 mid-flow cancellation reliability core
 
 ALTER TABLE "Order"

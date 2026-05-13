@@ -116,8 +116,10 @@ CMD ["./docker-entrypoint.sh"]
 # -----------------------------------------------------------------------------
 FROM node:20-alpine AS development
 
-# Install OpenSSL for Prisma
-RUN apk add --no-cache openssl
+# Install OpenSSL for Prisma + aws-cli for parity with production (docker-entrypoint.sh boot path)
+# Fix #30 (index-30-validated.md L8033-L8041): aws-cli v1 Alpine apk (~100MB) satisfies
+# `cloudwatch put-metric-data` for migration observability; v1 keeps image-size budget.
+RUN apk add --no-cache openssl aws-cli
 
 WORKDIR /app
 

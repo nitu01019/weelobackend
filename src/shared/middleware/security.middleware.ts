@@ -253,3 +253,35 @@ export function securityResponseHeaders(
 
   next();
 }
+
+// =============================================================================
+// Estela #24b (Zoe Z6 2026-05-11) — RFC 7234 §3 / §4.2.2: 201 Created and 200 OK
+// responses to POST/PUT/PATCH/DELETE are heuristically cacheable by intermediaries
+// (mobile-app HTTP cache, ELB, ISP transparent proxies on 4G) when no explicit
+// Cache-Control directive is present. A cached 201 replayed offline could mislead
+// the app into thinking a brand-new order was created — worse with the #6
+// `Idempotent-Replayed` rollout where a cached 201 carrying `Idempotent-Replayed:
+// false` (the original fresh response) tricks the captain/customer app into the
+// "new order" branch when the request never reached origin.
+//
+// CORS preflight (OPTIONS) is intentionally excluded — the 204 No Content
+// preflight is short-cached by the browser via Access-Control-Max-Age and
+// setting no-store there would defeat preflight caching without security
+// benefit.
+// =============================================================================
+const MUTATION_METHODS: ReadonlySet<string> = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+export function noStoreOnMutations(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void {
+  if (MUTATION_METHODS.has(req.method)) {
+    // `no-store` covers private + shared caches; `must-revalidate` + `no-cache`
+    // are belt-and-suspenders for non-conformant intermediaries seen in field
+    // tests on Indian 4G carriers (ISP transparent proxies pre-2022 ignored
+    // bare `no-store`).
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  }
+  next();
+}

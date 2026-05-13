@@ -10,6 +10,21 @@
 # =============================================================================
 
 set -e
+set -o pipefail
+
+# =============================================================================
+# Migration-harness env-var hooks (Fix #25 + #30 — shellspec-pluggable)
+# =============================================================================
+# Tests inject SLEEP_FN=:, AWS_CLI=stub-aws, RAND_FN=__rand_zero, DATE_FN=frozen-date
+# to make the migrate_with_retry + emit_migration_metric functions unit-testable.
+# Production defaults preserve current behavior. Alpine ash supports `set -o pipefail`
+# (without it, `cmd | tee` returns tee's rc=0 → silent migration-failure emitted as
+# `migration_status=success` to CloudWatch).
+: "${SLEEP_FN:=sleep}"
+: "${AWS_CLI:=aws}"
+: "${RAND_FN:=__rand_default}"
+: "${DATE_FN:=date}"
+__rand_default() { echo "$((RANDOM % 3))"; }
 
 echo "🚀 Starting Weelo Backend..."
 
@@ -53,11 +68,82 @@ if [ -n "$DATABASE_URL" ] && echo "$DATABASE_URL" | grep -q "^postgres"; then
     npx prisma migrate resolve --applied "20260329_add_on_hold_status_and_vehicle_index" 2>&1 || true
     echo "✅ Baseline complete — all known migrations marked as applied"
 
+    # =========================================================================
+    # MIGRATION RETRY HARNESS (Fix #25) + ALARM EMIT WRAPPER (Fix #30)
+    # =========================================================================
+    # FF-gated: FF_MIGRATION_RETRY_HARNESS_ENABLED defaults OFF — current behavior
+    # preserved byte-equivalent (raw `prisma migrate deploy` with same error message
+    # and exit 1). FF=true engages retry-on-55P03 + CloudWatch metric emission.
+    # Prereq for FF=true: Bootstrap PR-0 (scripts/bootstrap-prisma-migrations.sh)
+    # must run first to create _prisma_migrations table on the prod DB
+    # (CLAUDE.md L477-485). Without it, prisma migrate deploy hot-loops 5× then fails
+    # with P3005.
+    # =========================================================================
+    migrate_with_retry() {
+      # Mandatory #5: feature-flag the entire harness OFF until Bootstrap PR-0 completes.
+      if [ "${FF_MIGRATION_RETRY_HARNESS_ENABLED:-false}" != "true" ]; then
+        echo "[MIGRATE] harness disabled (FF_MIGRATION_RETRY_HARNESS_ENABLED!=true) — skipping"
+        return 0
+      fi
+
+      local attempt=1 max=5
+      while [ $attempt -le $max ]; do
+        if npx prisma migrate deploy 2>&1 | tee /tmp/mig.log; then
+          $AWS_CLI cloudwatch put-metric-data --namespace Weelo/Backend \
+            --metric-name migration_status --value 1 \
+            --dimensions result=success --region "${AWS_REGION:-ap-south-1}" || true
+          echo "[MIGRATE] success attempt=$attempt"
+          return 0
+        fi
+        if grep -qE "55P03|lock_not_available" /tmp/mig.log; then
+          $AWS_CLI cloudwatch put-metric-data --namespace Weelo/Backend \
+            --metric-name migration_lock_not_available_total --value 1 \
+            --region "${AWS_REGION:-ap-south-1}" || true
+          local jitter; jitter=$($RAND_FN)
+          $SLEEP_FN $((5 * attempt + jitter))
+          echo "[MIGRATE] retry attempt=$attempt reason=lock_not_available"
+          attempt=$((attempt + 1))
+        else
+          echo "[MIGRATE] fail attempt=$attempt reason=non_lock_error"
+          return 1
+        fi
+      done
+      echo "[MIGRATE] giveup attempts=$max"
+      return 1
+    }
+
+    emit_migration_metric() {
+      local name=$1 value=$2 result=$3
+      # || true neutralizes set -e for CloudWatch throttle/network blips; transient
+      # API failures must not block boot. The [MIGRATE] log lines from migrate_with_retry
+      # are the primary signal; CloudWatch is the alarm channel only.
+      $AWS_CLI cloudwatch put-metric-data \
+        --namespace Weelo/Backend \
+        --metric-name "$name" --value "$value" \
+        --dimensions "result=$result" \
+        --region "${AWS_REGION:-ap-south-1}" 2>/dev/null || true
+    }
+
     # Step 2: Deploy any NEW migrations added after the baseline
-    npx prisma migrate deploy 2>&1 || {
+    if [ "${FF_MIGRATION_RETRY_HARNESS_ENABLED:-false}" = "true" ]; then
+      start=$($DATE_FN +%s)
+      if migrate_with_retry; then
+        duration=$(( $($DATE_FN +%s) - start ))
+        emit_migration_metric migration_duration_seconds "$duration" success
+        emit_migration_metric migration_status 1 success
+      else
+        duration=$(( $($DATE_FN +%s) - start ))
+        emit_migration_metric migration_duration_seconds "$duration" failed
+        emit_migration_metric migration_status 1 failed
+        exit 1
+      fi
+    else
+      # FF=false: current behavior unchanged (legacy direct deploy)
+      npx prisma migrate deploy 2>&1 || {
         echo "❌ Prisma migrate deploy failed — aborting startup to prevent broken state"
         exit 1
-    }
+      }
+    fi
     
     # Create OtpStore table (for cross-task OTP fallback when Redis is unavailable)
     # This table is NOT managed by Prisma — it's a simple key-value store for OTPs

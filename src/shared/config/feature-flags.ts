@@ -506,9 +506,10 @@ export type NumericFlagKey = keyof typeof NUMERIC_FLAGS;
  * Check if a boolean feature flag is enabled.
  *
  * Precedence:
- *   1. If env var is set, explicit 'true'/'false' wins.
- *   2. Otherwise, `flag.defaultValue` (if declared) wins (F-B-53).
- *   3. Otherwise, category implicit default:
+ *   1. Global FF_ALL_OFF / FF_ALL_ON (Phase 2 Fix #27 — CI matrix kill-switch).
+ *   2. If env var is set, explicit 'true'/'false' wins.
+ *   3. Otherwise, `flag.defaultValue` (if declared) wins (F-B-53).
+ *   4. Otherwise, category implicit default:
  *        ops:     ON  (safe-by-default, opt-out)
  *        release: OFF (explicit opt-in)
  *
@@ -517,6 +518,20 @@ export type NumericFlagKey = keyof typeof NUMERIC_FLAGS;
  * where over-delivery is safe but under-delivery is not).
  */
 export function isEnabled(flag: FlagDefinition): boolean {
+  // Phase 2 Fix #27 (Faisal R6-A non-placeholder half):
+  // Global FF_ALL_OFF / FF_ALL_ON enable the CI matrix to exercise every
+  // flag's OFF and ON branch via three workflow profiles
+  // [all_default, all_on, all_off]. Order: kill-switch wins.
+  //
+  // NOTE: The placeholder-category carve-out (Solution L7274-7314 of
+  // index-30-validated.md) is DEFERRED. At this HEAD, FlagCategory is
+  // 'ops' | 'release' only — no placeholder flag exists and isEnabled
+  // has no throw-on-flip. When a future phase introduces a 'placeholder'
+  // category (e.g. GEO_H3_SHARD_ENABLED), it MUST also restore the
+  // pre-check ordering per Fix #27 Solution.
+  if (process.env.FF_ALL_OFF === '1') return false;
+  if (process.env.FF_ALL_ON === '1') return true;
+
   const value = process.env[flag.env];
   // Explicit env override wins.
   if (value === 'true') return true;
