@@ -1,0 +1,228 @@
+=== git rev-parse HEAD ===
+f0509ec27f62ab0b8b40f2054625386c5e9e3346
+
+=== git status --short (untracked summary) ===
+ M Dockerfile
+ M Dockerfile.production
+?? .claude/
+?? .context/
+?? .council-2026-04-24/PSQL_COMMANDS_TO_RUN.sh
+?? .council-2026-04-24/snapshot_queue_worker_pre_A3.txt
+?? .council-2026-04-24/truck-hold.routes.ts.recovered
+?? .eslintrc.eslint-rules.json
+?? .eslintrc.pii-overlay.json
+?? .github/CODEOWNERS
+      86
+
+=== npm run build (tsc) ===
+
+> weelo-unified-backend@2.0.0 build
+> tsc
+
+
+=== npm test (jest) ===
+
+    F-B-77 violation: the following files declare broadcastToTransporters without delegating to the canonical source:
+      - modules/order/order-broadcast-send.service.ts
+
+    Each fork must thin-wrap to order-delegates-bridge.service.ts or order-broadcast.service.ts. See WEELO-CRITICAL-SOLUTION.md §F-B-77.
+
+      86 |
+      87 |     if (offenders.length > 0) {
+    > 88 |       throw new Error(
+         |             ^
+      89 |         `F-B-77 violation: the following files declare broadcastToTransporters without delegating to the canonical source:\n  - ${offenders.join('\n  - ')}\n\nEach fork must thin-wrap to order-delegates-bridge.service.ts or order-broadcast.service.ts. See WEELO-CRITICAL-SOLUTION.md §F-B-77.`
+      90 |       );
+      91 |     }
+
+      at Object.<anonymous> (.claude/worktrees/drafter-t2-residual/src/__tests__/broadcast-canonicality.test.ts:88:13)
+
+FAIL .claude/worktrees/drafter-t2-residual/src/modules/booking/__tests__/booking.routes.legacy-proxy.test.ts
+  ● booking routes legacy proxy -> canonical order flow › uses canonical order service and preserves compatibility headers for POST /bookings
+
+    TypeError: (0 , redis_service_1.timerBatchLimit) is not a function
+
+      45 | const ORDER_TIMER_CHECK_INTERVAL_MS = parseInt(process.env.TIMER_POLL_INTERVAL_MS || '2000', 10) || 2_000;
+      46 | // Fix #1: Batch limit uses shared helper (TIMER_BATCH_LIMIT env, default 100, max TIMER_BATCH_LIMIT_MAX=500)
+    > 47 | const ORDER_TIMER_BATCH_LIMIT = timerBatchLimit();
+         |                                                ^
+      48 | // NEW#2: Orphan recovery runs every 5m by default; raise to 60s under heavy crash scenarios
+      49 | const TIMER_ORPHAN_RECOVERY_INTERVAL_MS = parseInt(process.env.TIMER_ORPHAN_RECOVERY_INTERVAL_MS || '300000', 10) || 300_000;
+      50 |
+
+      at Object.<anonymous> (.claude/worktrees/drafter-t2-residual/src/modules/order/order-timer.service.ts:47:48)
+      at Object.<anonymous> (.claude/worktrees/drafter-t2-residual/src/modules/booking/booking.routes.ts:39:1)
+      at .claude/worktrees/drafter-t2-residual/src/modules/booking/__tests__/booking.routes.legacy-proxy.test.ts:122:31
+      at Object.<anonymous> (.claude/worktrees/drafter-t2-residual/src/modules/booking/__tests__/booking.routes.legacy-proxy.test.ts:122:31)
+
+FAIL .claude/worktrees/surgeon-t2-family-a/src/modules/booking/__tests__/booking.routes.legacy-proxy.test.ts
+  ● booking routes legacy proxy -> canonical order flow › uses canonical order service and preserves compatibility headers for POST /bookings
+
+    TypeError: (0 , redis_service_1.timerBatchLimit) is not a function
+
+      45 | const ORDER_TIMER_CHECK_INTERVAL_MS = parseInt(process.env.TIMER_POLL_INTERVAL_MS || '2000', 10) || 2_000;
+      46 | // Fix #1: Batch limit uses shared helper (TIMER_BATCH_LIMIT env, default 100, max TIMER_BATCH_LIMIT_MAX=500)
+    > 47 | const ORDER_TIMER_BATCH_LIMIT = timerBatchLimit();
+         |                                                ^
+      48 | // NEW#2: Orphan recovery runs every 5m by default; raise to 60s under heavy crash scenarios
+      49 | const TIMER_ORPHAN_RECOVERY_INTERVAL_MS = parseInt(process.env.TIMER_ORPHAN_RECOVERY_INTERVAL_MS || '300000', 10) || 300_000;
+      50 |
+
+      at Object.<anonymous> (.claude/worktrees/surgeon-t2-family-a/src/modules/order/order-timer.service.ts:47:48)
+      at Object.<anonymous> (.claude/worktrees/surgeon-t2-family-a/src/modules/booking/booking.routes.ts:39:1)
+      at .claude/worktrees/surgeon-t2-family-a/src/modules/booking/__tests__/booking.routes.legacy-proxy.test.ts:122:31
+      at Object.<anonymous> (.claude/worktrees/surgeon-t2-family-a/src/modules/booking/__tests__/booking.routes.legacy-proxy.test.ts:122:31)
+
+FAIL .claude/worktrees/surgeon-t2-family-a/src/__tests__/env-example-completeness.test.ts
+  ● F-C-75 verify-env-example contract › CI entry-point exits 0 for the current repo state
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 0
+    Received: 1
+
+      61 |   it('CI entry-point exits 0 for the current repo state', () => {
+      62 |     const { code, stdout } = runLint();
+    > 63 |     expect(code).toBe(0);
+         |                  ^
+      64 |     expect(stdout).toMatch(/\[verify-env-example\] OK/);
+      65 |   });
+      66 |
+
+      at Object.<anonymous> (.claude/worktrees/surgeon-t2-family-a/src/__tests__/env-example-completeness.test.ts:63:18)
+
+  ● F-C-75 verify-env-example contract › CI entry-point FAILS (non-zero exit) when .env.example drops a declared key
+
+    expect(received).toMatch(expected)
+
+    Expected pattern: /FLEX_HOLD_EXTENSION_SECONDS/
+    Received string:  ""
+
+      81 |       const { code, stderr } = runLint({ envExamplePathOverride: tmpExample });
+      82 |       expect(code).not.toBe(0);
+    > 83 |       expect(stderr).toMatch(/FLEX_HOLD_EXTENSION_SECONDS/);
+         |                      ^
+      84 |     } finally {
+      85 |       fs.rmSync(tmpDir, { recursive: true, force: true });
+      86 |     }
+
+      at Object.<anonymous> (.claude/worktrees/surgeon-t2-family-a/src/__tests__/env-example-completeness.test.ts:83:22)
+
+FAIL .claude/worktrees/drafter-t2-residual/src/__tests__/presence-config-invariant.test.ts
+  ● F-B-05 presence TTL SSOT › invariant › exposes canonical driver and transporter TTLs
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 36
+    Received: 84
+
+      26 |       // Defaults: heartbeat=12 → driver=36, transporter=60.
+      27 |       expect(cfg.HEARTBEAT_INTERVAL_SECONDS).toBe(12);
+    > 28 |       expect(cfg.DRIVER_PRESENCE_TTL_SECONDS).toBe(36);
+         |                                               ^
+      29 |       expect(cfg.TRANSPORTER_PRESENCE_TTL_SECONDS).toBe(60);
+      30 |     });
+      31 |   });
+
+      at Object.<anonymous> (.claude/worktrees/drafter-t2-residual/src/__tests__/presence-config-invariant.test.ts:28:47)
+
+FAIL e2e/customer-weelo.spec.ts
+  ● Test suite failed to run
+
+    Cannot find module '@playwright/test' from 'e2e/customer-weelo.spec.ts'
+
+      20 |
+      21 | // @ts-nocheck — Phase 0.6 scaffold only; harness helpers land in Phase 7.
+    > 22 | import { test, expect } from '@playwright/test';
+         | ^
+      23 | import { io } from 'socket.io-client';
+      24 | import { SocketEvent } from '../packages/contracts/events.generated';
+      25 |
+
+      at Resolver._throwModNotFoundError (node_modules/jest-resolve/build/resolver.js:427:11)
+      at Object.<anonymous> (e2e/customer-weelo.spec.ts:22:1)
+
+FAIL e2e/captain-weelo-captain.spec.ts
+  ● Test suite failed to run
+
+    Cannot find module '@playwright/test' from 'e2e/captain-weelo-captain.spec.ts'
+
+      16 |
+      17 | // @ts-nocheck — Phase 0.6 scaffold only; harness helpers land in Phase 7.
+    > 18 | import { test, expect } from '@playwright/test';
+         | ^
+      19 | import { io } from 'socket.io-client';
+      20 | import { SocketEvent } from '../packages/contracts/events.generated';
+      21 |
+
+      at Resolver._throwModNotFoundError (node_modules/jest-resolve/build/resolver.js:427:11)
+      at Object.<anonymous> (e2e/captain-weelo-captain.spec.ts:18:1)
+
+FAIL src/__tests__/phase8-notification-pod-fixes.test.ts
+  ● Test suite failed to run
+
+    Jest worker encountered 4 child process exceptions, exceeding retry limit
+
+      at ChildProcessWorker.initialize (node_modules/jest-worker/build/workers/ChildProcessWorker.js:181:21)
+
+
+Test Suites: 233 failed, 733 passed, 966 total
+Tests:       1012 failed, 12 skipped, 36033 passed, 37057 total
+Snapshots:   0 total
+Time:        129.615 s
+Ran all test suites.
+
+=== npm run lint (eslint) ===
+   66:23  warning  Unexpected any. Specify a different type        @typescript-eslint/no-explicit-any
+   67:25  warning  Unexpected any. Specify a different type        @typescript-eslint/no-explicit-any
+   68:28  warning  Unexpected any. Specify a different type        @typescript-eslint/no-explicit-any
+   69:33  warning  Unexpected any. Specify a different type        @typescript-eslint/no-explicit-any
+   70:28  warning  Unexpected any. Specify a different type        @typescript-eslint/no-explicit-any
+   71:28  warning  Unexpected any. Specify a different type        @typescript-eslint/no-explicit-any
+   72:22  warning  Unexpected any. Specify a different type        @typescript-eslint/no-explicit-any
+   73:22  warning  Unexpected any. Specify a different type        @typescript-eslint/no-explicit-any
+   74:23  warning  Unexpected any. Specify a different type        @typescript-eslint/no-explicit-any
+   75:21  warning  Unexpected any. Specify a different type        @typescript-eslint/no-explicit-any
+  113:28  warning  Unexpected any. Specify a different type        @typescript-eslint/no-explicit-any
+  116:29  warning  Unexpected any. Specify a different type        @typescript-eslint/no-explicit-any
+  119:28  warning  Unexpected any. Specify a different type        @typescript-eslint/no-explicit-any
+  120:27  warning  Unexpected any. Specify a different type        @typescript-eslint/no-explicit-any
+  121:29  warning  Unexpected any. Specify a different type        @typescript-eslint/no-explicit-any
+  124:29  warning  Unexpected any. Specify a different type        @typescript-eslint/no-explicit-any
+  125:25  warning  Unexpected any. Specify a different type        @typescript-eslint/no-explicit-any
+  128:29  warning  Unexpected any. Specify a different type        @typescript-eslint/no-explicit-any
+  129:25  warning  Unexpected any. Specify a different type        @typescript-eslint/no-explicit-any
+  131:26  warning  Unexpected any. Specify a different type        @typescript-eslint/no-explicit-any
+  142:31  warning  Unexpected any. Specify a different type        @typescript-eslint/no-explicit-any
+  143:30  warning  Unexpected any. Specify a different type        @typescript-eslint/no-explicit-any
+  159:25  warning  Unexpected any. Specify a different type        @typescript-eslint/no-explicit-any
+  160:28  warning  Unexpected any. Specify a different type        @typescript-eslint/no-explicit-any
+  167:27  warning  Unexpected any. Specify a different type        @typescript-eslint/no-explicit-any
+  222:43  warning  Unexpected any. Specify a different type        @typescript-eslint/no-explicit-any
+  223:42  warning  Unexpected any. Specify a different type        @typescript-eslint/no-explicit-any
+  224:40  warning  Unexpected any. Specify a different type        @typescript-eslint/no-explicit-any
+  346:10  warning  'logger' is defined but never used              @typescript-eslint/no-unused-vars
+  514:30  error    Require statement not part of import statement  @typescript-eslint/no-var-requires
+  554:30  error    Require statement not part of import statement  @typescript-eslint/no-var-requires
+  605:30  error    Require statement not part of import statement  @typescript-eslint/no-var-requires
+  741:32  error    Require statement not part of import statement  @typescript-eslint/no-var-requires
+  768:32  error    Require statement not part of import statement  @typescript-eslint/no-var-requires
+  809:32  error    Require statement not part of import statement  @typescript-eslint/no-var-requires
+  971:30  error    Require statement not part of import statement  @typescript-eslint/no-var-requires
+
+/Users/nitishbhardwaj/Downloads/weelo-backend/src/__tests__/wiring-verification-tests.test.ts
+  82:7  warning  'ALL_EMIT_SOURCES' is assigned a value but never used  @typescript-eslint/no-unused-vars
+
+/Users/nitishbhardwaj/Downloads/weelo-backend/src/config/environment.ts
+   49:7   warning  Unexpected console statement  no-console
+   55:5   warning  Unexpected console statement  no-console
+  276:5   warning  Unexpected console statement  no-console
+  277:27  warning  Unexpected console statement  no-console
+  278:5   warning  Unexpected console statement  no-console
+
+✖ 8104 problems (2228 errors, 5876 warnings)
+  7 errors and 0 warnings potentially fixable with the `--fix` option.
+
+
+=== baseline-capture-complete ===
+Wed May 13 10:23:26 IST 2026
