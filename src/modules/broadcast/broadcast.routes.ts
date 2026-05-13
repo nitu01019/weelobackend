@@ -23,6 +23,8 @@ import { logger } from '../../shared/services/logger.service';
 import { redisService } from '../../shared/services/redis.service';
 import { AppError } from '../../shared/types/error.types';
 import { buildAcceptResponse } from '../../shared/api-response.builder';
+import { setIdempotentReplayedHeader } from '../../shared/http/idempotency-headers';
+import { readIdempotencyKey } from '../../shared/utils/idempotency-key.helper';
 
 const router = Router();
 
@@ -185,7 +187,7 @@ router.post(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const body = validateSchema(acceptBroadcastBodySchema, req.body);
-      const idempotencyKeyHeader = req.header('X-Idempotency-Key');
+      const idempotencyKeyHeader = readIdempotencyKey(req);
       const idempotencyKey = idempotencyKeyHeader
         ? validateSchema(idempotencyKeyHeaderSchema, idempotencyKeyHeader)
         : undefined;
@@ -217,6 +219,7 @@ router.post(
         resultCode: result.resultCode || 'ASSIGNED',
         replayed: result.replayed === true,
       });
+      setIdempotentReplayedHeader(res, { replayed: result.replayed === true });
       res.json({
         ...structured,
         // Backward-compatible top-level fields for existing clients

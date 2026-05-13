@@ -67,6 +67,7 @@ import {
   noStoreOnMutations
 } from './shared/middleware/security.middleware';
 import { backwardCompatMiddleware } from './shared/middleware/backward-compat.middleware';
+import { apiVersionMiddleware } from './shared/middleware/api-version.middleware';
 import { correlationMiddleware } from './shared/context/correlation';
 import { authMiddleware, roleGuard } from './shared/middleware/auth.middleware';
 // import { cache } from './shared/middleware/cache.middleware'; // TODO: Create cache middleware
@@ -319,7 +320,25 @@ app.use(cors({
     'X-Trace-ID',
     'X-Load-Test-Run-Id',
     'X-Device-Id',
-    'X-Idempotency-Key'
+    'Idempotency-Key',
+    'X-Idempotency-Key',
+    'Accept-Version',     // Fix #29 — API version negotiation
+    'X-API-Version'       // Fix #29 — legacy alias
+  ],
+  // Fix #29 BLOCKER #3 — without Access-Control-Expose-Headers browser SDKs
+  // CANNOT read Deprecation/Sunset/Link from cross-origin responses (CWE-942 /
+  // OWASP A05). IETF draft names (no X- prefix) chosen because
+  // express-rate-limit at HEAD uses `standardHeaders: true`.
+  exposedHeaders: [
+    'Deprecation',                                  // Fix #29
+    'Sunset',                                       // Fix #29
+    'Link',                                         // Fix #29
+    'Idempotent-Replayed',                          // Fix #6
+    'Retry-After',                                  // Fix #7
+    'X-Request-ID',                                 // ops/SRE correlation
+    'RateLimit-Limit',                              // express-rate-limit standardHeaders
+    'RateLimit-Remaining',                          // express-rate-limit standardHeaders
+    'RateLimit-Reset'                               // express-rate-limit standardHeaders
   ],
   credentials: true,
   maxAge: 86400 // 24 hours preflight cache
@@ -340,6 +359,12 @@ app.use(preventParamPollution);
 // Backward compatibility: rewrite legacy Captain app paths to canonical routes
 // Fixes BRK-4 (/trips/*), BRK-2 (plural /tracking/trips/), and general path normalization
 app.use(backwardCompatMiddleware);
+
+// Fix #29: API version negotiation (Accept-Version / X-API-Version).
+// Mounted AFTER backwardCompat so legacy paths land on the rewritten route,
+// and BEFORE /api/v1 route blocks so req.apiVersion is set for every handler.
+// On v1 emits Deprecation+Sunset+Link headers (RFC 8594 + RFC 5988).
+app.use(apiVersionMiddleware);
 
 // Estela #24b (Zoe Z6): set Cache-Control: no-store on POST/PUT/PATCH/DELETE
 // so intermediaries (mobile HTTP cache, ELB, ISP 4G proxies) cannot replay a

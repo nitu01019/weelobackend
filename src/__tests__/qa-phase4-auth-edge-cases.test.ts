@@ -354,13 +354,19 @@ describe('QA Phase 4 — Auth Edge Cases', () => {
 
     it('M3.8 credentials is true for CORS', () => {
       const corsStart = serverSource.indexOf('app.use(cors(');
-      const corsBlock = serverSource.substring(corsStart, corsStart + 600);
+      // Phase 5 Fix #8 + Fix #29 grew the cors() block beyond 600 bytes
+      // (added Idempotency-Key + Accept-Version + X-API-Version to
+      // allowedHeaders, plus a NEW exposedHeaders array with 9 entries).
+      // Walk to the closing `}));` to extract the full block regardless of size.
+      const corsEnd = serverSource.indexOf('}));', corsStart);
+      const corsBlock = serverSource.substring(corsStart, corsEnd === -1 ? corsStart + 2000 : corsEnd);
       expect(corsBlock).toContain('credentials: true');
     });
 
     it('M3.9 preflight cache maxAge is set', () => {
       const corsStart = serverSource.indexOf('app.use(cors(');
-      const corsBlock = serverSource.substring(corsStart, corsStart + 600);
+      const corsEnd = serverSource.indexOf('}));', corsStart);
+      const corsBlock = serverSource.substring(corsStart, corsEnd === -1 ? corsStart + 2000 : corsEnd);
       expect(corsBlock).toContain('maxAge:');
     });
 

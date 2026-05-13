@@ -235,6 +235,19 @@ router.post('/search', placesRateLimiter, async (req: Request, res: Response) =>
 
         // Check if Google Maps is available
         if (!googleMapsService.isAvailable()) {
+            // RFC 7231 §6.6.4: Retry-After MAY be on 503 but MUST NOT mislead.
+            // GOOGLE_MAPS_API_KEY missing = permanent configuration error, not transient.
+            // INTENTIONALLY OMIT Retry-After — recovery is not expected without ops action.
+            if (process.env.FF_503_ENVELOPE_NORMALIZE === 'true') {
+                return res.status(503).json({
+                    success: false,
+                    error: {
+                        code: 'SERVICE_UNAVAILABLE',
+                        message: 'Geocoding service not configured.',
+                    },
+                });
+            }
+            // Default OFF — preserve HEAD wire format (flat sibling fields).
             return res.status(503).json({
                 success: false,
                 error: 'SERVICE_UNAVAILABLE',
@@ -313,6 +326,19 @@ router.post('/reverse', placesRateLimiter, async (req: Request, res: Response) =
 
         // Check if Google Maps is available
         if (!googleMapsService.isAvailable()) {
+            // RFC 7231 §6.6.4: Retry-After MAY be on 503 but MUST NOT mislead.
+            // GOOGLE_MAPS_API_KEY missing = permanent configuration error, not transient.
+            // INTENTIONALLY OMIT Retry-After — recovery is not expected without ops action.
+            if (process.env.FF_503_ENVELOPE_NORMALIZE === 'true') {
+                return res.status(503).json({
+                    success: false,
+                    error: {
+                        code: 'SERVICE_UNAVAILABLE',
+                        message: 'Geocoding service not configured.',
+                    },
+                });
+            }
+            // Default OFF — preserve HEAD wire format (flat sibling fields).
             return res.status(503).json({
                 success: false,
                 error: 'SERVICE_UNAVAILABLE',

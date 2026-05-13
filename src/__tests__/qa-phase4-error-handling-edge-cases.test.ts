@@ -43,12 +43,21 @@ describe('M7: Retry-After header on 429 responses', () => {
   // -------------------------------------------------------------------------
   describe('Source structure', () => {
     it('error.middleware.ts contains the M7 fix comment marker', () => {
-      expect(errorMiddlewareSource).toContain('M7');
+      // Phase 5 Fix #7 updated the rationale comment from RFC 6585 §4 / M7 to
+      // RFC 7231 §7.1.3 (delta-seconds integer for 429+503). Accept either.
+      const hasM7 = errorMiddlewareSource.includes('M7');
+      const hasRfc7231 = errorMiddlewareSource.includes('RFC 7231');
+      expect(hasM7 || hasRfc7231).toBe(true);
     });
 
     it('checks error.statusCode === 429 before setting Retry-After', () => {
-      // The conditional guard must exist so non-429 errors are excluded
-      expect(errorMiddlewareSource).toMatch(/error\.statusCode\s*===\s*429/);
+      // Phase 5 Fix #7 generalized the 429-only gate to a Set membership check
+      // covering 429+503 (RETRY_AFTER_STATUSES). Accept either pattern.
+      const hasOld = /error\.statusCode\s*===\s*429/.test(errorMiddlewareSource);
+      const hasNew =
+        /RETRY_AFTER_STATUSES[\s\S]*?429/.test(errorMiddlewareSource) ||
+        /new Set<number>\(\[[^)]*429/.test(errorMiddlewareSource);
+      expect(hasOld || hasNew).toBe(true);
     });
 
     it('reads retryAfter from error.details first', () => {
@@ -60,10 +69,18 @@ describe('M7: Retry-After header on 429 responses', () => {
     });
 
     it('falls back to 30 seconds when no retryAfter value is provided', () => {
-      // The nullish coalescing chain should end with '30'
-      expect(errorMiddlewareSource).toMatch(
-        /error\.details\?\.\s*retryAfter\s*\?\?\s*error\.details\?\.\s*retryAfterSeconds\s*\?\?\s*['"]30['"]/,
-      );
+      // Phase 5 Fix #7 refactored the inline ?? chain into a helper with
+      // `Math.max(0, Math.floor(Number(raRaw) || 30))` integer coercion per
+      // RFC 7231 §7.1.3. Accept either the original ?? chain or the new helper.
+      const hasOldChain =
+        /error\.details\?\.\s*retryAfter\s*\?\?\s*error\.details\?\.\s*retryAfterSeconds\s*\?\?\s*['"]30['"]/.test(
+          errorMiddlewareSource,
+        );
+      const hasNewHelper =
+        /error\.details\?\.\s*retryAfter\s*\?\?\s*error\.details\?\.\s*retryAfterSeconds\s*\?\?\s*30\b/.test(
+          errorMiddlewareSource,
+        );
+      expect(hasOldChain || hasNewHelper).toBe(true);
     });
 
     it('sets the Retry-After header via res.setHeader', () => {
@@ -73,7 +90,12 @@ describe('M7: Retry-After header on 429 responses', () => {
     });
 
     it('converts the retryAfter value to string via String()', () => {
-      expect(errorMiddlewareSource).toContain('String(retryAfter)');
+      // Phase 5 Fix #7 renamed the local variable from `retryAfter` to `ra`
+      // (the integer-coerced value). Both forms call `String(...)` with the
+      // numeric retry value before passing to res.setHeader. Accept either.
+      const hasOldName = errorMiddlewareSource.includes('String(retryAfter)');
+      const hasNewName = errorMiddlewareSource.includes('String(ra)');
+      expect(hasOldName || hasNewName).toBe(true);
     });
   });
 
@@ -886,21 +908,36 @@ describe('Unknown error (non-AppError) handling in error.middleware.ts', () => {
     });
 
     it('unknown errors do NOT receive Retry-After header', () => {
-      // The Retry-After logic is inside the AppError instanceof check,
-      // so it never runs for plain Error instances
+      // Phase 5 Fix #7 extracted the Retry-After logic into a module-level
+      // helper `setRetryAfterIfApplicable` defined ABOVE errorHandler, so the
+      // string 'Retry-After' first appears before the `instanceof AppError`
+      // check. The CALL site of the helper (`setRetryAfterIfApplicable(res,`)
+      // is still inside the AppError branch. The semantic invariant — no
+      // Retry-After set on plain Error (unknown) — is preserved.
       const appErrorBlock = errorMiddlewareSource.indexOf(
         'if (error instanceof AppError)',
       );
-      const retryAfterBlock = errorMiddlewareSource.indexOf('Retry-After');
       const unknownBlock = errorMiddlewareSource.indexOf(
         'Unknown error - send generic response',
       );
 
       expect(appErrorBlock).toBeGreaterThan(-1);
-      expect(retryAfterBlock).toBeGreaterThan(appErrorBlock);
-      expect(unknownBlock).toBeGreaterThan(retryAfterBlock);
-      // Retry-After appears before the unknown block, confirming it is
-      // inside the AppError branch, not the unknown branch.
+      expect(unknownBlock).toBeGreaterThan(appErrorBlock);
+
+      // Verify the helper CALL site (or inline setHeader) lives between the
+      // AppError branch start and the unknown branch — i.e. Retry-After is
+      // set only on the AppError path, not the unknown-error path.
+      const branchBody = errorMiddlewareSource.slice(appErrorBlock, unknownBlock);
+      const hasCallInBranch =
+        branchBody.includes('setRetryAfterIfApplicable(res') ||
+        /res\.setHeader\s*\(\s*['"]Retry-After['"]/.test(branchBody);
+      expect(hasCallInBranch).toBe(true);
+
+      // Verify no Retry-After is set inside the unknown-error branch.
+      const unknownBody = errorMiddlewareSource.slice(unknownBlock);
+      expect(unknownBody).not.toMatch(
+        /res\.setHeader\s*\(\s*['"]Retry-After['"]/,
+      );
     });
 
     it('unknown errors never expose stack traces in the response', () => {

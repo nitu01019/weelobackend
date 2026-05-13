@@ -18,6 +18,7 @@ import { logger } from '../../shared/services/logger.service';
 import { bookingQueue, Priority } from '../../shared/resilience/request-queue';
 import { normalizeOrderLifecycleState } from '../../shared/utils/order-lifecycle.utils';
 import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
+import { readIdempotencyKey } from '../../shared/utils/idempotency-key.helper';
 
 const router = Router();
 
@@ -36,7 +37,7 @@ router.post(
       });
       const { orderId } = req.params;
       const { reason } = req.body ?? {};
-      const idempotencyKey = req.header('X-Idempotency-Key') || req.header('x-idempotency-key') || undefined;
+      const idempotencyKey = readIdempotencyKey(req);
       const result = await canonicalOrderService.cancelOrder(orderId, req.user!.userId, reason, idempotencyKey);
 
       if (!result.success) {

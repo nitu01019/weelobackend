@@ -28,6 +28,7 @@ import { logger } from '../../shared/services/logger.service';
 import { redisService } from '../../shared/services/redis.service';
 import { transporterRateLimit } from '../../shared/middleware/transporter-rate-limit.middleware';
 import { getErrorMessage } from '../../shared/utils/error.utils';
+import { readIdempotencyKey } from '../../shared/utils/idempotency-key.helper';
 
 // =============================================================================
 // ZOD VALIDATION SCHEMAS
@@ -89,7 +90,7 @@ router.post(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const transporterId = req.user!.userId;
-      const idempotencyKey = (req.header('X-Idempotency-Key') || req.header('x-idempotency-key') || '').trim() || undefined;
+      const idempotencyKey = readIdempotencyKey(req);
 
       const parsed = holdTrucksSchema.safeParse(req.body);
       if (!parsed.success) {
@@ -155,7 +156,7 @@ router.post(
       }
       const { holdId, assignments } = parsed.data;
 
-      const idempotencyKey = (req.header('X-Idempotency-Key') || req.header('x-idempotency-key') || '').trim();
+      const idempotencyKey = readIdempotencyKey(req);
       idempotencyCacheKey = idempotencyKey ? `idempotency:truck-hold:confirm:${transporterId}:${holdId}:${idempotencyKey}` : null;
 
       if (idempotencyCacheKey) {
@@ -191,7 +192,7 @@ router.post(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const transporterId = req.user!.userId;
-      const idempotencyKey = (req.header('X-Idempotency-Key') || req.header('x-idempotency-key') || '').trim() || undefined;
+      const idempotencyKey = readIdempotencyKey(req);
       const parsed = releaseHoldSchema.safeParse(req.body);
       if (!parsed.success) { return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: parsed.error.issues.map(i => i.message).join('; ') } }); }
       const { holdId } = parsed.data;

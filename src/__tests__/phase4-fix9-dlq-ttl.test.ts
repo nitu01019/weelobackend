@@ -161,7 +161,11 @@ describe('Phase 4 — Fix #9 — DLQ TTL on dlq:broadcasts', () => {
 
     await expect(
       svc.queueBroadcast('tx-1', 'new_broadcast', { foo: 'bar' })
-    ).rejects.toThrow(/exceeds cap/);
+    // Phase 5 Fix #7 replaced the naked `Error('Broadcast queue depth ... exceeds cap ...')`
+    // with `BackpressureError` whose PUBLIC message is generic per CWE-209
+    // ('Service temporarily unavailable. Please retry shortly.'); depth + cap
+    // now live in `internalMeta` for server-side logs only. Accept either form.
+    ).rejects.toThrow(/exceeds cap|Service temporarily unavailable/);
 
     // lPush + lTrim + expire — in that order on the same key
     expect(mockLPush).toHaveBeenCalledWith('dlq:broadcasts', expect.any(String));
@@ -185,7 +189,11 @@ describe('Phase 4 — Fix #9 — DLQ TTL on dlq:broadcasts', () => {
 
     await expect(
       svc.queueBroadcast('tx-2', 'new_broadcast', { foo: 'bar' })
-    ).rejects.toThrow(/exceeds cap/);
+    // Phase 5 Fix #7 replaced the naked `Error('Broadcast queue depth ... exceeds cap ...')`
+    // with `BackpressureError` whose PUBLIC message is generic per CWE-209
+    // ('Service temporarily unavailable. Please retry shortly.'); depth + cap
+    // now live in `internalMeta` for server-side logs only. Accept either form.
+    ).rejects.toThrow(/exceeds cap|Service temporarily unavailable/);
 
     // lPush + lTrim succeeded, expire failed — but [CRITICAL] log NOT emitted
     expect(mockLPush).toHaveBeenCalled();

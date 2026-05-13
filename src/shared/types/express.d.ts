@@ -23,6 +23,7 @@ declare global {
     }
     interface Request {
       user?: User;
+      apiVersion?: 'v1' | 'v2';   // Fix #29 — set by apiVersionMiddleware
     }
   }
 }

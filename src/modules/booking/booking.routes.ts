@@ -37,6 +37,8 @@ import crypto from 'crypto';
 import { AppError } from '../../shared/types/error.types';
 import { emitToUser, SocketEvent } from '../../shared/services/socket.service';
 import { setOrderExpiryTimer } from '../order/order-timer.service';
+import { setIdempotentReplayedHeader } from '../../shared/http/idempotency-headers';
+import { readIdempotencyKey } from '../../shared/utils/idempotency-key.helper';
 
 const router = Router();
 
@@ -195,7 +197,7 @@ router.post(
             }]
           });
 
-          const idempotencyKey = req.headers['x-idempotency-key'] as string | undefined;
+          const idempotencyKey = readIdempotencyKey(req);
           const serviceRequest = toCreateOrderServiceRequest(
             canonicalInput,
             {
@@ -223,6 +225,7 @@ router.post(
             canonical_path: '/api/v1/bookings/orders'
           });
 
+          setIdempotentReplayedHeader(res, result);
           res.status(201).json({
             success: true,
             data: {
@@ -261,7 +264,7 @@ router.post(
         }
       }
 
-      const idempotencyKey = req.headers['x-idempotency-key'] as string | undefined;
+      const idempotencyKey = readIdempotencyKey(req);
       const booking = await bookingService.createBooking(
         req.user!.userId,
         req.user!.phone,
@@ -269,6 +272,7 @@ router.post(
         idempotencyKey
       );
 
+      setIdempotentReplayedHeader(res, booking);
       res.status(201).json({
         success: true,
         data: { booking }
@@ -468,7 +472,7 @@ router.patch(
       if (FF_LEGACY_BOOKING_PROXY_TO_ORDER && error?.statusCode === 404) {
         try {
           const { reason } = req.body ?? {};
-          const idempotencyKey = req.header('X-Idempotency-Key') || req.header('x-idempotency-key') || undefined;
+          const idempotencyKey = readIdempotencyKey(req);
           const result = await canonicalOrderService.cancelOrder(req.params.id, req.user!.userId, reason, idempotencyKey);
 
           if (!result.success) {
@@ -587,7 +591,7 @@ router.post(
       });
 
       const normalizedInput = normalizeCreateOrderInput(req.body);
-      const idempotencyKey = req.headers['x-idempotency-key'] as string | undefined;
+      const idempotencyKey = readIdempotencyKey(req);
       const serviceRequest = toCreateOrderServiceRequest(
         normalizedInput,
         {
@@ -599,6 +603,7 @@ router.post(
       );
       const result = await canonicalOrderService.createOrder(serviceRequest);
 
+      setIdempotentReplayedHeader(res, result);
       res.status(201).json({
         success: true,
         data: buildCreateOrderResponseData(
@@ -701,7 +706,7 @@ router.post(
 
       const { orderId } = req.params;
       const { reason } = req.body ?? {};
-      const idempotencyKey = req.header('X-Idempotency-Key') || req.header('x-idempotency-key') || undefined;
+      const idempotencyKey = readIdempotencyKey(req);
       const result = await canonicalOrderService.cancelOrder(orderId, req.user!.userId, reason, idempotencyKey);
 
       if (!result.success) {

@@ -154,6 +154,12 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
       'socket_emit_while_adapter_down_total',
       'Socket emits processed while Redis adapter is down (local-instance only broadcast)'
     ),
+
+    // Fix #29 — API version negotiation observability.
+    // Labels: version = 'v1' | 'v2' | 'unknown'. The "flip FF_DISPATCH_PENDING"
+    // gate watches `version=v1` falling below 1% of total over the 90-day
+    // sunset window before lighting up the v2 payload shape.
+    counter('api_version_request_total', 'Total API requests by negotiated version (Fix #29)'),
   ];
 
   for (const def of defs) {

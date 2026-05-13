@@ -29,6 +29,7 @@ import { metrics } from '../monitoring/metrics.service';
 import { prismaClient } from '../database/prisma.service';
 import * as admin from 'firebase-admin';
 import { FLAGS, isEnabled } from '../config/feature-flags';
+import { BackpressureError } from '../types/error.types';
 
 // =============================================================================
 // TYPES
@@ -1958,7 +1959,12 @@ export class QueueService {
         logger.error('[CRITICAL] Broadcast dropped AND DLQ write failed', { transporterId, event });
       }
 
-      throw new Error(`Broadcast queue depth ${this.broadcastDepthSnapshot.depth} exceeds cap ${FF_QUEUE_DEPTH_CAP}`);
+      // CWE-209: depth + cap go to internalMeta (server-side log only). Public message is generic.
+      throw new BackpressureError(
+        'queue_depth_cap_exceeded',
+        { retryAfter: 5 },
+        { depth: this.broadcastDepthSnapshot.depth, cap: FF_QUEUE_DEPTH_CAP }
+      );
     }
 
     // Phase 4: auto-assign priority from event type if flag enabled

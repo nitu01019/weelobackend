@@ -29,6 +29,8 @@ import {
   normalizeCreateOrderInput,
   toCreateOrderServiceRequest
 } from '../order/order.contract';
+import { setIdempotentReplayedHeader } from '../../shared/http/idempotency-headers';
+import { readIdempotencyKey } from '../../shared/utils/idempotency-key.helper';
 
 const router = Router();
 
@@ -142,7 +144,7 @@ router.post(
             quantity: legacyPayload.trucksNeeded, pricePerTruck: legacyPayload.pricePerTruck
           }]
         });
-        const idempotencyKey = req.headers['x-idempotency-key'] as string | undefined;
+        const idempotencyKey = readIdempotencyKey(req);
         const serviceRequest = toCreateOrderServiceRequest(
           canonicalInput, { id: customerId, name: 'Customer', phone: req.user!.phone }, idempotencyKey
         );
@@ -151,6 +153,7 @@ router.post(
           result, canonicalInput, { id: customerId, name: 'Customer', phone: req.user!.phone }
         );
         logger.info('[OrderIngress] legacy_proxy_used=true', { customerId, orderId: result.orderId });
+        setIdempotentReplayedHeader(res, result);
         res.status(201).json({
           success: true,
           data: { booking: mapOrderResponseToLegacyBooking(responseData, legacyPayload) }
@@ -158,8 +161,9 @@ router.post(
         return;
       }
 
-      const idempotencyKey = req.headers['x-idempotency-key'] as string | undefined;
+      const idempotencyKey = readIdempotencyKey(req);
       const booking = await bookingService.createBooking(req.user!.userId, req.user!.phone, req.body, idempotencyKey);
+      setIdempotentReplayedHeader(res, booking);
       res.status(201).json({ success: true, data: { booking } });
     } catch (error) { return next(error); }
   }
@@ -298,11 +302,12 @@ router.post(
       }
       logger.info('[OrderIngress] create_order_request', { route_path: '/api/v1/bookings/orders', customerId });
       const normalizedInput = normalizeCreateOrderInput(req.body);
-      const idempotencyKey = req.headers['x-idempotency-key'] as string | undefined;
+      const idempotencyKey = readIdempotencyKey(req);
       const serviceRequest = toCreateOrderServiceRequest(
         normalizedInput, { id: customerId, name: 'Customer', phone: req.user!.phone }, idempotencyKey
       );
       const result = await canonicalOrderService.createOrder(serviceRequest);
+      setIdempotentReplayedHeader(res, result);
       res.status(201).json({
         success: true,
         data: buildCreateOrderResponseData(result, normalizedInput, { id: req.user!.userId, name: 'Customer', phone: req.user!.phone })

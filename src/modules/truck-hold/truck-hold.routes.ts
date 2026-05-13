@@ -25,6 +25,7 @@ import { logger } from '../../shared/services/logger.service';
 import { redisService } from '../../shared/services/redis.service';
 import { transporterRateLimit } from '../../shared/middleware/transporter-rate-limit.middleware';
 import { prismaClient } from '../../shared/database/prisma.service';
+import { readIdempotencyKey } from '../../shared/utils/idempotency-key.helper';
 
 const router = Router();
 
@@ -109,7 +110,7 @@ router.post(
       const { orderId, vehicleType, vehicleSubtype } = req.body;
       const quantityRaw = req.body?.quantity;
       const quantityNumber = Number(quantityRaw);
-      const idempotencyKey = (req.header('X-Idempotency-Key') || req.header('x-idempotency-key') || '').trim() || undefined;
+      const idempotencyKey = readIdempotencyKey(req);
       
       // Validate required fields
       if (!orderId || !vehicleType || !Number.isFinite(quantityNumber)) {
@@ -262,7 +263,7 @@ router.post(
         }
       }
 
-      const idempotencyKey = (req.header('X-Idempotency-Key') || req.header('x-idempotency-key') || '').trim();
+      const idempotencyKey = readIdempotencyKey(req);
       idempotencyCacheKey = idempotencyKey
         ? `idempotency:truck-hold:confirm:${transporterId}:${holdId}:${idempotencyKey}`
         : null;
@@ -342,7 +343,7 @@ router.post(
     try {
       const transporterId = req.user!.userId;
       const { holdId } = req.body;
-      const idempotencyKey = (req.header('X-Idempotency-Key') || req.header('x-idempotency-key') || '').trim() || undefined;
+      const idempotencyKey = readIdempotencyKey(req);
       
       if (!holdId) {
         return res.status(400).json({

@@ -10,6 +10,7 @@ import { createBookingSchema, getBookingsQuerySchema } from './booking.schema';
 import { validateSchema } from '../../shared/utils/validation.utils';
 import { successResponse } from '../../shared/types/api.types';
 import { asyncHandler } from '../../shared/middleware/error.middleware';
+import { readIdempotencyKey } from '../../shared/utils/idempotency-key.helper';
 
 class BookingController {
   /**
@@ -29,7 +30,7 @@ class BookingController {
     const data = validateSchema(createBookingSchema, req.body);
     
     // SCALABILITY: Get idempotency key from header
-    const idempotencyKey = req.headers['x-idempotency-key'] as string | undefined;
+    const idempotencyKey = readIdempotencyKey(req);
     
     const booking = await bookingService.createBooking(userId, userPhone, data, idempotencyKey);
     

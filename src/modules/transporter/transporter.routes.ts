@@ -169,6 +169,8 @@ router.put(
             transporterId,
             retryAfterMs
           });
+          // RFC 7231 §7.1.3: delta-seconds = 1*DIGIT; ceil ms → integer seconds.
+          res.setHeader('Retry-After', String(Math.ceil(retryAfterMs / 1000)));
           return res.status(429).json({
             success: false,
             error: {
@@ -603,6 +605,8 @@ router.post(
           indexedVehicleKeys: vehicleEntries.length,
           error: availabilityError?.message || 'unknown'
         });
+        // RFC 7231 §7.1.3: delta-seconds = 1*DIGIT — heartbeat-sync transient overload.
+        res.setHeader('Retry-After', '5');
         res.status(503).json({
           success: false,
           error: {

@@ -165,7 +165,7 @@ class AuthService {
         phone: maskForLogging(phone, 2, 4),
         role
       });
-      throw new AppError(503, 'SERVICE_UNAVAILABLE', 'OTP service temporarily unavailable. Please try again in a moment.');
+      throw new AppError(503, 'SERVICE_UNAVAILABLE', 'OTP service temporarily unavailable. Please try again in a moment.', { retryAfter: 10 });
     }
 
     // ==========================================================================
@@ -299,11 +299,11 @@ class AuthService {
       } catch (err: unknown) {
         const createErrMsg = err instanceof Error ? err.message : String(err);
         logger.error('Error creating user in DB', { error: createErrMsg });
-        throw new AppError(503, 'DB_UNAVAILABLE', 'Unable to create user account. Please try again.');
+        throw new AppError(503, 'DB_UNAVAILABLE', 'Unable to create user account. Please try again.', { retryAfter: 5 });
       }
 
       if (!dbUser || !dbUser.id) {
-        throw new AppError(503, 'DB_UNAVAILABLE', 'Unable to create user account. Please try again.');
+        throw new AppError(503, 'DB_UNAVAILABLE', 'Unable to create user account. Please try again.', { retryAfter: 5 });
       }
       isNewUser = true;
 

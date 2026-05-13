@@ -258,6 +258,14 @@ export interface CreateOrderResponse {
   }[];
   expiresAt: string;
   expiresIn: number;  // SCALABILITY: Duration in seconds - UI uses this for countdown timer
+  // NEW — Idempotent-Replayed signal (Stripe parity).
+  replayed?: boolean;
+  // NEW — dev/staging only; production callers MUST NOT depend on this.
+  replaySource?: 'redis-cache' | 'db-replay';
+  // Fix #29 v2 payload field — added only when FF_DISPATCH_PENDING=true AND
+  // Accept-Version: v2. PREP PR: FF defaults OFF so this is dormant at runtime;
+  // typed as optional so Moshi/decoders treat it as nullable in v2 clients.
+  dispatchPending?: boolean;
 }
 
 export { ActiveTruckRequestOrderGroup } from './order-query.service';
@@ -627,7 +635,7 @@ class OrderService {
       if (inflight > MAX_CONCURRENT_ORDERS) {
         await redisService.incrBy(BACKPRESSURE_KEY, -1).catch((err: unknown) => { logger.warn('[ORDER] Backpressure decrement failed', { error: err instanceof Error ? err.message : String(err) }); });
         logger.warn('[ORDER] System backpressure: too many concurrent order creates', { inflight, max: MAX_CONCURRENT_ORDERS });
-        throw new AppError(503, 'SYSTEM_BUSY', 'System is processing too many orders. Please retry in a few seconds.');
+        throw new AppError(503, 'SYSTEM_BUSY', 'System is processing too many orders. Please retry in a few seconds.', { retryAfter: 5 });
       }
     } catch (err: unknown) {
       // If Redis fails, use in-memory fallback instead of allowing everything through
@@ -642,7 +650,7 @@ class OrderService {
         // FIX-35: Rejection already decremented, reset flag
         usedInMemoryFallback = false;
         logger.warn('[ORDER] In-memory backpressure triggered (Redis unavailable)', { inMemoryInflight, max: IN_MEMORY_MAX });
-        throw new AppError(503, 'SYSTEM_BUSY', 'System is processing too many orders. Please retry in a few seconds.');
+        throw new AppError(503, 'SYSTEM_BUSY', 'System is processing too many orders. Please retry in a few seconds.', { retryAfter: 5 });
       }
       logger.warn('[ORDER] Backpressure counter failed, using in-memory fallback', { error: (err as Error).message, inMemoryInflight, max: IN_MEMORY_MAX });
     }
@@ -710,6 +718,8 @@ class OrderService {
         if (cached) {
           const cachedResponse = JSON.parse(cached) as CreateOrderResponse;
           logger.info(`✅ Idempotency HIT: Returning cached order ${cachedResponse.orderId.substring(0, 8)}... for key ${request.idempotencyKey.substring(0, 8)}...`);
+          cachedResponse.replayed = true;
+          cachedResponse.replaySource = 'redis-cache';
           return cachedResponse;
         }
         logger.debug(`🔍 Idempotency MISS: Processing new order for key ${request.idempotencyKey.substring(0, 8)}...`);
@@ -730,7 +740,7 @@ class OrderService {
           idempotencyKey: `${request.idempotencyKey.substring(0, 8)}...`,
           orderId: dbReplay.orderId
         });
-        return dbReplay;
+        return { ...dbReplay, replayed: true, replaySource: 'db-replay' as const };
       }
     }
 

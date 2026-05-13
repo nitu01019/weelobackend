@@ -327,7 +327,7 @@ class BookingService {
     customerPhone: string,
     data: CreateBookingInput,
     idempotencyKey?: string
-  ): Promise<BookingRecord & { matchingTransportersCount: number; timeoutSeconds: number }> {
+  ): Promise<BookingRecord & { matchingTransportersCount: number; timeoutSeconds: number; replayed?: boolean; replaySource?: 'redis-cache' | 'db-replay' }> {
     // FIX A5#27: Redis concurrency counter — backpressure to prevent system overload
     const BOOKING_CONCURRENCY_LIMIT = Math.max(1, config.bookingConcurrencyLimit);
     const BACKPRESSURE_TTL_SECONDS = 300;
@@ -379,7 +379,9 @@ class BookingService {
           return {
             ...existingBooking,
             matchingTransportersCount: matchingTransporters.length,
-            timeoutSeconds: Math.floor(BOOKING_CONFIG.TIMEOUT_MS / 1000)
+            timeoutSeconds: Math.floor(BOOKING_CONFIG.TIMEOUT_MS / 1000),
+            replayed: true,
+            replaySource: 'redis-cache' as const,
           };
         }
       }
@@ -436,7 +438,9 @@ class BookingService {
           return {
             ...existingDedupeBooking,
             matchingTransportersCount: matchingTransporters.length,
-            timeoutSeconds: Math.floor(BOOKING_CONFIG.TIMEOUT_MS / 1000)
+            timeoutSeconds: Math.floor(BOOKING_CONFIG.TIMEOUT_MS / 1000),
+            replayed: true,
+            replaySource: 'redis-cache' as const,
           };
         }
       }

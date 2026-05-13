@@ -112,7 +112,7 @@ export async function authMiddleware(
         consecutiveRedisFailures++;
         if (AUTH_REDIS_FAIL_POLICY === 'closed') {
           logger.error('[AUTH] Redis unavailable, rejecting request (fail-closed policy)', { userId: decoded.userId, path: req.path });
-          return next(new AppError(503, 'SERVICE_UNAVAILABLE', 'Authentication service temporarily unavailable'));
+          return next(new AppError(503, 'SERVICE_UNAVAILABLE', 'Authentication service temporarily unavailable', { retryAfter: 10 }));
         }
         logger.warn('[Auth] JTI blacklist check failed-open', { jti: decoded.jti, userId: decoded.userId, path: req.path });
         metrics.incrementCounter('auth_redis_failopen_total', { check_type: 'jti_blacklist' });
@@ -137,7 +137,7 @@ export async function authMiddleware(
       consecutiveRedisFailures++;
       if (AUTH_REDIS_FAIL_POLICY === 'closed') {
         logger.error('[AUTH] Redis unavailable, rejecting request (fail-closed policy)', { userId: decoded.userId, path: req.path });
-        return next(new AppError(503, 'SERVICE_UNAVAILABLE', 'Authentication service temporarily unavailable'));
+        return next(new AppError(503, 'SERVICE_UNAVAILABLE', 'Authentication service temporarily unavailable', { retryAfter: 10 }));
       }
       logger.warn('[Auth] Suspension check failed-open', { userId: decoded.userId, path: req.path });
       metrics.incrementCounter('auth_redis_failopen_total', { check_type: 'suspension' });
