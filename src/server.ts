@@ -742,6 +742,29 @@ async function bootstrap(): Promise<void> {
     logger.warn(`[Startup] Idempotency cleanup job failed to start (non-fatal): ${msg}`);
   }
 
+  // Fix #10: Periodic archival of OrderDispatchOutbox rows where status='dispatched'.
+  // Bounded DELETE with FOR UPDATE SKIP LOCKED, per-batch statement_timeout,
+  // distributed Redis lock. See cleanup-dispatch-outbox.job.ts.
+  try {
+    const { startCleanupDispatchOutbox } = await import('./shared/jobs/cleanup-dispatch-outbox.job');
+    startCleanupDispatchOutbox();
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn(`[Startup] Dispatch outbox cleanup job failed to start (non-fatal): ${msg}`);
+  }
+
+  // Fix #1 (PART A): In-process EMF emitter for `broadcast_queue_depth`.
+  // FF-gated (FF_EMF_INPROCESS_FALLBACK, default OFF) — opt-in fallback until
+  // sidecar EMF emitter rolls out. See emf-bridge.ts and the companion
+  // scripts/monitoring/setup-broadcast-queue-depth-alarm.sh (PART B).
+  try {
+    const { startEmfBroadcastDepthBridge } = await import('./shared/monitoring/emf-bridge');
+    startEmfBroadcastDepthBridge();
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn(`[Startup] EMF broadcast depth bridge failed to start (non-fatal): ${msg}`);
+  }
+
   // -------------------------------------------------------------------------
   // BEGIN prefix-overlap assertion (F-B-03)
   // Fail-fast at boot if two Redis namespace owners share an overlapping prefix.
@@ -946,10 +969,11 @@ const gracefulShutdown = async (signal: string) => {
     logger.error('Error stopping background intervals', err);
   }
 
-  // A5#8: Stop queue service and flush buffers before disconnecting Redis/Prisma
+  // A5#8: Stop queue service and flush buffers before disconnecting Redis/Prisma.
+  // Fix #5 (PART C): await so we don't SIGKILL mid Lua promote / mid stream flush.
   try {
     const { queueService }: typeof import('./shared/services/queue.service') = require('./shared/services/queue.service');
-    queueService.stop();
+    await queueService.stop();
     logger.info('Queue service stopped and buffers flushed');
   } catch (err) {
     logger.error('Error stopping queue service', err);

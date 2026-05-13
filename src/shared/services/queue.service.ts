@@ -66,6 +66,17 @@ export const TRACKING_QUEUE_HARD_LIMIT = Math.max(1000, parseInt(process.env.TRA
 // M-6 FIX: Configurable DLQ cap (was hardcoded 1000, now defaults to 5000)
 // Higher cap preserves more failed jobs for post-mortem debugging.
 export const DLQ_MAX_SIZE = Math.max(100, parseInt(process.env.DLQ_MAX_SIZE || '5000', 10) || 5000);
+
+// Fix #9 — DLQ TTL ceiling. 14 days = 2× canonical source-queue retention
+// (AWS SQS rule: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html).
+// EXPIRE is idempotent (https://redis.io/commands/expire/) so re-issuing on every
+// write is wasteful but safe. Per-key idle TTL; per-element age remains bounded by
+// DLQ_MAX_SIZE LTRIM eviction.
+export const DLQ_TTL_SECONDS = 14 * 24 * 60 * 60; // 1_209_600
+
+// Terminal failures — kept longer for post-mortem evidence (max-replay exhausted).
+// 30d covers India CGRF avg grievance window.
+export const DLQ_PERMANENT_TTL_SECONDS = 30 * 24 * 60 * 60; // 2_592_000
 export const TRACKING_QUEUE_DEPTH_SAMPLE_MS = Math.max(100, parseInt(process.env.TRACKING_QUEUE_DEPTH_SAMPLE_MS || '500', 10) || 500);
 export const FF_CANCELLED_ORDER_QUEUE_GUARD = process.env.FF_CANCELLED_ORDER_QUEUE_GUARD !== 'false';
 // FAIL-CLOSED by default: if guard lookup is ambiguous, we prefer dropping stale
@@ -443,6 +454,35 @@ export class RedisQueue extends EventEmitter {
   // At-least-once delivery: max age (ms) before a processing job is considered stale
   // and re-enqueued on startup. 5 minutes is generous — most jobs complete in <10s.
   private readonly STALE_PROCESSING_THRESHOLD_MS = 5 * 60 * 1000;
+
+  // Fix #5: in-flight delay-poller tick promise, awaited by stop() so SIGKILL
+  // can't land between ZRANGEBYSCORE/LPUSH/ZREMRANGEBYSCORE half-steps.
+  private inflightTickPromise: Promise<void> | null = null;
+
+  // Fix #5 (PART A): Single atomic Lua replacing the 3-RT promote loop.
+  // KEYS[1] = delayedKey  KEYS[2..5] = critical/high/normal/low priority lists
+  // ARGV[1] = now ms      ARGV[2..5] = MessagePriority enum values (CRITICAL/HIGH/NORMAL/LOW)
+  // Returns: number of promoted jobs.
+  private static readonly DELAY_PROMOTE_LUA = `
+    local readyJobs = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1])
+    if #readyJobs == 0 then return 0 end
+    for i = 1, #readyJobs do
+      local job = readyJobs[i]
+      local pri = tonumber(ARGV[4]) -- default NORMAL
+      local ok, parsed = pcall(cjson.decode, job)
+      if ok and type(parsed) == 'table' and type(parsed.priority) == 'number' then
+        pri = parsed.priority
+      end
+      local target = KEYS[4]
+      if     pri == tonumber(ARGV[2]) then target = KEYS[2]
+      elseif pri == tonumber(ARGV[3]) then target = KEYS[3]
+      elseif pri == tonumber(ARGV[5]) then target = KEYS[5]
+      end
+      redis.call('LPUSH', target, job)
+    end
+    redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[1])
+    return #readyJobs
+  `;
 
   constructor() {
     super();
@@ -865,14 +905,28 @@ export class RedisQueue extends EventEmitter {
   }
 
   /**
-   * Stop processing jobs
+   * Stop processing jobs.
+   * Fix #5 (PART B): Widened to async + bounded await on in-flight delay-poller
+   * tick. SIGTERM → clearInterval cancels future ticks, then we await the current
+   * tick (bounded by QUEUE_SHUTDOWN_TICK_TIMEOUT_MS, default 5s) so the Lua
+   * promote completes server-side before pod death.
    */
-  stop(): void {
+  async stop(): Promise<void> {
     this.isRunning = false;
     this.queueWorkers.clear();
     if (this.delayPollerInterval) {
       clearInterval(this.delayPollerInterval);
       this.delayPollerInterval = null;
+    }
+    if (this.inflightTickPromise) {
+      const SHUTDOWN_TICK_TIMEOUT_MS = Math.max(
+        1000,
+        parseInt(process.env.QUEUE_SHUTDOWN_TICK_TIMEOUT_MS || '5000', 10) || 5000,
+      );
+      await Promise.race([
+        this.inflightTickPromise.catch(() => undefined),
+        new Promise<void>(resolve => setTimeout(resolve, SHUTDOWN_TICK_TIMEOUT_MS)),
+      ]);
     }
     logger.info('⏹️ Redis Queue processor stopped');
   }
@@ -890,39 +944,73 @@ export class RedisQueue extends EventEmitter {
     this.delayPollerInterval = setInterval(async () => {
       if (!this.isRunning) return;
 
-      for (const queueName of this.processors.keys()) {
-        try {
-          const delayedKey = this.getDelayedKey(queueName);
-          const now = Date.now();
+      // Fix #5 (PART A2): capture the per-tick promise so stop() can await it.
+      this.inflightTickPromise = (async () => {
+        for (const queueName of this.processors.keys()) {
+          try {
+            const delayedKey = this.getDelayedKey(queueName);
+            const now = Date.now();
 
-          // Find all jobs whose processAfter timestamp has passed
-          const readyJobs = await redisService.zRangeByScore(delayedKey, 0, now);
-          if (readyJobs.length === 0) continue;
+            // Fix #5 (PART A): FF-gated atomic Lua eval (default ON).
+            // Legacy 3-RT path preserved when FF_DELAY_POLLER_ATOMIC_PROMOTE=false.
+            const useAtomic = process.env.FF_DELAY_POLLER_ATOMIC_PROMOTE !== 'false';
+            if (useAtomic) {
+              const criticalKey = this.getPriorityQueueKey(queueName, MessagePriority.CRITICAL);
+              const highKey = this.getPriorityQueueKey(queueName, MessagePriority.HIGH);
+              const normalKey = this.getPriorityQueueKey(queueName, MessagePriority.NORMAL);
+              const lowKey = this.getPriorityQueueKey(queueName, MessagePriority.LOW);
 
-          // H7 FIX: Move each ready job to the correct priority list
-          for (const jobStr of readyJobs) {
-            let priority = MessagePriority.NORMAL;
-            try {
-              const parsed = JSON.parse(jobStr);
-              if (typeof parsed.priority === 'number') {
-                priority = parsed.priority;
+              const promotedRaw = await redisService.eval(
+                RedisQueue.DELAY_PROMOTE_LUA,
+                [delayedKey, criticalKey, highKey, normalKey, lowKey],
+                [
+                  now.toString(),
+                  String(MessagePriority.CRITICAL),
+                  String(MessagePriority.HIGH),
+                  String(MessagePriority.NORMAL),
+                  String(MessagePriority.LOW),
+                ],
+              );
+              const promoted: number = typeof promotedRaw === 'number'
+                ? promotedRaw
+                : (Array.isArray(promotedRaw) ? promotedRaw.length : 0);
+              if (promoted > 0) {
+                try {
+                  metrics.incrementCounter('delay_promotion_atomic_total', { queue: queueName }, promoted);
+                } catch { /* never break the tick on a metric write */ }
+                logger.debug(`[DelayPoller] Atomically promoted ${promoted} job(s) for ${queueName}`);
               }
-            } catch { /* default to NORMAL */ }
-            const targetKey = this.getPriorityQueueKey(queueName, priority);
-            await redisService.lPush(targetKey, jobStr);
-          }
+            } else {
+              // Legacy non-atomic path preserved verbatim for emergency FF flip-off.
+              const readyJobs = await redisService.zRangeByScore(delayedKey, 0, now);
+              if (readyJobs.length === 0) continue;
 
-          // Remove moved jobs from the sorted set
-          await redisService.zRemRangeByScore(delayedKey, 0, now);
+              for (const jobStr of readyJobs) {
+                let priority = MessagePriority.NORMAL;
+                try {
+                  const parsed = JSON.parse(jobStr);
+                  if (typeof parsed.priority === 'number') {
+                    priority = parsed.priority;
+                  }
+                } catch { /* default to NORMAL */ }
+                const targetKey = this.getPriorityQueueKey(queueName, priority);
+                await redisService.lPush(targetKey, jobStr);
+              }
 
-          if (readyJobs.length > 0) {
-            logger.debug(`[DelayPoller] Moved ${readyJobs.length} ready job(s) from delayed:${queueName} to queue`);
+              await redisService.zRemRangeByScore(delayedKey, 0, now);
+
+              if (readyJobs.length > 0) {
+                logger.debug(`[DelayPoller] Moved ${readyJobs.length} ready job(s) from delayed:${queueName} to queue (legacy)`);
+              }
+            }
+          } catch (err: unknown) {
+            // Non-fatal — jobs stay in sorted set, will be picked up next iteration.
+            const msg = err instanceof Error ? err.message : 'unknown';
+            logger.warn(`[DelayPoller] Error for ${queueName}: ${msg}`);
           }
-        } catch (err: any) {
-          // Non-fatal — jobs stay in sorted set, will be picked up next iteration
-          logger.warn(`[DelayPoller] Error for ${queueName}: ${err.message}`);
         }
-      }
+      })();
+      await this.inflightTickPromise;
     }, 1000); // Poll every 1 second — lightweight, just a ZRANGEBYSCORE per queue
 
     this.delayPollerInterval.unref(); // Don't prevent Node.js from exiting
@@ -985,7 +1073,8 @@ interface IQueue {
   addBatch<T>(queueName: string, jobs: { type: string; data: T; priority?: number }[]): Promise<string[]>;
   process(queueName: string, processor: JobProcessor): void;
   start(): void;
-  stop(): void;
+  // Fix #5: widen to support both sync (InMemoryQueue) and async (RedisQueue) impls.
+  stop(): void | Promise<void>;
   getStats(): any;
   getQueueDepth(queueName: string): Promise<number>;
 }
@@ -1861,6 +1950,9 @@ export class QueueService {
         await redisService.lPush('dlq:broadcasts', dlqEntry);
         // M-6 FIX: Configurable DLQ cap (env: DLQ_MAX_SIZE, default 5000)
         await redisService.lTrim('dlq:broadcasts', 0, DLQ_MAX_SIZE - 1);
+        // Fix #9 — 14d TTL. .catch isolates EXPIRE-only failure from the outer
+        // catch's [CRITICAL] log (TTL-set failure ≠ DLQ write failure).
+        await redisService.expire('dlq:broadcasts', DLQ_TTL_SECONDS).catch(() => { /* never break */ });
       } catch {
         // DLQ write also failed -- log to stdout for CloudWatch
         logger.error('[CRITICAL] Broadcast dropped AND DLQ write failed', { transporterId, event });
@@ -2229,13 +2321,18 @@ export class QueueService {
   }
 
   /**
-   * Stop all queue processing
+   * Stop all queue processing.
+   * Fix #5 (PART B2): widened to async so callers can `await` both the inner
+   * stop (which itself awaits the in-flight delay-poller tick) AND the tracking
+   * stream sink flush. Previously the inner stop and flush were both detached,
+   * meaning SIGKILL at ECS StopTimeout could land mid-promote and mid-flush.
    */
-  stop(): void {
-    this.queue.stop();
-    this.trackingStreamSink.flush().catch((error: any) => {
+  async stop(): Promise<void> {
+    await this.queue.stop();
+    await this.trackingStreamSink.flush().catch((error: unknown) => {
+      const msg = error instanceof Error ? error.message : 'unknown';
       logger.warn('Failed to flush tracking stream sink during queue shutdown', {
-        message: error?.message || 'unknown'
+        message: msg,
       });
     });
   }
