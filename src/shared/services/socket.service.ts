@@ -1330,9 +1330,15 @@ export function initializeSocket(server: HttpServer): Server {
               for (const msgStr of messages) {
                 try {
                   const envelope = JSON.parse(msgStr);
+                  // Phase 7 follow-up — Defect #2: defensive UUID fallback for
+                  // legacy envelopes written BEFORE Phase 7 Fix #13 (no eventId
+                  // on either layer). 10-min UNACKED_QUEUE_TTL window means
+                  // some legacy envelopes co-exist at deploy moment. Without
+                  // this fallback they replay with `eventId: undefined` and FE
+                  // ring-buffer dedup collides on the literal string.
                   socket.emit(envelope.event || 'replay', {
                     ...envelope.payload,
-                    eventId: envelope.payload?.eventId ?? envelope.eventId,
+                    eventId: envelope.payload?.eventId ?? envelope.eventId ?? randomUUID(),
                     _seq: envelope.seq,
                     _replayed: true
                   });
