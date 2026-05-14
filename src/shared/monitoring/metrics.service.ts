@@ -495,6 +495,19 @@ class MetricsService {
     }
   }
 
+  /**
+   * Read a gauge's current value.
+   * Returns `undefined` if the gauge is not registered (callers should treat
+   * unregistered gauges as zero when emitting metrics to downstream sinks).
+   *
+   * Added for Phase 4 Fix #1 — EMF bridge reads broadcast_queue_depth here to
+   * publish CloudWatch metrics. Public method (not optional-chain workaround)
+   * so type-checker catches a missing-method regression at the call site.
+   */
+  getGaugeValue(name: string): number | undefined {
+    return this.gauges.get(name)?.value;
+  }
+
   // ===========================================================================
   // HISTOGRAM METHODS
   // ===========================================================================
