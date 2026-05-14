@@ -936,7 +936,21 @@ process.on('unhandledRejection', (reason) => {
 // GRACEFUL SHUTDOWN
 // =============================================================================
 
-const gracefulShutdown = async (signal: string) => {
+/**
+ * Phase 7 follow-up — Defect #3: reentrancy guard. Concurrent SIGTERM+SIGINT
+ * would otherwise both proceed through drain/queue.stop/prisma.disconnect.
+ * Linkerd/Envoy "idempotent graceful stop" pattern.
+ */
+let _shutdownInProgress = false;
+
+/** @internal — exported for reentrancy-guard tests; do not call from app code. */
+export const gracefulShutdown = async (signal: string) => {
+  if (_shutdownInProgress) {
+    logger.info(`${signal} ignored — shutdown already in progress`);
+    return;
+  }
+  _shutdownInProgress = true;
+
   logger.info(`${signal} received. Starting graceful shutdown...`);
 
   // Phase 10: Set shutdown flag — middleware returns 503, health returns 503

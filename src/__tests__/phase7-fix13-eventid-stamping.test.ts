@@ -260,8 +260,13 @@ describe('Phase 7 — Fix #13: eventId stamping across retransmission paths', ()
         path.resolve(__dirname, '../shared/services/socket.service.ts'),
         'utf8'
       );
+      // Phase 7 follow-up — Defect #2 added a defensive `?? randomUUID()` tail
+      // to close the legacy-envelope undefined-eventId gap. The DDIA invariant
+      // (payload eventId preferred, envelope eventId fallback) is unchanged;
+      // the third fallback only fires for pre-Phase-7 envelopes during the
+      // 10-min UNACKED_QUEUE_TTL window after deploy.
       expect(src).toContain(
-        "eventId: envelope.payload?.eventId ?? envelope.eventId,"
+        "eventId: envelope.payload?.eventId ?? envelope.eventId ?? randomUUID(),"
       );
     });
   });

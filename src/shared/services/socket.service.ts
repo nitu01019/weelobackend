@@ -131,6 +131,16 @@ const SOCKET_EVENT_VERSION = 1;
 const SOCKET_MULTI_ROOM_EMIT_CHUNK_SIZE = Math.min(500, Math.max(25, parseInt(process.env.SOCKET_MULTI_ROOM_EMIT_CHUNK_SIZE || '300', 10) || 300));
 
 /**
+ * Phase 7 follow-up — Defect #11: Prometheus cardinality safety. Any metric
+ * labelled by `socket.data.role` (which originates from JWT claims) must clamp
+ * unknown values to a bounded allowlist. Defense in depth on top of upstream
+ * JWT validation. Applied at the Phase 7-introduced call site at L368-374
+ * (socket_reconnect_post_drain_total). Pre-existing call sites at L316 / L339
+ * are out of scope for this sprint.
+ */
+const KNOWN_ROLES = new Set(['customer', 'transporter', 'driver', 'admin']);
+
+/**
  * Socket Events — F-C-52 canonical registry
  *
  * The hand-rolled map that used to live here (67+ LOC, prone to 3-repo drift
@@ -324,6 +334,23 @@ export function initializeSocket(server: HttpServer): Server {
 
   // Connection handler
   io.on('connection', async (socket: Socket) => {
+    // Phase 7 follow-up — Defect #5: reject new connections during graceful
+    // drain. Without this, new sockets arriving in the 5s pre-drain window
+    // (DRAIN_PREDRAIN_MS) would join rooms + run replay logic only to be
+    // surprised by `socket.disconnect(true)` from the drain loop, then
+    // retry against this same draining pod (thundering-herd-to-self).
+    // Linkerd / Envoy "fail-fast during drain" pattern.
+    // Lazy-require matches existing inline-require convention (L257, L271,
+    // L313, L338, L371) and avoids the static-import circular-dependency
+    // risk between socket.service.ts and server.ts.
+    try {
+      const { isShuttingDown }: typeof import('../../server') = require('../../server');
+      if (isShuttingDown()) {
+        socket.disconnect(true);
+        return;
+      }
+    } catch { /* server module not loaded in test harness — proceed */ }
+
     // === Fix #14 — Socket.IO CSR (Connection State Recovery) outcome observation ===
     // `socket.recovered` is set by @socket.io/redis-streams-adapter when the
     // connectionStateRecovery config (line ~270) attempts to restore the prior
@@ -369,8 +396,12 @@ export function initializeSocket(server: HttpServer): Server {
           await new Promise<void>(resolve => setTimeout(resolve, enhancedJitterMs));
           try {
             const { metrics } = require('../monitoring/metrics.service');
+            // Phase 7 follow-up — Defect #11: clamp role label to KNOWN_ROLES.
+            const clampedRole = (typeof socket.data.role === 'string' && KNOWN_ROLES.has(socket.data.role))
+              ? socket.data.role
+              : 'unknown';
             metrics.incrementCounter('socket_reconnect_post_drain_total', {
-              role: socket.data.role || 'unknown',
+              role: clampedRole,
             });
           } catch { /* metrics optional */ }
           didEnhancedJitter = true;
@@ -1330,9 +1361,15 @@ export function initializeSocket(server: HttpServer): Server {
               for (const msgStr of messages) {
                 try {
                   const envelope = JSON.parse(msgStr);
+                  // Phase 7 follow-up — Defect #2: defensive UUID fallback for
+                  // legacy envelopes written BEFORE Phase 7 Fix #13 (no eventId
+                  // on either layer). 10-min UNACKED_QUEUE_TTL window means
+                  // some legacy envelopes co-exist at deploy moment. Without
+                  // this fallback they replay with `eventId: undefined` and FE
+                  // ring-buffer dedup collides on the literal string.
                   socket.emit(envelope.event || 'replay', {
                     ...envelope.payload,
-                    eventId: envelope.payload?.eventId ?? envelope.eventId,
+                    eventId: envelope.payload?.eventId ?? envelope.eventId ?? randomUUID(),
                     _seq: envelope.seq,
                     _replayed: true
                   });
@@ -2373,7 +2410,12 @@ export async function drainSocketsStaggered(): Promise<void> {
 
   try {
     const totalSockets = ioInstance.sockets.sockets.size;
-    const podId = process.env.HOSTNAME || `pod-${process.pid}`;
+    // Phase 7 follow-up — Defect #6: append randomUUID-derived nonce to the
+    // fallback. In ECS Fargate / bare-metal Docker without explicit HOSTNAME,
+    // every container has process.pid === 1 (PID namespace) — pre-fix every
+    // pod collapsed to literal `pod-1` and raced on the same drain marker key.
+    // NIST SP 800-92 §5 — unique host identification.
+    const podId = process.env.HOSTNAME || `pod-${process.pid}-${randomUUID().slice(0, 8)}`;
     const drainStartMs = Date.now();
 
     // Phase A: write Redis drain-marker FIRST. `io.emit` is fire-and-forget on

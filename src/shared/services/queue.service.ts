@@ -1300,13 +1300,32 @@ export class QueueService {
       }
 
       // === PHASE 4: SEQUENCE NUMBERING (flag-gated) ===
+      // Phase 7 follow-up — Defect #1: stamp eventId on the envelope payload so
+      // Phase-4 replay at socket.service.ts:1335 returns the SAME eventId as the
+      // live wire emission. Without this, replay carries `eventId: undefined`
+      // and FE ring-buffer dedup collides on the literal `undefined`.
+      // Reuses the verbatim pattern from L1950-1952 (DLQ enqueue). Side-effect:
+      // _seq mutation lands on the clone (closes Defect #7 for this path).
+      // DDIA Ch.11 §"Idempotent Consumers".
       let seq: number | undefined;
+      let dataWithEventId: any = data;
       if (FF_SEQUENCE_DELIVERY_ENABLED) {
         try {
           // Step 1: increment seq counter (must be sequential — need value)
           seq = await redisService.incr(`socket:seq:${transporterId}`);
+
+          // Phase 7 follow-up — Defect #1: mint/preserve eventId on a CLONE
+          // (verbatim pattern from queue.service.ts:1950-1952).
+          dataWithEventId = data && typeof data === 'object' && !Array.isArray(data)
+            ? { ...(data as Record<string, unknown>), eventId: (data as any).eventId ?? crypto.randomUUID() }
+            : data;
+
           const envelope = JSON.stringify({
-            seq, event, payload: data, createdAt: job.createdAt
+            seq,
+            event,
+            eventId: (dataWithEventId as any)?.eventId,
+            payload: dataWithEventId,
+            createdAt: job.createdAt
           });
           // Step 2: store in unacked set + refresh TTL (parallel — independent ops)
           await Promise.all([
@@ -1320,9 +1339,12 @@ export class QueueService {
               UNACKED_QUEUE_TTL_SECONDS
             )
           ]);
-          // Attach seq to outgoing payload for client-side dedup
-          if (data && typeof data === 'object') {
-            data._seq = seq;
+          // Attach seq to outgoing payload for client-side dedup.
+          // Phase 7 follow-up — Defect #7: mutate the CLONE (not the original
+          // shared payload reference). Arrays still pass through to original
+          // (matches L1951 pattern; production payloads are typed objects).
+          if (dataWithEventId && typeof dataWithEventId === 'object') {
+            (dataWithEventId as Record<string, unknown>)._seq = seq;
           }
         } catch (seqError: any) {
           // Sequence numbering is best-effort — never block delivery
@@ -1340,8 +1362,10 @@ export class QueueService {
         // Fire both channels in parallel — neither blocks the other
         const results = await Promise.allSettled([
           // Channel A: Socket.IO (primary, foreground)
+          // Phase 7 follow-up — Defect #1: emit the stamped clone so the live
+          // wire eventId matches the ZSET envelope eventId (DDIA invariant).
           Promise.resolve().then(() => {
-            emitToUser(transporterId, event, data);
+            emitToUser(transporterId, event, dataWithEventId);
             metrics.incrementCounter('broadcast_delivery_delivered', { channel: 'socket' });
           }),
           // Channel B: FCM Push (fallback, background/offline)
@@ -1385,7 +1409,9 @@ export class QueueService {
         }
       } else {
         // Original path — Socket.IO only
-        emitToUser(transporterId, event, data);
+        // Phase 7 follow-up — Defect #1: same stamped-clone discipline as the
+        // dual-channel branch above.
+        emitToUser(transporterId, event, dataWithEventId);
         metrics.incrementCounter('broadcast_delivery_delivered', { channel: 'socket' });
       }
       // Phase 6: Delivery latency (enqueue → emit completion)
