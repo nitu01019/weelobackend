@@ -43,3 +43,26 @@ jobs:
 
       - name: Verify env.example parity
         run: npm run lint:env
+
+      - name: lint-env-example-no-prod-superuser
+        run: |
+          set -e
+          for f in .env.example .env.production.example; do
+            [ -f "$f" ] || continue
+            if grep -E '^DATABASE_URL=.*@.*production' "$f"; then
+              echo "FAIL: production DATABASE_URL in checked-in env example ($f)"
+              exit 1
+            fi
+          done
+
+      - name: lint-no-prod-db-npm-scripts
+        run: |
+          set -e
+          bad=$(jq -r '.scripts | to_entries[]
+            | select(.key | test("^db:push:prod($|:)|^db:migrate:prod($|:(?!ecs-task$))"))
+            | .key' package.json)
+          if [ -n "$bad" ]; then
+            echo "FAIL: production DB npm script with non-ECS-task name:"
+            echo "$bad"
+            exit 1
+          fi

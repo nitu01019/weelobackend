@@ -31,6 +31,13 @@ import express from 'express';
 
 type FlagCategory = 'ops' | 'release';
 
+interface FlagMetadata {
+  readonly createdAt: string;   // ISO date (YYYY-MM-DD)
+  readonly sunsetAt: string;    // ISO date — when audit starts warning
+  readonly owner: string;       // @user or @team in CODEOWNERS notation
+  readonly state: 'rollout' | 'stable' | 'pending-retirement';
+}
+
 interface FlagDefinition {
   readonly env: string;
   readonly category: FlagCategory;
@@ -43,6 +50,7 @@ interface FlagDefinition {
    * delivery paths" property is preserved if the env var is ever unset.
    */
   readonly defaultValue?: boolean;
+  readonly meta?: FlagMetadata;
 }
 
 interface NumericFlagDefinition {

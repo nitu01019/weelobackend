@@ -19,8 +19,7 @@
     "contracts:verify": "node packages/contracts/verify.mjs",
     "db:migrate:dev": "prisma migrate dev",
     "db:generate": "prisma generate",
-    "db:push:prod": "prisma migrate deploy",
-    "db:push:prod:deploy": "prisma migrate deploy",
+    "db:migrate:prod:ecs-task": "prisma migrate deploy",
     "docker:build": "docker build -t weelo-backend:latest .",
     "docker:dev": "docker-compose up -d",
     "docker:down": "docker-compose down",
@@ -76,5 +75,10 @@
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "overrides": {
+    "protobufjs": "^7.5.6",
+    "fast-xml-builder": "^1.1.7",
+    "fast-xml-parser": "^5.7.0"
   }
 }

@@ -30,5 +30,5 @@
     }
   },
   "include": ["src/**/*", "packages/contracts/*.ts"],
-  "exclude": ["node_modules", "dist", "src/instrumentation.ts", "src/instrument.ts", "packages/contracts/codegen.mjs", "packages/contracts/verify.mjs"]
+  "exclude": ["node_modules", "dist", "packages/contracts/codegen.mjs", "packages/contracts/verify.mjs"]
 }
