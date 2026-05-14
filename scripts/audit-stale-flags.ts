@@ -3,7 +3,6 @@
 // Slack-only notification per Indira R4-A SHIP-REDUCED — no auto-PR (92-flag-scale noise risk).
 import * as fs from 'fs';
 import * as path from 'path';
-import { execSync } from 'child_process';
 import { FLAGS } from '../src/shared/config/feature-flags';
 
 interface StaleEntry {
@@ -14,23 +13,46 @@ interface StaleEntry {
   owner: string;
 }
 
-// Pandora R6-C #28 (Set VALIDATED 2026-05-12): grep BOTH env string AND `FLAGS.${key}`.
-// Env-only grep undercounts because canonical caller pattern is `isEnabled(FLAGS.X)`,
-// e.g. DURABLE_EMIT_ENABLED env-grep=0 production hits vs combined=8 at
+// Pandora R6-C #28 (Set VALIDATED 2026-05-12): scan src/ for BOTH env string AND `FLAGS.${key}`.
+// Env-only scan undercounts because canonical caller pattern is `isEnabled(FLAGS.X)`,
+// e.g. DURABLE_EMIT_ENABLED env-only=0 production hits vs combined=8 at
 // socket.service.ts:2318/2368/2394/2470/2512/2541/2566/2594.
+// Implementation: pure-Node directory walk. Replaces a prior `grep | wc -l` shell-out
+// (Semgrep child_process taint via envName/flagKey args). Stack-based to avoid the
+// taint-via-recursive-arg pattern on path.join.
 function callsiteCount(envName: string, flagKey: string): number {
-  try {
-    const grep = execSync(
-      `grep -rln -e "${envName}" -e "FLAGS\\.${flagKey}" src/ 2>/dev/null | wc -l`,
-      { encoding: 'utf8' }
-    ).trim();
-    return parseInt(grep, 10) || 0;
-  } catch {
-    return 0;
+  const flagPattern = `FLAGS.${flagKey}`;
+  let count = 0;
+  const stack: string[] = ['src'];
+  while (stack.length > 0) {
+    const current = stack.pop() as string;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const fullPath = `${current}/${entry.name}`;
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+      } else if (entry.isFile()) {
+        let content: string;
+        try {
+          content = fs.readFileSync(fullPath, 'utf8');
+        } catch {
+          continue;
+        }
+        if (content.includes(envName) || content.includes(flagPattern)) {
+          count++;
+        }
+      }
+    }
   }
+  return count;
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const now = new Date();
   const stale: StaleEntry[] = [];
   const missing: string[] = [];
@@ -82,10 +104,18 @@ function main(): void {
         })),
       }],
     };
-    execSync(
-      `curl -fsS -X POST -H 'Content-Type: application/json' -d '${JSON.stringify(body).replace(/'/g, "'\\''")}' '${webhook}' || true`
-    );
+    // Native fetch (Node 18+). Webhook failure is non-fatal — preserves the prior `|| true` semantics.
+    await fetch(webhook, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).catch(() => {
+      // ignore — webhook delivery is best-effort; audit data is still written to the report file
+    });
   }
 }
 
-main();
+main().catch((err) => {
+  console.error('audit-stale-flags failed:', err);
+  process.exitCode = 1;
+});
