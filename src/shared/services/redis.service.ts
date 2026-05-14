@@ -1558,6 +1558,12 @@ class RealRedisClient implements IRedisClient {
    * If key2 is null/empty, only key1 is touched (single-key mode).
    *
    * Single Lua script = single Redis round-trip = atomic on the slot owner.
+   *
+   * Phase 7 follow-up — Defect #4: pass `[key1]` (length 1) when key2 is
+   * null/empty rather than `[key1, '']`. Redis Cluster CRC16-routes EVERY
+   * entry in KEYS — slot('') = 0 ≠ slot(real key) → CROSSSLOT error on
+   * every heartbeat under REDIS_CLUSTER=true. Idiomatic Lua `#KEYS == 2`
+   * replaces the previous empty-string guard.
    */
   async sAddPairWithExpire(
     key1: string,
@@ -1569,13 +1575,14 @@ class RealRedisClient implements IRedisClient {
     const luaScript = `
         redis.call('SADD', KEYS[1], ARGV[2])
         redis.call('EXPIRE', KEYS[1], ARGV[1])
-        if KEYS[2] and KEYS[2] ~= '' then
+        if #KEYS == 2 then
             redis.call('SADD', KEYS[2], ARGV[2])
             redis.call('EXPIRE', KEYS[2], ARGV[1])
         end
         return 1
     `;
-    await this.eval(luaScript, [key1, key2 || ''], [String(ttlSeconds), member]);
+    const keys: string[] = key2 ? [key1, key2] : [key1];
+    await this.eval(luaScript, keys, [String(ttlSeconds), member]);
   }
 
   /** Eris #3 — bounded metric write; never throws. */
