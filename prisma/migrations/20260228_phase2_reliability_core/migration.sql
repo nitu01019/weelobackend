@@ -1,3 +1,6 @@
+SET LOCAL lock_timeout = '3s';
+SET LOCAL statement_timeout = '60s';
+
 -- Phase 2 reliability core: dispatch visibility + DB idempotency + strict quantity checks
 
 ALTER TABLE "Order"

@@ -91,4 +91,32 @@ aws cloudwatch put-dashboard \
   --dashboard-name "${DASHBOARD_NAME}" \
   --dashboard-body file:///tmp/weelo-phase8-dashboard.json
 
+# Fix #30 (index-30-validated.md L8086-L8109): migration observability alarms.
+# Paired with #25 migrate_with_retry emit path in scripts/docker-entrypoint.sh.
+# Uses repo-canonical ${ALARM_SNS_TOPIC_ARN} (required-asserted at L7 above).
+aws cloudwatch put-metric-alarm \
+  --alarm-name weelo-migration-lock-not-available \
+  --alarm-description "Migration retried due to 55P03 lock_not_available >= 3 times in 15min" \
+  --metric-name migration_lock_not_available_total \
+  --namespace Weelo/Backend \
+  --statistic Sum --period 900 \
+  --evaluation-periods 1 --threshold 3 \
+  --comparison-operator GreaterThanOrEqualToThreshold \
+  --treat-missing-data notBreaching \
+  --alarm-actions "${ALARM_SNS_TOPIC_ARN}" \
+  --region ap-south-1
+
+aws cloudwatch put-metric-alarm \
+  --alarm-name weelo-migration-failed \
+  --alarm-description "Migration completed with result=failed at least once in last 15min" \
+  --metric-name migration_status \
+  --namespace Weelo/Backend \
+  --dimensions Name=result,Value=failed \
+  --statistic Sum --period 900 \
+  --evaluation-periods 1 --threshold 1 \
+  --comparison-operator GreaterThanOrEqualToThreshold \
+  --treat-missing-data notBreaching \
+  --alarm-actions "${ALARM_SNS_TOPIC_ARN}" \
+  --region ap-south-1
+
 echo "CloudWatch alarms and dashboard configured"

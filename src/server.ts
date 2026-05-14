@@ -63,7 +63,8 @@ import {
   sanitizeInput,
   preventParamPollution,
   blockSuspiciousRequests,
-  securityResponseHeaders
+  securityResponseHeaders,
+  noStoreOnMutations
 } from './shared/middleware/security.middleware';
 import { backwardCompatMiddleware } from './shared/middleware/backward-compat.middleware';
 import { correlationMiddleware } from './shared/context/correlation';
@@ -339,6 +340,14 @@ app.use(preventParamPollution);
 // Backward compatibility: rewrite legacy Captain app paths to canonical routes
 // Fixes BRK-4 (/trips/*), BRK-2 (plural /tracking/trips/), and general path normalization
 app.use(backwardCompatMiddleware);
+
+// Estela #24b (Zoe Z6): set Cache-Control: no-store on POST/PUT/PATCH/DELETE
+// so intermediaries (mobile HTTP cache, ELB, ISP 4G proxies) cannot replay a
+// cached 201/200 mutation response. Mounted AFTER backwardCompat so the final
+// method is known, BEFORE routes so all handlers see the header set. GET
+// routes' existing Cache-Control (private, max-age=300) at profile.routes.ts:76
+// + customer.routes.ts:47/77/107 is unaffected.
+app.use(noStoreOnMutations);
 
 // Request logging
 app.use(requestLogger);

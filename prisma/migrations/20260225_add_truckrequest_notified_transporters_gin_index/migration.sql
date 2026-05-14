@@ -1,3 +1,12 @@
+-- Phase 2 Fix #25 NOTE: the `SET LOCAL lock_timeout / statement_timeout` headers
+-- prepended to the other 6 migration.sql files are OMITTED here because this file
+-- is `-- prisma:no-transaction` (L24, required for CREATE INDEX CONCURRENTLY).
+-- `SET LOCAL` is transaction-scoped and would be a silent no-op outside a transaction.
+-- Operator runbook PATH A at L13 below already uses session-level `SET lock_timeout`
+-- (not SET LOCAL) for the manual psql application path. CREATE INDEX CONCURRENTLY
+-- uses SHARE UPDATE EXCLUSIVE lock (non-blocking) so the ACCESS EXCLUSIVE timeout
+-- protection from the headers isn't required for this migration.
+
 -- HEAD a43aebea: this file currently contains a NON-CONCURRENT CREATE INDEX. At 400-500 RPS
 -- with TruckRequest as a hot dispatch-path table, building a non-concurrent GIN index acquires
 -- SHARE lock and blocks all writes until the build finishes — multi-second stall = deploy outage.
