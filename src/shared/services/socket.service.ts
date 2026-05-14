@@ -39,6 +39,7 @@ import { logger } from './logger.service';
 import { redisService } from './redis.service';
 import { socketCircuit } from './circuit-breaker.service';
 import { isEnabled, FLAGS } from '../config/feature-flags';
+import { hashUserId } from '../utils/error-log.utils';
 import {
   TRANSPORTER_PRESENCE_KEY,
   PRESENCE_TTL_SECONDS as TRANSPORTER_PRESENCE_TTL,
@@ -344,7 +345,7 @@ export function initializeSocket(server: HttpServer): Server {
       if (claimedLastSeq > 0) {
         logger.warn('[CSR] Recovery FAILED for known-session client', {
           socketId: socket.id,
-          userId: socket.data.userId,
+          userId: hashUserId(socket.data.userId),
           role: socket.data.role,
           lastSeq: claimedLastSeq,
         });

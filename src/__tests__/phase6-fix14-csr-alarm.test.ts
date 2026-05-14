@@ -23,6 +23,7 @@ import { readFileSync } from 'fs';
 import * as path from 'path';
 import { metrics } from '../shared/monitoring/metrics.service';
 import { logger } from '../shared/services/logger.service';
+import { hashUserId } from '../shared/utils/error-log.utils';
 
 // ============================================================================
 // METRIC REGISTRATION
@@ -123,6 +124,9 @@ describe('Phase 6 — Fix #14: counter increments by branch', () => {
 describe('Phase 6 — Fix #14: structured warn log gate', () => {
     // Mirrors the logic block from socket.service.ts inside io.on('connection').
     // Kept in sync by the static-grep test below.
+    // FU-3 (2026-05-14): userId is passed through hashUserId() before logging
+    // so DPDP §3 PII never lands in /weelo/application — see hashUserId at
+    // src/shared/utils/error-log.utils.ts.
     function csrObservation(
         recovered: boolean,
         handshakeAuth: { lastSeq?: number },
@@ -134,7 +138,7 @@ describe('Phase 6 — Fix #14: structured warn log gate', () => {
             if (claimedLastSeq > 0) {
                 logger.warn('[CSR] Recovery FAILED for known-session client', {
                     socketId: socketData.id,
-                    userId: socketData.userId,
+                    userId: hashUserId(socketData.userId),
                     role: socketData.role,
                     lastSeq: claimedLastSeq,
                 });
@@ -144,7 +148,7 @@ describe('Phase 6 — Fix #14: structured warn log gate', () => {
         return { warnEmitted };
     }
 
-    it('recovered=false AND lastSeq=5 → warn emitted with structured fields', () => {
+    it('recovered=false AND lastSeq=5 → warn emitted with hashed userId (DPDP §3)', () => {
         const warnSpy = jest.spyOn(logger, 'warn').mockImplementation();
         const { warnEmitted } = csrObservation(
             false,
@@ -156,11 +160,18 @@ describe('Phase 6 — Fix #14: structured warn log gate', () => {
             '[CSR] Recovery FAILED for known-session client',
             expect.objectContaining({
                 socketId: 'sock-abc',
-                userId: 'user-123',
+                userId: expect.stringMatching(/^user_[a-f0-9]{12}$/),
                 role: 'driver',
                 lastSeq: 5,
             }),
         );
+        // Raw userId must NEVER appear in the logged payload.
+        // `logger.warn` has a 1-arg overload in its public type, but the
+        // runtime call here is 2-arg; cast through unknown to access the
+        // structured-meta argument.
+        const loggedMeta = (warnSpy.mock.calls[0] as unknown as [string, { userId: string }])[1];
+        expect(loggedMeta.userId).not.toBe('user-123');
+        expect(loggedMeta.userId).not.toContain('user-123');
         warnSpy.mockRestore();
     });
 
@@ -199,6 +210,67 @@ describe('Phase 6 — Fix #14: structured warn log gate', () => {
         );
         expect(warnEmitted).toBe(false);
         warnSpy.mockRestore();
+    });
+
+    // FU-3 — Stability invariant: the same raw userId must produce the same
+    // hashed prefix across calls (and ideally across processes) so ops can
+    // pivot from one CSR-fail log line to every other failure for that user
+    // by grepping the hash. If the hash drifted per-call, the field would be
+    // useless for correlation.
+    it('FU-3: hashed userId is stable across repeated warn calls for the same user', () => {
+        const warnSpy = jest.spyOn(logger, 'warn').mockImplementation();
+        csrObservation(
+            false,
+            { lastSeq: 5 },
+            { id: 'sock-1', userId: 'user-XYZ', role: 'driver' },
+        );
+        csrObservation(
+            false,
+            { lastSeq: 7 },
+            { id: 'sock-2', userId: 'user-XYZ', role: 'driver' },
+        );
+        expect(warnSpy).toHaveBeenCalledTimes(2);
+        // See cast-through-unknown note above — same reason here.
+        type WarnCall = [string, { userId: string }];
+        const first = (warnSpy.mock.calls[0] as unknown as WarnCall)[1];
+        const second = (warnSpy.mock.calls[1] as unknown as WarnCall)[1];
+        expect(first.userId).toMatch(/^user_[a-f0-9]{12}$/);
+        expect(first.userId).toBe(second.userId);
+        // And a different raw userId must produce a different hash.
+        csrObservation(
+            false,
+            { lastSeq: 9 },
+            { id: 'sock-3', userId: 'user-OTHER', role: 'driver' },
+        );
+        const third = (warnSpy.mock.calls[2] as unknown as WarnCall)[1];
+        expect(third.userId).not.toBe(first.userId);
+        warnSpy.mockRestore();
+    });
+});
+
+// ============================================================================
+// FU-3 — hashUserId helper contract
+// ============================================================================
+
+describe('Phase 6 — FU-3: hashUserId() PII contract', () => {
+    it('returns user_<12-hex> shape for a normal userId', () => {
+        expect(hashUserId('user-abc')).toMatch(/^user_[a-f0-9]{12}$/);
+    });
+
+    it('is deterministic — same input → same output', () => {
+        expect(hashUserId('user-abc')).toBe(hashUserId('user-abc'));
+    });
+
+    it('collapses null / undefined / empty to user_anonymous (no PII leak on absent value)', () => {
+        expect(hashUserId(null)).toBe('user_anonymous');
+        expect(hashUserId(undefined)).toBe('user_anonymous');
+        expect(hashUserId('')).toBe('user_anonymous');
+    });
+
+    it('never returns the raw input (irreversibility smoke)', () => {
+        const raw = 'user-7889559631';
+        expect(hashUserId(raw)).not.toContain(raw);
+        expect(hashUserId(raw)).not.toContain('7889559631');
     });
 });
 

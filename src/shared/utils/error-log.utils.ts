@@ -31,6 +31,7 @@
 
 import { AppError } from '../types/error.types';
 import { getErrorCategory, ErrorCode } from '../../core/constants';
+import { sha256Hash } from './crypto.utils';
 
 export interface ErrorLogMeta {
   errorCode: string;
@@ -127,6 +128,27 @@ export function toLogMeta(error: unknown): ErrorLogMeta {
     errorMessage: redactErrorMessage(stringified),
     errorCategory: deriveCategory('INTERNAL_ERROR'),
   };
+}
+
+/**
+ * Stable opaque prefix for a userId (DPDP §3 PII minimisation, FU-3).
+ * SHA-256 → first 12 hex chars, prefixed `user_` so logs are grep-able
+ * yet not reversible without a rainbow table.
+ *
+ * Operational note: ops can correlate failures by searching the hash
+ * across CloudWatch; pre-image lookup requires a server-side mapping
+ * that stays in the secure tier (not in /weelo/application, 30d).
+ *
+ * `null` / `undefined` / empty input collapses to `user_anonymous` so
+ * callers never need a defensive truthy-check at the log site.
+ *
+ * Delegates the digest to `sha256Hash` from crypto.utils.ts (the single
+ * SHA-256 sink in the codebase) — this function owns ONLY the PII
+ * contract (prefix + truncation + empty-collapse).
+ */
+export function hashUserId(userId: string | undefined | null): string {
+  if (!userId) return 'user_anonymous';
+  return `user_${sha256Hash(String(userId)).slice(0, 12)}`;
 }
 
 /**
