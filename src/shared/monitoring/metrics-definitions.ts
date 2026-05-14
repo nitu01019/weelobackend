@@ -184,6 +184,19 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
       'Socket.IO CSR (Connection State Recovery) outcomes — labels: recovered (true|false), role — Finding #14',
     ),
 
+    // Fix #12 — Pod-restart graceful drain: reconnects that detected a Redis
+    // drain-marker for their previous pod and applied 2-10s enhanced jitter
+    // (instead of the default 0-2s FIX-46 jitter) to avoid thundering-herd
+    // hammering the remaining pods during ECS rolling deploy. Pre-registered
+    // here (NOT auto-created) because metrics.service.ts:incrementCounter emits
+    // `logger.warn('Counter X not found')` on unregistered names — that warn is
+    // itself unthrottled and would defeat the very telemetry the counter was
+    // added to capture. Per CLAUDE.md 2026-05-14 correction.
+    counter(
+      'socket_reconnect_post_drain_total',
+      'Reconnects that detected a Redis drain-marker for their previous pod and applied 2-10s enhanced jitter — labels: role — Finding #12',
+    ),
+
     // Fix #18 — Log-throttle internal counters. MUST be registered here (NOT
     // auto-created) because metrics.service.ts:incrementCounter emits
     // `logger.warn('Counter X not found')` on unregistered names — that warn
@@ -204,6 +217,17 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
     // gate watches `version=v1` falling below 1% of total over the 90-day
     // sunset window before lighting up the v2 payload shape.
     counter('api_version_request_total', 'Total API requests by negotiated version (Fix #29)'),
+
+    // Fix #16 — H3 parent→child fallback engagement counter. Pre-registered
+    // (NOT auto-created) per the same rule that protects Fix #12 and Fix #18
+    // counters above: metrics.service.ts:incrementCounter emits an unthrottled
+    // `logger.warn('Counter X not found')` on unregistered names — which on a
+    // hot dispatch path (every res-7 cold-keyspace read during FF warm-up)
+    // would defeat the very telemetry the counter was added to capture.
+    counter(
+      'h3_index_parent_fallback_total',
+      'Read-path engagements of the res-7 parent → res-8 child fallback in getCandidatesNewRing (Fix #16). Bumps when the res-7 parent SUNION returns empty and the pinned res-8 fallback ringK is consulted — health signal for dual-index warm-up coverage. No labels.',
+    ),
   ];
 
   for (const def of defs) {

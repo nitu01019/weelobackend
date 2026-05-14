@@ -1013,24 +1013,21 @@ const gracefulShutdown = async (signal: string) => {
     logger.error('Error stopping Google Maps metrics', err);
   }
 
-  // Phase 10 Issue 2: Graceful Socket.IO disconnect
-  // Tell all connected clients "reconnect NOW" instead of silently dropping.
-  // Clients already have reconnect logic — this triggers it immediately.
+  // Phase 10 Issue 2 + Fix #12: Graceful Socket.IO drain (staggered).
+  // Replaces the single-tick `io.sockets.sockets.forEach(s => s.disconnect(true))`
+  // blast with an ELB Connection Draining / Linkerd shutdown pattern:
+  //   Phase A: emit `server_drain_pending` + write Redis drain-marker
+  //   Phase B: disconnect in batches of 100 with 250ms inter-batch sleeps
+  //   Phase C: 1s final flush window
+  // Hard-capped at DRAIN_HARD_CAP_MS (18s default / 30s when ECS taskdef
+  // stopTimeout is bumped to ≥45s) so the AbortController fires before the
+  // Node force-shutdown timer below.
   try {
-    const { getIO }: typeof import('./shared/services/socket.service') = require('./shared/services/socket.service');
-    const io = getIO();
-    if (io) {
-      const socketCount = io.sockets.sockets.size;
-      logger.info(`[Shutdown] Disconnecting ${socketCount} WebSocket client(s) with reason 'server_shutting_down'`);
-      io.sockets.sockets.forEach((socket: any) => {
-        socket.disconnect(true); // true = force close (sends 'disconnect' event with reason)
-      });
-      // Brief pause to let disconnect frames flush to clients
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      logger.info('[Shutdown] All WebSocket clients disconnected');
-    }
+    const { drainSocketsStaggered }: typeof import('./shared/services/socket.service') = require('./shared/services/socket.service');
+    await drainSocketsStaggered();
+    logger.info('[Shutdown] WebSocket staggered drain complete');
   } catch (err) {
-    logger.error('Error disconnecting WebSocket clients', err);
+    logger.error('Error draining WebSocket clients', err);
   }
 
   server.close(async () => {
@@ -1060,13 +1057,23 @@ const gracefulShutdown = async (signal: string) => {
     process.exit(0);
   });
 
-  // Force shutdown after 25 seconds (H-10 FIX: 25s < ECS default 30s SIGKILL,
-  // giving 5s buffer for clean exit before ECS force-kills the container)
+  // Fix #12 — Force-shutdown timer with ECS-coordinated bump.
+  // Default path (env unset): 25s force-shutdown < 30s ECS SIGKILL — 5s buffer
+  // preserved (the load-bearing H-10 invariant). Drain hard-cap inside
+  // socket.service.ts is 18s on this path so AbortController fires before
+  // force-shutdown which fires before SIGKILL.
+  // Bumped path (ECS_STOPTIMEOUT_CONFIRMED_GTE_45S=true): 35s force-shutdown
+  // < ≥45s SIGKILL — drain hard-cap inside socket.service.ts bumps to 30s.
+  // BOTH timers are driven from the same env var so they CANNOT desynchronise.
+  // Rollout: backend code first, ECS taskdef stopTimeout bump second (AWS ELB
+  // Connection Draining best practice).
   // L1 FIX: unref() so this doesn't prevent Node.js from exiting if everything else is done
+  const ECS_STOPTIMEOUT_BUMPED = process.env.ECS_STOPTIMEOUT_CONFIRMED_GTE_45S === 'true';
+  const FORCE_SHUTDOWN_MS = ECS_STOPTIMEOUT_BUMPED ? 35_000 : 25_000;
   setTimeout(() => {
-    logger.error('Forced shutdown after timeout');
+    logger.error(`Forced shutdown after ${FORCE_SHUTDOWN_MS}ms timeout`);
     process.exit(1);
-  }, 25000).unref();
+  }, FORCE_SHUTDOWN_MS).unref();
 };
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));

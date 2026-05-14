@@ -26,18 +26,36 @@
 
 import { availabilityService } from '../../shared/services/availability.service';
 import { generateVehicleKey, generateVehicleKeyCandidates } from '../../shared/services/vehicle-key.service';
-import { h3GeoIndexService, FF_H3_INDEX_ENABLED } from '../../shared/services/h3-geo-index.service';
+import {
+  h3GeoIndexService,
+  FF_H3_INDEX_ENABLED,
+  FF_H3_DUAL_INDEX_READ,
+  FF_H3_DUAL_INDEX_WRITE
+} from '../../shared/services/h3-geo-index.service';
 import { distanceMatrixService } from '../../shared/services/distance-matrix.service';
 import { redisService } from '../../shared/services/redis.service';
 import { logger } from '../../shared/services/logger.service';
 // Fix F2: Import shared haversine instead of local duplicate
 import { haversineDistanceKm } from '../../shared/utils/geospatial.utils';
 
+/**
+ * Fix #15/#16 — RadiusStep carries the per-step query resolution and a
+ * PINNED `h3FallbackRingK` (no runtime arithmetic; closes Attack #3).
+ *
+ * - `h3QueryResolution` selects child (8) vs parent (7) index. Parent reads
+ *   require both FF_H3_DUAL_INDEX_WRITE and FF_H3_DUAL_INDEX_READ to be true.
+ * - `h3FallbackRingK` is the equivalent res-8 ringK used when the res-7
+ *   parent index is empty (warm-up / partial-write / FF mid-flip).
+ */
 export interface RadiusStep {
   radiusKm: number;
   windowMs: number;
-  /** H3 ring count for this step (used when FF_H3_INDEX_ENABLED=true) */
-  h3RingK?: number;
+  /** Ring K at h3QueryResolution */
+  h3RingK: number;
+  /** 7 = parent index; 8 = child index */
+  h3QueryResolution: number;
+  /** res-8 equivalent ringK for fallback (PINNED, no × 2.65 arithmetic) */
+  h3FallbackRingK: number;
 }
 
 export interface ProgressiveMatchState {
@@ -63,17 +81,22 @@ export interface CandidateTransporter {
 // ============================================================================
 
 /**
- * Fix H-X2: Unified 6-step progressive radius expansion with H3 ring mappings.
- * Ring K -> approximate radius: ringK x 0.461km (H3 res 8 edge length)
- * Total: 10+10+15+15+15+15 = 80s < 108s (passes booking.service startup validation)
+ * Fix H-X2 + Fix #15/#16: Unified 6-step progressive radius expansion.
+ *
+ * - Steps 0-2 (radiusKm ≤ 15km) query at res-8 (child index, h3RingK = h3FallbackRingK).
+ * - Steps 3-5 (radiusKm ≥ 30km) query at res-7 parent index when FF_H3_DUAL_INDEX
+ *   is on; fallback to res-8 using the PINNED `h3FallbackRingK` (NO runtime × 2.65).
+ *
+ * Total window: 10+10+15+15+15+15 = 80s < 108s (passes booking.service startup validation).
  */
 export const PROGRESSIVE_RADIUS_STEPS: RadiusStep[] = [
-  { radiusKm: 5,   windowMs: 10_000, h3RingK: 8 },
-  { radiusKm: 10,  windowMs: 10_000, h3RingK: 15 },
-  { radiusKm: 15,  windowMs: 15_000, h3RingK: 22 },
-  { radiusKm: 30,  windowMs: 15_000, h3RingK: 44 },
-  { radiusKm: 60,  windowMs: 15_000, h3RingK: 88 },
-  { radiusKm: 100, windowMs: 15_000, h3RingK: 150 }
+  { radiusKm: 5,   windowMs: 10_000, h3RingK: 8,   h3QueryResolution: 8, h3FallbackRingK: 8 },
+  { radiusKm: 10,  windowMs: 10_000, h3RingK: 15,  h3QueryResolution: 8, h3FallbackRingK: 15 },
+  { radiusKm: 15,  windowMs: 15_000, h3RingK: 22,  h3QueryResolution: 8, h3FallbackRingK: 22 },
+  // Steps 3-5: query at the res-7 parent index when FF on; fallback ringK is pinned.
+  { radiusKm: 30,  windowMs: 15_000, h3RingK: 17,  h3QueryResolution: 7, h3FallbackRingK: 44 },
+  { radiusKm: 60,  windowMs: 15_000, h3RingK: 33,  h3QueryResolution: 7, h3FallbackRingK: 88 },
+  { radiusKm: 100, windowMs: 15_000, h3RingK: 57,  h3QueryResolution: 7, h3FallbackRingK: 150 }
 ];
 
 function getActiveSteps(): RadiusStep[] {
@@ -134,15 +157,14 @@ class ProgressiveRadiusMatcher {
     // ========================================================================
     let candidates: CandidateTransporter[] | undefined;
 
-    if (FF_H3_INDEX_ENABLED && step.h3RingK !== undefined) {
+    if (FF_H3_INDEX_ENABLED) {
       const { h3Circuit } = require('../../shared/services/circuit-breaker.service');
       candidates = await h3Circuit.tryWithFallback(
         () => this.findCandidatesH3({
           pickupLat,
           pickupLng,
           vehicleKeys: vehicleKeyCandidates,
-          ringK: step.h3RingK!,
-          radiusKm: step.radiusKm,
+          step,
           alreadyNotified,
           limit
         }),
@@ -225,18 +247,30 @@ class ProgressiveRadiusMatcher {
     pickupLat: number;
     pickupLng: number;
     vehicleKeys: string[];
-    ringK: number;
-    radiusKm: number;
+    step: RadiusStep;
     alreadyNotified: Set<string>;
     limit: number;
   }): Promise<CandidateTransporter[] | undefined> {
-    const { pickupLat, pickupLng, vehicleKeys, ringK, radiusKm, alreadyNotified, limit } = params;
+    const { pickupLat, pickupLng, vehicleKeys, step, alreadyNotified, limit } = params;
+    const radiusKm = step.radiusKm;
 
     try {
+      // Fix #16 (Attack #4): Snapshot FF + step config ONCE per dispatch.
+      // All parallel vehicleKey lookups within this Promise.all observe the SAME
+      // dualReadOn / useParent / ringK / queryRes / fallbackRingK values, even if
+      // env vars or step mutations happen mid-flight. Closes mid-flight race.
+      const dualReadOn = FF_H3_DUAL_INDEX_READ && FF_H3_DUAL_INDEX_WRITE;
+      const useParent = dualReadOn && step.h3QueryResolution === 7;
+      const ringK = useParent ? step.h3RingK : step.h3FallbackRingK;
+      const queryRes = useParent ? 7 : 8;
+      const fallbackRingK = step.h3FallbackRingK;
+
       // FIX #2: H3 lookup across ALL vehicleKey variants (parallel)
       const candidateArrays = await Promise.all(
         vehicleKeys.map(key =>
-          h3GeoIndexService.getCandidatesNewRing(pickupLat, pickupLng, key, ringK, alreadyNotified)
+          h3GeoIndexService.getCandidatesNewRing(
+            pickupLat, pickupLng, key, ringK, alreadyNotified, queryRes, fallbackRingK
+          )
         )
       );
       const rawCandidateIds = [...new Set(candidateArrays.flat())];
@@ -328,6 +362,9 @@ class ProgressiveRadiusMatcher {
         matchingSource: 'h3_index',
         vehicleKeys,
         ringK,
+        queryRes,
+        fallbackRingK,
+        dualReadOn,
         radiusKm,
         h3RawCandidates: rawCandidateIds.length,
         h3LiveCandidates: candidateIds.length,

@@ -30,6 +30,7 @@
  */
 
 import { Server as HttpServer } from 'http';
+import { randomUUID } from 'crypto';
 import { Server, Socket } from 'socket.io';
 import { createAdapter } from '@socket.io/redis-streams-adapter';
 import jwt from 'jsonwebtoken';
@@ -352,9 +353,37 @@ export function initializeSocket(server: HttpServer): Server {
       }
     }
 
+    // Fix #12 — Pod-restart graceful drain: enhanced 2-10s jitter for reconnects
+    // landing here whose previous pod is currently in a drain window. Captain/
+    // Customer clients persist `podId` from the `server_drain_pending` event and
+    // pass it back as `auth.lastPodId` on the next reconnect handshake. If the
+    // Redis drain-marker for that pod is still live, we know this reconnect is
+    // part of a thundering herd and spread it 2-10s instead of the default 0-2s.
+    const previousPod = (socket.handshake.auth as { lastPodId?: unknown })?.lastPodId;
+    let didEnhancedJitter = false;
+    if (typeof previousPod === 'string' && previousPod.length > 0 && previousPod.length < 256) {
+      try {
+        const drainMarker = await redisService.get(`pod:drained:${previousPod}`);
+        if (drainMarker) {
+          const enhancedJitterMs = 2_000 + Math.random() * 8_000;
+          await new Promise<void>(resolve => setTimeout(resolve, enhancedJitterMs));
+          try {
+            const { metrics } = require('../monitoring/metrics.service');
+            metrics.incrementCounter('socket_reconnect_post_drain_total', {
+              role: socket.data.role || 'unknown',
+            });
+          } catch { /* metrics optional */ }
+          didEnhancedJitter = true;
+        }
+      } catch { /* Redis unavailable — fall through to existing 2s jitter */ }
+    }
+
     // FIX-46 (#110): Jitter to prevent thundering herd on mass reconnect
     // C-6 FIX: Increased from 500ms to 2000ms — spreads DB load over 4x wider window during ECS deploys
-    await new Promise(resolve => setTimeout(resolve, Math.random() * 2000));
+    // Fix #12: SKIP if we already spread by 2-10s above (drain-aware path).
+    if (!didEnhancedJitter) {
+      await new Promise(resolve => setTimeout(resolve, Math.random() * 2000));
+    }
 
     const userId = socket.data.userId;
     const role = socket.data.role;
@@ -1303,6 +1332,7 @@ export function initializeSocket(server: HttpServer): Server {
                   const envelope = JSON.parse(msgStr);
                   socket.emit(envelope.event || 'replay', {
                     ...envelope.payload,
+                    eventId: envelope.payload?.eventId ?? envelope.eventId,
                     _seq: envelope.seq,
                     _replayed: true
                   });
@@ -1566,10 +1596,42 @@ function withSocketMeta(data: any, seqOverride?: number): any {
   }
   return {
     ...data,
+    eventId: typeof data.eventId === 'string' && data.eventId.length > 0
+      ? data.eventId
+      : randomUUID(),
     eventVersion: SOCKET_EVENT_VERSION,
     serverTimeMs: Date.now(),
     _seq: typeof seqOverride === 'number' ? seqOverride : getNextSequenceSync()
   };
+}
+
+/**
+ * Fix #13 follow-up (Codex Gate 3 — Phase 7) — eventId stamping helper for the
+ * room-emit family (emitToBooking / emitToTrip / emitToOrder / emitToRoom /
+ * emitToAllTransporters / emitToTransporterDrivers / emitToUsers).
+ *
+ * MIRRORS Section 1.5 of the durableEmit pattern at this file's :1685-1696.
+ * Without this, persistRoomEnvelopes wrote RAW `data` to the ZSET (no eventId)
+ * while the live room emit separately minted via withSocketMeta — replay then
+ * carried a DIFFERENT (or missing) eventId than the live wire, breaking the
+ * DDIA Ch.11 §"Idempotent Consumers" invariant the Fix #13 Solution promised
+ * for the user-room path. Codex Gate 3 caught the asymmetric coverage; lead
+ * extended Section 1.5 to the 7 room helpers here.
+ *
+ * Caller MUST pass `stampedPayload` to BOTH persistRoomEnvelopes AND the live
+ * io.to(...).emit(event, withSocketMeta(stampedPayload)) call so live wire and
+ * ZSET wire converge on the SAME eventId for the same business event.
+ */
+function stampForRoomEmit(data: unknown): { eventId: string; stampedPayload: unknown } {
+  const isObjectPayload = !!data && typeof data === 'object' && !Array.isArray(data);
+  const existing = isObjectPayload ? (data as { eventId?: unknown }).eventId : undefined;
+  const eventId = (typeof existing === 'string' && existing.length > 0)
+    ? existing
+    : randomUUID();
+  const stampedPayload = isObjectPayload
+    ? { ...(data as Record<string, unknown>), eventId }
+    : data;
+  return { eventId, stampedPayload };
 }
 
 // =============================================================================
@@ -1650,12 +1712,25 @@ const DURABLE_EMIT_TTL_SECONDS = 600;
 async function durableEmit(userId: string, event: string, data: any): Promise<boolean> {
   if (!io) return false;
   let seq: number | undefined;
+  // Fix #13 Section 1.5: stamp eventId BEFORE ZADD so envelope.payload carries
+  // a stable business-event id that survives Phase-4 ZSET replay. Reuse the
+  // same value for the live emit (Section 1.6) so live + replay paths carry
+  // IDENTICAL eventIds per DDIA Ch.11 §"Idempotent Consumers".
+  const eventId = (data && typeof data === 'object' && !Array.isArray(data) &&
+                   typeof (data as { eventId?: unknown }).eventId === 'string' &&
+                   ((data as { eventId: string }).eventId).length > 0)
+    ? (data as { eventId: string }).eventId
+    : randomUUID();
+  const stampedPayload = (data && typeof data === 'object' && !Array.isArray(data))
+    ? { ...(data as Record<string, unknown>), eventId }
+    : data;
   try {
     seq = await redisService.incr(`socket:seq:${userId}`);
     const envelope = JSON.stringify({
       seq,
       event,
-      payload: data,
+      payload: stampedPayload,
+      eventId,
       createdAt: Date.now()
     });
     // ZADD + TTL refresh in parallel (independent ops)
@@ -1673,7 +1748,7 @@ async function durableEmit(userId: string, event: string, data: any): Promise<bo
     seq = undefined;
   }
   try {
-    io.to(`user:${userId}`).emit(event, withSocketMeta(data, seq));
+    io.to(`user:${userId}`).emit(event, withSocketMeta(stampedPayload, seq));
   } catch (emitErr: unknown) {
     socketCircuit.reportFailure();
     const msg = emitErr instanceof Error ? emitErr.message : String(emitErr);
@@ -1714,7 +1789,7 @@ function enumerateRoomUserIds(room: string): string[] {
  * any Redis error — best-effort. This is the room-emit companion to the
  * full `durableEmit(userId, event, data)` which does both ZADD and emit.
  */
-async function persistRoomEnvelopes(userIds: string[], event: string, data: any): Promise<void> {
+async function persistRoomEnvelopes(userIds: string[], event: string, data: any, eventId: string): Promise<void> {
   if (userIds.length === 0) return;
   await Promise.all(userIds.map(async (uid) => {
     try {
@@ -1722,7 +1797,10 @@ async function persistRoomEnvelopes(userIds: string[], event: string, data: any)
       const envelope = JSON.stringify({
         seq,
         event,
+        // Caller stamps eventId via stampForRoomEmit; envelope.payload.eventId
+        // and envelope.eventId top-level both resolve to the same value.
         payload: data,
+        eventId,
         createdAt: Date.now()
       });
       await Promise.all([
@@ -1909,11 +1987,14 @@ export function emitToBooking(bookingId: string, event: string, data: any): void
   // the unacked store is populated for reconnect replay. The io.to(room).emit
   // still fires once (cross-instance via Redis adapter) so connected users
   // receive exactly one payload. Telemetry and flag-off paths are unchanged.
+  // Fix #13 follow-up (Codex Gate 3): stamp eventId ONCE so persisted envelope
+  // and live wire converge on identical eventId (mirrors Section 1.5).
+  const { eventId, stampedPayload } = stampForRoomEmit(data);
   if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
     const userIds = enumerateRoomUserIds(`booking:${bookingId}`);
-    persistRoomEnvelopes(userIds, event, data).catch(() => { /* already logged per-user */ });
+    persistRoomEnvelopes(userIds, event, stampedPayload, eventId).catch(() => { /* already logged per-user */ });
   }
-  io.to(`booking:${bookingId}`).emit(event, withSocketMeta(data));
+  io.to(`booking:${bookingId}`).emit(event, withSocketMeta(stampedPayload));
   logger.debug(`Emitted ${event} to booking ${bookingId}`);
 }
 
@@ -1935,12 +2016,15 @@ export function emitToTrip(tripId: string, event: string, data: any): void {
   // F-B-26: Durable persistence for lifecycle trip events (trip_assigned,
   // order_completed, cascade_reassigned, etc.). LOCATION_UPDATED is
   // telemetry — never ZADDed regardless of flag state.
+  // Fix #13 follow-up (Codex Gate 3): stamp eventId ONCE so persisted envelope
+  // and live wire converge on identical eventId (mirrors Section 1.5).
+  const { eventId, stampedPayload } = stampForRoomEmit(data);
   if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
     const userIds = enumerateRoomUserIds(roomName);
-    persistRoomEnvelopes(userIds, event, data).catch(() => { /* already logged per-user */ });
+    persistRoomEnvelopes(userIds, event, stampedPayload, eventId).catch(() => { /* already logged per-user */ });
   }
 
-  io.to(roomName).emit(event, withSocketMeta(data));
+  io.to(roomName).emit(event, withSocketMeta(stampedPayload));
 }
 
 /**
@@ -2011,11 +2095,14 @@ export function emitToOrder(orderId: string, event: string, data: any): void {
   // room before the room broadcast. Order events (order_cancelled,
   // order_expired, order_completed, truck_confirmed, new_broadcast) are
   // exactly the events dropped on reconnect per the audit reproduction.
+  // Fix #13 follow-up (Codex Gate 3): stamp eventId ONCE so persisted envelope
+  // and live wire converge on identical eventId (mirrors Section 1.5).
+  const { eventId, stampedPayload } = stampForRoomEmit(data);
   if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
     const userIds = enumerateRoomUserIds(`order:${orderId}`);
-    persistRoomEnvelopes(userIds, event, data).catch(() => { /* already logged per-user */ });
+    persistRoomEnvelopes(userIds, event, stampedPayload, eventId).catch(() => { /* already logged per-user */ });
   }
-  io.to(`order:${orderId}`).emit(event, withSocketMeta(data));
+  io.to(`order:${orderId}`).emit(event, withSocketMeta(stampedPayload));
   logger.debug(`Emitted ${event} to order ${orderId}`);
 }
 
@@ -2053,11 +2140,14 @@ export function emitToUsers(userIds: string[], event: string, data: any): void {
   // F-B-26: For lifecycle events, ZADD each recipient's envelope BEFORE the
   // batched emit so reconnect replay covers the fan-out. The envelope write
   // is per-user (independent seq counters), run in parallel.
+  // Fix #13 follow-up (Codex Gate 3): stamp eventId ONCE so persisted envelope
+  // and live wire converge on identical eventId (mirrors Section 1.5).
+  const { eventId, stampedPayload } = stampForRoomEmit(data);
   if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
-    persistRoomEnvelopes(uniqueUserIds, event, data).catch(() => { /* already logged per-user */ });
+    persistRoomEnvelopes(uniqueUserIds, event, stampedPayload, eventId).catch(() => { /* already logged per-user */ });
   }
 
-  const payload = withSocketMeta(data);
+  const payload = withSocketMeta(stampedPayload);
   const userRooms = uniqueUserIds.map((userId) => `user:${userId}`);
   const chunkSize = SOCKET_MULTI_ROOM_EMIT_CHUNK_SIZE;
 
@@ -2082,12 +2172,15 @@ export function emitToRoom(room: string, event: string, data: any): void {
   // F-B-26: For lifecycle events, enumerate local room members and ZADD each
   // userId's envelope before the broadcast. Covers ad-hoc rooms outside of
   // the booking/trip/order families (e.g., transporter scoped rooms).
+  // Fix #13 follow-up (Codex Gate 3): stamp eventId ONCE so persisted envelope
+  // and live wire converge on identical eventId (mirrors Section 1.5).
+  const { eventId, stampedPayload } = stampForRoomEmit(data);
   if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
     const userIds = enumerateRoomUserIds(room);
-    persistRoomEnvelopes(userIds, event, data).catch(() => { /* already logged per-user */ });
+    persistRoomEnvelopes(userIds, event, stampedPayload, eventId).catch(() => { /* already logged per-user */ });
   }
 
-  io.to(room).emit(event, withSocketMeta(data));
+  io.to(room).emit(event, withSocketMeta(stampedPayload));
 
   logger.debug(`Emitted ${event} to room ${room}`);
 }
@@ -2103,12 +2196,15 @@ export function emitToAllTransporters(event: string, data: any): void {
   // F-B-26: Lifecycle events to all transporters (e.g. new_broadcast
   // fan-out) must be durable per-recipient. Enumerate the local
   // role:transporter room and ZADD each user's envelope before the broadcast.
+  // Fix #13 follow-up (Codex Gate 3): stamp eventId ONCE so persisted envelope
+  // and live wire converge on identical eventId (mirrors Section 1.5).
+  const { eventId, stampedPayload } = stampForRoomEmit(data);
   if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
     const userIds = enumerateRoomUserIds('role:transporter');
-    persistRoomEnvelopes(userIds, event, data).catch(() => { /* already logged per-user */ });
+    persistRoomEnvelopes(userIds, event, stampedPayload, eventId).catch(() => { /* already logged per-user */ });
   }
 
-  io.to('role:transporter').emit(event, withSocketMeta(data));
+  io.to('role:transporter').emit(event, withSocketMeta(stampedPayload));
   logger.debug(`Broadcast ${event} to transporters`);
 }
 
@@ -2128,13 +2224,16 @@ export function emitToTransporterDrivers(transporterId: string, event: string, d
   // F-B-26: Driver-room lifecycle fan-out (e.g., truck_confirmed reaching
   // drivers under a transporter). ZADD each local driver's envelope before
   // the room broadcast so reconnect replay recovers missed messages.
+  // Fix #13 follow-up (Codex Gate 3): stamp eventId ONCE so persisted envelope
+  // and live wire converge on identical eventId (mirrors Section 1.5).
+  const { eventId, stampedPayload } = stampForRoomEmit(data);
   if (isEnabled(FLAGS.DURABLE_EMIT_ENABLED) && LIFECYCLE_EMIT_EVENTS.has(event)) {
     const userIds = enumerateRoomUserIds(`transporter:${transporterId}`);
-    persistRoomEnvelopes(userIds, event, data).catch(() => { /* already logged per-user */ });
+    persistRoomEnvelopes(userIds, event, stampedPayload, eventId).catch(() => { /* already logged per-user */ });
   }
 
   // Emit to all drivers in transporter room
-  io.to(`transporter:${transporterId}`).emit(event, withSocketMeta(data));
+  io.to(`transporter:${transporterId}`).emit(event, withSocketMeta(stampedPayload));
 
   logger.debug(`Emitted ${event} to drivers of transporter:${transporterId}`);
 }
@@ -2210,6 +2309,117 @@ export function cleanupAdapterReconnect(): void {
   if (adapterReconnectTimer) {
     clearInterval(adapterReconnectTimer);
     adapterReconnectTimer = null;
+  }
+}
+
+// =============================================================================
+// Fix #12 — Pod-restart graceful drain protocol
+// =============================================================================
+// Replaces the single-tick `io.sockets.sockets.forEach(s => s.disconnect(true))`
+// blast at server.ts which fires 4K+ disconnect frames in ONE event-loop tick —
+// kernel net.ipv4.tcp_wmem cannot absorb that without backpressure; downstream
+// pods see a thundering reconnect herd; Phase-4 replay storms silently.
+//
+// Protocol (ELB Connection Draining / Linkerd shutdown):
+//   Phase A: io.emit('server_drain_pending') + Redis drain-marker write so
+//            reconnects landing on OTHER pods can detect "we just lost pod X"
+//            via auth.lastPodId even if io.emit didn't reach them on 2G.
+//   Phase B: iterate live Map directly (no snapshot), batches of 100, 250ms
+//            inter-batch sleep with setImmediate yield — gives kernel TCP
+//            write buffers time to flush.
+//   Phase C: 1s final flush window before HTTP server.close().
+//
+// Math: 4000 sockets / 100 batch = 40 batches × 250ms = 10s drain + 5s pre
+// + 1s flush = ~16s. AbortController hard-cap (18s default / 30s bumped)
+// fires before Node force-shutdown (25s / 35s) which fires before SIGKILL.
+const DRAIN_PREDRAIN_MS = 5_000;
+const DRAIN_BATCH_SIZE = 100;
+const DRAIN_BATCH_INTERVAL_MS = 250;
+const DRAIN_FINAL_FLUSH_MS = 1_000;
+// Env-gated, co-evolves with src/server.ts FORCE_SHUTDOWN_MS. A single env var
+// drives both timers so they CANNOT desynchronise. Default path (env unset):
+// drain caps at 18s → 25s Node force-shutdown → 30s SIGKILL. Bumped path
+// (env=true): drain caps at 30s → 35s Node force-shutdown → ≥45s SIGKILL.
+const DRAIN_HARD_CAP_MS =
+  process.env.ECS_STOPTIMEOUT_CONFIRMED_GTE_45S === 'true' ? 30_000 : 18_000;
+const DRAIN_MARKER_TTL_SEC = 60;
+
+export async function drainSocketsStaggered(): Promise<void> {
+  const ioInstance = getIO();
+  if (!ioInstance) return;
+
+  // AbortController tied to drain hard-cap so SIGKILL doesn't race a stuck setTimeout.
+  const abort = new AbortController();
+  const cap = setTimeout(() => abort.abort(), DRAIN_HARD_CAP_MS);
+
+  // Cancellable sleep helper — wraps setTimeout in a Promise that resolves
+  // immediately when the abort signal fires (no timers/promises dependency).
+  const sleepCancellable = (ms: number): Promise<void> =>
+    new Promise<void>(resolve => {
+      if (abort.signal.aborted) {
+        resolve();
+        return;
+      }
+      const t = setTimeout(() => {
+        abort.signal.removeEventListener('abort', onAbort);
+        resolve();
+      }, ms);
+      const onAbort = (): void => {
+        clearTimeout(t);
+        resolve();
+      };
+      abort.signal.addEventListener('abort', onAbort, { once: true });
+    });
+
+  try {
+    const totalSockets = ioInstance.sockets.sockets.size;
+    const podId = process.env.HOSTNAME || `pod-${process.pid}`;
+    const drainStartMs = Date.now();
+
+    // Phase A: write Redis drain-marker FIRST. `io.emit` is fire-and-forget on
+    // poor networks (~5-15% loss on 2G) per Socket.IO delivery-guarantees docs;
+    // the marker is the canonical drain-detection channel for reconnects landing
+    // on OTHER pods. ELB Connection Draining / Linkerd shutdown pattern.
+    await redisService
+      .set(
+        `pod:drained:${podId}`,
+        JSON.stringify({ podId, drainStartMs, drainPlannedSec: DRAIN_PREDRAIN_MS / 1000 }),
+        DRAIN_MARKER_TTL_SEC,
+      )
+      .catch(() => {
+        /* drain proceeds even if marker fails — degrades to existing jitter */
+      });
+
+    ioInstance.emit('server_drain_pending', {
+      drainSeconds: DRAIN_PREDRAIN_MS / 1000,
+      podId,
+      drainStartMs,
+    });
+    await sleepCancellable(DRAIN_PREDRAIN_MS);
+
+    // Phase B: iterate live Map directly. Avoids snapshotting a 4K-element array
+    // at the GC-sensitive shutdown moment; setImmediate between batches yields
+    // the event loop so engine.io can flush close frames to kernel.
+    let count = 0;
+    for (const socket of ioInstance.sockets.sockets.values()) {
+      socket.disconnect(true);
+      count++;
+      if (count % DRAIN_BATCH_SIZE === 0 && count < totalSockets) {
+        await new Promise<void>(r => setImmediate(r));
+        await sleepCancellable(DRAIN_BATCH_INTERVAL_MS);
+      }
+    }
+
+    // Phase C: final flush window before HTTP server.close().
+    await sleepCancellable(DRAIN_FINAL_FLUSH_MS);
+
+    logger.info('[Drain] Socket drain complete', {
+      podId,
+      totalSockets: count,
+      elapsedMs: Date.now() - drainStartMs,
+    });
+  } finally {
+    clearTimeout(cap);
   }
 }
 
