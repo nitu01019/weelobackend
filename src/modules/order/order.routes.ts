@@ -33,6 +33,8 @@ import { createOrderSchema } from '../booking/booking.schema';
 // FIX F-1-4: Use shared utils instead of inline duplicates
 import { normalizeOrderLifecycleState, normalizeOrderStatus } from '../../shared/utils/order-lifecycle.utils';
 import { maskPhoneForExternal } from '../../shared/utils/pii.utils';
+import { setIdempotentReplayedHeader } from '../../shared/http/idempotency-headers';
+import { readIdempotencyKey } from '../../shared/utils/idempotency-key.helper';
 
 const router = Router();
 
@@ -201,7 +203,7 @@ router.post(
       // window gated by ALLOW_MISSING_IDEMPOTENCY_KEY_UNTIL so already-deployed
       // clients that pre-date the header roll-out keep working until the
       // deadline passes.
-      const clientKey = (req.headers['x-idempotency-key'] as string | undefined)?.trim();
+      const clientKey = readIdempotencyKey(req);
       const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
       const graceUntilRaw = process.env.ALLOW_MISSING_IDEMPOTENCY_KEY_UNTIL;
@@ -286,6 +288,7 @@ router.post(
           }
         );
 
+        setIdempotentReplayedHeader(res, result);
         res.status(201).json({
           success: true,
           data: responseData
@@ -574,7 +577,7 @@ router.post(
       const { id: orderId } = req.params;
       const user = req.user;
       const reason = typeof req.body.reason === 'string' ? req.body.reason.substring(0, 500) : '';
-      const idempotencyKey = req.header('X-Idempotency-Key') || req.header('x-idempotency-key') || undefined;
+      const idempotencyKey = readIdempotencyKey(req);
 
       logger.info(`📛 Order cancellation requested: ${orderId} by ${user.phone}`);
 
@@ -999,7 +1002,7 @@ router.delete(
     try {
       const { orderId } = req.params;
       const user = req.user;
-      const idempotencyKey = req.header('X-Idempotency-Key') || req.header('x-idempotency-key') || undefined;
+      const idempotencyKey = readIdempotencyKey(req);
 
       logger.info(`📛 Cancel request: Order ${orderId} by customer ${user.phone}`);
 

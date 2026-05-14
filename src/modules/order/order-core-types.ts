@@ -130,4 +130,12 @@ export interface CreateOrderResponse {
   }[];
   expiresAt: string;
   expiresIn: number;  // SCALABILITY: Duration in seconds - UI uses this for countdown timer
+  // NEW — Idempotent-Replayed signal (Stripe parity).
+  replayed?: boolean;
+  // NEW — dev/staging only; production callers MUST NOT depend on this.
+  replaySource?: 'redis-cache' | 'db-replay';
+  // Fix #29 v2 payload field — added only when FF_DISPATCH_PENDING=true AND
+  // Accept-Version: v2. PREP PR: FF defaults OFF so this is dormant at runtime;
+  // typed as optional so Moshi/decoders treat it as nullable in v2 clients.
+  dispatchPending?: boolean;
 }

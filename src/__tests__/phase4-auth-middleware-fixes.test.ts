@@ -264,13 +264,20 @@ describe('M3: CORS X-Device-Id + X-Idempotency-Key headers', () => {
 
   it('M3.7 CORS credentials is set to true', () => {
     const corsIdx = source.indexOf('app.use(cors(');
-    const corsBlock = source.substring(corsIdx, corsIdx + 500);
+    // Phase 5 Fix #8 + Fix #29 grew the cors() block (added Idempotency-Key,
+    // Accept-Version, X-API-Version to allowedHeaders + NEW exposedHeaders
+    // array with 9 entries). The credentials/maxAge fields now sit beyond
+    // the original 500-byte window. Walk to the closing `}));` of the cors()
+    // call to extract the full block regardless of size.
+    const corsEnd = source.indexOf('}));', corsIdx);
+    const corsBlock = source.substring(corsIdx, corsEnd === -1 ? corsIdx + 2000 : corsEnd);
     expect(corsBlock).toContain('credentials: true');
   });
 
   it('M3.8 CORS maxAge enables preflight caching', () => {
     const corsIdx = source.indexOf('app.use(cors(');
-    const corsBlock = source.substring(corsIdx, corsIdx + 500);
+    const corsEnd = source.indexOf('}));', corsIdx);
+    const corsBlock = source.substring(corsIdx, corsEnd === -1 ? corsIdx + 2000 : corsEnd);
     // maxAge should be set to a positive number (86400 = 24h)
     expect(corsBlock).toMatch(/maxAge:\s*\d+/);
   });

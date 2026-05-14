@@ -498,7 +498,8 @@ export async function withDbTimeout<T>(
         throw new AppError(
           503,
           'DB_TIMEOUT',
-          'Database operation timed out. Please retry.'
+          'Database operation timed out. Please retry.',
+          { retryAfter: 5 }
         );
       }
 

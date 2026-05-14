@@ -230,7 +230,8 @@ class S3UploadService {
       throw new AppError(
         503,
         'S3_NOT_CONFIGURED',
-        'File upload service is not available'
+        'File upload service is not available',
+        { retryAfter: 5 }
       );
     }
 

@@ -229,7 +229,7 @@ export class BookingCreateService {
       if (inflight > BOOKING_CONCURRENCY_LIMIT) {
         await redisService.incrBy(ctx.concurrencyKey, -1).catch(() => {});
         ctx.incremented = false;
-        throw new AppError(503, 'SYSTEM_BUSY', 'Too many bookings being processed.');
+        throw new AppError(503, 'SYSTEM_BUSY', 'Too many bookings being processed.', { retryAfter: 5 });
       }
     } catch (err) {
       if (err instanceof AppError) throw err; // re-throw 503

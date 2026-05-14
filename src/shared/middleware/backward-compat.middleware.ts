@@ -22,9 +22,10 @@
  *                                       -> PUT  /api/v1/tracking/trip/:id/status
  *   /api/v1/tracking/trips/            -> /api/v1/tracking/trip/  (plural fix)
  *
- * Headers added on every rewrite (RFC 8594):
+ * Headers added on every rewrite (RFC 8594 + RFC 5988):
  *   Deprecation: true
- *   Sunset: Sat, 31 Dec 2026 23:59:59 GMT
+ *   Sunset: Thu, 31 Dec 2026 23:59:59 GMT   (env-overridable via SUNSET_DATE_HTTP_DATE)
+ *   Link: <successor>; rel="successor-version", <docs>; rel="deprecation"; type="text/html"
  *
  * =============================================================================
  */
@@ -116,11 +117,21 @@ const REWRITE_RULES: ReadonlyArray<RewriteRule> = [
   },
 ];
 
-// ---- RFC 8594 deprecation headers -----------------------------------------
+// ---- RFC 8594 + RFC 5988 deprecation headers ------------------------------
+// Env-derived so an operator can extend the sunset (or roll it back) via an
+// ECS task-def env update — no code change required.
+// Calendar fix (Fix #29 BLOCKER #2): Dec 31 2026 is THURSDAY (not Saturday).
+// Strict RFC 7231 §7.1.1.1 IMF-fixdate parsers reject day-of-week/date
+// mismatches; V8/Python/browser Date.parse silently ignore but Go's
+// http.ParseTime and other libs may reject.
+
+const SUNSET_HTTP_DATE = process.env.SUNSET_DATE_HTTP_DATE ?? 'Thu, 31 Dec 2026 23:59:59 GMT';
+const SUCCESSOR_DOCS_URL =
+  process.env.API_DEPRECATION_DOCS_URL ?? 'https://docs.weelo.example/api/deprecations';
 
 const DEPRECATION_HEADERS: Readonly<Record<string, string>> = {
   Deprecation: 'true',
-  Sunset: 'Sat, 31 Dec 2026 23:59:59 GMT',
+  Sunset: SUNSET_HTTP_DATE,
 };
 
 // ---- middleware ------------------------------------------------------------
@@ -166,6 +177,18 @@ export function backwardCompatMiddleware(
     for (const [header, value] of Object.entries(DEPRECATION_HEADERS)) {
       res.setHeader(header, value);
     }
+    // RFC 5988 + RFC 8594 §3 — pair Deprecation/Sunset with a successor-version +
+    // deprecation Link so automated clients can self-migrate without reading the
+    // changelog. Use res.append (not setHeader): when both this middleware AND
+    // apiVersionMiddleware fire on the same legacy /trips/* request, two Link
+    // headers must coexist per RFC 7230 §3.2.2 (combined into a comma-separated
+    // list). setHeader would silently overwrite whichever value the prior
+    // middleware emitted.
+    res.append(
+      'Link',
+      `<${rewrittenPath}>; rel="successor-version", ` +
+        `<${SUCCESSOR_DOCS_URL}>; rel="deprecation"; type="text/html"`,
+    );
 
     logger.info(
       `[BackwardCompat] ${originalMethod} ${originalUrl} --> ${req.method} ${req.url}`,

@@ -1,15 +1,54 @@
 {
   "root": true,
   "parser": "@typescript-eslint/parser",
-  "plugins": ["@typescript-eslint"],
-  "extends": ["eslint:recommended", "plugin:@typescript-eslint/recommended"],
-  "env": { "node": true, "es2021": true },
-  "parserOptions": { "ecmaVersion": 2021, "sourceType": "module" },
+  "plugins": [
+    "@typescript-eslint"
+  ],
+  "extends": [
+    "eslint:recommended",
+    "plugin:@typescript-eslint/recommended"
+  ],
+  "env": {
+    "node": true,
+    "es2021": true
+  },
+  "parserOptions": {
+    "ecmaVersion": 2021,
+    "sourceType": "module"
+  },
   "rules": {
     "no-console": "warn",
     "@typescript-eslint/no-explicit-any": "warn",
-    "@typescript-eslint/no-unused-vars": ["warn", { "argsIgnorePattern": "^_" }],
-    "@typescript-eslint/no-require-imports": "off"
+    "@typescript-eslint/no-unused-vars": [
+      "warn",
+      {
+        "argsIgnorePattern": "^_"
+      }
+    ],
+    "@typescript-eslint/no-require-imports": "off",
+    "no-restricted-syntax": [
+      "error",
+      {
+        "selector": "CallExpression[callee.object.name='req'][callee.property.name='header'][arguments.0.value=/^[xX]-[iI]dempotency-[kK]ey$/]",
+        "message": "Use readIdempotencyKey(req) from src/shared/utils/idempotency-key.helper.ts — direct header reads bypass the IETF bare-name dual-accept and RFC 7230 §3.2.2 duplicate-header rejection."
+      },
+      {
+        "selector": "CallExpression[callee.object.name='req'][callee.property.name='header'][arguments.0.value=/^[iI]dempotency-[kK]ey$/]",
+        "message": "Use readIdempotencyKey(req) — direct header reads bypass duplicate-header rejection and VCHAR charset gate."
+      },
+      {
+        "selector": "MemberExpression[object.object.name='req'][object.property.name='headers'][property.value=/^x-idempotency-key$/i]",
+        "message": "Use readIdempotencyKey(req) — direct header reads bypass dual-accept."
+      },
+      {
+        "selector": "MemberExpression[object.object.name='req'][object.property.name='headers'][property.value=/^idempotency-key$/i]",
+        "message": "Use readIdempotencyKey(req) — direct header reads bypass duplicate-header rejection and VCHAR charset gate."
+      }
+    ]
   },
-  "ignorePatterns": ["dist/", "node_modules/", "*.js"]
+  "ignorePatterns": [
+    "dist/",
+    "node_modules/",
+    "*.js"
+  ]
 }

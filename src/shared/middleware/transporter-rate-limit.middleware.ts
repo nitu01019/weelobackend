@@ -111,11 +111,14 @@ export function transporterRateLimit(action: keyof typeof RATE_LIMITS) {
 
         logger.warn(`[RateLimit] Blocked transporter ${transporterId} on ${action} (blocked for ${ttl}s)`);
 
+        res.setHeader('Retry-After', String(ttl));
         return res.status(429).json({
           success: false,
-          error: 'RATE_LIMIT_EXCEEDED',
-          message: `Too many ${action} requests. Please try again in ${ttl} seconds.`,
-          retryAfter: ttl
+          error: {
+            code: 'RATE_LIMIT_EXCEEDED',
+            message: `Too many ${action} requests. Please try again in ${ttl} seconds.`,
+            details: { retryAfter: ttl },
+          },
         });
       }
 
@@ -133,11 +136,14 @@ export function transporterRateLimit(action: keyof typeof RATE_LIMITS) {
         await redisService.set(blockKey, '1', limit.blockDuration);
         logger.warn(`[RateLimit] Rate limit exceeded for transporter ${transporterId} on ${action} (${current}/${limit.max})`);
 
+        res.setHeader('Retry-After', String(limit.blockDuration));
         return res.status(429).json({
           success: false,
-          error: 'RATE_LIMIT_EXCEEDED',
-          message: `Maximum ${limit.max} ${action} requests per ${limit.window} seconds exceeded.`,
-          retryAfter: limit.blockDuration
+          error: {
+            code: 'RATE_LIMIT_EXCEEDED',
+            message: `Maximum ${limit.max} ${action} requests per ${limit.window} seconds exceeded.`,
+            details: { retryAfter: limit.blockDuration },
+          },
         });
       }
 
@@ -157,6 +163,20 @@ export function transporterRateLimit(action: keyof typeof RATE_LIMITS) {
         transporterId,
         error: error instanceof Error ? error.message : String(error),
       });
+      // RFC 7231 §7.1.3: Retry-After is delta-seconds; emit unconditionally so retry layer benefits immediately.
+      res.setHeader('Retry-After', '30');
+      // Joaquin R8: envelope-shape change is breaking for Captain/Customer Android — gated default OFF.
+      if (process.env.FF_503_ENVELOPE_NORMALIZE === 'true') {
+        return res.status(503).json({
+          success: false,
+          error: {
+            code: 'RATE_LIMITER_UNAVAILABLE',
+            message: 'Rate limiting unavailable. Please retry shortly.',
+            details: { retryAfter: 30 },
+          },
+        });
+      }
+      // Default OFF — preserve HEAD wire format (flat string in `error`).
       return res.status(503).json({
         success: false,
         error: 'Rate limiting unavailable',

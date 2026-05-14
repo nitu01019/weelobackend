@@ -31,6 +31,7 @@ import { TERMINAL_STATUSES } from '../booking/booking.types';
 import type { OrderCreateContext } from './order-create-context';
 import { assertValidTransition, ORDER_VALID_TRANSITIONS } from '../../core/state-machines';
 import type { CreateOrderRequest, CreateOrderResponse } from './order-core-types';
+import { FLAGS, isEnabled } from '../../shared/config/feature-flags';
 import type { DispatchAttemptContext, DispatchAttemptOutcome } from './order-types';
 import {
   FF_ORDER_DISPATCH_OUTBOX,
@@ -107,7 +108,7 @@ export async function acquireOrderBackpressure(ctx: OrderCreateContext): Promise
       // Fix #34/#73: Rejection already decremented, so reset flag
       ctx.redisBackpressureIncremented = false;
       logger.warn('[ORDER] System backpressure: too many concurrent order creates', { inflight, max: ctx.maxConcurrentOrders });
-      throw new AppError(503, 'SYSTEM_BUSY', 'System is processing too many orders. Please retry in a few seconds.');
+      throw new AppError(503, 'SYSTEM_BUSY', 'System is processing too many orders. Please retry in a few seconds.', { retryAfter: 5 });
     }
   } catch (err: unknown) {
     // If Redis fails, use in-memory fallback instead of allowing everything through
@@ -122,7 +123,7 @@ export async function acquireOrderBackpressure(ctx: OrderCreateContext): Promise
       // Fix #34/#73: Rejection already decremented, so reset flag
       ctx.inMemoryBackpressureIncremented = false;
       logger.warn('[ORDER] In-memory backpressure triggered (Redis unavailable)', { inMemoryInflight, max: IN_MEMORY_MAX });
-      throw new AppError(503, 'SYSTEM_BUSY', 'System is processing too many orders. Please retry in a few seconds.');
+      throw new AppError(503, 'SYSTEM_BUSY', 'System is processing too many orders. Please retry in a few seconds.', { retryAfter: 5 });
     }
     logger.warn('[ORDER] Backpressure counter failed, using in-memory fallback', { error: (err as Error).message, inMemoryInflight, max: IN_MEMORY_MAX });
   }
@@ -304,7 +305,7 @@ export async function checkOrderServerIdempotency(ctx: OrderCreateContext): Prom
         logger.info('Idempotent replay: returning existing order', { orderId: existingDedupeId, idempotencyHash: ctx.idempotencyHash });
         const totalTrucks = ctx.request.vehicleRequirements.reduce((sum, req) => sum + req.quantity, 0);
         const totalAmount = ctx.request.vehicleRequirements.reduce((sum, req) => sum + (req.quantity * req.pricePerTruck), 0);
-        return {
+        const response: CreateOrderResponse = {
           orderId: existingDedupeId,
           totalTrucks,
           totalAmount,
@@ -318,6 +319,8 @@ export async function checkOrderServerIdempotency(ctx: OrderCreateContext): Prom
           expiresAt: existingDedupeOrder.expiresAt,
           expiresIn: 0
         };
+        applyV2DispatchPending(response, ctx);
+        return response;
       }
     }
   } catch (error: unknown) {
@@ -325,6 +328,37 @@ export async function checkOrderServerIdempotency(ctx: OrderCreateContext): Prom
     logger.warn(`[ORDER] Redis server-idempotency check failed: ${msg}. Proceeding without dedup (DB TX is authoritative).`);
   }
   return null;
+}
+
+/**
+ * Fix #29 — dormant v2 payload hook. Only mutates `response` when BOTH the
+ * `FF_DISPATCH_PENDING` flag is enabled AND the caller's request was tagged
+ * `Accept-Version: v2` by `apiVersionMiddleware`. In the PREP PR the flag
+ * defaults OFF and `req.apiVersion` defaults `'v1'`, so this is unreachable
+ * at runtime — the FLIP PR turns it on after Captain + Customer apps roll
+ * out the `Accept-Version: v2` header.
+ *
+ * `ctx.apiVersion` is the optional surface the controller copies in from
+ * `req.apiVersion` (the Express augmentation in src/shared/types/express.d.ts).
+ * Read it via narrow access so the dormant path adds no runtime cost.
+ */
+function applyV2DispatchPending(
+  response: CreateOrderResponse,
+  ctx: { apiVersion?: 'v1' | 'v2' },
+): void {
+  if (ctx.apiVersion !== 'v2') return;
+  if (!isEnabled(FLAGS.DISPATCH_PENDING)) return;
+  response.dispatchPending = computeDispatchPending();
+}
+
+/**
+ * Stub for the v2 dispatchPending payload field. Replaced in the FLIP PR
+ * with the real computation (truckRequests where state ∈ {queued, dispatching}).
+ * Returns `false` here because the call site is unreachable in the PREP PR
+ * (gated by FF_DISPATCH_PENDING=false default).
+ */
+function computeDispatchPending(): boolean {
+  return false;
 }
 
 export async function resolveServerRouteDistance(ctx: OrderCreateContext): Promise<void> {

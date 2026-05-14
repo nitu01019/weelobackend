@@ -378,7 +378,7 @@ class SmsService {
         }
       }
 
-      throw new AppError(503, 'SMS_DELIVERY_FAILED', 'Unable to send SMS. Please try again.');
+      throw new AppError(503, 'SMS_DELIVERY_FAILED', 'Unable to send SMS. Please try again.', { retryAfter: 10 });
     }
 
     // --- No secondary provider: primary failed all retries ---
@@ -409,7 +409,7 @@ class SmsService {
       }
     }
 
-    throw new AppError(503, 'SMS_DELIVERY_FAILED', 'Unable to send SMS. Please try again.');
+    throw new AppError(503, 'SMS_DELIVERY_FAILED', 'Unable to send SMS. Please try again.', { retryAfter: 10 });
   }
   
   /**

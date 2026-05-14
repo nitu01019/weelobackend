@@ -187,7 +187,7 @@ class DriverAuthService {
       logger.error('[DRIVER AUTH] ❌ CRITICAL: OTP not stored in Redis OR PostgreSQL', {
         driverPhone: maskForLogging(driverPhone, 2, 4)
       });
-      throw new AppError(503, 'SERVICE_UNAVAILABLE', 'OTP service temporarily unavailable. Please try again in a moment.');
+      throw new AppError(503, 'SERVICE_UNAVAILABLE', 'OTP service temporarily unavailable. Please try again in a moment.', { retryAfter: 10 });
     }
 
     // 5. Send OTP to TRANSPORTER's phone via SMS
@@ -210,7 +210,7 @@ class DriverAuthService {
           dbKey: { phone: driverPhone, role: 'driver' },
           logContext: { driverPhone: maskForLogging(driverPhone, 2, 4), reason: 'sms_send_failed' }
         });
-        throw new AppError(503, 'SMS_SEND_FAILED', 'Could not deliver OTP. Please try again in a moment.');
+        throw new AppError(503, 'SMS_SEND_FAILED', 'Could not deliver OTP. Please try again in a moment.', { retryAfter: 10 });
       }
       // Non-production only: allow pending/dev fallback behavior.
     }

@@ -17,6 +17,12 @@ export interface OrderCreateContext {
   // --- Input (set once at the start) ---
   readonly request: CreateOrderRequest;
 
+  // Fix #29 — API version negotiated by apiVersionMiddleware on the inbound
+  // request. PREP PR: this field is never populated (caller does not copy
+  // from req.apiVersion yet). FLIP PR: the route handler will assign
+  // `ctx.apiVersion = req.apiVersion` so dispatchPending lights up for v2.
+  apiVersion?: 'v1' | 'v2';
+
   // --- Backpressure ---
   backpressureKey: string;
   maxConcurrentOrders: number;

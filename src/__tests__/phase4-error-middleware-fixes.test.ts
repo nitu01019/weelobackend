@@ -120,7 +120,14 @@ describe('M7: Retry-After header on 429 responses', () => {
 
   describe('Source scanning: error.middleware.ts patterns', () => {
     it('should contain a statusCode === 429 check', () => {
-      expect(errorMiddlewareSrc).toMatch(/statusCode\s*===\s*429/);
+      // Phase 5 Fix #7 generalized the 429-only gate to a Set covering 429+503
+      // (RETRY_AFTER_STATUSES). Accept either the original M7 pattern or the
+      // generalized helper that includes 429 in its membership.
+      const hasOld = /statusCode\s*===\s*429/.test(errorMiddlewareSrc);
+      const hasNew =
+        /RETRY_AFTER_STATUSES[\s\S]*?429/.test(errorMiddlewareSrc) ||
+        /new Set<number>\(\[[^)]*429/.test(errorMiddlewareSrc);
+      expect(hasOld || hasNew).toBe(true);
     });
 
     it('should contain res.setHeader("Retry-After", ...) call', () => {
@@ -139,8 +146,13 @@ describe('M7: Retry-After header on 429 responses', () => {
     });
 
     it('should have a fallback value of "30" for Retry-After', () => {
-      // Match the nullish coalescing or OR pattern with '30' as the last fallback
-      expect(errorMiddlewareSrc).toMatch(/['"]30['"]/);
+      // Phase 5 Fix #7 changed `String(retryAfter ?? 30)` to
+      // `Math.max(0, Math.floor(Number(raRaw) || 30))` per RFC 7231 §7.1.3
+      // integer coercion. The literal 30 is preserved but is now a bare numeric
+      // (was previously inside the `String(...)` template). Accept both forms.
+      const hasQuoted = /['"]30['"]/.test(errorMiddlewareSrc);
+      const hasBare = /\|\|\s*30\b/.test(errorMiddlewareSrc) || /\?\?\s*30\b/.test(errorMiddlewareSrc);
+      expect(hasQuoted || hasBare).toBe(true);
     });
 
     it('should use String() to coerce the Retry-After value', () => {
@@ -148,9 +160,13 @@ describe('M7: Retry-After header on 429 responses', () => {
     });
 
     it('should contain a comment referencing RFC 6585 or M7', () => {
-      const hasRfc = errorMiddlewareSrc.includes('RFC 6585');
+      // Phase 5 Fix #7 updated the rationale comment from RFC 6585 §4 (429-only)
+      // to RFC 7231 §7.1.3 (delta-seconds integer for 429+503). Accept either
+      // citation — both reference the same Retry-After contract.
+      const hasRfc6585 = errorMiddlewareSrc.includes('RFC 6585');
       const hasM7 = errorMiddlewareSrc.includes('M7');
-      expect(hasRfc || hasM7).toBe(true);
+      const hasRfc7231 = errorMiddlewareSrc.includes('RFC 7231');
+      expect(hasRfc6585 || hasM7 || hasRfc7231).toBe(true);
     });
   });
 

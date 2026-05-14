@@ -450,6 +450,24 @@ export const FLAGS = {
     category: 'release' as const,
     description: 'Legacy avoid=highways|tolls for truckMode routes (F-A-40)',
   },
+
+  // --- Fix #29: API v2 release flags (two-PR rollout) ---
+  // Both default OFF. PR-1 (prep) ships apiVersionMiddleware + CORS headers +
+  // dormant hook with FF_DISPATCH_PENDING=false. PR-2 (flip, ≥1 deploy cycle
+  // later) flips FF_DISPATCH_PENDING=true once Captain + Customer apps have
+  // shipped Accept-Version: v2 headers and Moshi-nullable dispatchPending.
+  ORDER_API_V2: {
+    env: 'FF_ORDER_API_V2',
+    category: 'release' as const,
+    description: 'Enable v2 response payload shape on orders endpoints (Fix #29)',
+    defaultValue: false,
+  },
+  DISPATCH_PENDING: {
+    env: 'FF_DISPATCH_PENDING',
+    category: 'release' as const,
+    description: 'Include dispatchPending field on v2 order responses (Fix #29)',
+    defaultValue: false,
+  },
 } as const;
 
 // ---------------------------------------------------------------------------

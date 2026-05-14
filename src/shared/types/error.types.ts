@@ -2,11 +2,17 @@
  * =============================================================================
  * ERROR TYPES
  * =============================================================================
- * 
+ *
  * Custom error classes for consistent error handling.
  * All operational errors should use AppError.
  * =============================================================================
  */
+
+import { HTTP_STATUS } from '../../core/constants';
+// Aliased import: this file already exports a string-enum `ErrorCode` below, so
+// the numeric `ErrorCode` enum from core/constants is imported under an alias to
+// avoid name collision. NumericErrorCode.BACKPRESSURE resolves to 'SYS_9013'.
+import { ErrorCode as NumericErrorCode } from '../../core/constants';
 
 /**
  * Application Error class
@@ -139,5 +145,51 @@ export enum ErrorCode {
   VALIDATION_ERROR = 'VALIDATION_ERROR',
   INTERNAL_ERROR = 'INTERNAL_ERROR',
   NOT_FOUND = 'NOT_FOUND',
-  RATE_LIMIT_EXCEEDED = 'RATE_LIMIT_EXCEEDED'
+  RATE_LIMIT_EXCEEDED = 'RATE_LIMIT_EXCEEDED',
+  BACKPRESSURE = 'BACKPRESSURE',     // NEW — pairs with SYS_9013 numeric code
+}
+
+/**
+ * Backpressure error — 503 with Retry-After.
+ *
+ * CWE-209 (Information Exposure): the PUBLIC `message` is generic and MUST NOT
+ * interpolate internal context (queue depth, cap, hostname, internal IDs). Such
+ * data goes in `internalReason` + `internalMeta`, which the error middleware logs
+ * server-side ONLY and never serializes into the client response body.
+ *
+ * Public wire contract:
+ *   HTTP 503
+ *   Retry-After: <seconds>
+ *   { success: false, error: { code: 'BACKPRESSURE', message: 'Service temporarily unavailable. Please retry shortly.' } }
+ */
+export interface BackpressureDetails extends Record<string, unknown> {
+  /** Integer seconds — SAFE to expose; becomes the Retry-After header value. */
+  retryAfter: number;
+}
+
+export class BackpressureError extends AppError {
+  /** Server-side only — never reaches the client response body. */
+  public readonly internalReason: string;
+  /** Server-side only — never reaches the client response body. */
+  public readonly internalMeta: Record<string, unknown>;
+
+  constructor(
+    internalReason: string,
+    details: BackpressureDetails = { retryAfter: 5 },
+    internalMeta: Record<string, unknown> = {},
+    options?: { cause?: unknown }
+  ) {
+    super(
+      HTTP_STATUS.SERVICE_UNAVAILABLE,
+      NumericErrorCode.BACKPRESSURE,
+      'Service temporarily unavailable. Please retry shortly.',
+      details
+    );
+    this.internalReason = internalReason;
+    this.internalMeta = internalMeta;
+    if (options?.cause !== undefined) {
+      // ES2022 Error.cause — preserves root-cause chain for server-side debugging.
+      (this as Error & { cause?: unknown }).cause = options.cause;
+    }
+  }
 }

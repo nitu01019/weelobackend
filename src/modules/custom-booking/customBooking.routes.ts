@@ -32,6 +32,7 @@ import {
     getRequestsQuerySchema,
     cancelRequestSchema
 } from './customBooking.schema';
+import { readIdempotencyKey } from '../../shared/utils/idempotency-key.helper';
 
 const router = Router();
 
@@ -55,7 +56,7 @@ router.post(
         try {
             // === IDEMPOTENCY CHECK ===
             // Prevents duplicate submissions if user clicks submit multiple times
-            const idempotencyKey = req.headers['x-idempotency-key'] as string;
+            const idempotencyKey = readIdempotencyKey(req);
             if (idempotencyKey) {
                 const existing = await redisService.get(`custom_booking:idempotent:${idempotencyKey}`);
                 if (existing) {

@@ -415,7 +415,8 @@ export enum ErrorCode {
   S3_ERROR = 'SYS_9009',
   CIRCUIT_BREAKER_OPEN = 'SYS_9010',
   TIMEOUT_ERROR = 'SYS_9011',
-  IDEMPOTENCY_CONFLICT = 'SYS_9012'        // ⭐ NEW: For duplicate requests
+  IDEMPOTENCY_CONFLICT = 'SYS_9012',        // ⭐ NEW: For duplicate requests
+  BACKPRESSURE = 'SYS_9013',         // NEW — 503 transient overload (RFC 6585 §4 Retry-After)
 }
 
 /**

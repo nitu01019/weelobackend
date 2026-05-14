@@ -15,8 +15,20 @@
 
 import { Request, Response, NextFunction } from 'express';
 import { logger } from '../services/logger.service';
-import { AppError } from '../types/error.types';
+import { AppError, BackpressureError } from '../types/error.types';
 import { config } from '../../config/environment';
+
+const RETRY_AFTER_STATUSES = new Set<number>([429, 503]);
+
+function setRetryAfterIfApplicable(res: Response, error: AppError): void {
+  if (!RETRY_AFTER_STATUSES.has(error.statusCode)) return;
+  // RFC 7231 §7.1.3 `delta-seconds = 1*DIGIT`: coerce to non-negative integer.
+  // CloudFlare/ALB strip non-integer Retry-After; producers passing float (e.g. ttl=5.7)
+  // would silently lose the header without this guard.
+  const raRaw = error.details?.retryAfter ?? error.details?.retryAfterSeconds ?? 30;
+  const ra = Math.max(0, Math.floor(Number(raRaw) || 30));
+  res.setHeader('Retry-After', String(ra));
+}
 
 /**
  * Global error handler middleware
@@ -30,7 +42,8 @@ export function errorHandler(
 ): void {
   const requestId = (req.headers['x-request-id'] as string) || undefined;
 
-  // Log the full error server-side
+  // Server-side log — include BackpressureError internal context if present (CWE-209: never serialized).
+  const isBackpressure = error instanceof BackpressureError;
   logger.error('Request error', {
     error: error.message,
     stack: error.stack,
@@ -38,21 +51,21 @@ export function errorHandler(
     method: req.method,
     ip: req.ip,
     userId: req.userId || 'anonymous',
-    requestId
+    requestId,
+    ...(isBackpressure && {
+      internalReason: (error as BackpressureError).internalReason,
+      internalMeta: (error as BackpressureError).internalMeta,
+    }),
   });
 
   // Determine if this is a known operational error
   if (error instanceof AppError) {
+    setRetryAfterIfApplicable(res, error);
     // Fix G3: Sanitize error details outside development to prevent leaking internal state
     // M8: Allow details for 4xx errors (field-level validation, rate-limit info) — only strip for 5xx
     const safeDetails = error.details && (config.isDevelopment || error.statusCode < 500)
       ? error.details
       : undefined;
-    // M7: RFC 6585 — 429 responses SHOULD include Retry-After header
-    if (error.statusCode === 429) {
-      const retryAfter = error.details?.retryAfter ?? error.details?.retryAfterSeconds ?? '30';
-      res.setHeader('Retry-After', String(retryAfter));
-    }
     res.status(error.statusCode).json({
       success: false,
       error: {

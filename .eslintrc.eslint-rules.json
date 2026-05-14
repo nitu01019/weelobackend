@@ -1,0 +1,55 @@
+{
+  "root": true,
+  "parser": "@typescript-eslint/parser",
+  "plugins": ["@typescript-eslint"],
+  "extends": [
+    "eslint:recommended",
+    "plugin:@typescript-eslint/recommended"
+  ],
+  "env": { "node": true, "es2021": true },
+  "parserOptions": { "ecmaVersion": 2021, "sourceType": "module" },
+  "rules": {
+    "no-console": "off",
+    "no-unused-vars": "off",
+    "no-undef": "off",
+    "no-empty": "off",
+    "no-useless-escape": "off",
+    "no-prototype-builtins": "off",
+    "no-case-declarations": "off",
+    "no-constant-condition": "off",
+    "no-async-promise-executor": "off",
+    "no-control-regex": "off",
+    "@typescript-eslint/no-unused-vars": "off",
+    "@typescript-eslint/no-explicit-any": "off",
+    "@typescript-eslint/no-var-requires": "off",
+    "@typescript-eslint/no-empty-function": "off",
+    "@typescript-eslint/no-non-null-assertion": "off",
+    "@typescript-eslint/ban-ts-comment": "off",
+    "@typescript-eslint/no-this-alias": "off",
+    "@typescript-eslint/no-require-imports": "off",
+    "no-setinterval-without-unref": "warn",
+    "cas-vehicle-update-must-check-count": "warn",
+    "lock-holder-must-be-randomUUID": "warn",
+    "no-pii-in-redis-key": "warn",
+    "no-restricted-syntax": [
+      "error",
+      {
+        "selector": "CallExpression[callee.property.name='header'][arguments.0.value=/^[xX]-[iI]dempotency-[kK]ey$/]",
+        "message": "Use readIdempotencyKey(req) from src/shared/utils/idempotency-key.helper.ts — direct header reads bypass the IETF bare-name dual-accept and RFC 7230 §3.2.2 duplicate-header rejection."
+      },
+      {
+        "selector": "CallExpression[callee.property.name='header'][arguments.0.value=/^[iI]dempotency-[kK]ey$/]",
+        "message": "Use readIdempotencyKey(req) — direct header reads bypass duplicate-header rejection and VCHAR charset gate."
+      },
+      {
+        "selector": "MemberExpression[object.property.name='headers'][property.value=/^x-idempotency-key$/i]",
+        "message": "Use readIdempotencyKey(req) — direct header reads bypass dual-accept."
+      },
+      {
+        "selector": "MemberExpression[object.property.name='headers'][property.value=/^idempotency-key$/i]",
+        "message": "Use readIdempotencyKey(req) — direct header reads bypass duplicate-header rejection and VCHAR charset gate."
+      }
+    ]
+  },
+  "ignorePatterns": ["dist/", "node_modules/", "*.js", "eslint-rules/"]
+}
