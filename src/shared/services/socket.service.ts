@@ -2410,7 +2410,12 @@ export async function drainSocketsStaggered(): Promise<void> {
 
   try {
     const totalSockets = ioInstance.sockets.sockets.size;
-    const podId = process.env.HOSTNAME || `pod-${process.pid}`;
+    // Phase 7 follow-up — Defect #6: append randomUUID-derived nonce to the
+    // fallback. In ECS Fargate / bare-metal Docker without explicit HOSTNAME,
+    // every container has process.pid === 1 (PID namespace) — pre-fix every
+    // pod collapsed to literal `pod-1` and raced on the same drain marker key.
+    // NIST SP 800-92 §5 — unique host identification.
+    const podId = process.env.HOSTNAME || `pod-${process.pid}-${randomUUID().slice(0, 8)}`;
     const drainStartMs = Date.now();
 
     // Phase A: write Redis drain-marker FIRST. `io.emit` is fire-and-forget on
