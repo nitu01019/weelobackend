@@ -131,6 +131,16 @@ const SOCKET_EVENT_VERSION = 1;
 const SOCKET_MULTI_ROOM_EMIT_CHUNK_SIZE = Math.min(500, Math.max(25, parseInt(process.env.SOCKET_MULTI_ROOM_EMIT_CHUNK_SIZE || '300', 10) || 300));
 
 /**
+ * Phase 7 follow-up — Defect #11: Prometheus cardinality safety. Any metric
+ * labelled by `socket.data.role` (which originates from JWT claims) must clamp
+ * unknown values to a bounded allowlist. Defense in depth on top of upstream
+ * JWT validation. Applied at the Phase 7-introduced call site at L368-374
+ * (socket_reconnect_post_drain_total). Pre-existing call sites at L316 / L339
+ * are out of scope for this sprint.
+ */
+const KNOWN_ROLES = new Set(['customer', 'transporter', 'driver', 'admin']);
+
+/**
  * Socket Events — F-C-52 canonical registry
  *
  * The hand-rolled map that used to live here (67+ LOC, prone to 3-repo drift
@@ -369,8 +379,12 @@ export function initializeSocket(server: HttpServer): Server {
           await new Promise<void>(resolve => setTimeout(resolve, enhancedJitterMs));
           try {
             const { metrics } = require('../monitoring/metrics.service');
+            // Phase 7 follow-up — Defect #11: clamp role label to KNOWN_ROLES.
+            const clampedRole = (typeof socket.data.role === 'string' && KNOWN_ROLES.has(socket.data.role))
+              ? socket.data.role
+              : 'unknown';
             metrics.incrementCounter('socket_reconnect_post_drain_total', {
-              role: socket.data.role || 'unknown',
+              role: clampedRole,
             });
           } catch { /* metrics optional */ }
           didEnhancedJitter = true;
