@@ -235,16 +235,33 @@ export const albConfig = {
  * CloudWatch Monitoring Configuration
  */
 export const cloudWatchConfig = {
-  // Log groups
+  // Log groups — DPDP Rule 8(3) §5(b) three-tier retention split.
+  //   audit/365d:        lawful-basis trail, breach-forensics horizon
+  //   application/30d:   winston output post-redactor; PII-minimised by #19
+  //   access/90d:        ALB request lines without bodies (path + status only)
+  //   error/30d:         winston error transport (same redactor as application)
   logGroups: {
-    application: '/weelo/application',
-    access: '/weelo/access',
-    error: '/weelo/error'
+    audit: {
+      name: '/weelo/audit',
+      retentionDays: parseInt(process.env.LOG_RETENTION_AUDIT_DAYS || '365', 10),
+    },
+    application: {
+      name: '/weelo/application',
+      retentionDays: parseInt(process.env.LOG_RETENTION_APP_DAYS || '30', 10),
+    },
+    access: {
+      name: '/weelo/access',
+      retentionDays: parseInt(process.env.LOG_RETENTION_ACCESS_DAYS || '90', 10),
+    },
+    error: {
+      name: '/weelo/error',
+      retentionDays: parseInt(process.env.LOG_RETENTION_APP_DAYS || '30', 10),
+    },
   },
-  
-  // Retention period (days)
-  logRetention: parseInt(process.env.LOG_RETENTION_DAYS || '30'),
-  
+
+  // Back-compat shim — DEPRECATED, remove once all consumers read tier-specific vars.
+  logRetention: parseInt(process.env.LOG_RETENTION_DAYS || '30', 10),
+
   // Metrics namespace
   metricsNamespace: 'Weelo/Backend',
   

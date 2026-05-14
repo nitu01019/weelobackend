@@ -903,10 +903,14 @@ describe('M8: Validation details for 4xx in production, stripped for 5xx', () =>
 
       errorHandler(error, req, res as unknown as Response, noopNext);
 
+      // Fix #19: error.message moved to `errorMessage`; `errorCode`/`errorClass`/`errorCategory`
+      // added alongside for CloudWatch metric-filter slicing.
       expect(logger.error).toHaveBeenCalledWith(
         'Request error',
         expect.objectContaining({
-          error: 'Bad request',
+          errorMessage: 'Bad request',
+          errorClass: 'AppError',
+          errorCode: 'VALIDATION_ERROR',
           path: '/api/v1/booking',
           method: 'POST',
         })
@@ -921,10 +925,13 @@ describe('M8: Validation details for 4xx in production, stripped for 5xx', () =>
 
       errorHandler(error, req, res as unknown as Response, noopNext);
 
+      // Fix #19: plain Error → errorCode='INTERNAL_ERROR', errorClass='Error'.
       expect(logger.error).toHaveBeenCalledWith(
         'Request error',
         expect.objectContaining({
-          error: 'Unexpected crash',
+          errorMessage: 'Unexpected crash',
+          errorClass: 'Error',
+          errorCode: 'INTERNAL_ERROR',
         })
       );
     });
@@ -940,7 +947,9 @@ describe('M8: Validation details for 4xx in production, stripped for 5xx', () =>
       expect(logger.error).toHaveBeenCalledWith(
         'Request error',
         expect.objectContaining({
-          error: 'Too many requests',
+          errorMessage: 'Too many requests',
+          errorClass: 'AppError',
+          errorCode: 'RATE_LIMIT_EXCEEDED',
         })
       );
     });
