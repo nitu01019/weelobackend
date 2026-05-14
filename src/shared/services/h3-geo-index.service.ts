@@ -87,6 +87,21 @@ const H3_PARENT_RESOLUTION = H3_RESOLUTION - 1;
 const H3_PARENT_CELL_NAMESPACE = `h3:${H3_PARENT_RESOLUTION}`;
 
 /**
+ * Phase 7 follow-up — Defect #9: boot guard. h3-js v4 `cellToParent(res)`
+ * rejects res outside [0, 15] with a synchronous Error deep in the dispatch
+ * hot path. If H3_RESOLUTION=0 (lower bound of the env clamp at L56), parent
+ * resolution would be -1 and every cellToParent call would throw. Fail loud
+ * at module load so misconfig is caught at boot, not at runtime.
+ */
+if (H3_PARENT_RESOLUTION < 0 || H3_PARENT_RESOLUTION > 15) {
+    throw new Error(
+        `[H3Index] BOOT GUARD: H3_PARENT_RESOLUTION=${H3_PARENT_RESOLUTION} outside valid range [0,15]. `
+        + `H3_RESOLUTION=${H3_RESOLUTION} — parent = H3_RESOLUTION - 1. `
+        + `Set H3_RESOLUTION to a value in [1, 15] to fix.`,
+    );
+}
+
+/**
  * Fix #16 — FF gating dual-index (default OFF; READ requires WRITE).
  * Both must be EXPLICITLY 'true' to take effect (rollback safety invariant I3).
  */
