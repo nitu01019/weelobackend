@@ -1944,8 +1944,14 @@ export class QueueService {
 
       // Fix M-7: Store dropped broadcast in Redis DLQ for recovery
       try {
+        // Fix #13 Section 3: stamp eventId at first DLQ enqueue so replay
+        // via scripts/replay-broadcast-dlq.ts preserves the same business-
+        // event id (FE ring-buffer dedup key) across DLQ → re-emit path.
+        const dataWithEventId = data && typeof data === 'object' && !Array.isArray(data)
+          ? { ...data, eventId: (data as any).eventId ?? crypto.randomUUID() }
+          : data;
         const dlqEntry = JSON.stringify({
-          transporterId, event, data,
+          transporterId, event, data: dataWithEventId,
           droppedAt: Date.now(), reason: 'queue_full'
         });
         await redisService.lPush('dlq:broadcasts', dlqEntry);

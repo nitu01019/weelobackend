@@ -216,6 +216,13 @@ interface IRedisClient {
    */
   sAddWithExpire(key: string, ttlSeconds: number, ...members: string[]): Promise<void>;
 
+  /**
+   * Fix #16 — Atomic dual-key SADD + EXPIRE via Lua script.
+   * key2 may be null/empty to skip the second key (single-key mode).
+   * Both keys must hash to the same cluster slot (use `{tag}` braces).
+   */
+  sAddPairWithExpire(key1: string, key2: string | null, ttlSeconds: number, member: string): Promise<void>;
+
   // Raw client access (for Socket.IO Redis Streams adapter)
   getRawClient(): any;
 }
@@ -846,6 +853,25 @@ class InMemoryRedisClient implements IRedisClient {
     // In-memory fallback: separate calls (no atomicity concern in single-process dev mode)
     await this.sAdd(key, ...members);
     await this.expire(key, ttlSeconds);
+  }
+
+  /**
+   * Fix #16 — In-memory equivalent of the dual-key Lua eval. Single-process so
+   * atomicity is trivially preserved by JS event-loop semantics.
+   */
+  async sAddPairWithExpire(
+    key1: string,
+    key2: string | null,
+    ttlSeconds: number,
+    member: string
+  ): Promise<void> {
+    if (!member) return;
+    await this.sAdd(key1, member);
+    await this.expire(key1, ttlSeconds);
+    if (key2 && key2 !== '') {
+      await this.sAdd(key2, member);
+      await this.expire(key2, ttlSeconds);
+    }
   }
 }
 
@@ -1524,6 +1550,32 @@ class RealRedisClient implements IRedisClient {
     }
     this.recordEvalShaPath('weeloSAddWithExpire', this.hotPathCmds === null ? 'flag-off' : 'fallback');
     await this.eval(getScriptLua('weeloSAddWithExpire'), [key], [String(ttlSeconds), ...members]);
+  }
+
+  /**
+   * Fix #16 — Atomic dual-key SADD + EXPIRE via plain Lua EVAL.
+   * Both keys must hash to the same cluster slot (caller uses `{tag}` braces).
+   * If key2 is null/empty, only key1 is touched (single-key mode).
+   *
+   * Single Lua script = single Redis round-trip = atomic on the slot owner.
+   */
+  async sAddPairWithExpire(
+    key1: string,
+    key2: string | null,
+    ttlSeconds: number,
+    member: string
+  ): Promise<void> {
+    if (!member) return;
+    const luaScript = `
+        redis.call('SADD', KEYS[1], ARGV[2])
+        redis.call('EXPIRE', KEYS[1], ARGV[1])
+        if KEYS[2] and KEYS[2] ~= '' then
+            redis.call('SADD', KEYS[2], ARGV[2])
+            redis.call('EXPIRE', KEYS[2], ARGV[1])
+        end
+        return 1
+    `;
+    await this.eval(luaScript, [key1, key2 || ''], [String(ttlSeconds), member]);
   }
 
   /** Eris #3 — bounded metric write; never throws. */
@@ -2993,6 +3045,19 @@ class RedisService {
    */
   async sAddWithExpire(key: string, ttlSeconds: number, ...members: string[]): Promise<void> {
     return this.client.sAddWithExpire(key, ttlSeconds, ...members);
+  }
+
+  /**
+   * Fix #16 — Atomic dual-key SADD + EXPIRE via Lua. Both keys must hash to
+   * the same cluster slot (caller uses `{tag}` braces). key2 null = single key.
+   */
+  async sAddPairWithExpire(
+    key1: string,
+    key2: string | null,
+    ttlSeconds: number,
+    member: string
+  ): Promise<void> {
+    return this.client.sAddPairWithExpire(key1, key2, ttlSeconds, member);
   }
 
   // ===========================================================================

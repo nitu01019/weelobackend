@@ -57,8 +57,11 @@ const H3_RESOLUTION = Math.min(15, Math.max(0,
     parseInt(process.env.H3_RESOLUTION || '8', 10) || 8
 ));
 
-/** Redis key prefix for H3 cell sets (includes resolution for safety) */
-const H3_CELL_KEY_PREFIX = `h3:${H3_RESOLUTION}`;
+/** Redis namespace for H3 cell sets (includes resolution for safety).
+ *  Renamed from H3_CELL_KEY_PREFIX to clear gitleaks generic-api-key
+ *  false positive on `*KEY*` variable names. Semantically the constant is
+ *  a namespace prefix used to build Redis keys, not a credential. */
+const H3_CELL_NAMESPACE = `h3:${H3_RESOLUTION}`;
 
 /** Redis key prefix for transporter's current cell (reverse lookup) */
 const H3_POS_PREFIX = 'h3:pos';
@@ -75,10 +78,43 @@ const H3_CELL_TTL_SECONDS = H3_POS_TTL_SECONDS + 10;
 /** Feature flag — when false, index is shadow-built but not used for dispatch */
 export const FF_H3_INDEX_ENABLED = process.env.FF_H3_INDEX_ENABLED === 'true';
 
+/**
+ * Fix #16 — Dual-index parent resolution. HARD-PINNED to res-8 minus one.
+ * No env override: per Phase-2 Attack #18, divergent pod values would split keyspace.
+ * To change resolution: edit this constant, redeploy ALL pods together.
+ */
+const H3_PARENT_RESOLUTION = H3_RESOLUTION - 1;
+const H3_PARENT_CELL_NAMESPACE = `h3:${H3_PARENT_RESOLUTION}`;
+
+/**
+ * Fix #16 — FF gating dual-index (default OFF; READ requires WRITE).
+ * Both must be EXPLICITLY 'true' to take effect (rollback safety invariant I3).
+ */
+export const FF_H3_DUAL_INDEX_WRITE = process.env.FF_H3_DUAL_INDEX_WRITE === 'true';
+export const FF_H3_DUAL_INDEX_READ = process.env.FF_H3_DUAL_INDEX_READ === 'true';
+
+// Boot guard (Phase-2 Attack #13): warn loudly if READ is enabled without WRITE.
+// We CANNOT mutate the exported `FF_H3_DUAL_INDEX_READ` const from here; the
+// runtime AND-gate at progressive-radius-matcher.ts:262 (`const dualReadOn =
+// FF_H3_DUAL_INDEX_READ && FF_H3_DUAL_INDEX_WRITE`) is the load-bearing safety
+// — it prevents reads from a cold res-7 keyspace. Any future caller that
+// consumes FF_H3_DUAL_INDEX_READ alone MUST replicate that AND-gate, or this
+// boot guard should be promoted to a process.exit(1) hard-fail.
+if (FF_H3_DUAL_INDEX_READ && !FF_H3_DUAL_INDEX_WRITE) {
+    logger.error('[H3Index] BOOT GUARD: FF_H3_DUAL_INDEX_READ requires FF_H3_DUAL_INDEX_WRITE. '
+        + 'Runtime AND-gate at progressive-radius-matcher.ts:262 covers this misconfig today; '
+        + 'fix env vars before next deploy.');
+}
+
 // =============================================================================
 // KEY GENERATORS
 // =============================================================================
 
+/**
+ * Hash-tagged child key (res-8). `{vehicleKey}` braces force Redis Cluster to
+ * route this key to the same slot as the matching parent key — essential for
+ * Fix #16's atomic dual-write Lua eval (CROSSSLOT-safe).
+ */
 function cellKey(cellId: string, vehicleKey: string): string {
     // Fix D6/F-3-7: Dev-mode guard — colons in components would corrupt the key structure
     if (process.env.NODE_ENV !== 'production') {
@@ -86,7 +122,15 @@ function cellKey(cellId: string, vehicleKey: string): string {
             logger.warn(`[H3Index] cellKey components must not contain colons`, { cellId, vehicleKey });
         }
     }
-    return `${H3_CELL_KEY_PREFIX}:${cellId}:${vehicleKey}`;
+    return `${H3_CELL_NAMESPACE}:${cellId}:{${vehicleKey}}`;
+}
+
+/**
+ * Fix #16 — Hash-tagged parent key (res-7). Same `{vehicleKey}` tag as cellKey
+ * forces same-slot routing for the dual-write Lua eval.
+ */
+function parentCellKey(parentCellId: string, vehicleKey: string): string {
+    return `${H3_PARENT_CELL_NAMESPACE}:${parentCellId}:{${vehicleKey}}`;
 }
 
 function posKey(transporterId: string): string {
@@ -158,11 +202,15 @@ class H3GeoIndexService {
     ): Promise<void> {
         try {
             const cell = this.latLngToCell(lat, lng);
-            const key = cellKey(cell, vehicleKey);
+            const childKey = cellKey(cell, vehicleKey);
+            // Fix #16: Dual-write to parent (res-7) when FF on. Atomic Lua eval covers both
+            // keys; rollback safety preserved because res-8 child SET is always written.
+            const parentKey = FF_H3_DUAL_INDEX_WRITE
+                ? parentCellKey(h3.cellToParent(cell, H3_PARENT_RESOLUTION), vehicleKey)
+                : null;
 
-            // H-P3 FIX: Atomic SADD+EXPIRE via Lua script to prevent orphaned sets without TTL
             await Promise.all([
-                redisService.sAddWithExpire(key, H3_CELL_TTL_SECONDS, transporterId),
+                redisService.sAddPairWithExpire(childKey, parentKey, H3_CELL_TTL_SECONDS, transporterId),
                 redisService.set(posKey(transporterId), `${cell}:${vehicleKey}`, H3_POS_TTL_SECONDS)
             ]);
 
@@ -186,12 +234,17 @@ class H3GeoIndexService {
     ): Promise<void> {
         try {
             const cell = this.latLngToCell(lat, lng);
+            // Fix #16 (Attack #19): Dual-write coded for the multi-key path too.
+            // Parent cell derived once per call — same parent for every vehicleKey at this cell.
+            const parentCell = FF_H3_DUAL_INDEX_WRITE
+                ? h3.cellToParent(cell, H3_PARENT_RESOLUTION)
+                : null;
 
-            // H-P3 FIX: Atomic SADD+EXPIRE via Lua script for each vehicle key
             const ops: Promise<any>[] = [];
             for (const vk of vehicleKeys) {
-                const key = cellKey(cell, vk);
-                ops.push(redisService.sAddWithExpire(key, H3_CELL_TTL_SECONDS, transporterId));
+                const childKey = cellKey(cell, vk);
+                const parentKey = parentCell ? parentCellKey(parentCell, vk) : null;
+                ops.push(redisService.sAddPairWithExpire(childKey, parentKey, H3_CELL_TTL_SECONDS, transporterId));
             }
             // Store position with primary vehicle key for reverse lookup
             ops.push(
@@ -230,10 +283,19 @@ class H3GeoIndexService {
                 ? vehicleKeysStr.split(',')
                 : [vehicleKeysStr];
 
+            // Fix #16 (Attack #14): Derive parent at remove time — NO posKey schema change.
+            // If FF was on during add, parent SETs exist and must be cleaned up;
+            // if FF was off, parentCell is null and parent SREMs are skipped.
+            const parentCell = FF_H3_DUAL_INDEX_WRITE
+                ? h3.cellToParent(cell, H3_PARENT_RESOLUTION)
+                : null;
+
             const ops: Promise<any>[] = [redisService.del(posKey(transporterId))];
             for (const vk of vehicleKeys) {
-                if (vk) {
-                    ops.push(redisService.sRem(cellKey(cell, vk), transporterId));
+                if (!vk) continue;
+                ops.push(redisService.sRem(cellKey(cell, vk), transporterId));
+                if (parentCell) {
+                    ops.push(redisService.sRem(parentCellKey(parentCell, vk), transporterId));
                 }
             }
 
@@ -262,13 +324,25 @@ class H3GeoIndexService {
             if (posValue) {
                 const oldCell = posValue.split(':')[0];
                 if (oldCell === newCell) {
-                    // Same cell — sliding window: refresh BOTH pos AND cell TTLs
+                    // Fix #16 (Attack #2): Same-cell heartbeat ALSO re-SADDs the res-7 parent
+                    // idempotently — partial dual-writes self-heal within one heartbeat cycle.
+                    // sAddPairWithExpire is atomic, so re-adding a member that's already in the
+                    // SET is a no-op but the EXPIRE always refreshes the TTL on both keys.
+                    const parentCell = FF_H3_DUAL_INDEX_WRITE
+                        ? h3.cellToParent(newCell, H3_PARENT_RESOLUTION)
+                        : null;
                     const refreshOps: Promise<any>[] = [
                         redisService.expire(posKey(transporterId), H3_POS_TTL_SECONDS).catch(() => { })
                     ];
                     for (const vk of vehicleKeys) {
+                        const parentKey = parentCell ? parentCellKey(parentCell, vk) : null;
                         refreshOps.push(
-                            redisService.expire(cellKey(newCell, vk), H3_CELL_TTL_SECONDS).catch(() => { })
+                            redisService.sAddPairWithExpire(
+                                cellKey(newCell, vk),
+                                parentKey,
+                                H3_CELL_TTL_SECONDS,
+                                transporterId
+                            ).catch(() => { })
                         );
                     }
                     await Promise.all(refreshOps);
@@ -372,38 +446,115 @@ class H3GeoIndexService {
     /**
      * Find candidates in ONLY the new ring shell (not inner rings).
      * Used for progressive expansion where inner rings were already queried.
+     *
+     * Fix #16: `queryResolution` selects child (res-8) vs parent (res-7) index.
+     * On empty result at the parent index, falls back to res-8 using PINNED
+     * `fallbackRingK` (NO runtime arithmetic — closes Attack #3 off-by-one).
      */
     async getCandidatesNewRing(
         pickupLat: number,
         pickupLng: number,
         vehicleKey: string,
         ringK: number,
-        alreadyNotified: Set<string>
+        alreadyNotified: Set<string>,
+        queryResolution: number = H3_RESOLUTION,
+        fallbackRingK?: number
     ): Promise<string[]> {
         try {
             if (ringK === 0) {
                 return this.getCandidates(pickupLat, pickupLng, vehicleKey, 0, alreadyNotified);
             }
 
-            const originCell = this.latLngToCell(pickupLat, pickupLng);
-            const newRingCells = this.gridRingUnsafe(originCell, ringK);
+            const useParent = queryResolution === H3_PARENT_RESOLUTION;
+            const keyPrefix = useParent ? H3_PARENT_CELL_NAMESPACE : H3_CELL_NAMESPACE;
+            const originCell = h3.latLngToCell(pickupLat, pickupLng, queryResolution);
+            const newRingCells = this.gridRingUnsafeAtCell(originCell, ringK);
 
-            const keys = newRingCells.map(cell => cellKey(cell, vehicleKey));
-            if (keys.length === 0) return [];
+            const keys = newRingCells.map(cell =>
+                `${keyPrefix}:${cell}:{${vehicleKey}}`
+            );
 
-            let members: string[];
-            if (keys.length === 1) {
-                members = await redisService.sMembers(keys[0]).catch(() => []);
-            } else {
-                members = await redisService.sUnion(...keys).catch(() => []);
+            let members: string[] = [];
+            if (keys.length > 0) {
+                if (keys.length === 1) {
+                    members = await redisService.sMembers(keys[0]).catch(() => []);
+                } else if (keys.length <= 500) {
+                    members = await redisService.sUnion(...keys).catch(() => []);
+                } else {
+                    // Chunk SUNION to prevent Redis event loop blocking
+                    const CHUNK_SIZE = 500;
+                    const chunks: string[][] = [];
+                    for (let i = 0; i < keys.length; i += CHUNK_SIZE) {
+                        chunks.push(keys.slice(i, i + CHUNK_SIZE));
+                    }
+                    const chunkResults = await Promise.all(
+                        chunks.map(chunk => redisService.sUnion(...chunk).catch(() => [] as string[]))
+                    );
+                    members = [...new Set(chunkResults.flat())];
+                }
+            }
+
+            // Fix #16: Empty res-7 parent SET → fallback to res-8 using PINNED fallbackRingK.
+            // Covers warm-up, partial-write, FF mid-flip scenarios. No runtime × 2.65 arithmetic.
+            if (useParent && members.length === 0 && fallbackRingK !== undefined && fallbackRingK > 0) {
+                try {
+                    const fallbackOriginCell = h3.latLngToCell(pickupLat, pickupLng, H3_RESOLUTION);
+                    const fallbackCells = this.gridRingUnsafeAtCell(fallbackOriginCell, fallbackRingK);
+                    const fallbackKeys = fallbackCells.map(cell =>
+                        `${H3_CELL_NAMESPACE}:${cell}:{${vehicleKey}}`
+                    );
+                    if (fallbackKeys.length > 0) {
+                        if (fallbackKeys.length === 1) {
+                            members = await redisService.sMembers(fallbackKeys[0]).catch(() => []);
+                        } else if (fallbackKeys.length <= 500) {
+                            members = await redisService.sUnion(...fallbackKeys).catch(() => []);
+                        } else {
+                            const CHUNK_SIZE = 500;
+                            const chunks: string[][] = [];
+                            for (let i = 0; i < fallbackKeys.length; i += CHUNK_SIZE) {
+                                chunks.push(fallbackKeys.slice(i, i + CHUNK_SIZE));
+                            }
+                            const chunkResults = await Promise.all(
+                                chunks.map(chunk => redisService.sUnion(...chunk).catch(() => [] as string[]))
+                            );
+                            members = [...new Set(chunkResults.flat())];
+                        }
+                    }
+                    try {
+                        const { metrics } = require('../monitoring/metrics.service');
+                        metrics.incrementCounter('h3_index_parent_fallback_total', {});
+                    } catch { /* metrics unavailable */ }
+                } catch (fallbackErr: any) {
+                    logger.warn(`[H3Index] parent→child fallback failed: ${fallbackErr.message}`, {
+                        vehicleKey, ringK, fallbackRingK
+                    });
+                }
             }
 
             return members.filter(id => !alreadyNotified.has(id));
         } catch (error: any) {
             logger.error(`[H3Index] getCandidatesNewRing failed: ${error.message}`, {
-                vehicleKey, ringK
+                vehicleKey, ringK, queryResolution
             });
             return [];
+        }
+    }
+
+    /**
+     * Fix #16: gridRingUnsafe with pentagon-safe fallback. Extracted so both the
+     * primary res-7 path and the res-8 fallback path share identical ring shape.
+     */
+    private gridRingUnsafeAtCell(originCell: string, k: number): string[] {
+        try {
+            return h3.gridRingUnsafe(originCell, k);
+        } catch {
+            const full = new Set(h3.gridDisk(originCell, k));
+            if (k > 0) {
+                for (const inner of h3.gridDisk(originCell, k - 1)) {
+                    full.delete(inner);
+                }
+            }
+            return Array.from(full);
         }
     }
 

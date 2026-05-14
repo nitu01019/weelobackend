@@ -1,7 +1,7 @@
 asyncapi: 3.0.0
 info:
   title: Weelo Socket Event Contracts
-  version: 1.0.0
+  version: 1.1.0
   description: |
     Canonical event-name registry for Weelo socket traffic. Source of truth for
     backend, captain, and customer repos. Codegen emits:
@@ -258,6 +258,42 @@ channels:
   eta_updated:
     address: eta_updated
     messages: {}
+
+# ---------------------------------------------------------------------------
+# Fix #13 (v1.1.0) — Dedup contract for at-least-once retransmission paths.
+# Stable `eventId` (UUIDv4) is stamped at first emission and preserved through
+# DLQ replay + Phase-4 ZSET replay so FE ring-buffer dedup can key on a stable
+# id per Kleppmann DDIA Ch.11 §"Idempotent Consumers". `_seq` is a per-process
+# transport-level monotonic counter — it CHANGES per retransmission and is
+# NOT a dedup key.
+# ---------------------------------------------------------------------------
+components:
+  messageTraits:
+    DedupableEvent:
+      headers:
+        type: object
+        required: [eventId]
+        properties:
+          eventId:
+            type: string
+            format: uuid
+            description: Stable business-event id (UUIDv4); same value across all retransmission paths.
+          eventVersion:
+            type: integer
+            minimum: 1
+          serverTimeMs:
+            type: integer
+          _seq:
+            type: integer
+            description: Per-process transport-level monotonic counter; NOT a dedup key (changes per retransmission). Use eventId instead.
+          _replayed:
+            type: boolean
+            default: false
+          _reconnectDelivery:
+            type: boolean
+            default: false
+      x-retention: PT24H
+      x-delivery-guarantee: at-least-once
 
 # ---------------------------------------------------------------------------
 # Legacy aliases — additional TS member names mapping to an existing wire value.
