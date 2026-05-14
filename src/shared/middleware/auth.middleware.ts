@@ -17,6 +17,7 @@ import jwt from 'jsonwebtoken';
 import { config } from '../../config/environment';
 import { AppError } from '../types/error.types';
 import { logger } from '../services/logger.service';
+import { logErrorThrottled } from '../utils/log-throttle';
 import { redisService } from '../services/redis.service';
 import { prismaClient } from '../database/prisma.service';
 import { metrics } from '../monitoring/metrics.service';
@@ -111,7 +112,8 @@ export async function authMiddleware(
       } catch (err) {
         consecutiveRedisFailures++;
         if (AUTH_REDIS_FAIL_POLICY === 'closed') {
-          logger.error('[AUTH] Redis unavailable, rejecting request (fail-closed policy)', { userId: decoded.userId, path: req.path });
+          // Fix #18: throttle hot-path fail-closed log; same key dedups with the suspension-check site below.
+          logErrorThrottled('auth_redis_unavailable', '[AUTH] Redis unavailable, rejecting request (fail-closed policy)', { userId: decoded.userId, path: req.path });
           return next(new AppError(503, 'SERVICE_UNAVAILABLE', 'Authentication service temporarily unavailable', { retryAfter: 10 }));
         }
         logger.warn('[Auth] JTI blacklist check failed-open', { jti: decoded.jti, userId: decoded.userId, path: req.path });
@@ -136,7 +138,8 @@ export async function authMiddleware(
     } catch (err) {
       consecutiveRedisFailures++;
       if (AUTH_REDIS_FAIL_POLICY === 'closed') {
-        logger.error('[AUTH] Redis unavailable, rejecting request (fail-closed policy)', { userId: decoded.userId, path: req.path });
+        // Fix #18: throttle hot-path fail-closed log; same key dedups with the JTI-blacklist site above.
+        logErrorThrottled('auth_redis_unavailable', '[AUTH] Redis unavailable, rejecting request (fail-closed policy)', { userId: decoded.userId, path: req.path });
         return next(new AppError(503, 'SERVICE_UNAVAILABLE', 'Authentication service temporarily unavailable', { retryAfter: 10 }));
       }
       logger.warn('[Auth] Suspension check failed-open', { userId: decoded.userId, path: req.path });

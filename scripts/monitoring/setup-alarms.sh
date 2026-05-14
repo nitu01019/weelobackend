@@ -119,4 +119,21 @@ aws cloudwatch put-metric-alarm \
   --alarm-actions "${ALARM_SNS_TOPIC_ARN}" \
   --region ap-south-1
 
+# Fix #14 (Phase 6 follow-up): socket Connection-State Recovery (CSR) failure-rate alarm.
+# Paired with src/shared/services/socket.service.ts:333-341 emit on recovered=false.
+# Threshold 50/min calibrated initial — revisit after 7-day production false-rate baseline
+# per Helix INTEGRATOR-NOTE. P3 severity (silent room-membership loss, not user-blocking).
+aws cloudwatch put-metric-alarm \
+  --alarm-name "weelo-socket-csr-failure-rate" \
+  --alarm-description "[P3] Fix #14 — silent CSR pipeline failure: reconnecting clients lost room memberships (broadcast/status events go to a room they're not in anymore). Threshold calibrated after 7-day production false-rate baseline per Helix INTEGRATOR-NOTE; revisit in ops review." \
+  --metric-name socket_csr_attempt_total \
+  --namespace Weelo/Backend \
+  --dimensions Name=recovered,Value=false \
+  --statistic Sum --period 60 \
+  --evaluation-periods 2 --threshold 50 \
+  --comparison-operator GreaterThanThreshold \
+  --treat-missing-data notBreaching \
+  --alarm-actions "${ALARM_SNS_TOPIC_ARN}" \
+  --region "${AWS_REGION:-ap-south-1}"
+
 echo "CloudWatch alarms and dashboard configured"

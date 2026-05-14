@@ -155,6 +155,50 @@ export function registerDefaultCounters(counters: Map<string, CounterMetric>): v
       'Socket emits processed while Redis adapter is down (local-instance only broadcast)'
     ),
 
+    // Fix #11 — Reconnect-time sequence-replay outcome SLI.
+    // Wired at 5 swallow sites in socket.service.ts (booking-path, order-path,
+    // customer state-sync, Phase4 success + empty + catch). The outcome label
+    // is a const-asserted union {success, empty, failure}; source is a const-
+    // asserted union {phase4, booking_active, order_active, customer_state_sync}.
+    // Cardinality: 4 sources × ~4 roles × 3 outcomes = 48 series — well under
+    // the CW 10K ceiling. CloudWatch alarm: rate(outcome=failure) > 0.5%.
+    counter(
+      'socket_reconnect_replay_total',
+      'Reconnect-time sequence-replay attempts by outcome — labels: outcome (success|failure|empty), role, source (phase4|booking_active|order_active|customer_state_sync)'
+    ),
+    counter(
+      'socket_reconnect_replay_messages_total',
+      'Individual messages replayed on reconnect (incremented by N on success) — labels: role, source'
+    ),
+
+    // Fix #14 — Socket.IO CSR (Connection State Recovery) outcome observation.
+    // Labels: recovered = 'true' | 'false', role = 'transporter' | 'driver' |
+    // 'customer' | 'unknown'. Cardinality = 2 × ~4 = 8 series.
+    // Call site: src/shared/services/socket.service.ts `io.on('connection')`
+    // handler — increments once per connection event. The alarm wired against
+    // `recovered=false` surfaces silent CSR-pipeline failures where reconnecting
+    // clients lose all prior room memberships, leading to "stuck UI" with zero
+    // log signal. See index-30-validated.md Finding #14.
+    counter(
+      'socket_csr_attempt_total',
+      'Socket.IO CSR (Connection State Recovery) outcomes — labels: recovered (true|false), role — Finding #14',
+    ),
+
+    // Fix #18 — Log-throttle internal counters. MUST be registered here (NOT
+    // auto-created) because metrics.service.ts:incrementCounter emits
+    // `logger.warn('Counter X not found')` on unregistered names — that warn
+    // is itself unthrottled, which would defeat Fix #18 at exactly the
+    // Redis-down flood profile (500 RPS × N emitters) the fix targets. Caught
+    // by the race-condition red-team agent during Gate 4.
+    counter(
+      'log_throttle_suppressed_total',
+      'Hot-path error logs suppressed by per-key throttle (Fix #18) — labels: key (stable throttle identifier such as auth_redis_unavailable, rate_limiter_redis_failopen, ratelimit_redis_down)',
+    ),
+    counter(
+      'log_throttle_keyspace_full_total',
+      'Throttle keyspace overflow events (Fix #18) — emitted on MAX_KEYS=256 eviction in production/staging; labels: drop_key_prefix',
+    ),
+
     // Fix #29 — API version negotiation observability.
     // Labels: version = 'v1' | 'v2' | 'unknown'. The "flip FF_DISPATCH_PENDING"
     // gate watches `version=v1` falling below 1% of total over the 90-day

@@ -494,9 +494,12 @@ aws logs get-log-events \
 
 ### 3. ✅ Metrics Counters Not Registered (RESOLVED 2026-04-11)
 - **What:** CLAUDE.md listed dot-notation names (`hold.request.total`) but actual code uses underscores (`hold_request_total`). All 9 hold metrics were already registered in `initializeDefaultMetrics()` AND duplicated in `metrics-definitions.ts` (which was never imported).
-- **Fix applied:** Removed ~360 lines of duplicated inline registrations from `metrics.service.ts`. Constructor now delegates to `registerDefaultCounters/Gauges/Histograms` from `metrics-definitions.ts` (single source of truth). Additionally, `incrementCounter` and `observeHistogram` auto-create metrics on first use, so no WARN was ever emitted by these methods.
+- **Fix applied:** Removed ~360 lines of duplicated inline registrations from `metrics.service.ts`. Constructor now delegates to `registerDefaultCounters/Gauges/Histograms` from `metrics-definitions.ts` (single source of truth).
 - **Files changed:** `src/shared/monitoring/metrics.service.ts` (881 -> 523 lines)
 - **Tests:** All 165 metrics tests pass (fix-metrics-service-hardening, phase6-observability, manager-fix-tracking-metrics)
+- **CORRECTION (2026-05-14):** Earlier doc claimed `incrementCounter` and `observeHistogram` auto-create metrics on first use. That is FALSE. Verified at `src/shared/monitoring/metrics.service.ts:453-462`: `incrementCounter` does `const counter = this.counters.get(name); if (!counter) { logger.warn(\`Counter ${name} not found\`); return; }` — it logs an **unthrottled** `logger.warn` and returns without recording. `observeHistogram` (line 518+) and the gauge setters behave the same way (no warn on gauges, but no auto-create either). Consequence: any new counter MUST be pre-registered in `metrics-definitions.ts` BEFORE the first call site lands in code — otherwise the warn flood at the very call site you are trying to instrument will defeat the telemetry the counter was added to capture (and, in a hot path, drown the logger).
+- **Rule:** All new counters/gauges/histograms must be added to `registerDefaultCounters` / `registerDefaultGauges` / `registerDefaultHistograms` in `metrics-definitions.ts` (single source of truth). Verified by Phase 6 race-team finding 2026-05-14 (`log_throttle_suppressed_total`, `log_throttle_keyspace_full_total` were initially unregistered — Fix #18's throttle was defeated by its own unthrottled `Counter not found` warn under the Redis-down 500 RPS flood profile until corrected at `metrics-definitions.ts:194-201`).
+- **Note corrected 2026-05-14 per Phase 6 PR #12 follow-up.**
 
 ### 4. 🟢 No `_prisma_migrations` table (LOW — future risk)
 - **What:** DB was set up with `prisma db push` not `prisma migrate deploy`

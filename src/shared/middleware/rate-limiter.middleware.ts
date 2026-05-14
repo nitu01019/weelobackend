@@ -33,6 +33,7 @@ import { Request, Response } from 'express';
 import { config } from '../../config/environment';
 import { redisService } from '../services/redis.service';
 import { logger } from '../services/logger.service';
+import { logErrorThrottled } from '../utils/log-throttle';
 import { FLAGS, isEnabled } from '../config/feature-flags';
 import { isInCidrList } from '../utils/net.utils';
 import { metrics } from '../monitoring/metrics.service';
@@ -137,7 +138,13 @@ class RedisRateLimitStore {
       // - NOT totalHits:0 (fail-open, security vulnerability)
       // - YES in-memory counter (per-instance, still enforces limits)
       // When Redis comes back → next call auto-uses Redis (seamless recovery)
-      logger.warn(`[RateLimit] Redis failed for ${key}: ${error.message} — using in-memory counter`);
+      // Fix #18: throttle hot-path Redis-failopen log (~500 RPS × 3 emitters peak).
+      // Stable key dedups all 3 emitters in this file to ≤1 emission per windowMs.
+      logErrorThrottled('rate_limiter_redis_failopen', '[RateLimit] Redis failopen — using in-memory counter', {
+        emitter: 'increment',
+        key,
+        error: error.message,
+      });
       return this.incrementMemory(key);
     }
   }
@@ -156,7 +163,12 @@ class RedisRateLimitStore {
       // Atomic decrement — avoids read-modify-write race condition
       await redisService.incrBy(redisKey, -1);
     } catch (error: any) {
-      logger.warn(`[RateLimit] Redis decrement failed for ${key}: ${error.message}`);
+      // Fix #18: throttle hot-path Redis-failopen log; same key dedups with the increment/resetKey sites.
+      logErrorThrottled('rate_limiter_redis_failopen', '[RateLimit] Redis failopen — using in-memory counter', {
+        emitter: 'decrement',
+        key,
+        error: error.message,
+      });
       // Non-critical — just means one extra request counted
     }
   }
@@ -173,7 +185,12 @@ class RedisRateLimitStore {
     try {
       await redisService.del(redisKey);
     } catch (error: any) {
-      logger.warn(`[RateLimit] Redis resetKey failed for ${key}: ${error.message}`);
+      // Fix #18: throttle hot-path Redis-failopen log; same key dedups with the increment/decrement sites.
+      logErrorThrottled('rate_limiter_redis_failopen', '[RateLimit] Redis failopen — using in-memory counter', {
+        emitter: 'resetKey',
+        key,
+        error: error.message,
+      });
     }
   }
 }

@@ -19,6 +19,7 @@
 
 import { Request, Response, NextFunction } from 'express';
 import { logger } from '../services/logger.service';
+import { logErrorThrottled } from '../utils/log-throttle';
 import { redisService } from '../services/redis.service';
 
 interface RateLimitConfig {
@@ -157,8 +158,9 @@ export function transporterRateLimit(action: keyof typeof RATE_LIMITS) {
       next();
 
     } catch (error: unknown) {
-      // If Redis fails, reject the request (fail closed) to prevent abuse
-      logger.error(`[RateLimit] Redis error, denying request for safety`, {
+      // If Redis fails, reject the request (fail closed) to prevent abuse.
+      // Fix #18: throttle this hot-path error log (≤1 emit / 10s / pod).
+      logErrorThrottled('ratelimit_redis_down', `[RateLimit] Redis error, denying request for safety`, {
         action,
         transporterId,
         error: error instanceof Error ? error.message : String(error),

@@ -39,6 +39,7 @@ import { logger } from './logger.service';
 import { redisService } from './redis.service';
 import { socketCircuit } from './circuit-breaker.service';
 import { isEnabled, FLAGS } from '../config/feature-flags';
+import { hashUserId } from '../utils/error-log.utils';
 import {
   TRANSPORTER_PRESENCE_KEY,
   PRESENCE_TTL_SECONDS as TRANSPORTER_PRESENCE_TTL,
@@ -284,8 +285,73 @@ export function initializeSocket(server: HttpServer): Server {
     }
   });
 
+  // ===========================================================================
+  // Fix #11 — Reconnect-time sequence-replay outcome SLI.
+  // Wired at 5 swallow sites below (booking-path, order-path, customer state-
+  // sync, Phase4 success+empty branches + Phase4 catch). The const-asserted
+  // tuples narrow the `source` and `outcome` arguments to compile-time literal
+  // unions so a typo (`recordReplayOutcome('badsorce', ...)`) fails tsc.
+  // OpenTelemetry "instrumentation library" pattern — single source of metric-
+  // name strings, no inline ceremony at call sites.
+  // ===========================================================================
+  const REPLAY_OUTCOMES = ['success', 'failure', 'empty'] as const;
+  type ReplayOutcome = typeof REPLAY_OUTCOMES[number];
+  const REPLAY_SOURCES = ['phase4', 'booking_active', 'order_active', 'customer_state_sync'] as const;
+  type ReplaySource = typeof REPLAY_SOURCES[number];
+
+  // Metrics-optional helper. Bare `catch { }` matches the file's existing
+  // adapter-failure/recovery counter pattern at L1499/L1518 — a metric outage
+  // MUST NOT block reconnect-replay correctness (Fix #11 invariant).
+  function recordReplayOutcome(
+    source: ReplaySource,
+    role: string,
+    outcome: ReplayOutcome,
+    messageCount: number = 0
+  ): void {
+    try {
+      const { metrics } = require('../monitoring/metrics.service');
+      metrics.incrementCounter('socket_reconnect_replay_total', { outcome, role, source });
+      if (outcome === 'success' && messageCount > 0) {
+        metrics.incrementCounter('socket_reconnect_replay_messages_total', { role, source }, messageCount);
+      }
+    } catch { }
+  }
+  // Reference REPLAY_OUTCOMES to retain its `const` declaration for compile-
+  // time literal-union narrowing of ReplayOutcome (eslint no-unused-vars).
+  void REPLAY_OUTCOMES;
+  void REPLAY_SOURCES;
+
   // Connection handler
   io.on('connection', async (socket: Socket) => {
+    // === Fix #14 — Socket.IO CSR (Connection State Recovery) outcome observation ===
+    // `socket.recovered` is set by @socket.io/redis-streams-adapter when the
+    // connectionStateRecovery config (line ~270) attempts to restore the prior
+    // session. When false on a client that DID present a prior session
+    // (`handshake.auth.lastSeq > 0`), all room memberships were lost — operator
+    // signal required. Cardinality: {recovered:'true'|'false'} × ~4 roles = 8
+    // series. See index-30-validated.md Finding #14.
+    // socket.io v4 typings declare `readonly recovered: boolean` on Socket
+    // (node_modules/socket.io/dist/socket.d.ts:55) — no `as any` cast needed.
+    const csrRecovered = socket.recovered === true;
+    try {
+      const { metrics } = require('../monitoring/metrics.service');
+      metrics.incrementCounter('socket_csr_attempt_total', {
+        recovered: String(csrRecovered),
+        role: socket.data.role || 'unknown',
+      });
+    } catch { /* metrics optional — never block connection */ }
+    if (!csrRecovered) {
+      const claimedLastSeq = Number((socket.handshake.auth as { lastSeq?: number })?.lastSeq || 0);
+      if (claimedLastSeq > 0) {
+        logger.warn('[CSR] Recovery FAILED for known-session client', {
+          socketId: socket.id,
+          userId: hashUserId(socket.data.userId),
+          role: socket.data.role,
+          lastSeq: claimedLastSeq,
+        });
+      }
+    }
+
     // FIX-46 (#110): Jitter to prevent thundering herd on mass reconnect
     // C-6 FIX: Increased from 500ms to 2000ms — spreads DB load over 4x wider window during ECS deploys
     await new Promise(resolve => setTimeout(resolve, Math.random() * 2000));
@@ -850,10 +916,16 @@ export function initializeSocket(server: HttpServer): Server {
                 _seq: undefined             // skip sequence numbering for reconcile push
               });
             }
+            recordReplayOutcome('booking_active', socket.data.role || 'unknown', 'success', broadcasts.length);
+          } else {
+            // No active broadcasts — GOOD steady-state. Distinguish from 'failure' so
+            // dashboards compute success-ratio = success / (success + failure).
+            recordReplayOutcome('booking_active', socket.data.role || 'unknown', 'empty');
           }
         } catch (e: any) {
           // Non-critical — client BroadcastFlowCoordinator.requestReconcile() is the fallback
           logger.warn(`[Socket] Failed to push active broadcasts on connect for ${userId}: ${e.message}`);
+          recordReplayOutcome('booking_active', socket.data.role || 'unknown', 'failure');
         }
       })();
 
@@ -895,9 +967,13 @@ export function initializeSocket(server: HttpServer): Server {
 
           if (activeOrderBroadcasts.length > 0) {
             logger.info(`[Socket] Transporter ${userId} reconnect: replayed ${activeOrderBroadcasts.length} order-path broadcast(s)`);
+            recordReplayOutcome('order_active', socket.data.role || 'unknown', 'success', activeOrderBroadcasts.length);
+          } else {
+            recordReplayOutcome('order_active', socket.data.role || 'unknown', 'empty');
           }
         } catch (orderReplayErr: any) {
           logger.warn(`[Socket] Order-path reconnect replay failed: ${orderReplayErr?.message}`);
+          recordReplayOutcome('order_active', socket.data.role || 'unknown', 'failure');
         }
       })();
     } else if (role === 'customer') {
@@ -930,6 +1006,7 @@ export function initializeSocket(server: HttpServer): Server {
             logger.info(`[Socket] Customer ${userId} reconnected — pushing ${activeOrders.length} active order(s)`);
           }
 
+          let emittedCount = 0;
           for (const order of activeOrders) {
             const confirmedCount = order.truckRequests.filter(
               (tr: any) => tr.status === 'confirmed' || tr.status === 'assigned'
@@ -945,6 +1022,7 @@ export function initializeSocket(server: HttpServer): Server {
               _reconnectDelivery: true,
               _replayed: true,
             });
+            emittedCount += 1;
 
             // Re-join customer to order room
             const orderRoom = `order:${order.id}`;
@@ -970,13 +1048,22 @@ export function initializeSocket(server: HttpServer): Server {
                   _reconnectDelivery: true,
                   _replayed: true,
                 });
+                emittedCount += 1;
               }
             }
           } catch (bookingErr: any) {
             logger.warn(`[Socket] Customer reconnect booking lookup failed: ${bookingErr?.message}`);
+            // Swallow inner — outer-success still records what was actually emitted.
+            // Partial replay is still a real replay (per Fix #11 Section 5 comment).
+          }
+          if (emittedCount > 0) {
+            recordReplayOutcome('customer_state_sync', socket.data.role || 'unknown', 'success', emittedCount);
+          } else {
+            recordReplayOutcome('customer_state_sync', socket.data.role || 'unknown', 'empty');
           }
         } catch (e: any) {
           logger.warn(`[Socket] Customer reconnect state sync failed: ${e?.message}`);
+          recordReplayOutcome('customer_state_sync', socket.data.role || 'unknown', 'failure');
         }
       })();
     }
@@ -1209,7 +1296,8 @@ export function initializeSocket(server: HttpServer): Server {
               '+inf'        // max: all newer messages
             );
             if (messages.length > 0) {
-              logger.info(`[Phase4] Replaying ${messages.length} unacked messages for ${userId} (lastSeq=${lastSeq})`);
+              logger.info(`[Phase4] Replaying ${messages.length} unacked messages for ${userId} (lastSeq=${lastSeq}, role=${role})`);
+              recordReplayOutcome('phase4', role || 'unknown', 'success', messages.length);
               for (const msgStr of messages) {
                 try {
                   const envelope = JSON.parse(msgStr);
@@ -1222,12 +1310,18 @@ export function initializeSocket(server: HttpServer): Server {
                   // Skip malformed messages
                 }
               }
+            } else {
+              // Empty replay (client reconnected with lastSeq up-to-date, nothing to
+              // send) is the GOOD steady-state — distinguish from 'failure' so
+              // dashboards compute success-ratio = success / (success + failure).
+              recordReplayOutcome('phase4', role || 'unknown', 'empty');
             }
           } catch (replayErr: any) {
             // Replay is best-effort — never block connection
             logger.warn(`[Phase4] Sequence replay failed for ${userId}`, {
               error: replayErr?.message
             });
+            recordReplayOutcome('phase4', role || 'unknown', 'failure');
           }
         })();
       }

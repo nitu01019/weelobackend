@@ -16,6 +16,7 @@
 import { Request, Response, NextFunction } from 'express';
 import { logger } from '../services/logger.service';
 import { AppError, BackpressureError } from '../types/error.types';
+import { toLogMeta, redactErrorMessage } from '../utils/error-log.utils';
 import { config } from '../../config/environment';
 
 const RETRY_AFTER_STATUSES = new Set<number>([429, 503]);
@@ -43,10 +44,15 @@ export function errorHandler(
   const requestId = (req.headers['x-request-id'] as string) || undefined;
 
   // Server-side log — include BackpressureError internal context if present (CWE-209: never serialized).
+  // Fix #19: spread errorCode / errorClass / errorMessage / errorCategory taxonomy so CloudWatch
+  // metric filters can slice by `$.errorCategory = "authentication"` etc. The "Request error"
+  // message text is unchanged so existing CloudWatch filters keyed on `[level=ERROR, msg="Request error"]`
+  // continue to match. Stack pattern-redacted (CWE-532 defense-in-depth — error.stack can carry
+  // PII baked into thrown error messages along the throw chain).
   const isBackpressure = error instanceof BackpressureError;
   logger.error('Request error', {
-    error: error.message,
-    stack: error.stack,
+    ...toLogMeta(error),
+    stack: error.stack ? redactErrorMessage(error.stack) : undefined,
     path: req.path,
     method: req.method,
     ip: req.ip,
