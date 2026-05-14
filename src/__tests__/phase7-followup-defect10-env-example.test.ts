@@ -36,12 +36,16 @@ describe('Phase 7 follow-up — Defect #10 .env.example covers all new Phase 7 e
   ];
 
   it.each(REQUIRED_KEYS)('declares %s with a safe default', (key) => {
-    // Each key must appear with an explicit assignment (`KEY=value`)
-    expect(env).toMatch(new RegExp(`^${key}=`, 'm'));
+    // Each key must appear with an explicit assignment (`KEY=value`).
+    // String-based scan to avoid `new RegExp(${key})` which trips Semgrep
+    // javascript.lang.security.audit.detect-non-literal-regexp.
+    const lines = env.split(/\r?\n/);
+    expect(lines.some((line) => line.startsWith(`${key}=`))).toBe(true);
   });
 
   it('all new flags default to safe values (false where boolean)', () => {
-    // Match each boolean flag → expect `=false` default
+    // Each boolean flag must default to `false`, with `\b` semantics after the
+    // value (next char is end-of-line or a non-word char like space, tab, #).
     const booleanDefaultFalse = [
       'FF_H3_DUAL_INDEX_WRITE',
       'FF_H3_DUAL_INDEX_READ',
@@ -49,8 +53,16 @@ describe('Phase 7 follow-up — Defect #10 .env.example covers all new Phase 7 e
       'ECS_STOPTIMEOUT_CONFIRMED_GTE_45S',
       'REDIS_CLUSTER',
     ];
+    const lines = env.split(/\r?\n/);
     for (const key of booleanDefaultFalse) {
-      expect(env).toMatch(new RegExp(`^${key}=false\\b`, 'm'));
+      const prefix = `${key}=false`;
+      const matched = lines.some((line) => {
+        if (!line.startsWith(prefix)) return false;
+        const after = line.charAt(prefix.length);
+        // `\b` equivalent: empty (end of line) OR non-word char.
+        return after === '' || /[^A-Za-z0-9_]/.test(after);
+      });
+      expect(matched).toBe(true);
     }
   });
 
