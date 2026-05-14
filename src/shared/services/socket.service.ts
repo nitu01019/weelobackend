@@ -334,6 +334,23 @@ export function initializeSocket(server: HttpServer): Server {
 
   // Connection handler
   io.on('connection', async (socket: Socket) => {
+    // Phase 7 follow-up — Defect #5: reject new connections during graceful
+    // drain. Without this, new sockets arriving in the 5s pre-drain window
+    // (DRAIN_PREDRAIN_MS) would join rooms + run replay logic only to be
+    // surprised by `socket.disconnect(true)` from the drain loop, then
+    // retry against this same draining pod (thundering-herd-to-self).
+    // Linkerd / Envoy "fail-fast during drain" pattern.
+    // Lazy-require matches existing inline-require convention (L257, L271,
+    // L313, L338, L371) and avoids the static-import circular-dependency
+    // risk between socket.service.ts and server.ts.
+    try {
+      const { isShuttingDown }: typeof import('../../server') = require('../../server');
+      if (isShuttingDown()) {
+        socket.disconnect(true);
+        return;
+      }
+    } catch { /* server module not loaded in test harness — proceed */ }
+
     // === Fix #14 — Socket.IO CSR (Connection State Recovery) outcome observation ===
     // `socket.recovered` is set by @socket.io/redis-streams-adapter when the
     // connectionStateRecovery config (line ~270) attempts to restore the prior
